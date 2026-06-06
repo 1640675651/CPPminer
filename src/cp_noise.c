@@ -23,8 +23,8 @@
 static const uint8_t SEED_LABEL_A[32] = "A_tensor";
 static const uint8_t SEED_LABEL_B[32] = "B_tensor";
 
-/* bzminer_mining_config(4096, 256) — from pearl_mining.MiningConfiguration.to_bytes() */
-const uint8_t PEARL_BZMINER_CONFIG[52] = {
+/* scattered mining config (4096, 256) — pearl_mining.MiningConfiguration.to_bytes() */
+const uint8_t PEARL_SCATTERED_CONFIG[52] = {
     0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
     0x07, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
     0x0f, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -52,7 +52,7 @@ void pearl_set_contiguous_tiles(int on){
 }
 
 static const uint8_t* pearl_active_mining_config(void){
-    return g_pearl_contiguous_tiles ? PEARL_CONTIGUOUS_CONFIG : PEARL_BZMINER_CONFIG;
+    return g_pearl_contiguous_tiles ? PEARL_CONTIGUOUS_CONFIG : PEARL_SCATTERED_CONFIG;
 }
 
 static size_t padded_chunk_len(size_t raw_len){

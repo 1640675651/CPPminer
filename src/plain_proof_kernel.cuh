@@ -1,4 +1,4 @@
-/* BzMiner plain_proof jackpot kernel — 8×16 periodic hash tiles. */
+/* plain_proof jackpot kernel — 8×16 periodic hash tiles. */
 #ifndef PLAIN_PROOF_KERNEL_CUH
 #define PLAIN_PROOF_KERNEL_CUH
 
@@ -20,7 +20,7 @@ __device__ __forceinline__ uint32_t pp_rotl32(uint32_t x, int s) {
     return (x << s) | (x >> (32 - s));
 }
 
-/* BzMiner: scattered offsets within 128/256 periods; contiguous: block-aligned. */
+/* Scattered offsets within 128/256 periods; contiguous mode uses block-aligned tiles. */
 __device__ __forceinline__ int pp_row_trows(int part_idx) {
     if(PP_CONTIGUOUS_MODE) return part_idx * PP_HASH_H;
     const int base[16] = {
@@ -31,7 +31,7 @@ __device__ __forceinline__ int pp_row_trows(int part_idx) {
 
 __device__ __forceinline__ int pp_col_tcols(int part_idx) {
     if(PP_CONTIGUOUS_MODE) return part_idx * PP_HASH_W;
-    /* Valid t_cols for BzMiner cols_pattern (pearl_mining offset_is_valid): even 0..30 */
+    /* Valid t_cols for scattered cols_pattern (pearl_mining offset_is_valid): even 0..30 */
     const int base[16] = {
         0, 2, 4, 6, 8, 10, 12, 14,
         16, 18, 20, 22, 24, 26, 28, 30

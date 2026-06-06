@@ -186,7 +186,7 @@ int main(int argc, char** argv)
                g_m_active, g_n_active, K_DIM, R_RANK,
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n",
-               g_contiguous_tiles ? "contiguous 8x16 blocks" : "BzMiner periodic");
+               g_contiguous_tiles ? "contiguous 8x16 blocks" : "periodic scattered 8x16");
         printf("[mode] hash_tiles=%dx%d (%d total)\n",
                row_parts, col_parts, row_parts * col_parts);
         printf("[mode] host~%.0f MiB (signal A+B)\n", host_mib);

@@ -1,4 +1,5 @@
 /build/
+/rust/cp-proof-ffi/target/
 /third_party/blake3/
 *.exe
 *.obj

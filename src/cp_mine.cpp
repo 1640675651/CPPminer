@@ -4,6 +4,7 @@
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
 #include "cp_pool.h"
+#include "cp_proof.h"
 #include "cp_state.h"
 #include "cp_util.h"
 
@@ -47,25 +48,17 @@ int cp_mine_job(
     cp_job_mine_begin(job_key);
 
     const char* tmp = g_dev_dims ? "pp_dev" : "pp_prod";
-    char hdr_path[512], a_path[512], bt_path[512], proof_path[512];
+    char hdr_path[512], proof_path[512];
 #ifdef _WIN32
     snprintf(hdr_path, sizeof(hdr_path), "%s\\%s_header.bin", g_workdir, tmp);
-    snprintf(a_path, sizeof(a_path), "%s\\%s_A.bin", g_workdir, tmp);
-    snprintf(bt_path, sizeof(bt_path), "%s\\%s_Bt.bin", g_workdir, tmp);
     snprintf(proof_path, sizeof(proof_path), "%s\\%s_proof.b64", g_workdir, tmp);
 #else
     snprintf(hdr_path, sizeof(hdr_path), "%s/%s_header.bin", g_workdir, tmp);
-    snprintf(a_path, sizeof(a_path), "%s/%s_A.bin", g_workdir, tmp);
-    snprintf(bt_path, sizeof(bt_path), "%s/%s_Bt.bin", g_workdir, tmp);
     snprintf(proof_path, sizeof(proof_path), "%s/%s_proof.b64", g_workdir, tmp);
 #endif
     cp_path_abs(hdr_path, sizeof(hdr_path));
-    cp_path_abs(a_path, sizeof(a_path));
-    cp_path_abs(bt_path, sizeof(bt_path));
     cp_path_abs(proof_path, sizeof(proof_path));
     cp_path_to_posix(hdr_path);
-    cp_path_to_posix(a_path);
-    cp_path_to_posix(bt_path);
     cp_path_to_posix(proof_path);
 
     double t0 = cp_now_sec();
@@ -212,37 +205,6 @@ int cp_mine_job(
                (unsigned long long)nonce, t_rows, t_cols);
         fflush(stdout);
 
-        if(!cp_write_file_bin(a_path, h_Ap_global, szAp) ||
-           !cp_write_file_bin(bt_path, h_BpT_global, szBpT)){
-            printf("[plain] failed to write A/B for proof builder (nonce=%llu)\n",
-                   (unsigned long long)nonce);
-            fflush(stdout);
-            nonce++;
-            continue;
-        }
-
-        snprintf(subcmd, sizeof(subcmd),
-            "build --header \"%s\" --m %d --n %d --k %d --r %d "
-            "--t-rows %d --t-cols %d --a-file \"%s\" --b-file \"%s\" "
-            "--out-b64 \"%s\"%s",
-            hdr_path,
-            g_m_active, g_n_active, K_DIM, R_RANK,
-            t_rows, t_cols, a_path, bt_path, proof_path,
-            g_contiguous_tiles ? " --contiguous-tiles" : "");
-        if(cp_run_python(subcmd) != 0){
-            printf("[plain] build failed (nonce=%llu), continuing job\n",
-                   (unsigned long long)nonce);
-            fflush(stdout);
-            nonce++;
-            continue;
-        }
-
-        if(cp_job_should_cancel()){
-            printf("[plain] job cancelled before verify/submit\n"); fflush(stdout);
-            rc = CP_JOB_CANCELLED;
-            goto job_done;
-        }
-
         free(b64);
         b64 = NULL;
         b64 = (char*)malloc(PLAIN_PROOF_B64_MAX);
@@ -252,14 +214,27 @@ int cp_mine_job(
             continue;
         }
 
-        if(!cp_read_file_text(proof_path, b64, PLAIN_PROOF_B64_MAX)){
-            printf("[plain] read proof b64 failed (nonce=%llu), continuing job\n",
-                   (unsigned long long)nonce);
-            fflush(stdout);
-            free(b64);
-            b64 = NULL;
-            nonce++;
-            continue;
+        {
+            const uint8_t* mining_cfg = g_contiguous_tiles
+                ? PEARL_CONTIGUOUS_CONFIG : PEARL_SCATTERED_CONFIG;
+            char errbuf[512];
+            int prc = cp_proof_build(
+                header, (size_t)hlen,
+                mining_cfg, 52,
+                h_Ap_global, h_BpT_global,
+                g_m_active, g_n_active, K_DIM, R_RANK,
+                t_rows, t_cols, g_contiguous_tiles,
+                b64, PLAIN_PROOF_B64_MAX,
+                errbuf, sizeof(errbuf));
+            if(prc != 0){
+                printf("[plain] proof build failed (nonce=%llu): %s\n",
+                       (unsigned long long)nonce, errbuf[0] ? errbuf : "unknown");
+                fflush(stdout);
+                free(b64);
+                b64 = NULL;
+                nonce++;
+                continue;
+            }
         }
 
         bn = (int)strlen(b64);
@@ -270,6 +245,20 @@ int cp_mine_job(
             b64 = NULL;
             nonce++;
             continue;
+        }
+
+        if(g_dry_run || g_plain_verify){
+            FILE* pf = fopen(proof_path, "wb");
+            if(pf){
+                fwrite(b64, 1, (size_t)bn, pf);
+                fclose(pf);
+            }
+        }
+
+        if(cp_job_should_cancel()){
+            printf("[plain] job cancelled before verify/submit\n"); fflush(stdout);
+            rc = CP_JOB_CANCELLED;
+            goto job_done;
         }
 
         if(g_plain_verify && target_hex[0]){

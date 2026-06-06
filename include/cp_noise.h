@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-extern const uint8_t PEARL_BZMINER_CONFIG[52];
+extern const uint8_t PEARL_SCATTERED_CONFIG[52];
 extern const uint8_t PEARL_CONTIGUOUS_CONFIG[52];
 
 void pearl_set_contiguous_tiles(int on);

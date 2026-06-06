@@ -22,12 +22,12 @@ sys.path.insert(0, str(ROOT))
 
 from miner1 import MiningConfig, generate_ab  # noqa: E402
 from plain_proof_mine import (  # noqa: E402
-    BZMINER_COLS_PATTERN,
-    BZMINER_ROWS_PATTERN,
+    BZMINER_COLS_PATTERN as SCATTERED_COLS_PATTERN,
+    BZMINER_ROWS_PATTERN as SCATTERED_ROWS_PATTERN,
     CONTIGUOUS_COLS_PATTERN,
     CONTIGUOUS_ROWS_PATTERN,
     build_plain_proof,
-    bzminer_mining_config,
+    bzminer_mining_config as scattered_mining_config,
     contiguous_mining_config,
     job_key,
 )
@@ -69,9 +69,9 @@ def cmd_build(args: argparse.Namespace) -> int:
         rows_pat = CONTIGUOUS_ROWS_PATTERN
         cols_pat = CONTIGUOUS_COLS_PATTERN
     else:
-        pearl_cfg = bzminer_mining_config(args.k, args.r)
-        rows_pat = BZMINER_ROWS_PATTERN
-        cols_pat = BZMINER_COLS_PATTERN
+        pearl_cfg = scattered_mining_config(args.k, args.r)
+        rows_pat = SCATTERED_ROWS_PATTERN
+        cols_pat = SCATTERED_COLS_PATTERN
 
     A, bt = _load_ab(header, cfg, args.nonce, args.a_file, args.b_file)
 
@@ -129,7 +129,7 @@ def main() -> int:
     p_build.add_argument(
         "--contiguous-tiles",
         action="store_true",
-        help="contiguous 8x16 tile rows/cols (debug; pool uses BzMiner scattered)",
+        help="contiguous 8x16 tile rows/cols (debug; default is production scattered layout)",
     )
     p_build.set_defaults(func=cmd_build)
 

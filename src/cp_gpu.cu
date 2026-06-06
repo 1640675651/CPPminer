@@ -35,10 +35,10 @@ static int g_contiguous = 0;
 
 static void sync_tile_config(void)
 {
-    static const int bz_row[PP_HASH_H] = {
+    static const int scattered_row[PP_HASH_H] = {
         0, 8, 32, 40, 64, 72, 96, 104
     };
-    static const int bz_col[PP_HASH_W] = {
+    static const int scattered_col[PP_HASH_W] = {
         0, 1, 32, 33, 64, 65, 96, 97,
         128, 129, 160, 161, 192, 193, 224, 225
     };
@@ -49,8 +49,8 @@ static void sync_tile_config(void)
         for(int i = 0; i < PP_HASH_H; i++) row_pat[i] = i;
         for(int i = 0; i < PP_HASH_W; i++) col_pat[i] = i;
     } else {
-        memcpy(row_pat, bz_row, sizeof(row_pat));
-        memcpy(col_pat, bz_col, sizeof(col_pat));
+        memcpy(row_pat, scattered_row, sizeof(row_pat));
+        memcpy(col_pat, scattered_col, sizeof(col_pat));
     }
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));

@@ -1,7 +1,8 @@
 # Build cpminer.exe (CUDA) on Windows.
-# Requires: NVIDIA CUDA Toolkit 12.x, MSVC (VS Build Tools), nvidia-smi.
+# Requires: NVIDIA CUDA Toolkit 12.x, MSVC (VS Build Tools), nvidia-smi, Rust (cargo on PATH).
 #
 # Usage:
+#   conda activate pearl
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -CudaArch 61
 
@@ -16,6 +17,28 @@ $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
 $OutExe = Join-Path $Root "cpminer.exe"
 $script:VcvarsBat = $null
+$script:ClExe = $null
+
+function Get-SanitizedPathForNvcc {
+    param([string]$PathValue)
+    # Drop conda envs and mingw so nvcc/host compile use MSVC, not pearl's toolchain.
+    ($PathValue -split ';' | Where-Object {
+        $_ -and $_ -notmatch '\\miniconda3\\|\\anaconda3\\|\\envs\\|mingw-w64|\\.cargo\\bin'
+    }) -join ';'
+}
+
+function Clear-CondaToolchainOverrides {
+    # Conda envs (e.g. pearl) often set CC/CXX to non-MSVC tools, which breaks nvcc's
+    # Visual Studio setup even when vcvars64.bat is present.
+    foreach ($var in @('CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CPPFLAGS')) {
+        if (Test-Path "env:$var") {
+            Remove-Item "env:$var" -ErrorAction SilentlyContinue
+        }
+    }
+    if ($env:CONDA_PREFIX) {
+        Write-Host "=== Conda active ($env:CONDA_PREFIX); cleared CC/CXX for nvcc ==="
+    }
+}
 
 function Initialize-MSVC {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -27,12 +50,17 @@ function Initialize-MSVC {
     $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
     if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsPath" }
     $script:VcvarsBat = $vcvars
+    Write-Host "=== MSVC: $vsPath ==="
     cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
     }
-    $cl = (Get-Command cl.exe).Source
-    $env:CUDAHOSTCXX = $cl
-    $env:CUDAHOSTC = $cl
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+        throw "cl.exe not on PATH after vcvars64"
+    }
+    $script:ClExe = (Get-Command cl.exe).Source
+    $env:CUDAHOSTCXX = $script:ClExe
+    $env:CUDAHOSTC = $script:ClExe
+    Write-Host "=== cl.exe: $($script:ClExe) ==="
 }
 
 function Find-CudaRoot {
@@ -75,17 +103,27 @@ function Ensure-Blake3 {
 
 function Invoke-Nvcc {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$NvccArgs)
-    if ($script:VcvarsBat) {
-        $quoted = ($NvccArgs | ForEach-Object {
-            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '""') + '"' } else { $_ }
-        }) -join ' '
-        cmd /c "`"$script:VcvarsBat`" >nul 2>&1 && `"$Nvcc`" $quoted"
-    } else {
-        & $Nvcc @NvccArgs
+    if (-not $script:ClExe) { throw "MSVC cl.exe not configured (Initialize-MSVC missing?)" }
+    $ccbin = @("-ccbin", $script:ClExe)
+    $allArgs = $ccbin + $NvccArgs
+    $quoted = ($allArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '""') + '"' } else { $_ }
+    }) -join ' '
+    $savedPath = $env:PATH
+    $env:PATH = Get-SanitizedPathForNvcc -PathValue $env:PATH
+    try {
+        if ($script:VcvarsBat) {
+            cmd /c "`"$script:VcvarsBat`" >nul 2>&1 && set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+        } else {
+            cmd /c "set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+        }
+    } finally {
+        $env:PATH = $savedPath
     }
-    if ($LASTEXITCODE -ne 0) { throw "nvcc failed" }
+    if ($LASTEXITCODE -ne 0) { throw "nvcc failed: $($NvccArgs -join ' ')" }
 }
 
+Clear-CondaToolchainOverrides
 Initialize-MSVC
 $CudaRoot = Find-CudaRoot
 $Nvcc = Join-Path $CudaRoot "bin\nvcc.exe"
@@ -98,6 +136,26 @@ $Nosimd = @("-DBLAKE3_NO_AVX512", "-DBLAKE3_NO_AVX2", "-DBLAKE3_NO_SSE41", "-DBL
 Write-Host "=== CUDA: $CudaRoot  Arch: $NvccArch ==="
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 Ensure-Blake3
+
+Write-Host "=== Building cp-proof-ffi (Rust) ==="
+$RustDir = Join-Path $Root "rust\cp-proof-ffi"
+$PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
+if (-not (Test-Path $PearlBlake3)) {
+    throw "Vendored pearl-blake3 missing at third_party/pearl-blake3"
+}
+Push-Location $RustDir
+try {
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        throw "Rust cargo not found. conda activate pearl (or install from https://rustup.rs)"
+    }
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+} finally {
+    Pop-Location
+}
+$RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
+if (-not (Test-Path $RustLib)) { throw "Missing $RustLib" }
+Write-Host "=== Rust lib: $RustLib ==="
 
 foreach ($unit in @(
     @{ src = "blake3.c"; extra = $Nosimd },
@@ -125,6 +183,10 @@ $gpuFlags = @("-arch=$NvccArch", "-O3") + $HostOpenMP + $Inc + @(
 Invoke-Nvcc @gpuFlags
 
 Write-Host "=== Linking $OutExe ==="
+$RustExtra = @(
+    $RustLib,
+    "userenv.lib", "ws2_32.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib"
+)
 $linkArgs = @(
     "-arch=$NvccArch", "-O3",
     (Join-Path $BuildDir "main.obj"),
@@ -137,9 +199,8 @@ $linkArgs = @(
     (Join-Path $BuildDir "cp_noise.obj"),
     (Join-Path $BuildDir "blake3.obj"),
     (Join-Path $BuildDir "blake3_dispatch.obj"),
-    (Join-Path $BuildDir "blake3_portable.obj"),
-    "-o", $OutExe
-)
+    (Join-Path $BuildDir "blake3_portable.obj")
+) + $RustExtra + @("-o", $OutExe)
 Invoke-Nvcc @linkArgs
 
 Write-Host "=== Done: $OutExe ==="
