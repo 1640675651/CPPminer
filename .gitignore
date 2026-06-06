@@ -1,0 +1,8 @@
+/build/
+/third_party/blake3/
+*.exe
+*.obj
+*.lib
+*.exp
+pp_dev_*
+pp_prod_*
