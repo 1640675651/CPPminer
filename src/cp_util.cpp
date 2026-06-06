@@ -354,10 +354,10 @@ double cp_pp_macs_per_hash_tile(void)
     return (double)PP_HASH_H * (double)PP_HASH_W * (double)K_DIM;
 }
 
-double cp_pp_effective_mac_rate(uint64_t attempts, int tiles_per_attempt, double elapsed_sec)
+double cp_pp_mac_rate_from_tiles(uint64_t tiles_scanned, double elapsed_sec)
 {
     if(elapsed_sec < 1e-9) elapsed_sec = 1e-9;
-    return (double)attempts * (double)tiles_per_attempt * cp_pp_macs_per_hash_tile() / elapsed_sec;
+    return (double)tiles_scanned * cp_pp_macs_per_hash_tile() / elapsed_sec;
 }
 
 void cp_pp_fmt_mac_rate(double mac_s, char* out, size_t out_sz)

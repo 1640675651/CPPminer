@@ -114,7 +114,8 @@ int cp_gpu_mine_plain_proof(
     const int8_t* h_A, const int8_t* h_B,
     const uint8_t* a_key, const uint32_t pool_tgt[8],
     int m, int n,
-    int* out_t_rows, int* out_t_cols)
+    int* out_t_rows, int* out_t_cols,
+    uint64_t* out_tiles_scanned)
 {
     size_t szAp  = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
@@ -131,7 +132,10 @@ int cp_gpu_mine_plain_proof(
     int zero = 0;
     int found = 0;
     const int total_tiles = row_parts * col_parts;
+    uint64_t tiles_scanned = 0;
     double scan_t0 = cp_now_sec();
+
+    if(out_tiles_scanned) *out_tiles_scanned = 0;
 
     sync_tile_config();
 
@@ -150,14 +154,21 @@ int cp_gpu_mine_plain_proof(
     }
 
     for(int rp0 = 0; rp0 < row_parts && !found; rp0 += batch){
-        if(cp_job_should_cancel()) return -1;
+        if(cp_job_should_cancel()){
+            if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+            return -1;
+        }
         int rpb = batch;
         if(rp0 + rpb > row_parts) rpb = row_parts - rp0;
         for(int cp0 = 0; cp0 < col_parts && !found; cp0 += batch){
-            if(cp_job_should_cancel()) return -1;
+            if(cp_job_should_cancel()){
+                if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+                return -1;
+            }
             int cpb = batch;
             if(cp0 + cpb > col_parts) cpb = col_parts - cp0;
             dim3 grid(cpb, rpb);
+            const uint64_t batch_tiles = (uint64_t)rpb * (uint64_t)cpb;
 
             for(int i = 0; i < g_ngpu; i++){
                 GpuCtx* g = &g_gpus[i];
@@ -189,19 +200,22 @@ int cp_gpu_mine_plain_proof(
                     fflush(stdout);
                 }
             }
+
+            tiles_scanned += batch_tiles;
         }
-        if((rp0 / batch) % 4 == 0){
-            int tiles_done = (rp0 + rpb) * col_parts;
+        if((rp0 / batch) % 4 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
             if(scan_sec < 1e-9) scan_sec = 1e-9;
-            double scan_mac_s = (double)tiles_done * cp_pp_macs_per_hash_tile() / scan_sec;
+            double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
-            printf("[gpu] plain_proof progress: row parts %d/%d tiles %d/%d (%.1f%%) %s\n",
-                   rp0 + rpb, row_parts, tiles_done, total_tiles,
-                   100.0 * (double)tiles_done / (double)total_tiles, mac_buf);
+            printf("[gpu] plain_proof progress: row parts %d/%d tiles %llu/%d (%.1f%%) %s\n",
+                   rp0 + rpb, row_parts,
+                   (unsigned long long)tiles_scanned, total_tiles,
+                   100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);
         }
     }
+    if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
     return found;
 }

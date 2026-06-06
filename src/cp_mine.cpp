@@ -78,6 +78,7 @@ int cp_mine_job(
     int tiles_per_attempt = 0;
     uint64_t nonce = 0;
     uint64_t attempts = 0;
+    uint64_t tiles_scanned_total = 0;
     double elapsed = 0.0;
     double hs = 0.0;
     double last_report = 0.0;
@@ -166,9 +167,11 @@ int cp_mine_job(
             fflush(stdout);
         }
 
+        uint64_t scan_tiles = 0;
         found = cp_gpu_mine_plain_proof(
             h_A_scan, h_B_scan, a_key, pool_tgt,
-            g_m_active, g_n_active, &t_rows, &t_cols);
+            g_m_active, g_n_active, &t_rows, &t_cols, &scan_tiles);
+        tiles_scanned_total += scan_tiles;
         attempts++;
 
         if(found < 0){
@@ -182,11 +185,12 @@ int cp_mine_job(
                 double sec = now - t0;
                 if(sec < 1e-3) sec = 1e-3;
                 char mac_buf[32];
-                cp_pp_fmt_mac_rate(cp_pp_effective_mac_rate(attempts, tiles_per_attempt, sec),
+                cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_scanned_total, sec),
                                    mac_buf, sizeof(mac_buf));
-                printf("[plain] nonce=%llu attempts=%llu (%.2f/s) effective %s no share yet\n",
+                printf("[plain] nonce=%llu attempts=%llu tiles=%llu (%.2f/s) %s no share yet\n",
                        (unsigned long long)nonce,
                        (unsigned long long)attempts,
+                       (unsigned long long)tiles_scanned_total,
                        (double)attempts / sec, mac_buf);
                 fflush(stdout);
                 last_report = now;
@@ -279,12 +283,13 @@ int cp_mine_job(
 
         elapsed = cp_now_sec() - t0;
         if(elapsed < 1e-3) elapsed = 1e-3;
-        hs = cp_pp_effective_mac_rate(attempts, tiles_per_attempt, elapsed);
+        hs = cp_pp_mac_rate_from_tiles(tiles_scanned_total, elapsed);
         {
             char mac_buf[32];
             cp_pp_fmt_mac_rate(hs, mac_buf, sizeof(mac_buf));
-            printf("[plain] proof ready (%d chars) nonce=%llu attempts=%llu elapsed=%.2fs effective %s (hs=%.0f)\n",
+            printf("[plain] proof ready (%d chars) nonce=%llu attempts=%llu tiles=%llu elapsed=%.2fs %s (hs=%.0f)\n",
                    bn, (unsigned long long)nonce, (unsigned long long)attempts,
+                   (unsigned long long)tiles_scanned_total,
                    elapsed, mac_buf, hs);
         }
         fflush(stdout);
