@@ -94,12 +94,16 @@ int cp_mine_job(
     fwrite(header, 1, (size_t)hlen, hf);
     fclose(hf);
 
-    h_A_scan = (int8_t*)malloc(szAp);
-    h_B_scan = (int8_t*)malloc(szBpT);
-    if(!h_A_scan || !h_B_scan){
-        fprintf(stderr,"OOM scan buffers\n");
-        rc = CP_JOB_CANCELLED;
-        goto job_done;
+    h_A_scan = NULL;
+    h_B_scan = NULL;
+    if(g_cpu_matrix_gen){
+        h_A_scan = (int8_t*)malloc(szAp);
+        h_B_scan = (int8_t*)malloc(szBpT);
+        if(!h_A_scan || !h_B_scan){
+            fprintf(stderr,"OOM scan buffers\n");
+            rc = CP_JOB_CANCELLED;
+            goto job_done;
+        }
     }
 
     pearl_job_key(header, hlen, job_key_bytes);
@@ -127,38 +131,38 @@ int cp_mine_job(
             goto job_done;
         }
 
-        if(nonce < 3 || nonce % 16 == 0){
-            printf("[gen] nonce=%llu: generating A (%dx%d) and B^T (%dx%d)...\n",
-                   (unsigned long long)nonce,
-                   g_m_active, K_DIM, g_n_active, K_DIM);
-            fflush(stdout);
-        }
+        if(g_cpu_matrix_gen){
+            if(nonce < 3 || nonce % 16 == 0){
+                printf("[gen] nonce=%llu: CPU A/B + noise (debug path)...\n",
+                       (unsigned long long)nonce);
+                fflush(stdout);
+            }
 
-        if(pearl_generate_ab(ab_seed, ab_len, g_m_active, g_n_active, K_DIM,
-                            h_Ap_global, h_BpT_global) != 0){
-            printf("[plain] job cancelled during A,B generation\n"); fflush(stdout);
-            rc = CP_JOB_CANCELLED;
-            goto job_done;
-        }
+            if(pearl_generate_ab(ab_seed, ab_len, g_m_active, g_n_active, K_DIM,
+                                h_Ap_global, h_BpT_global) != 0){
+                printf("[plain] job cancelled during A,B generation\n"); fflush(stdout);
+                rc = CP_JOB_CANCELLED;
+                goto job_done;
+            }
 
-        pearl_commitment_seeds(job_key_bytes, h_Ap_global, h_BpT_global,
-                               g_m_active, g_n_active, K_DIM, b_seed, a_key);
+            pearl_commitment_seeds(job_key_bytes, h_Ap_global, h_BpT_global,
+                                   g_m_active, g_n_active, K_DIM, b_seed, a_key);
 
-        if(nonce < 3 || nonce % 16 == 0){
-            printf("[gen] nonce=%llu: fusing noisy int8 for GPU scan...\n",
+            if(pearl_build_noisy_matrices(g_m_active, g_n_active, K_DIM, R_RANK,
+                                          b_seed, a_key, h_Ap_global, h_BpT_global,
+                                          h_A_scan, h_B_scan) != 0){
+                if(cp_job_should_cancel()){
+                    printf("[plain] job cancelled during noise fusion\n"); fflush(stdout);
+                    rc = CP_JOB_CANCELLED;
+                } else {
+                    printf("[gen] noisy matrix build failed\n"); fflush(stdout);
+                }
+                goto job_done;
+            }
+        } else if(nonce < 3 || nonce % 16 == 0){
+            printf("[gen] nonce=%llu: GPU random matrix gen + noise...\n",
                    (unsigned long long)nonce);
             fflush(stdout);
-        }
-        if(pearl_build_noisy_matrices(g_m_active, g_n_active, K_DIM, R_RANK,
-                                      b_seed, a_key, h_Ap_global, h_BpT_global,
-                                      h_A_scan, h_B_scan) != 0){
-            if(cp_job_should_cancel()){
-                printf("[plain] job cancelled during noise fusion\n"); fflush(stdout);
-                rc = CP_JOB_CANCELLED;
-            } else {
-                printf("[gen] noisy matrix build failed\n"); fflush(stdout);
-            }
-            goto job_done;
         }
 
         if(nonce < 3 || nonce % 16 == 0){
@@ -168,9 +172,16 @@ int cp_mine_job(
         }
 
         uint64_t scan_tiles = 0;
-        found = cp_gpu_mine_plain_proof(
-            h_A_scan, h_B_scan, a_key, pool_tgt,
-            g_m_active, g_n_active, &t_rows, &t_cols, &scan_tiles);
+        found = cp_gpu_mine_attempt(
+            ab_seed, ab_len, job_key_bytes, pool_tgt,
+            g_m_active, g_n_active,
+            g_cpu_matrix_gen,
+            g_cpu_matrix_gen ? h_A_scan : NULL,
+            g_cpu_matrix_gen ? h_B_scan : NULL,
+            g_cpu_matrix_gen ? a_key : NULL,
+            h_Ap_global,
+            h_BpT_global,
+            &t_rows, &t_cols, &scan_tiles);
         tiles_scanned_total += scan_tiles;
         attempts++;
 

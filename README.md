@@ -63,6 +63,7 @@ cmake --build . --config Release
 | `--devices` | CUDA device list, e.g. `0` or `0,1` |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--contiguous-tiles` | Debug tile layout (contiguous 8×16 blocks vs production scattered) |
+| `--cpu-gen` | CPU BLAKE3 matrix gen + noise (debug; default is full GPU path) |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build/verify proofs without submitting |
 | `--no-verify` | Skip Python verify before submit (recommended; proof build is native Rust) |

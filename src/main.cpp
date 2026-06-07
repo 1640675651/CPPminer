@@ -24,11 +24,15 @@ static void print_usage(void)
     printf("  --devices N[,M]    CUDA devices (default: 0)\n");
     printf("  --dev                m=n=8192 for testing\n");
     printf("  --contiguous-tiles   8x16 contiguous hash tiles (debug)\n");
+    printf("  --cpu-gen            CPU BLAKE3 matrix gen (debug; default GPU random)\n");
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build/verify proof but do not submit\n");
     printf("  --no-verify          skip verify before submit\n");
+    printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
+    printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
+           M_DIM);
 }
 
 static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -103,6 +107,8 @@ int main(int argc, char** argv)
     const char* wallet = NULL;
     int devs[MAX_GPUS] = {0};
     int ndev = 0;
+    int align_test = 0;
+    int align_test_prod = 0;
 
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--pool") && i + 1 < argc){
@@ -131,6 +137,8 @@ int main(int argc, char** argv)
             g_dev_dims = 1;
         } else if(!strcmp(argv[i], "--contiguous-tiles")){
             g_contiguous_tiles = 1;
+        } else if(!strcmp(argv[i], "--cpu-gen")){
+            g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
@@ -149,10 +157,28 @@ int main(int argc, char** argv)
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--no-verify")){
             g_plain_verify = 0;
+        } else if(!strcmp(argv[i], "--align-test")){
+            align_test = 1;
+        } else if(!strcmp(argv[i], "--align-test-prod")){
+            align_test = 1;
+            align_test_prod = 1;
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
         }
+    }
+
+    if(align_test){
+        if(!ndev){ devs[0] = 0; ndev = 1; }
+        pearl_set_contiguous_tiles(g_contiguous_tiles);
+        cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
+        if(pearl_run_alignment_tests() != 0) return 1;
+        if(align_test_prod){
+            if(pearl_run_alignment_tests_prod(M_DIM, M_DIM, K_DIM) != 0) return 1;
+            if(cp_gpu_run_alignment_tests(devs[0], M_DIM, N_DIM) != 0) return 1;
+        }
+        printf("[align-test] all tests passed\n");
+        return 0;
     }
 
     if(!wallet){ fprintf(stderr, "--wallet required\n"); return 1; }
@@ -190,6 +216,9 @@ int main(int argc, char** argv)
         printf("[mode] hash_tiles=%dx%d (%d total)\n",
                row_parts, col_parts, row_parts * col_parts);
         printf("[mode] host~%.0f MiB (signal A+B)\n", host_mib);
+        printf("[mode] matrix gen: %s\n",
+               g_cpu_matrix_gen ? "CPU BLAKE3 (debug --cpu-gen)"
+                                : "GPU random + GPU commitment/noise");
         printf("[mode] verify=%d dry_run=%d max_nonce=%d\n",
                g_plain_verify, g_dry_run, g_max_nonce);
     }

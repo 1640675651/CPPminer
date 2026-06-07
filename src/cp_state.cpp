@@ -14,4 +14,5 @@ char worker_global[64] = "rig01";
 char agent_global[64] = "cpminer/1.0";
 int g_dry_run = 0;
 int g_plain_verify = 0;
+int g_cpu_matrix_gen = 0;
 int g_max_nonce = 0;

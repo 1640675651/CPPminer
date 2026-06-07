@@ -11,13 +11,29 @@ void cp_gpu_init(int* devs, int ndev);
 void cp_gpu_shutdown(void);
 void cp_gpu_set_contiguous_tiles(int on);
 
-/* Returns 1 on share, 0 on miss, -1 if job cancelled.
- * out_tiles_scanned receives hash tiles actually evaluated (optional). */
+/* CPU matrix path: upload host noisy matrices and scan. */
 int cp_gpu_mine_plain_proof(const int8_t* h_A, const int8_t* h_B,
                             const uint8_t* a_key, const uint32_t pool_tgt[8],
                             int m, int n,
                             int* out_t_rows, int* out_t_cols,
                             uint64_t* out_tiles_scanned);
+
+/* GPU matrix path (default): random fill + GPU commitment/noise, then scan.
+ * On share, copies signal A/B^T to h_A_sig/h_Bt_sig for proof build. */
+/* End-to-end GPU vs CPU check at given m,n (production: m=n=131072). */
+int cp_gpu_run_alignment_tests(int dev, int m, int n);
+
+int cp_gpu_mine_attempt(
+    const uint8_t* ab_seed, int ab_seed_len,
+    const uint8_t job_key[32],
+    const uint32_t pool_tgt[8],
+    int m, int n,
+    int cpu_matrices,
+    const int8_t* h_A_noisy, const int8_t* h_B_noisy,
+    const uint8_t* a_key,
+    int8_t* h_A_sig, int8_t* h_Bt_sig,
+    int* out_t_rows, int* out_t_cols,
+    uint64_t* out_tiles_scanned);
 
 #ifdef __cplusplus
 }
