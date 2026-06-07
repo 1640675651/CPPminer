@@ -165,12 +165,6 @@ int cp_mine_job(
             fflush(stdout);
         }
 
-        if(nonce < 3 || nonce % 16 == 0){
-            printf("[gen] nonce=%llu: launching GPU scan (%d tiles)...\n",
-                   (unsigned long long)nonce, tiles_per_attempt);
-            fflush(stdout);
-        }
-
         uint64_t scan_tiles = 0;
         found = cp_gpu_mine_attempt(
             ab_seed, ab_len, job_key_bytes, pool_tgt,
@@ -198,10 +192,9 @@ int cp_mine_job(
                 char mac_buf[32];
                 cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_scanned_total, sec),
                                    mac_buf, sizeof(mac_buf));
-                printf("[plain] nonce=%llu attempts=%llu tiles=%llu (%.2f/s) %s no share yet\n",
+                printf("[plain] nonce=%llu attempts=%llu (%.2f/s) %s no share yet\n",
                        (unsigned long long)nonce,
                        (unsigned long long)attempts,
-                       (unsigned long long)tiles_scanned_total,
                        (double)attempts / sec, mac_buf);
                 fflush(stdout);
                 last_report = now;
@@ -298,9 +291,8 @@ int cp_mine_job(
         {
             char mac_buf[32];
             cp_pp_fmt_mac_rate(hs, mac_buf, sizeof(mac_buf));
-            printf("[plain] proof ready (%d chars) nonce=%llu attempts=%llu tiles=%llu elapsed=%.2fs %s (hs=%.0f)\n",
+            printf("[plain] proof ready (%d chars) nonce=%llu attempts=%llu elapsed=%.2fs %s (hs=%.0f)\n",
                    bn, (unsigned long long)nonce, (unsigned long long)attempts,
-                   (unsigned long long)tiles_scanned_total,
                    elapsed, mac_buf, hs);
         }
         fflush(stdout);

@@ -1,4 +1,4 @@
-/* Per-period (128×256) cuBLAS GEMM + scattered 8×16 hash-tile jackpot scan. */
+/* Per-period cuBLAS GEMM + cooperative 8x16 hash-tile jackpot (reads C_hist). */
 #ifndef PLAIN_PROOF_PERIOD_CUH
 #define PLAIN_PROOF_PERIOD_CUH
 
@@ -26,15 +26,7 @@ __device__ __forceinline__ size_t pp_c_hist_step_plane_elems(int batch_count)
     return (size_t)PP_ROW_PERIOD * (size_t)batch_count * (size_t)PP_COL_PERIOD;
 }
 
-/* C += prev (element-wise). */
-__global__ void plain_proof_plane_add_kernel(
-    int32_t* __restrict__ C,
-    const int32_t* __restrict__ prev,
-    int n)
-{
-    const int i = (int)((size_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if(i < n) C[i] += prev[i];
-}
+/* C_hist[step] holds rank partials; jackpot cumulates across steps. */
 
 __device__ __forceinline__ int pp_period_row_base(int local_rp){
     const int base[16] = {
@@ -55,7 +47,7 @@ __device__ __forceinline__ int pp_period_col_base(int local_cp){
 __global__ void plain_proof_period_gemm_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
-    int K, int R,
+    int m, int n, int K, int R,
     int row_period, int col_period,
     int batch_idx, int batch_count,
     int32_t* __restrict__ C_hist)
@@ -64,22 +56,20 @@ __global__ void plain_proof_period_gemm_kernel(
     const int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if(r >= PP_ROW_PERIOD || c >= PP_COL_PERIOD) return;
 
-    const int8_t* a_row = A + (size_t)(row_period * PP_ROW_PERIOD + r) * (size_t)K;
-    const int8_t* b_row = B + (size_t)(col_period * PP_COL_PERIOD + c) * (size_t)K;
+    const int grow = row_period * PP_ROW_PERIOD + r;
+    const int gcol = col_period * PP_COL_PERIOD + c;
 
-    int32_t cell = 0;
     for(int ll = R; ll <= K; ll += R){
-        for(int l = ll - R; l < ll; l += 4){
-            cell = pp_dot_i8_rows(cell, a_row, b_row, l, l + 4);
-        }
         const int step = ll / R - 1;
+        const int8_t* a_row = pp_ap_panel_ptr(A, step, grow, m, K, R);
+        const int8_t* b_row = pp_bp_panel_ptr(B, step, gcol, n, K, R);
+        int32_t cell = pp_dot_i8_panel(0, a_row, b_row, 0, R);
         C_hist[pp_c_hist_index(step, r, batch_idx, c, batch_count)] = cell;
     }
 }
 
-/* One block per period, one thread per hash tile (256 threads/block). */
-__global__ void __launch_bounds__(PP_TILES_PER_PERIOD)
-plain_proof_period_jackpot_kernel(
+/* One block per hash tile (8x16 threads); reads C_hist rank partials, one BLAKE3/block. */
+__global__ void plain_proof_period_jackpot_kernel(
     const int32_t* __restrict__ C_hist,
     int batch_count,
     int K, int R,
@@ -92,9 +82,15 @@ plain_proof_period_jackpot_kernel(
     int* __restrict__ out_t_cols,
     int* __restrict__ found_flag)
 {
-    const int b = (int)blockIdx.x;
-    const int tile = (int)threadIdx.x;
-    if(tile >= PP_TILES_PER_PERIOD) return;
+    const int blk = (int)blockIdx.x;
+    const int b = blk / PP_TILES_PER_PERIOD;
+    const int tile = blk % PP_TILES_PER_PERIOD;
+    if(b >= batch_count) return;
+
+    if(*found_flag) return;
+
+    const int u = (int)threadIdx.y;
+    const int v = (int)threadIdx.x;
 
     const int local_rp = tile / 16;
     const int local_cp = tile % 16;
@@ -104,31 +100,44 @@ plain_proof_period_jackpot_kernel(
     const int t_rows = row_period * PP_ROW_PERIOD + row_base;
     const int t_cols = col_period * PP_COL_PERIOD + col_base;
 
-    if(*found_flag) return;
+    const int rel_r = row_base + PP_ROW_PAT[u];
+    const int rel_c = col_base + PP_COL_PAT[v];
+    const bool valid = row_period * PP_ROW_PERIOD + rel_r < M
+                    && col_period * PP_COL_PERIOD + rel_c < N;
 
+    __shared__ int32_t s_tile[PP_HASH_H * PP_HASH_W];
+    __shared__ uint32_t s_jackpot[PP_JACKPOT_WORDS];
+
+    if(u == 0 && v == 0)
+        for(int i = 0; i < PP_JACKPOT_WORDS; i++) s_jackpot[i] = 0u;
+    s_tile[u * PP_HASH_W + v] = 0;
+    __syncthreads();
+
+    int32_t cell = 0;
     const int num_steps = K / R;
-    uint32_t jackpot[PP_JACKPOT_WORDS];
-    for(int i = 0; i < PP_JACKPOT_WORDS; i++) jackpot[i] = 0u;
-
     for(int step = 0; step < num_steps; step++){
-        uint32_t xored = 0u;
-        for(int u = 0; u < PP_HASH_H; u++){
-            const int rel_r = row_base + PP_ROW_PAT[u];
-            if(row_period * PP_ROW_PERIOD + rel_r >= M) continue;
-            for(int v = 0; v < PP_HASH_W; v++){
-                const int rel_c = col_base + PP_COL_PAT[v];
-                if(col_period * PP_COL_PERIOD + rel_c >= N) continue;
-                const int32_t cell = C_hist[
-                    pp_c_hist_index(step, rel_r, b, rel_c, batch_count)];
-                xored ^= (uint32_t)cell;
-            }
+        if(valid){
+            const int32_t partial = C_hist[
+                pp_c_hist_index(step, rel_r, b, rel_c, batch_count)];
+            cell += partial;
         }
-        const int tid = step % PP_JACKPOT_WORDS;
-        jackpot[tid] = pp_rotl32(jackpot[tid], PP_LROT) ^ xored;
+        s_tile[u * PP_HASH_W + v] = cell;
+        __syncthreads();
+
+        if(u == 0 && v == 0){
+            uint32_t xored = 0u;
+            for(int i = 0; i < PP_HASH_H * PP_HASH_W; i++)
+                xored ^= (uint32_t)s_tile[i];
+            const int tid = step % PP_JACKPOT_WORDS;
+            s_jackpot[tid] = pp_rotl32(s_jackpot[tid], PP_LROT) ^ xored;
+        }
+        __syncthreads();
     }
 
+    if(u != 0 || v != 0) return;
+
     uint32_t msg[PP_JACKPOT_WORDS];
-    for(int i = 0; i < PP_JACKPOT_WORDS; i++) msg[i] = jackpot[i];
+    for(int i = 0; i < PP_JACKPOT_WORDS; i++) msg[i] = s_jackpot[i];
 
     uint32_t digest[8];
     b3_compress64(a_key8, msg, digest);

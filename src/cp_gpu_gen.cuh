@@ -130,7 +130,60 @@ __global__ void cp_build_perm_pairs_kernel(
     }
 }
 
+/* Fuse row-major signal + noise into separate noisy buffer in step-major layout
+ * Ap[step][row][r] (not in-place). Commitment/proof use d_A_sig row-major only. */
 __global__ void cp_fuse_noise_a_kernel(
+    const int8_t* signal, int8_t* noisy,
+    int m, int k, int rank,
+    const uint8_t noise_seed[32],
+    const uint32_t* pairs)
+{
+    int row = (int)blockIdx.x;
+    if(row >= m) return;
+    extern __shared__ int8_t sh_noise_row[];
+    if(threadIdx.x == 0){
+        int8_t el[512];
+        d_generate_uniform_row(row, rank, CP_SEED_LABEL_A, noise_seed, el);
+        d_matvec_sparse_perm(pairs, k, el, sh_noise_row);
+    }
+    __syncthreads();
+    for(int l = (int)threadIdx.x; l < k; l += (int)blockDim.x){
+        size_t src = (size_t)row * (size_t)k + (size_t)l;
+        int step = l / rank;
+        int ri = l % rank;
+        /* step-major dst: reorder while fusing (same bytes as row-major noisy). */
+        size_t dst = ((size_t)step * (size_t)m + (size_t)row) * (size_t)rank + (size_t)ri;
+        noisy[dst] = (int8_t)((int32_t)signal[src] + (int32_t)sh_noise_row[l]);
+    }
+}
+
+/* B^T rows: same step-major layout as A (BpT[step][col][r]). */
+__global__ void cp_fuse_noise_b_kernel(
+    const int8_t* signal, int8_t* noisy,
+    int n, int k, int rank,
+    const uint8_t noise_seed[32],
+    const uint32_t* pairs)
+{
+    int col = (int)blockIdx.x;
+    if(col >= n) return;
+    extern __shared__ int8_t sh_noise_row[];
+    if(threadIdx.x == 0){
+        int8_t br[512];
+        d_generate_uniform_row(col, rank, CP_SEED_LABEL_B, noise_seed, br);
+        d_matvec_sparse_perm(pairs, k, br, sh_noise_row);
+    }
+    __syncthreads();
+    for(int l = (int)threadIdx.x; l < k; l += (int)blockDim.x){
+        size_t src = (size_t)col * (size_t)k + (size_t)l;
+        int step = l / rank;
+        int ri = l % rank;
+        size_t dst = ((size_t)step * (size_t)n + (size_t)col) * (size_t)rank + (size_t)ri;
+        noisy[dst] = (int8_t)((int32_t)signal[src] + (int32_t)sh_noise_row[l]);
+    }
+}
+
+/* Fuse into row-major noisy Ap/BpT (same layout as d_A_sig). */
+__global__ void cp_fuse_noise_a_rowmajor_kernel(
     const int8_t* signal, int8_t* noisy,
     int m, int k, int rank,
     const uint8_t noise_seed[32],
@@ -151,7 +204,7 @@ __global__ void cp_fuse_noise_a_kernel(
     }
 }
 
-__global__ void cp_fuse_noise_b_kernel(
+__global__ void cp_fuse_noise_b_rowmajor_kernel(
     const int8_t* signal, int8_t* noisy,
     int n, int k, int rank,
     const uint8_t noise_seed[32],
@@ -170,6 +223,30 @@ __global__ void cp_fuse_noise_b_kernel(
         size_t idx = (size_t)col * (size_t)k + (size_t)l;
         noisy[idx] = (int8_t)((int32_t)signal[idx] + (int32_t)sh_noise_row[l]);
     }
+}
+
+/* Row-major m×k (CPU path) -> step-major Ap[step][row][r]. */
+__global__ void cp_pack_rowmajor_to_step_kernel(
+    const int8_t* src, int8_t* dst, int rows, int k, int rank)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if(idx >= rows * k) return;
+    int row = idx / k;
+    int col = idx % k;
+    int step = col / rank;
+    int ri = col % rank;
+    dst[((size_t)step * (size_t)rows + (size_t)row) * (size_t)rank + (size_t)ri] =
+        src[(size_t)row * (size_t)k + (size_t)col];
+}
+
+__global__ void cp_gather_ap_row_kernel(
+    const int8_t* ap_step, int row, int m, int k, int rank, int8_t* out)
+{
+    int l = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if(l >= k) return;
+    int step = l / rank;
+    int ri = l % rank;
+    out[l] = ap_step[((size_t)step * (size_t)m + (size_t)row) * (size_t)rank + (size_t)ri];
 }
 
 #endif /* CP_GPU_GEN_CUH */

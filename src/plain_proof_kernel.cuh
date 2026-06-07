@@ -15,6 +15,8 @@ __constant__ int PP_COL_PAT[PP_HASH_W] = {
     128, 129, 160, 161, 192, 193, 224, 225
 };
 __constant__ int PP_CONTIGUOUS_MODE = 0;
+/* 1 = step-major panels (default); 0 = row-major m×k (cuBLAS lda=K_DIM). */
+__constant__ int PP_STEP_MAJOR_AP = 1;
 
 __device__ __forceinline__ uint32_t pp_rotl32(uint32_t x, int s) {
     return (x << s) | (x >> (32 - s));
@@ -39,6 +41,45 @@ __device__ __forceinline__ int pp_col_tcols(int part_idx) {
     return (part_idx / 16) * 256 + base[part_idx % 16];
 }
 
+/* int8 row dot [l0,l1) within one rank panel (local offsets 0..R). */
+__device__ __forceinline__ int32_t pp_dot_i8_panel(
+    int32_t acc, const int8_t* a_row, const int8_t* b_row, int l0, int l1)
+{
+    for(int l = l0; l < l1; l += 4){
+        acc = __dp4a(*(const int32_t*)(a_row + l), *(const int32_t*)(b_row + l), acc);
+    }
+    return acc;
+}
+
+/* Ap/BpT step-major: [step][row_or_col][r] with step plane = dim * R. */
+__device__ __forceinline__ const int8_t* pp_ap_step_row(
+    const int8_t* ap, int step, int row, int m, int r)
+{
+    return ap + ((size_t)step * (size_t)m + (size_t)row) * (size_t)r;
+}
+
+__device__ __forceinline__ const int8_t* pp_bp_step_row(
+    const int8_t* bp, int step, int col, int n, int r)
+{
+    return bp + ((size_t)step * (size_t)n + (size_t)col) * (size_t)r;
+}
+
+__device__ __forceinline__ const int8_t* pp_ap_panel_ptr(
+    const int8_t* ap, int step, int row, int m, int k_dim, int r)
+{
+    if(PP_STEP_MAJOR_AP)
+        return pp_ap_step_row(ap, step, row, m, r);
+    return ap + (size_t)row * (size_t)k_dim + (size_t)step * (size_t)r;
+}
+
+__device__ __forceinline__ const int8_t* pp_bp_panel_ptr(
+    const int8_t* bp, int step, int col, int n, int k_dim, int r)
+{
+    if(PP_STEP_MAJOR_AP)
+        return pp_bp_step_row(bp, step, col, n, r);
+    return bp + (size_t)col * (size_t)k_dim + (size_t)step * (size_t)r;
+}
+
 /* int8 row dot [l0,l1); R and K are multiples of 4. Max |acc| < 4096*128^2 fits int32. */
 __device__ __forceinline__ int32_t pp_dot_i8_rows(
     int32_t acc, const int8_t* a_row, const int8_t* b_row, int l0, int l1)
@@ -51,7 +92,7 @@ __device__ __forceinline__ int32_t pp_dot_i8_rows(
 
 /*
  * One block = one hash tile at (row_part, col_part).
- * A, B: int8 row-major (signal + pearl_noise fused); __dp4a int8 MAC, int32 tile acc.
+ * A, B: int8 step-major noisy matrices Ap[step][row][r], Bp[step][col][r].
  * bound: jackpot hash target (LE uint256), already scaled by h*w*k_eff.
  */
 __global__ void plain_proof_jackpot_kernel(
@@ -81,8 +122,8 @@ __global__ void plain_proof_jackpot_kernel(
     const int bc = t_cols + PP_COL_PAT[v];
     if(ar >= M || bc >= N) return;
 
-    const int8_t* a_row = A + (size_t)ar * (size_t)K;
-    const int8_t* b_row = B + (size_t)bc * (size_t)K;
+    const int8_t* a_row = pp_ap_panel_ptr(A, 0, ar, M, K, R);
+    const int8_t* b_row = pp_bp_panel_ptr(B, 0, bc, N, K, R);
 
     __shared__ int32_t s_tile[PP_HASH_H * PP_HASH_W];
     __shared__ uint32_t s_jackpot[PP_JACKPOT_WORDS];
@@ -94,7 +135,10 @@ __global__ void plain_proof_jackpot_kernel(
 
     int32_t cell = 0;
     for(int ll = R; ll <= K; ll += R) {
-        cell = pp_dot_i8_rows(cell, a_row, b_row, ll - R, ll);
+        const int step = (ll / R) - 1;
+        a_row = pp_ap_panel_ptr(A, step, ar, M, K, R);
+        b_row = pp_bp_panel_ptr(B, step, bc, N, K, R);
+        cell = pp_dot_i8_panel(cell, a_row, b_row, 0, R);
         s_tile[u * PP_HASH_W + v] = cell;
         __syncthreads();
 
@@ -102,7 +146,6 @@ __global__ void plain_proof_jackpot_kernel(
             uint32_t xored = 0u;
             for(int i = 0; i < PP_HASH_H * PP_HASH_W; i++)
                 xored ^= (uint32_t)s_tile[i];
-            int step = (ll / R) - 1;
             int tid = step % PP_JACKPOT_WORDS;
             s_jackpot[tid] = pp_rotl32(s_jackpot[tid], PP_LROT) ^ xored;
         }

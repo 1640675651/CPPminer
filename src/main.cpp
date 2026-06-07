@@ -27,6 +27,8 @@ static void print_usage(void)
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (debug)\n");
     printf("  --period-batch N     col-period batch size for cuBLAS (default %d, max %d)\n",
            CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
+    printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
+           K_DIM, R_RANK);
     printf("  --cpu-gen            CPU BLAKE3 matrix gen (debug; default GPU random)\n");
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
@@ -115,6 +117,7 @@ int main(int argc, char** argv)
     int align_test_prod = 0;
     int no_period_gemm = 0;
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
+    int step_major_ap = 1;
     int profile_scan = 0;
     int profile_runs = 10;
 
@@ -151,6 +154,10 @@ int main(int argc, char** argv)
             const char* v = argv[i] + 14;
             if(*v == '=') period_batch = atoi(v + 1);
             else if(i + 1 < argc) period_batch = atoi(argv[++i]);
+        } else if(!strcmp(argv[i], "--row-major-ap")){
+            step_major_ap = 0;
+        } else if(!strcmp(argv[i], "--step-major")){
+            step_major_ap = 1;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
@@ -195,6 +202,7 @@ int main(int argc, char** argv)
         cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
         cp_gpu_set_period_gemm(!no_period_gemm);
         cp_gpu_set_period_batch(period_batch);
+        cp_gpu_set_step_major_ap(step_major_ap);
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
             if(pearl_run_alignment_tests_prod(M_DIM, M_DIM, K_DIM) != 0) return 1;
@@ -214,6 +222,7 @@ int main(int argc, char** argv)
         cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
         cp_gpu_set_period_gemm(1);
         cp_gpu_set_period_batch(period_batch);
+        cp_gpu_set_step_major_ap(step_major_ap);
         int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
         int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
         if(g_dev_dims){
@@ -232,6 +241,7 @@ int main(int argc, char** argv)
     cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
     cp_gpu_set_period_gemm(!no_period_gemm);
     cp_gpu_set_period_batch(period_batch);
+    cp_gpu_set_step_major_ap(step_major_ap);
 
     if(g_dev_dims){
         g_m_active = DEV_M_DIM;
@@ -260,6 +270,9 @@ int main(int argc, char** argv)
                (g_contiguous_tiles || no_period_gemm) ? "per-tile kernel"
                : "period GEMM + batched jackpot");
         if(!g_contiguous_tiles && !no_period_gemm){
+            printf("[mode] Ap/BpT layout: %s (cuBLAS lda=%d)\n",
+                   step_major_ap ? "step-major panels" : "row-major strided",
+                   step_major_ap ? R_RANK : K_DIM);
             printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
                    period_batch,
                    (double)period_batch * (double)(K_DIM / R_RANK)

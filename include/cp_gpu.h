@@ -12,6 +12,7 @@ void cp_gpu_shutdown(void);
 void cp_gpu_set_contiguous_tiles(int on);
 void cp_gpu_set_period_gemm(int on);
 void cp_gpu_set_period_batch(int batch);
+void cp_gpu_set_step_major_ap(int on);
 
 /* CPU matrix path: upload host noisy matrices and scan. */
 int cp_gpu_mine_plain_proof(const int8_t* h_A, const int8_t* h_B,
