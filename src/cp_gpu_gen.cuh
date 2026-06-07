@@ -90,21 +90,15 @@ __global__ void cp_gen_random_matrix_kernel(
 }
 __global__ void cp_keyed_chunk_cv_kernel(
     const uint8_t* mat, size_t raw_len, size_t pad_len,
-    const uint8_t job_key[32], uint8_t* chunk_cvs)
+    const uint8_t job_key[32], uint8_t* chunk_cvs, int num_chunks)
 {
-    int chunk = (int)blockIdx.x;
+    int chunk = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if(chunk >= num_chunks) return;
     size_t off = (size_t)chunk * D_B3_CHUNK;
-    if(off >= pad_len) return;
     int len = (int)D_B3_CHUNK;
     if(off + (size_t)len > pad_len) len = (int)(pad_len - off);
-    uint8_t local[D_B3_CHUNK];
-    for(int i = 0; i < len; i++){
-        size_t gi = off + (size_t)i;
-        local[i] = (gi < raw_len) ? (uint8_t)mat[gi] : 0;
-    }
-    for(int i = len; i < (int)D_B3_CHUNK; i++) local[i] = 0;
-    d_b3_keyed_chunk_cv(job_key, (uint64_t)chunk, local, len,
-                        chunk_cvs + (size_t)chunk * D_B3_OUT);
+    d_b3_keyed_chunk_cv_glob(job_key, (uint64_t)chunk, mat, off, raw_len, len,
+                             chunk_cvs + (size_t)chunk * D_B3_OUT);
 }
 
 __global__ void cp_test_perm_hash_kernel(

@@ -203,6 +203,43 @@ __device__ __forceinline__ void d_b3_key_words(const uint8_t key[32], uint32_t k
     for(int i=0;i<8;i++) kw[i]=d_b3_load32(key + 4*i);
 }
 
+__device__ __forceinline__ uint8_t d_b3_mat_padded_byte(
+    const uint8_t* mat, size_t mat_off, size_t raw_len, int pos)
+{
+    size_t gi = mat_off + (size_t)pos;
+    return (gi < raw_len) ? mat[gi] : (uint8_t)0;
+}
+
+/* Keyed chunk CV from matrix bytes; zero-pads past raw_len (no 1 KiB thread-local copy). */
+__device__ __forceinline__ void d_b3_keyed_chunk_cv_glob(
+    const uint8_t key[32], uint64_t chunk_idx,
+    const uint8_t* mat, size_t mat_off, size_t raw_len, int chunk_len,
+    uint8_t cv_out[32])
+{
+    uint32_t kw[8];
+    d_b3_key_words(key, kw);
+    uint32_t cv[8];
+    for(int i = 0; i < 8; i++) cv[i] = kw[i];
+    int pos = 0;
+    int blocks_compressed = 0;
+    while(chunk_len - pos > D_B3_BLOCK){
+        uint8_t block[D_B3_BLOCK];
+        for(int i = 0; i < D_B3_BLOCK; i++)
+            block[i] = d_b3_mat_padded_byte(mat, mat_off, raw_len, pos + i);
+        uint8_t fl = (uint8_t)(D_B3_KEYED | (blocks_compressed == 0 ? D_B3_CHUNK_START : 0));
+        d_b3_compress_in_place(cv, block, D_B3_BLOCK, chunk_idx, fl);
+        blocks_compressed++;
+        pos += D_B3_BLOCK;
+    }
+    uint8_t tail[D_B3_BLOCK];
+    for(int i = 0; i < D_B3_BLOCK; i++)
+        tail[i] = d_b3_mat_padded_byte(mat, mat_off, raw_len, pos + i);
+    d_b3_compress_in_place(cv, tail, (uint8_t)(chunk_len - pos), chunk_idx,
+                           (uint8_t)(D_B3_KEYED | D_B3_CHUNK_END |
+                                     (blocks_compressed == 0 ? D_B3_CHUNK_START : 0)));
+    for(int i = 0; i < 8; i++) d_b3_store32(cv_out + 4 * i, cv[i]);
+}
+
 __device__ __forceinline__ void d_b3_keyed_chunk_cv(
     const uint8_t key[32], uint64_t chunk_idx,
     const uint8_t* chunk_data, int chunk_len, uint8_t cv_out[32])
