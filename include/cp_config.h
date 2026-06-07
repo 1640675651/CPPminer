@@ -9,6 +9,9 @@
 #define PP_HASH_H 8
 #define PP_HASH_W 16
 
+#define PP_ROW_PERIOD 128
+#define PP_COL_PERIOD 256
+
 #define INCOMPLETE_HEADER_BYTES 76
 #define HEADER_HEX_LEN (INCOMPLETE_HEADER_BYTES * 2)
 #define TARGET_HEX_LEN 64
@@ -21,6 +24,9 @@
 #define MAX_GPUS 16
 
 /* Job return codes (mine loop). */
+#define CP_PERIOD_BATCH_DEFAULT 32
+#define CP_PERIOD_BATCH_MAX     256
+
 #define CP_JOB_NONE       0
 #define CP_JOB_CANCELLED (-1)
 

@@ -4,6 +4,7 @@
 #include "cp_util.h"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,11 +17,20 @@
 #include "cp_gpu_gen.cuh"
 #include "cp_noise.h"
 #include "plain_proof_kernel.cuh"
+#include "plain_proof_period.cuh"
 
 #define CU_CHECK(call) do { \
     cudaError_t _e = (call); \
     if(_e != cudaSuccess){ \
         fprintf(stderr,"[CUDA] %s:%d %s: %s\n",__FILE__,__LINE__,#call,cudaGetErrorString(_e)); \
+        exit(1); \
+    } \
+} while(0)
+
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t _e = (call); \
+    if(_e != CUBLAS_STATUS_SUCCESS){ \
+        fprintf(stderr,"[CUBLAS] %s:%d %s: status %d\n",__FILE__,__LINE__,#call,(int)_e); \
         exit(1); \
     } \
 } while(0)
@@ -43,11 +53,102 @@ typedef struct {
     int*      d_out_t_rows;
     int*      d_out_t_cols;
     uint32_t* d_a_key8;
+    int32_t*  d_C_hist;
+    size_t    C_hist_cap;
+    cublasHandle_t cublas;
+    int       use_cublas_period;
 } GpuCtx;
 
 static GpuCtx g_gpus[MAX_GPUS];
 static int g_ngpu = 0;
 static int g_contiguous = 0;
+static int g_period_gemm = 1;
+static int g_period_batch = CP_PERIOD_BATCH_DEFAULT;
+
+static size_t pp_hist_per_period_int32s(void)
+{
+    return (size_t)(K_DIM / R_RANK) * (size_t)PP_ROW_PERIOD * (size_t)PP_COL_PERIOD;
+}
+
+static size_t pp_hist_per_period_bytes(void)
+{
+    return pp_hist_per_period_int32s() * sizeof(int32_t);
+}
+
+static const char* cublas_status_str(cublasStatus_t st)
+{
+    switch(st){
+    case CUBLAS_STATUS_SUCCESS: return "SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED: return "NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED: return "ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE: return "INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH: return "ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR: return "MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED: return "EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR: return "INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED: return "NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR: return "LICENSE_ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+/* Row-major C[M×N] = A[M×R] * B[N×R]^T (B = Bt rows). Same API as matmul_benchmark.cu. */
+static cublasStatus_t pp_cublas_gemm_i8_bt(
+    cublasHandle_t handle,
+    const int8_t* A, int lda,
+    const int8_t* B, int ldb,
+    int32_t* C, int ldc,
+    int M, int N, int R,
+    int32_t beta)
+{
+    const int32_t alpha = 1;
+    return cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, R,
+        &alpha,
+        B, CUDA_R_8I, ldb,
+        A, CUDA_R_8I, lda,
+        &beta, C, CUDA_R_32I, ldc,
+        CUDA_R_32I, CUBLAS_GEMM_DEFAULT);
+}
+
+/* Probe production-sized int8 GEMM (must use CUDA_R_32I compute type in .cu). */
+static int gpu_probe_cublas_int8(GpuCtx* g)
+{
+    const int M = PP_ROW_PERIOD;
+    const int N = PP_COL_PERIOD;
+    const int R = R_RANK;
+    int8_t *dA = NULL, *dB = NULL;
+    int32_t *dC = NULL;
+    cublasStatus_t st;
+
+    CU_CHECK(cudaSetDevice(g->dev));
+    CUBLAS_CHECK(cublasSetPointerMode(g->cublas, CUBLAS_POINTER_MODE_HOST));
+    CU_CHECK(cudaMalloc(&dA, (size_t)M * (size_t)K_DIM));
+    CU_CHECK(cudaMalloc(&dB, (size_t)N * (size_t)K_DIM));
+    CU_CHECK(cudaMalloc(&dC, (size_t)M * (size_t)N * sizeof(int32_t)));
+    CU_CHECK(cudaMemset(dA, 0, (size_t)M * (size_t)K_DIM));
+    CU_CHECK(cudaMemset(dB, 0, (size_t)N * (size_t)K_DIM));
+
+    st = pp_cublas_gemm_i8_bt(g->cublas, dA, K_DIM, dB, K_DIM, dC, N, M, N, R, 0);
+    CU_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    if(st != CUBLAS_STATUS_SUCCESS){
+        cudaDeviceProp prop;
+        CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
+        printf("[gpu] GPU%d: cuBLAS int8 GEMM probe failed (%s, status %d), "
+               "sm_%d%d -> CUDA period GEMM fallback\n",
+               g->dev, cublas_status_str(st), (int)st,
+               prop.major, prop.minor);
+        fflush(stdout);
+        return 0;
+    }
+    return 1;
+}
 
 static void sync_tile_config(void)
 {
@@ -79,7 +180,20 @@ static void sync_tile_config(void)
 void cp_gpu_set_contiguous_tiles(int on)
 {
     g_contiguous = on;
+    if(on) g_period_gemm = 0;
     if(g_ngpu > 0) sync_tile_config();
+}
+
+void cp_gpu_set_period_gemm(int on)
+{
+    g_period_gemm = on ? 1 : 0;
+}
+
+void cp_gpu_set_period_batch(int batch)
+{
+    if(batch < 1) batch = 1;
+    if(batch > CP_PERIOD_BATCH_MAX) batch = CP_PERIOD_BATCH_MAX;
+    g_period_batch = batch;
 }
 
 void cp_gpu_init(int* devs, int ndev)
@@ -95,7 +209,11 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
-        printf("[gpu] GPU%d OK\n", g->dev); fflush(stdout);
+        CUBLAS_CHECK(cublasCreate(&g->cublas));
+        g->use_cublas_period = gpu_probe_cublas_int8(g);
+        printf("[gpu] GPU%d OK (period GEMM: %s)\n", g->dev,
+               g->use_cublas_period ? "cuBLAS int8" : "CUDA __dp4a");
+        fflush(stdout);
     }
     sync_tile_config();
 }
@@ -122,6 +240,8 @@ void cp_gpu_shutdown(void)
         if(g->d_out_t_rows) cudaFree(g->d_out_t_rows);
         if(g->d_out_t_cols) cudaFree(g->d_out_t_cols);
         if(g->d_a_key8) cudaFree(g->d_a_key8);
+        if(g->d_C_hist) cudaFree(g->d_C_hist);
+        if(g->cublas){ cublasDestroy(g->cublas); g->cublas = NULL; }
     }
     g_ngpu = 0;
 }
@@ -161,6 +281,83 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         }
         g->chunk_cv_cap = cv_need;
     }
+    {
+        size_t hist_need = pp_hist_per_period_bytes() * (size_t)g_period_batch;
+        if(hist_need > g->C_hist_cap){
+            if(g->d_C_hist) cudaFree(g->d_C_hist);
+            CU_CHECK(cudaMalloc(&g->d_C_hist, hist_need));
+            g->C_hist_cap = hist_need;
+        }
+    }
+}
+
+/*
+ * cuBLAS cumulative rank-block GEMM (one GemmEx per batch item per rank step).
+ */
+static void gpu_period_gemm_cublas_batch(
+    GpuCtx* g, int row_period, int col_period0, int batch_count)
+{
+    const int M = PP_ROW_PERIOD;
+    const int N = PP_COL_PERIOD;
+    const int R = R_RANK;
+    const int num_steps = K_DIM / R;
+    const size_t plane = (size_t)M * (size_t)N;
+    const size_t hist_per_item = pp_hist_per_period_int32s();
+    const size_t row_base = (size_t)row_period * (size_t)M;
+    const size_t col_base = (size_t)col_period0 * (size_t)N;
+    const int8_t* A0 = g->d_Ap + row_base * (size_t)K_DIM;
+    const int8_t* B0 = g->d_BpT + col_base * (size_t)K_DIM;
+
+    for(int s = 0; s < num_steps; s++){
+        const int8_t* Ap = A0 + (size_t)s * (size_t)R;
+        const int8_t* Bp0 = B0 + (size_t)s * (size_t)R;
+
+        for(int b = 0; b < batch_count; b++){
+            const int8_t* Bp = Bp0 + (size_t)b * (size_t)N * (size_t)K_DIM;
+            int32_t* Cp = g->d_C_hist + (size_t)b * hist_per_item + (size_t)s * plane;
+
+            if(s > 0){
+                CU_CHECK(cudaMemcpy(Cp,
+                    g->d_C_hist + (size_t)b * hist_per_item + (size_t)(s - 1) * plane,
+                    plane * sizeof(int32_t), cudaMemcpyDeviceToDevice));
+            }
+
+            const int32_t beta = (s == 0) ? 0 : 1;
+            cublasStatus_t st = pp_cublas_gemm_i8_bt(
+                g->cublas, Ap, K_DIM, Bp, K_DIM, Cp, N, M, N, R, beta);
+            if(st != CUBLAS_STATUS_SUCCESS){
+                fprintf(stderr, "[CUBLAS] GemmEx failed: %s (%d)\n",
+                        cublas_status_str(st), (int)st);
+                exit(1);
+            }
+        }
+    }
+}
+
+static void gpu_period_gemm_cuda_batch(
+    GpuCtx* g, int row_period, int col_period0, int batch_count)
+{
+    const dim3 grid(PP_COL_PERIOD / 16, PP_ROW_PERIOD / 16);
+    const dim3 block(16, 16);
+    const size_t hist_per_item = pp_hist_per_period_int32s();
+
+    for(int b = 0; b < batch_count; b++){
+        plain_proof_period_gemm_kernel<<<grid, block>>>(
+            g->d_Ap, g->d_BpT,
+            K_DIM, R_RANK,
+            row_period, col_period0 + b,
+            g->d_C_hist + (size_t)b * hist_per_item);
+    }
+    CU_CHECK(cudaGetLastError());
+}
+
+static void gpu_period_gemm_batch(
+    GpuCtx* g, int row_period, int col_period0, int batch_count)
+{
+    if(g->use_cublas_period)
+        gpu_period_gemm_cublas_batch(g, row_period, col_period0, batch_count);
+    else
+        gpu_period_gemm_cuda_batch(g, row_period, col_period0, batch_count);
 }
 
 static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
@@ -436,12 +633,111 @@ done:
     return rc;
 }
 
+static int gpu_scan_device_period(
+    const uint8_t* a_key, const uint32_t pool_tgt[8],
+    int m, int n,
+    int* out_t_rows, int* out_t_cols,
+    uint64_t* out_tiles_scanned)
+{
+    uint32_t bound[8];
+    cp_scale_jackpot_target(pool_tgt, bound);
+
+    const int row_periods = cp_pp_num_row_periods(m, g_contiguous);
+    const int col_periods = cp_pp_num_col_periods(n, g_contiguous);
+    const int row_parts = cp_pp_num_row_parts(m, g_contiguous);
+    const int col_parts = cp_pp_num_col_parts(n, g_contiguous);
+    const int total_tiles = row_parts * col_parts;
+    int found = 0;
+    uint64_t tiles_scanned = 0;
+    double scan_t0 = cp_now_sec();
+
+    if(out_tiles_scanned) *out_tiles_scanned = 0;
+
+    printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
+           "(batch=%d, %s, %d hash tiles), difficulty scaled by %d\n",
+           row_periods, col_periods, g_period_batch,
+           g_gpus[0].use_cublas_period ? "cuBLAS" : "CUDA",
+           total_tiles, PP_HASH_H * PP_HASH_W * K_DIM);
+    fflush(stdout);
+
+    for(int rpi = 0; rpi < row_periods && !found; rpi++){
+        if(cp_job_should_cancel()){
+            if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+            return -1;
+        }
+        // column-batched GEMM
+        // 64MiB to store the C_hist for each batch
+        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_period_batch){
+            if(cp_job_should_cancel()){
+                if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+                return -1;
+            }
+            int batch_count = g_period_batch;
+            if(cpi0 + batch_count > col_periods)
+                batch_count = col_periods - cpi0;
+
+            // GEMM
+            for(int i = 0; i < g_ngpu; i++){
+                GpuCtx* g = &g_gpus[i];
+                CU_CHECK(cudaSetDevice(g->dev));
+                gpu_period_gemm_batch(g, rpi, cpi0, batch_count);
+                plain_proof_period_jackpot_kernel<<<batch_count, PP_TILES_PER_PERIOD>>>(
+                    g->d_C_hist,
+                    K_DIM, R_RANK,
+                    rpi, cpi0,
+                    m, n,
+                    bound[0], bound[1], bound[2], bound[3],
+                    bound[4], bound[5], bound[6], bound[7],
+                    g->d_a_key8,
+                    g->d_out_t_rows, g->d_out_t_cols, g->d_found);
+                CU_CHECK(cudaGetLastError());
+            }
+            // jackpot scan
+            for(int i = 0; i < g_ngpu; i++){
+                GpuCtx* g = &g_gpus[i];
+                CU_CHECK(cudaSetDevice(g->dev));
+                CU_CHECK(cudaDeviceSynchronize());
+                int f = 0;
+                CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+                if(f && !found){
+                    found = 1;
+                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
+                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
+                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
+                           g->dev, *out_t_rows, *out_t_cols);
+                    fflush(stdout);
+                }
+            }
+
+            tiles_scanned += (uint64_t)batch_count * (uint64_t)PP_TILES_PER_PERIOD;
+        }
+        if((rpi % 4) == 0 && !found){
+            double scan_sec = cp_now_sec() - scan_t0;
+            if(scan_sec < 1e-9) scan_sec = 1e-9;
+            double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
+            char mac_buf[32];
+            cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
+            printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%d (%.1f%%) %s\n",
+                   rpi + 1, row_periods,
+                   (unsigned long long)tiles_scanned, total_tiles,
+                   100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
+            fflush(stdout);
+        }
+    }
+    if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+    return found;
+}
+
 static int gpu_scan_device(
     const uint8_t* a_key, const uint32_t pool_tgt[8],
     int m, int n,
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned)
 {
+    if(g_period_gemm && !g_contiguous)
+        return gpu_scan_device_period(a_key, pool_tgt, m, n,
+                                      out_t_rows, out_t_cols, out_tiles_scanned);
+
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
 

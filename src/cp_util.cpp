@@ -349,6 +349,18 @@ int cp_pp_num_col_parts(int n, int contiguous)
     return (n / 256) * 16;
 }
 
+int cp_pp_num_row_periods(int m, int contiguous)
+{
+    if(contiguous) return m / PP_HASH_H;
+    return m / 128;
+}
+
+int cp_pp_num_col_periods(int n, int contiguous)
+{
+    if(contiguous) return n / PP_HASH_W;
+    return n / 256;
+}
+
 double cp_pp_macs_per_hash_tile(void)
 {
     return (double)PP_HASH_H * (double)PP_HASH_W * (double)K_DIM;

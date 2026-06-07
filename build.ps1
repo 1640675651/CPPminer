@@ -185,6 +185,7 @@ Invoke-Nvcc @gpuFlags
 Write-Host "=== Linking $OutExe ==="
 $RustExtra = @(
     $RustLib,
+    "cublas.lib",
     "userenv.lib", "ws2_32.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib"
 )
 $linkArgs = @(

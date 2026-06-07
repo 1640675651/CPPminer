@@ -24,6 +24,9 @@ static void print_usage(void)
     printf("  --devices N[,M]    CUDA devices (default: 0)\n");
     printf("  --dev                m=n=8192 for testing\n");
     printf("  --contiguous-tiles   8x16 contiguous hash tiles (debug)\n");
+    printf("  --no-period-gemm     per-tile scan instead of period GEMM (debug)\n");
+    printf("  --period-batch N     col-period batch size for cuBLAS (default %d, max %d)\n",
+           CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
     printf("  --cpu-gen            CPU BLAKE3 matrix gen (debug; default GPU random)\n");
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
@@ -109,6 +112,8 @@ int main(int argc, char** argv)
     int ndev = 0;
     int align_test = 0;
     int align_test_prod = 0;
+    int no_period_gemm = 0;
+    int period_batch = CP_PERIOD_BATCH_DEFAULT;
 
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--pool") && i + 1 < argc){
@@ -137,6 +142,12 @@ int main(int argc, char** argv)
             g_dev_dims = 1;
         } else if(!strcmp(argv[i], "--contiguous-tiles")){
             g_contiguous_tiles = 1;
+        } else if(!strcmp(argv[i], "--no-period-gemm")){
+            no_period_gemm = 1;
+        } else if(!strncmp(argv[i], "--period-batch", 14)){
+            const char* v = argv[i] + 14;
+            if(*v == '=') period_batch = atoi(v + 1);
+            else if(i + 1 < argc) period_batch = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
@@ -172,6 +183,8 @@ int main(int argc, char** argv)
         if(!ndev){ devs[0] = 0; ndev = 1; }
         pearl_set_contiguous_tiles(g_contiguous_tiles);
         cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
+        cp_gpu_set_period_gemm(!no_period_gemm);
+        cp_gpu_set_period_batch(period_batch);
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
             if(pearl_run_alignment_tests_prod(M_DIM, M_DIM, K_DIM) != 0) return 1;
@@ -189,6 +202,8 @@ int main(int argc, char** argv)
 
     pearl_set_contiguous_tiles(g_contiguous_tiles);
     cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
+    cp_gpu_set_period_gemm(!no_period_gemm);
+    cp_gpu_set_period_batch(period_batch);
 
     if(g_dev_dims){
         g_m_active = DEV_M_DIM;
@@ -213,6 +228,16 @@ int main(int argc, char** argv)
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n",
                g_contiguous_tiles ? "contiguous 8x16 blocks" : "periodic scattered 8x16");
+        printf("[mode] scan: %s\n",
+               (g_contiguous_tiles || no_period_gemm) ? "per-tile kernel"
+               : "period GEMM + batched jackpot");
+        if(!g_contiguous_tiles && !no_period_gemm){
+            printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
+                   period_batch,
+                   (double)period_batch * (double)(K_DIM / R_RANK)
+                   * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
+                   * (double)sizeof(int32_t) / (1024.0 * 1024.0));
+        }
         printf("[mode] hash_tiles=%dx%d (%d total)\n",
                row_parts, col_parts, row_parts * col_parts);
         printf("[mode] host~%.0f MiB (signal A+B)\n", host_mib);
