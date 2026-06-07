@@ -36,6 +36,7 @@ static void print_usage(void)
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
            M_DIM);
+    printf("  --profile-scan [N]   time GEMM vs jackpot per period batch (default N=10)\n");
 }
 
 static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -114,6 +115,8 @@ int main(int argc, char** argv)
     int align_test_prod = 0;
     int no_period_gemm = 0;
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
+    int profile_scan = 0;
+    int profile_runs = 10;
 
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--pool") && i + 1 < argc){
@@ -173,6 +176,13 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--align-test-prod")){
             align_test = 1;
             align_test_prod = 1;
+        } else if(!strncmp(argv[i], "--profile-scan", 14)){
+            profile_scan = 1;
+            const char* v = argv[i] + 14;
+            if(*v == '=') profile_runs = atoi(v + 1);
+            else if(i + 1 < argc && argv[i + 1][0] != '-')
+                profile_runs = atoi(argv[++i]);
+            if(profile_runs < 1) profile_runs = 1;
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
@@ -192,6 +202,24 @@ int main(int argc, char** argv)
         }
         printf("[align-test] all tests passed\n");
         return 0;
+    }
+
+    if(profile_scan){
+        if(!ndev){ devs[0] = 0; ndev = 1; }
+        if(no_period_gemm){
+            fprintf(stderr, "--profile-scan requires period GEMM (omit --no-period-gemm)\n");
+            return 1;
+        }
+        pearl_set_contiguous_tiles(g_contiguous_tiles);
+        cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
+        cp_gpu_set_period_gemm(1);
+        cp_gpu_set_period_batch(period_batch);
+        int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
+        int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
+        if(g_dev_dims){
+            printf("[profile-scan] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
+        }
+        return cp_gpu_run_scan_profile(devs[0], pm, pn, 2, profile_runs) != 0;
     }
 
     if(!wallet){ fprintf(stderr, "--wallet required\n"); return 1; }

@@ -25,6 +25,9 @@ int cp_gpu_mine_plain_proof(const int8_t* h_A, const int8_t* h_B,
 /* End-to-end GPU vs CPU check at given m,n (production: m=n=131072). */
 int cp_gpu_run_alignment_tests(int dev, int m, int n);
 
+/* Time one period batch: cuBLAS rank GEMMs vs jackpot kernel (no pool). */
+int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs);
+
 int cp_gpu_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,
     const uint8_t job_key[32],
