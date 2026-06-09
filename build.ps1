@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Drop stale records from an earlier failed build in the same shell session.
+if ($Error.Count -gt 0) { $Error.Clear() }
 $Root = $PSScriptRoot
 $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
@@ -51,8 +53,15 @@ function Initialize-MSVC {
     if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsPath" }
     $script:VcvarsBat = $vcvars
     Write-Host "=== MSVC: $vsPath ==="
-    cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-        if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>&1 | ForEach-Object {
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
     }
     if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
         throw "cl.exe not on PATH after vcvars64"
@@ -84,6 +93,27 @@ function Get-GpuArch {
     return "75"
 }
 
+function Ensure-Cutlass {
+    $cutlassRoot = Join-Path $Root "third_party\cutlass"
+    $cutlassHdr = Join-Path $cutlassRoot "include\cutlass\cutlass.h"
+    if (Test-Path $cutlassHdr) { return $cutlassRoot }
+    Write-Host "=== Fetching CUTLASS v2.11.0 ==="
+    $zipPath = Join-Path $BuildDir "cutlass-v2.11.0.zip"
+    $extractParent = Join-Path $Root "third_party"
+    New-Item -ItemType Directory -Force -Path $extractParent | Out-Null
+    Invoke-WebRequest -Uri "https://github.com/NVIDIA/cutlass/archive/refs/tags/v2.11.0.zip" `
+        -OutFile $zipPath -UseBasicParsing
+    Expand-Archive -Path $zipPath -DestinationPath $extractParent -Force
+    $extracted = Join-Path $extractParent "cutlass-2.11.0"
+    if (Test-Path $cutlassRoot) { Remove-Item $cutlassRoot -Recurse -Force }
+    Rename-Item $extracted $cutlassRoot
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $cutlassHdr)) {
+        throw "CUTLASS fetch failed: missing $cutlassHdr"
+    }
+    return $cutlassRoot
+}
+
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
     if (-not (Test-Path (Join-Path $b3Src "blake3.c"))) {
@@ -101,6 +131,34 @@ function Ensure-Blake3 {
     Copy-Item (Join-Path $b3Src "*") $B3Dir -Force
 }
 
+function Invoke-External {
+    <#
+    Run a native command without treating stderr as a terminating PowerShell error.
+    MSVC/nvcc/cargo routinely print warnings to stderr even on success; with
+    $ErrorActionPreference = Stop that aborts the script and poisons the shell.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Command,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $exitCode = 0
+    try {
+        & $Command 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                Write-Host $_.ToString()
+            } else {
+                Write-Host $_
+            }
+        }
+        if ($null -ne $LASTEXITCODE) { $exitCode = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($exitCode -ne 0) { throw $FailureMessage }
+}
+
 function Invoke-Nvcc {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$NvccArgs)
     if (-not $script:ClExe) { throw "MSVC cl.exe not configured (Initialize-MSVC missing?)" }
@@ -113,14 +171,14 @@ function Invoke-Nvcc {
     $env:PATH = Get-SanitizedPathForNvcc -PathValue $env:PATH
     try {
         if ($script:VcvarsBat) {
-            cmd /c "`"$script:VcvarsBat`" >nul 2>&1 && set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+            $cmdLine = "`"$script:VcvarsBat`" >nul 2>&1 && set CC=&& set CXX=&& `"$Nvcc`" $quoted"
         } else {
-            cmd /c "set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+            $cmdLine = "set CC=&& set CXX=&& `"$Nvcc`" $quoted"
         }
+        Invoke-External -Command { cmd /c $cmdLine } -FailureMessage "nvcc failed: $($NvccArgs -join ' ')"
     } finally {
         $env:PATH = $savedPath
     }
-    if ($LASTEXITCODE -ne 0) { throw "nvcc failed: $($NvccArgs -join ' ')" }
 }
 
 Clear-CondaToolchainOverrides
@@ -136,6 +194,9 @@ $Nosimd = @("-DBLAKE3_NO_AVX512", "-DBLAKE3_NO_AVX2", "-DBLAKE3_NO_SSE41", "-DBL
 Write-Host "=== CUDA: $CudaRoot  Arch: $NvccArch ==="
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 Ensure-Blake3
+$CutlassRoot = Ensure-Cutlass
+$Inc += "-I$(Join-Path $CutlassRoot 'include')"
+$Inc += "-I$(Join-Path $CutlassRoot 'examples/35_gemm_softmax')"
 
 Write-Host "=== Building cp-proof-ffi (Rust) ==="
 $RustDir = Join-Path $Root "rust\cp-proof-ffi"
@@ -148,8 +209,7 @@ try {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         throw "Rust cargo not found. conda activate pearl (or install from https://rustup.rs)"
     }
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+    Invoke-External -Command { cargo build --release } -FailureMessage "cargo build failed"
 } finally {
     Pop-Location
 }
@@ -169,7 +229,7 @@ foreach ($unit in @(
     Invoke-Nvcc @flags
 }
 
-foreach ($unit in @("cp_util.cpp", "cp_pool.cpp", "cp_job_ctrl.cpp", "cp_mine.cpp", "cp_state.cpp", "main.cpp")) {
+foreach ($unit in @("cp_util.cpp", "cp_pool.cpp", "cp_job_ctrl.cpp", "cp_mine.cpp", "cp_state.cpp", "main.cpp", "pp_tile_cell_map.cpp")) {
     $srcPath = Join-Path $Root "src\$unit"
     $obj = Join-Path $BuildDir ($unit -replace '\.cpp$', '.obj')
     $flags = @("-c", $srcPath, "-o", $obj, "-O2") + $Inc + $HostOpenMP
@@ -181,6 +241,12 @@ $gpuFlags = @("-arch=$NvccArch", "-O3") + $HostOpenMP + $Inc + @(
     "-o", (Join-Path $BuildDir "cp_gpu.obj")
 )
 Invoke-Nvcc @gpuFlags
+
+$cutlassFlags = @("-arch=$NvccArch", "-O3", "--std=c++17") + $HostOpenMP + $Inc + @(
+    "-c", (Join-Path $Root "src\pp_cutlass_gemm.cu"),
+    "-o", (Join-Path $BuildDir "pp_cutlass_gemm.obj")
+)
+Invoke-Nvcc @cutlassFlags
 
 Write-Host "=== Linking $OutExe ==="
 $RustExtra = @(
@@ -197,6 +263,8 @@ $linkArgs = @(
     (Join-Path $BuildDir "cp_mine.obj"),
     (Join-Path $BuildDir "cp_state.obj"),
     (Join-Path $BuildDir "cp_gpu.obj"),
+    (Join-Path $BuildDir "pp_cutlass_gemm.obj"),
+    (Join-Path $BuildDir "pp_tile_cell_map.obj"),
     (Join-Path $BuildDir "cp_noise.obj"),
     (Join-Path $BuildDir "blake3.obj"),
     (Join-Path $BuildDir "blake3_dispatch.obj"),
@@ -205,4 +273,12 @@ $linkArgs = @(
 Invoke-Nvcc @linkArgs
 
 Write-Host "=== Done: $OutExe ==="
-& $OutExe --help 2>&1 | Select-Object -First 15
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $OutExe --help 2>&1 | Select-Object -First 15 | ForEach-Object { Write-Host $_ }
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($Error.Count -gt 0) { $Error.Clear() }
+exit 0
