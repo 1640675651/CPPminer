@@ -32,43 +32,44 @@ int cp_cutlass_device_ok(int dev)
   return prop.major < 7 || (prop.major == 7 && prop.minor <= 5);
 }
 
-size_t cp_cutlass_tiles_per_batch(int batch_count)
+size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)
 {
-  return static_cast<size_t>(batch_count) *
+  return static_cast<size_t>(row_batch_count) *
+         static_cast<size_t>(col_batch_count) *
          static_cast<size_t>(cp_cutlass::CutlassScatteredTile128x256::
                                  kThreadsPerCta);
 }
 
-size_t cp_cutlass_tile_xor_bytes(int batch_count)
+size_t cp_cutlass_tile_xor_bytes(int row_batch_count, int col_batch_count)
 {
   const int num_steps = K_DIM / R_RANK;
-  return cp_cutlass_tiles_per_batch(batch_count) * static_cast<size_t>(num_steps) *
-         sizeof(uint32_t);
+  return cp_cutlass_tiles_per_batch(row_batch_count, col_batch_count) *
+         static_cast<size_t>(num_steps) * sizeof(uint32_t);
 }
 
 int cp_cutlass_period_batch(
     int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m, int n,
-    int row_period, int col_period0, int batch_count, int step_major,
-    uint32_t* d_tile_xor, size_t tiles_per_batch,
+    int row_period0, int col_period0, int row_batch_count, int col_batch_count,
+    int step_major, uint32_t* d_tile_xor, size_t tiles_per_batch,
     const CpCutlassJackpotLaunch* jackpot)
 {
   if (cudaSetDevice(dev) != cudaSuccess) {
     return -1;
   }
 
-  const int M = PP_ROW_PERIOD;
-  const int N_fat = batch_count * PP_COL_PERIOD;
+  const int M = row_batch_count * PP_ROW_PERIOD;
+  const int N_fat = col_batch_count * PP_COL_PERIOD;
   const int K = K_DIM;
-  const int cta_cols = batch_count;
+  const int cta_cols = col_batch_count;
   const size_t tile_count = tiles_per_batch;
 
   const int8_t* d_A = d_Ap;
   const int8_t* d_B = d_BpT;
   if (step_major) {
-    d_A = d_Ap + (size_t)row_period * PP_ROW_PERIOD * R_RANK;
+    d_A = d_Ap + (size_t)row_period0 * PP_ROW_PERIOD * R_RANK;
     d_B = d_BpT + (size_t)col_period0 * PP_COL_PERIOD * R_RANK;
   } else {
-    d_A = d_Ap + (size_t)row_period * PP_ROW_PERIOD * K_DIM;
+    d_A = d_Ap + (size_t)row_period0 * PP_ROW_PERIOD * K_DIM;
     d_B = d_BpT + (size_t)col_period0 * PP_COL_PERIOD * K_DIM;
   }
 

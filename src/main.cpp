@@ -26,8 +26,11 @@ static void print_usage(void)
     printf("  --dev                m=n=8192 for testing\n");
     printf("  --contiguous-tiles   8x16 contiguous hash tiles (debug)\n");
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (debug)\n");
-    printf("  --period-batch N     col-period batch size for cuBLAS (default %d, max %d)\n",
+    printf("  --period-batch N     col-period batch size (default %d, max %d)\n",
            CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
+    printf("  --col-period-batch N alias for --period-batch\n");
+    printf("  --row-period-batch N row-period batch size (default %d, max %d)\n",
+           CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
            K_DIM, R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + in-kernel jackpot (Pascal SIMT)\n");
@@ -119,6 +122,7 @@ int main(int argc, char** argv)
     int align_test_prod = 0;
     int no_period_gemm = 0;
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
+    int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = 1;
     int cutlass_fused = 0;
     int profile_scan = 0;
@@ -157,6 +161,14 @@ int main(int argc, char** argv)
             const char* v = argv[i] + 14;
             if(*v == '=') period_batch = atoi(v + 1);
             else if(i + 1 < argc) period_batch = atoi(argv[++i]);
+        } else if(!strncmp(argv[i], "--col-period-batch", 18)){
+            const char* v = argv[i] + 18;
+            if(*v == '=') period_batch = atoi(v + 1);
+            else if(i + 1 < argc) period_batch = atoi(argv[++i]);
+        } else if(!strncmp(argv[i], "--row-period-batch", 18)){
+            const char* v = argv[i] + 18;
+            if(*v == '=') row_period_batch = atoi(v + 1);
+            else if(i + 1 < argc) row_period_batch = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--row-major-ap")){
             step_major_ap = 0;
         } else if(!strcmp(argv[i], "--step-major")){
@@ -207,6 +219,7 @@ int main(int argc, char** argv)
         cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
         cp_gpu_set_period_gemm(!no_period_gemm);
         cp_gpu_set_period_batch(period_batch);
+        cp_gpu_set_row_period_batch(row_period_batch);
         cp_gpu_set_step_major_ap(step_major_ap);
         cp_gpu_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
@@ -230,6 +243,7 @@ int main(int argc, char** argv)
         cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
         cp_gpu_set_period_gemm(1);
         cp_gpu_set_period_batch(period_batch);
+        cp_gpu_set_row_period_batch(row_period_batch);
         cp_gpu_set_step_major_ap(step_major_ap);
         cp_gpu_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
@@ -251,6 +265,7 @@ int main(int argc, char** argv)
     cp_gpu_set_contiguous_tiles(g_contiguous_tiles);
     cp_gpu_set_period_gemm(!no_period_gemm);
     cp_gpu_set_period_batch(period_batch);
+    cp_gpu_set_row_period_batch(row_period_batch);
     cp_gpu_set_step_major_ap(step_major_ap);
     cp_gpu_set_cutlass_fused(cutlass_fused);
     pearl_set_cutlass_fused(cutlass_fused);
@@ -304,10 +319,13 @@ int main(int argc, char** argv)
                    step_major_ap ? R_RANK : K_DIM);
             if(cutlass_fused){
                 printf("[mode] jackpot: fused in GEMM kernel (no tile_xor / C_hist)\n");
+                printf("[mode] period batch: row=%d col=%d (prod full scan: row=1024 col=512 => 1 launch)\n",
+                       row_period_batch, period_batch);
             } else {
-                printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
-                       period_batch,
-                       (double)period_batch * (double)(K_DIM / R_RANK)
+                printf("[mode] period batch: row=%d col=%d (~%.0f MiB C_hist/GPU)\n",
+                       row_period_batch, period_batch,
+                       (double)row_period_batch * (double)period_batch
+                       * (double)(K_DIM / R_RANK)
                        * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
                        * (double)sizeof(int32_t) / (1024.0 * 1024.0));
             }

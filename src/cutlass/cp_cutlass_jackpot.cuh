@@ -34,11 +34,11 @@ __device__ __forceinline__ bool cp_cutlass_jackpot_target_ok(
 }
 
 __device__ __forceinline__ void cp_cutlass_tile_origin(
-    int row_period, int col_period0, int batch_idx, int thread_idx,
+    int row_period, int col_period, int thread_idx,
     int* out_t_rows, int* out_t_cols)
 {
     const int cta_row0 = row_period * PP_ROW_PERIOD;
-    const int cta_col0 = (col_period0 + batch_idx) * PP_COL_PERIOD;
+    const int cta_col0 = col_period * PP_COL_PERIOD;
     int row = 0;
     int col = 0;
     CutlassJackpotTile::thread_cell_global(
@@ -52,8 +52,7 @@ __device__ __forceinline__ void cp_cutlass_jackpot_try(
     const uint32_t* a_key8,
     const uint32_t bound[8],
     int row_period,
-    int col_period0,
-    int batch_idx,
+    int col_period,
     int thread_idx,
     int* found_flag,
     int* out_t_rows,
@@ -74,7 +73,7 @@ __device__ __forceinline__ void cp_cutlass_jackpot_try(
 
     int t_rows = 0;
     int t_cols = 0;
-    cp_cutlass_tile_origin(row_period, col_period0, batch_idx, thread_idx,
+    cp_cutlass_tile_origin(row_period, col_period, thread_idx,
                            &t_rows, &t_cols);
     *out_t_rows = t_rows;
     *out_t_cols = t_cols;

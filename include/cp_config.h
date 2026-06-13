@@ -25,7 +25,9 @@
 
 /* Job return codes (mine loop). */
 #define CP_PERIOD_BATCH_DEFAULT 32
-#define CP_PERIOD_BATCH_MAX     512 // 131072 cols / 256 cols per period = 512 periods per row
+#define CP_PERIOD_BATCH_MAX     512 /* 131072 cols / 256 cols per period */
+#define CP_ROW_PERIOD_BATCH_DEFAULT 1
+#define CP_ROW_PERIOD_BATCH_MAX   1024 /* 131072 rows / 128 rows per period */
 
 #define CP_JOB_NONE       0
 #define CP_JOB_CANCELLED (-1)

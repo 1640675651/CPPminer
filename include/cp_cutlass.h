@@ -11,24 +11,38 @@ extern "C" {
 /* Returns 0 if CUTLASS fused GEMM can run on the current device. */
 int cp_cutlass_device_ok(int dev);
 
-/* Fused GEMM + per-thread tile XOR for one period batch.
- * Ap/BpT must match step_major (1 = step panels, 0 = row-major m×k). */
+/* Fused GEMM + per-thread tile XOR for one period batch panel.
+ * Panel covers row_batch_count x col_batch_count hash periods (128x256 cells each).
+ * When jackpot is non-NULL, BLAKE3/target check runs in the GEMM kernel tail
+ * and d_tile_xor may be NULL. */
+typedef struct {
+    uint32_t bound[8];
+    const uint32_t* d_a_key8;
+    int* d_found;
+    int* d_out_t_rows;
+    int* d_out_t_cols;
+    int row_period0;
+    int col_period0;
+} CpCutlassJackpotLaunch;
+
 int cp_cutlass_period_batch(
     int dev,
     const int8_t* d_Ap,
     const int8_t* d_BpT,
     int m,
     int n,
-    int row_period,
+    int row_period0,
     int col_period0,
-    int batch_count,
+    int row_batch_count,
+    int col_batch_count,
     int step_major,
     uint32_t* d_tile_xor,
-    size_t tiles_per_batch);
+    size_t tiles_per_batch,
+    const CpCutlassJackpotLaunch* jackpot);
 
-size_t cp_cutlass_tiles_per_batch(int batch_count);
+size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count);
 
-size_t cp_cutlass_tile_xor_bytes(int batch_count);
+size_t cp_cutlass_tile_xor_bytes(int row_batch_count, int col_batch_count);
 
 #ifdef __cplusplus
 }

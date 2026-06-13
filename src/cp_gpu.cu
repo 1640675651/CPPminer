@@ -72,19 +72,40 @@ static GpuCtx g_gpus[MAX_GPUS];
 static int g_ngpu = 0;
 static int g_contiguous = 0;
 static int g_period_gemm = 1;
-static int g_period_batch = CP_PERIOD_BATCH_DEFAULT;
+static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
+static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 1;
 static int g_cutlass_fused = 0;
 
-static size_t pp_hist_batch_int32s(int batch_count)
+static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)
 {
-    return (size_t)(K_DIM / R_RANK) * (size_t)PP_ROW_PERIOD
-         * (size_t)batch_count * (size_t)PP_COL_PERIOD;
+    return (size_t)(K_DIM / R_RANK)
+         * (size_t)(row_batch_count * PP_ROW_PERIOD)
+         * (size_t)(col_batch_count * PP_COL_PERIOD);
 }
 
-static size_t pp_hist_batch_bytes(int batch_count)
+static size_t pp_hist_batch_bytes(int row_batch_count, int col_batch_count)
 {
-    return pp_hist_batch_int32s(batch_count) * sizeof(int32_t);
+    return pp_hist_batch_int32s(row_batch_count, col_batch_count) * sizeof(int32_t);
+}
+
+static int pp_clamp_row_period_batch(int batch)
+{
+    if(batch < 1) batch = 1;
+    if(batch > CP_ROW_PERIOD_BATCH_MAX) batch = CP_ROW_PERIOD_BATCH_MAX;
+    return batch;
+}
+
+static int pp_clamp_col_period_batch(int batch)
+{
+    if(batch < 1) batch = 1;
+    if(batch > CP_PERIOD_BATCH_MAX) batch = CP_PERIOD_BATCH_MAX;
+    return batch;
+}
+
+static int pp_batch_hash_tiles(int row_batch_count, int col_batch_count)
+{
+    return row_batch_count * col_batch_count * PP_TILES_PER_PERIOD;
 }
 
 static const char* cublas_status_str(cublasStatus_t st)
@@ -216,9 +237,17 @@ void cp_gpu_set_period_gemm(int on)
 
 void cp_gpu_set_period_batch(int batch)
 {
-    if(batch < 1) batch = 1;
-    if(batch > CP_PERIOD_BATCH_MAX) batch = CP_PERIOD_BATCH_MAX;
-    g_period_batch = batch;
+    cp_gpu_set_col_period_batch(batch);
+}
+
+void cp_gpu_set_row_period_batch(int batch)
+{
+    g_row_period_batch = pp_clamp_row_period_batch(batch);
+}
+
+void cp_gpu_set_col_period_batch(int batch)
+{
+    g_col_period_batch = pp_clamp_col_period_batch(batch);
 }
 
 void cp_gpu_set_step_major_ap(int on)
@@ -351,7 +380,8 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         if(g->use_cutlass_fused){
         /* Jackpot runs in CUTLASS mainloop tail; no tile_xor buffer. */
     } else {
-            size_t hist_need = pp_hist_batch_bytes(g_period_batch);
+            size_t hist_need = pp_hist_batch_bytes(
+                g_row_period_batch, g_col_period_batch);
             if(hist_need > g->C_hist_cap){
                 if(g->d_C_hist) cudaFree(g->d_C_hist);
                 CU_CHECK(cudaMalloc(&g->d_C_hist, hist_need));
@@ -449,15 +479,16 @@ static void gpu_period_gemm_panel_ptrs(
  * Ap/BpT layout: row-major lda=K_DIM (default) or step-major lda=R_RANK (--step-major).
  */
 static void gpu_period_gemm_cublas_batch(
-    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count)
+    GpuCtx* g, int m, int n, int row_period0, int col_period0,
+    int row_batch_count, int col_batch_count)
 {
-    const int M = PP_ROW_PERIOD;
+    const int M = row_batch_count * PP_ROW_PERIOD;
     const int N = PP_COL_PERIOD;
     const int R = R_RANK;
     const int num_steps = K_DIM / R;
-    const int N_fat = batch_count * N;
+    const int N_fat = col_batch_count * N;
     const size_t step_plane = (size_t)M * (size_t)N_fat;
-    const size_t row_base = (size_t)row_period * (size_t)M;
+    const size_t row_base = (size_t)row_period0 * (size_t)PP_ROW_PERIOD;
     const size_t col_base = (size_t)col_period0 * (size_t)N;
 
     for(int s = 0; s < num_steps; s++){
@@ -483,15 +514,16 @@ typedef struct {
 
 /* Profile only: per-step GemmEx timing (no plane_add). */
 static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
-    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count)
+    GpuCtx* g, int m, int n, int row_period0, int col_period0,
+    int row_batch_count, int col_batch_count)
 {
-    const int M = PP_ROW_PERIOD;
+    const int M = row_batch_count * PP_ROW_PERIOD;
     const int N = PP_COL_PERIOD;
     const int R = R_RANK;
     const int num_steps = K_DIM / R;
-    const int N_fat = batch_count * N;
+    const int N_fat = col_batch_count * N;
     const size_t step_plane = (size_t)M * (size_t)N_fat;
-    const size_t row_base = (size_t)row_period * (size_t)M;
+    const size_t row_base = (size_t)row_period0 * (size_t)PP_ROW_PERIOD;
     const size_t col_base = (size_t)col_period0 * (size_t)N;
     PeriodCublasBreakdown out = {0.f};
     static cudaEvent_t e0, e1;
@@ -529,28 +561,33 @@ static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
 }
 
 static void gpu_period_gemm_cuda_batch(
-    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count)
+    GpuCtx* g, int m, int n, int row_period0, int col_period0,
+    int row_batch_count, int col_batch_count)
 {
     const dim3 grid(PP_COL_PERIOD / 16, PP_ROW_PERIOD / 16);
     const dim3 block(16, 16);
 
-    for(int b = 0; b < batch_count; b++){
-        plain_proof_period_gemm_kernel<<<grid, block>>>(
-            g->d_Ap, g->d_BpT,
-            m, n, K_DIM, R_RANK,
-            row_period, col_period0 + b,
-            b, batch_count,
-            g->d_C_hist);
+    for(int rb = 0; rb < row_batch_count; rb++){
+        for(int cb = 0; cb < col_batch_count; cb++){
+            plain_proof_period_gemm_kernel<<<grid, block>>>(
+                g->d_Ap, g->d_BpT,
+                m, n, K_DIM, R_RANK,
+                row_period0 + rb, col_period0 + cb,
+                rb, cb, row_batch_count, col_batch_count,
+                g->d_C_hist);
+        }
     }
     CU_CHECK(cudaGetLastError());
 }
 
 static void gpu_period_gemm_batch(
-    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count,
+    GpuCtx* g, int m, int n, int row_period0, int col_period0,
+    int row_batch_count, int col_batch_count,
     const uint32_t bound[8])
 {
     if(g->use_cutlass_fused){
-        const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(batch_count);
+        const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(
+            row_batch_count, col_batch_count);
         CpCutlassJackpotLaunch jp;
         for(int i = 0; i < 8; i++)
             jp.bound[i] = bound[i];
@@ -558,21 +595,23 @@ static void gpu_period_gemm_batch(
         jp.d_found = g->d_found;
         jp.d_out_t_rows = g->d_out_t_rows;
         jp.d_out_t_cols = g->d_out_t_cols;
-        jp.row_period = row_period;
+        jp.row_period0 = row_period0;
         jp.col_period0 = col_period0;
         if(cp_cutlass_period_batch(
-               g->dev, g->d_Ap, g->d_BpT, m, n, row_period, col_period0,
-               batch_count, g_step_major_ap, nullptr, tiles_per_batch,
-               &jp) != 0){
+               g->dev, g->d_Ap, g->d_BpT, m, n, row_period0, col_period0,
+               row_batch_count, col_batch_count, g_step_major_ap, nullptr,
+               tiles_per_batch, &jp) != 0){
             fprintf(stderr, "[cutlass] period batch failed\n");
             exit(1);
         }
         return;
     }
     if(g->use_cublas_period)
-        gpu_period_gemm_cublas_batch(g, m, n, row_period, col_period0, batch_count);
+        gpu_period_gemm_cublas_batch(
+            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
     else
-        gpu_period_gemm_cuda_batch(g, m, n, row_period, col_period0, batch_count);
+        gpu_period_gemm_cuda_batch(
+            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
 }
 
 static void cp_gpu_merkle_finish_root(
@@ -907,19 +946,20 @@ static void scan_profile_ensure_events(cudaEvent_t ev[4])
 }
 
 static void launch_jackpot_batch(
-    GpuCtx* g, int batch_count, int rpi, int cpi0, int m, int n,
+    GpuCtx* g, int row_batch_count, int col_batch_count,
+    int row_period0, int col_period0, int m, int n,
     const uint32_t bound[8])
 {
     if(g->use_cutlass_fused)
         return;
 
-    const int num_blocks = batch_count * PP_TILES_PER_PERIOD;
+    const int num_blocks = pp_batch_hash_tiles(row_batch_count, col_batch_count);
     const dim3 block(PP_HASH_W, PP_HASH_H);
     plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
         g->d_C_hist,
-        batch_count,
+        row_batch_count, col_batch_count,
         K_DIM, R_RANK,
-        rpi, cpi0,
+        row_period0, col_period0,
         m, n,
         bound[0], bound[1], bound[2], bound[3],
         bound[4], bound[5], bound[6], bound[7],
@@ -929,8 +969,8 @@ static void launch_jackpot_batch(
 }
 
 static PeriodBatchTimes profile_period_batch_timed(
-    GpuCtx* g, int rpi, int cpi0, int batch_count, int m, int n,
-    const uint32_t bound[8], cudaEvent_t ev[4])
+    GpuCtx* g, int rpi0, int cpi0, int row_batch_count, int col_batch_count,
+    int m, int n, const uint32_t bound[8], cudaEvent_t ev[4])
 {
     PeriodBatchTimes t = {0.f, 0.f, 0.f};
     int zero = 0;
@@ -938,17 +978,19 @@ static PeriodBatchTimes profile_period_batch_timed(
 
     if(g->use_cublas_period && !g->use_cutlass_fused){
         PeriodCublasBreakdown cb = gpu_period_gemm_cublas_batch_timed(
-            g, m, n, rpi, cpi0, batch_count);
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count);
         t.gemm_ex_ms = cb.gemm_ex_ms;
     } else if(!g->use_cutlass_fused) {
         CU_CHECK(cudaEventRecord(ev[0]));
-        gpu_period_gemm_cuda_batch(g, m, n, rpi, cpi0, batch_count);
+        gpu_period_gemm_cuda_batch(
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
     } else {
         CU_CHECK(cudaEventRecord(ev[0]));
-        gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
+        gpu_period_gemm_batch(
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
@@ -958,7 +1000,8 @@ static PeriodBatchTimes profile_period_batch_timed(
     if(g->use_cutlass_fused){
         t.jackpot_ms = 0.f;
     } else {
-        launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
+        launch_jackpot_batch(
+            g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound);
         CU_CHECK(cudaEventRecord(ev[2]));
         CU_CHECK(cudaEventSynchronize(ev[2]));
         CU_CHECK(cudaEventElapsedTime(&t.jackpot_ms, ev[1], ev[2]));
@@ -977,12 +1020,14 @@ static PeriodBatchTimes profile_period_batch_timed(
 
 /* Same launch order as gpu_scan_device_period; timed with CUDA events. */
 static float profile_period_batch_cuda_ms(
-    GpuCtx* g, int rpi, int cpi0, int batch_count, int m, int n,
-    const uint32_t bound[8], cudaEvent_t e0, cudaEvent_t e1)
+    GpuCtx* g, int rpi0, int cpi0, int row_batch_count, int col_batch_count,
+    int m, int n, const uint32_t bound[8], cudaEvent_t e0, cudaEvent_t e1)
 {
     CU_CHECK(cudaEventRecord(e0));
-    gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
-    launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
+    gpu_period_gemm_batch(
+        g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound);
+    launch_jackpot_batch(
+        g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound);
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
         CU_CHECK(cudaDeviceSynchronize());
@@ -1048,7 +1093,7 @@ static float scan_batch_timing_finish(
 }
 
 static void scan_profile_print_summary(
-    int batch_count, int runs, double macs_per_batch,
+    int row_batch_count, int col_batch_count, int runs, double macs_per_batch,
     double gemm_ex_ms, double jackpot_ms, double sync_ms,
     double wall_ms, double sweep_ms, int sweep_batches,
     uint64_t sweep_tiles, double sweep_gpu_ms, double sweep_sync_ms,
@@ -1057,8 +1102,8 @@ static void scan_profile_print_summary(
     const double total_ms = gemm_ex_ms + jackpot_ms + sync_ms;
     const double gemm_ex_sec = gemm_ex_ms * 1e-3;
     const double total_sec = total_ms * 1e-3;
-    const size_t plane_int32s = (size_t)PP_ROW_PERIOD * (size_t)batch_count
-                              * (size_t)PP_COL_PERIOD;
+    const size_t plane_int32s = (size_t)(g_row_period_batch * PP_ROW_PERIOD)
+                              * (size_t)(g_col_period_batch * PP_COL_PERIOD);
     const double plane_mib = (double)plane_int32s * sizeof(int32_t) / (1024.0 * 1024.0);
     char gemm_ex_rate[32], total_rate[32], wall_rate[32];
     char sweep_wall_rate[32], sweep_gpu_rate[32];
@@ -1088,8 +1133,8 @@ static void scan_profile_print_summary(
     else
         snprintf(sweep_gpu_rate, sizeof(sweep_gpu_rate), "n/a");
 
-    printf("\n[profile-scan] %s  batch_count=%d  runs=%d\n",
-           gemm_mode, batch_count, runs);
+    printf("\n[profile-scan] %s  row_batch=%d col_batch=%d  runs=%d\n",
+           gemm_mode, row_batch_count, col_batch_count, runs);
     printf("[profile-scan] MACs/batch: %.3f GMAC (%.3f TMAC)\n",
            macs_per_batch / 1e9, macs_per_batch / 1e12);
     printf("[profile-scan] C_hist: %.2f MiB/step x %d steps (partials; cumsum in jackpot)\n",
@@ -1156,19 +1201,24 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     cp_scale_jackpot_target(pool_tgt, bound);
 
     const int col_periods = cp_pp_num_col_periods(n, g_contiguous);
-    int batch_count = g_period_batch;
-    if(batch_count > col_periods) batch_count = col_periods;
-    if(batch_count < 1){
-        fprintf(stderr, "[profile-scan] invalid batch_count for m=%d n=%d\n", m, n);
+    const int row_periods = cp_pp_num_row_periods(m, g_contiguous);
+    int row_batch_count = g_row_period_batch;
+    int col_batch_count = g_col_period_batch;
+    if(row_batch_count > row_periods) row_batch_count = row_periods;
+    if(col_batch_count > col_periods) col_batch_count = col_periods;
+    if(row_batch_count < 1 || col_batch_count < 1){
+        fprintf(stderr, "[profile-scan] invalid batch for m=%d n=%d\n", m, n);
         return -1;
     }
 
-    const double macs_per_batch = (double)batch_count
-                                * (double)PP_TILES_PER_PERIOD
+    const double macs_per_batch = (double)pp_batch_hash_tiles(
+                                      row_batch_count, col_batch_count)
                                 * cp_pp_macs_per_hash_tile();
 
-    printf("[profile-scan] m=%d n=%d k=%d r=%d period_batch=%d (using batch_count=%d)\n",
-           m, n, K_DIM, R_RANK, g_period_batch, batch_count);
+    printf("[profile-scan] m=%d n=%d k=%d r=%d row_batch=%d col_batch=%d "
+           "(panel %dx%d periods)\n",
+           m, n, K_DIM, R_RANK, g_row_period_batch, g_col_period_batch,
+           row_batch_count, col_batch_count);
     printf("[profile-scan] Ap/BpT: %s (cuBLAS lda=%d)\n",
            g_step_major_ap ? "step-major" : "row-major strided",
            g_step_major_ap ? R_RANK : K_DIM);
@@ -1199,15 +1249,16 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     const char* gemm_mode = g->use_cutlass_fused ? "CUTLASS fused GEMM"
                             : (g->use_cublas_period ? "cuBLAS int8 fat"
                                                     : "CUDA period GEMM");
-    const int rpi = 0;
+    const int rpi0 = 0;
     const int cpi0 = 0;
 
     for(int i = 0; i < warmup; i++)
-        (void)profile_period_batch_timed(g, rpi, cpi0, batch_count, m, n, bound, ev);
+        (void)profile_period_batch_timed(
+            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
 
     for(int i = 0; i < runs; i++){
         PeriodBatchTimes t = profile_period_batch_timed(
-            g, rpi, cpi0, batch_count, m, n, bound, ev);
+            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
         gemm_ex_sum += t.gemm_ex_ms;
         jackpot_sum += t.jackpot_ms;
         sync_sum += t.sync_ms;
@@ -1215,11 +1266,13 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
 
     for(int i = 0; i < warmup; i++)
         (void)profile_period_batch_cuda_ms(
-            g, rpi, cpi0, batch_count, m, n, bound, ev[0], ev[1]);
+            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
+            ev[0], ev[1]);
 
     for(int i = 0; i < runs; i++)
         wall_sum += profile_period_batch_cuda_ms(
-            g, rpi, cpi0, batch_count, m, n, bound, ev[0], ev[1]);
+            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
+            ev[0], ev[1]);
 
     /*
      * Full-scan sweep: identical loop shape to gpu_scan_device_period
@@ -1240,22 +1293,24 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
 
         scan_batch_timing_init(&batch_tm);
         printf("[profile-scan] full sweep (mining loop shape): "
-               "%d row periods x %d col periods, batch=%d\n",
-               row_periods, col_periods, batch_count);
+               "%d row periods x %d col periods, row_batch=%d col_batch=%d\n",
+               row_periods, col_periods, g_row_period_batch, g_col_period_batch);
         fflush(stdout);
 
-        for(int rpi = 0; rpi < row_periods; rpi++){
-            for(int cpi0 = 0; cpi0 < col_periods; cpi0 += batch_count){
-                int bc = batch_count;
-                if(cpi0 + bc > col_periods) bc = col_periods - cpi0;
+        for(int rpi0 = 0; rpi0 < row_periods; rpi0 += g_row_period_batch){
+            int rb = g_row_period_batch;
+            if(rpi0 + rb > row_periods) rb = row_periods - rpi0;
+            for(int cpi0 = 0; cpi0 < col_periods; cpi0 += g_col_period_batch){
+                int cb = g_col_period_batch;
+                if(cpi0 + cb > col_periods) cb = col_periods - cpi0;
 
-                const int batch_tiles = bc * PP_TILES_PER_PERIOD;
+                const int batch_tiles = pp_batch_hash_tiles(rb, cb);
                 const double wall_t0 = cp_now_sec();
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaEventRecord(batch_tm.batch_start));
 
-                gpu_period_gemm_batch(g, m, n, rpi, cpi0, bc, bound);
-                launch_jackpot_batch(g, bc, rpi, cpi0, m, n, bound);
+                gpu_period_gemm_batch(g, m, n, rpi0, cpi0, rb, cb, bound);
+                launch_jackpot_batch(g, rb, cb, rpi0, cpi0, m, n, bound);
 
                 CU_CHECK(cudaEventRecord(batch_tm.post_launch));
                 CU_CHECK(cudaDeviceSynchronize());
@@ -1268,7 +1323,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
                 (void)scan_batch_timing_finish(&batch_tm, batch_tiles, wall_ms);
                 tiles_scanned += (uint64_t)batch_tiles;
             }
-            if((rpi % 16) == 0){
+            if((rpi0 / g_row_period_batch) % 16 == 0){
                 double sweep_sec = cp_now_sec() - sweep_t0;
                 if(sweep_sec < 1e-9) sweep_sec = 1e-9;
                 char wall_buf[32], gpu_buf[32];
@@ -1284,7 +1339,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
                     snprintf(gpu_buf, sizeof(gpu_buf), "n/a");
                 printf("[profile-scan] sweep progress: row periods %d/%d "
                        "tiles %llu/%d (%.1f%%) %s wall | %s gpu\n",
-                       rpi + 1, row_periods,
+                       rpi0 + rb, row_periods,
                        (unsigned long long)tiles_scanned, total_tiles,
                        100.0 * (double)tiles_scanned / (double)total_tiles,
                        wall_buf, gpu_buf);
@@ -1301,7 +1356,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     }
 
     scan_profile_print_summary(
-        batch_count, runs, macs_per_batch,
+        row_batch_count, col_batch_count, runs, macs_per_batch,
         gemm_ex_sum / runs, jackpot_sum / runs, sync_sum / runs,
         wall_sum / runs, (double)sweep_ms, sweep_batches,
         sweep_tiles, sweep_gpu_ms, sweep_sync_ms, gemm_mode);
@@ -1333,28 +1388,34 @@ static int gpu_scan_device_period(
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
     printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
-           "(batch=%d, %d hash tiles), difficulty scaled by %d\n",
-           row_periods, col_periods, g_period_batch,
+           "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %d\n",
+           row_periods, col_periods, g_row_period_batch, g_col_period_batch,
            total_tiles, PP_HASH_H * PP_HASH_W * K_DIM);
     fflush(stdout);
 
-    for(int rpi = 0; rpi < row_periods && !found; rpi++){
+    for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch){
         if(cp_job_should_cancel()){
             if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
             return -1;
         }
-        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_period_batch){
-            int batch_count = g_period_batch;
-            if(cpi0 + batch_count > col_periods)
-                batch_count = col_periods - cpi0;
+        int row_batch = g_row_period_batch;
+        if(rpi0 + row_batch > row_periods)
+            row_batch = row_periods - rpi0;
 
-            const int batch_tiles = batch_count * PP_TILES_PER_PERIOD;
+        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
+            int col_batch = g_col_period_batch;
+            if(cpi0 + col_batch > col_periods)
+                col_batch = col_periods - cpi0;
+
+            const int batch_tiles = pp_batch_hash_tiles(row_batch, col_batch);
 
             for(int i = 0; i < g_ngpu; i++){
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
-                launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
+                gpu_period_gemm_batch(
+                    g, m, n, rpi0, cpi0, row_batch, col_batch, bound);
+                launch_jackpot_batch(
+                    g, row_batch, col_batch, rpi0, cpi0, m, n, bound);
             }
 
             for(int i = 0; i < g_ngpu; i++){
@@ -1375,14 +1436,14 @@ static int gpu_scan_device_period(
 
             tiles_scanned += (uint64_t)batch_tiles;
         }
-        if((rpi % 128) == 0 && !found){
+        if(rpi0 % 128 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
             if(scan_sec < 1e-9) scan_sec = 1e-9;
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
             printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%d (%.1f%%) %s\n",
-                   rpi + 1, row_periods,
+                   rpi0 + row_batch, row_periods,
                    (unsigned long long)tiles_scanned, total_tiles,
                    100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);

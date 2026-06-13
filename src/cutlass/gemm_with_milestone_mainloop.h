@@ -53,14 +53,14 @@ public:
     int *ptr_found;
     int *ptr_out_t_rows;
     int *ptr_out_t_cols;
-    int row_period;
+    int row_period0;
     int col_period0;
     bool enabled;
 
     CUTLASS_HOST_DEVICE
     JackpotParams()
         : ptr_a_key8(nullptr), ptr_found(nullptr), ptr_out_t_rows(nullptr),
-          ptr_out_t_cols(nullptr), row_period(0), col_period0(0), enabled(false) {
+          ptr_out_t_cols(nullptr), row_period0(0), col_period0(0), enabled(false) {
       for (int i = 0; i < 8; ++i) {
         bound[i] = 0u;
       }
@@ -353,11 +353,14 @@ public:
     if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
         params.jackpot.ptr_a_key8 != nullptr &&
         *params.jackpot.ptr_found == 0) {
-      const int batch_idx = threadblock_tile_offset.n();
+      const int row_period_eff =
+          params.jackpot.row_period0 + threadblock_tile_offset.m();
+      const int col_period_eff =
+          params.jackpot.col_period0 + threadblock_tile_offset.n();
       cp_cutlass_jackpot_try(
           jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
-          params.jackpot.row_period, params.jackpot.col_period0, batch_idx,
-          thread_idx, params.jackpot.ptr_found, params.jackpot.ptr_out_t_rows,
+          row_period_eff, col_period_eff, thread_idx,
+          params.jackpot.ptr_found, params.jackpot.ptr_out_t_rows,
           params.jackpot.ptr_out_t_cols);
     }
   }

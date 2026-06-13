@@ -9,7 +9,26 @@
 #define PP_TILES_PER_PERIOD 256
 #define PP_PERIOD_PLANE_ELEMS (PP_ROW_PERIOD * PP_COL_PERIOD)
 
-/* C_hist[step][row][batch_col] with batch_col = period_in_batch * 256 + col. */
+/* C_hist fat panel: row_batch*128 rows x col_batch*256 cols per step. */
+__device__ __forceinline__ size_t pp_c_hist_panel_index(
+    int step, int rel_r, int rel_c, int row_batch_count, int col_batch_count)
+{
+    const int panel_rows = row_batch_count * PP_ROW_PERIOD;
+    const int panel_cols = col_batch_count * PP_COL_PERIOD;
+    const size_t step_plane = (size_t)panel_rows * (size_t)panel_cols;
+    return (size_t)step * step_plane
+         + (size_t)rel_r * (size_t)panel_cols
+         + (size_t)rel_c;
+}
+
+__device__ __forceinline__ size_t pp_c_hist_step_plane_elems(
+    int row_batch_count, int col_batch_count)
+{
+    return (size_t)(row_batch_count * PP_ROW_PERIOD)
+         * (size_t)(col_batch_count * PP_COL_PERIOD);
+}
+
+/* Legacy col-only batch layout (row_batch_count=1). */
 __device__ __forceinline__ size_t pp_c_hist_index(
     int step, int rel_r, int batch_idx, int rel_c, int batch_count)
 {
@@ -49,7 +68,8 @@ __global__ void plain_proof_period_gemm_kernel(
     const int8_t* __restrict__ B,
     int m, int n, int K, int R,
     int row_period, int col_period,
-    int batch_idx, int batch_count,
+    int row_in_batch, int col_in_batch,
+    int row_batch_count, int col_batch_count,
     int32_t* __restrict__ C_hist)
 {
     const int r = (int)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -58,22 +78,25 @@ __global__ void plain_proof_period_gemm_kernel(
 
     const int grow = row_period * PP_ROW_PERIOD + r;
     const int gcol = col_period * PP_COL_PERIOD + c;
+    const int rel_r = row_in_batch * PP_ROW_PERIOD + r;
+    const int rel_c = col_in_batch * PP_COL_PERIOD + c;
 
     for(int ll = R; ll <= K; ll += R){
         const int step = ll / R - 1;
         const int8_t* a_row = pp_ap_panel_ptr(A, step, grow, m, K, R);
         const int8_t* b_row = pp_bp_panel_ptr(B, step, gcol, n, K, R);
         int32_t cell = pp_dot_i8_panel(0, a_row, b_row, 0, R);
-        C_hist[pp_c_hist_index(step, r, batch_idx, c, batch_count)] = cell;
+        C_hist[pp_c_hist_panel_index(step, rel_r, rel_c,
+                                     row_batch_count, col_batch_count)] = cell;
     }
 }
 
 /* One block per hash tile (8x16 threads); reads C_hist rank partials, one BLAKE3/block. */
 __global__ void plain_proof_period_jackpot_kernel(
     const int32_t* __restrict__ C_hist,
-    int batch_count,
+    int row_batch_count, int col_batch_count,
     int K, int R,
-    int row_period, int col_period0,
+    int row_period0, int col_period0,
     int M, int N,
     uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3,
     uint32_t b4, uint32_t b5, uint32_t b6, uint32_t b7,
@@ -83,11 +106,18 @@ __global__ void plain_proof_period_jackpot_kernel(
     int* __restrict__ found_flag)
 {
     const int blk = (int)blockIdx.x;
-    const int b = blk / PP_TILES_PER_PERIOD;
-    const int tile = blk % PP_TILES_PER_PERIOD;
-    if(b >= batch_count) return;
+    const int tiles_per_plane = PP_TILES_PER_PERIOD;
+    const int planes = row_batch_count * col_batch_count;
+    if(blk >= planes * tiles_per_plane) return;
 
     if(*found_flag) return;
+
+    const int plane = blk / tiles_per_plane;
+    const int tile = blk % tiles_per_plane;
+    const int row_in_batch = plane / col_batch_count;
+    const int col_in_batch = plane % col_batch_count;
+    const int row_period = row_period0 + row_in_batch;
+    const int col_period = col_period0 + col_in_batch;
 
     const int u = (int)threadIdx.y;
     const int v = (int)threadIdx.x;
@@ -96,14 +126,12 @@ __global__ void plain_proof_period_jackpot_kernel(
     const int local_cp = tile % 16;
     const int row_base = pp_period_row_base(local_rp);
     const int col_base = pp_period_col_base(local_cp);
-    const int col_period = col_period0 + b;
     const int t_rows = row_period * PP_ROW_PERIOD + row_base;
     const int t_cols = col_period * PP_COL_PERIOD + col_base;
 
-    const int rel_r = row_base + PP_ROW_PAT[u];
-    const int rel_c = col_base + PP_COL_PAT[v];
-    const bool valid = row_period * PP_ROW_PERIOD + rel_r < M
-                    && col_period * PP_COL_PERIOD + rel_c < N;
+    const int rel_r = row_in_batch * PP_ROW_PERIOD + row_base + PP_ROW_PAT[u];
+    const int rel_c = col_in_batch * PP_COL_PERIOD + col_base + PP_COL_PAT[v];
+    const bool valid = rel_r < M && rel_c < N;
 
     __shared__ int32_t s_tile[PP_HASH_H * PP_HASH_W];
     __shared__ uint32_t s_jackpot[PP_JACKPOT_WORDS];
@@ -118,7 +146,8 @@ __global__ void plain_proof_period_jackpot_kernel(
     for(int step = 0; step < num_steps; step++){
         if(valid){
             const int32_t partial = C_hist[
-                pp_c_hist_index(step, rel_r, b, rel_c, batch_count)];
+                pp_c_hist_panel_index(step, rel_r, rel_c,
+                                      row_batch_count, col_batch_count)];
             cell += partial;
         }
         s_tile[u * PP_HASH_W + v] = cell;

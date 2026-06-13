@@ -12,6 +12,8 @@ void cp_gpu_shutdown(void);
 void cp_gpu_set_contiguous_tiles(int on);
 void cp_gpu_set_period_gemm(int on);
 void cp_gpu_set_period_batch(int batch);
+void cp_gpu_set_row_period_batch(int batch);
+void cp_gpu_set_col_period_batch(int batch);
 void cp_gpu_set_step_major_ap(int on);
 void cp_gpu_set_cutlass_fused(int on);
 

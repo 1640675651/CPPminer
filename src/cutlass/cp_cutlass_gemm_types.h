@@ -106,7 +106,7 @@ struct FusedMilestoneGemmOp {
       jp.ptr_found = jackpot->d_found;
       jp.ptr_out_t_rows = jackpot->d_out_t_rows;
       jp.ptr_out_t_cols = jackpot->d_out_t_cols;
-      jp.row_period = jackpot->row_period;
+      jp.row_period0 = jackpot->row_period0;
       jp.col_period0 = jackpot->col_period0;
       for (int i = 0; i < 8; ++i) {
         jp.bound[i] = jackpot->bound[i];
