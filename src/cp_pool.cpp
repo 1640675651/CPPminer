@@ -91,6 +91,21 @@ static int net_wait_readable(int sock, int timeout_ms)
 #endif
 }
 
+static int net_buf_has_complete_json(void)
+{
+    char* start = (char*)memchr(net_buf, '{', net_pos);
+    if(!start) return 0;
+    int depth = 0;
+    for(char* p = start; p < net_buf + net_pos; p++){
+        if(*p == '{') depth++;
+        else if(*p == '}'){
+            depth--;
+            if(depth == 0) return 1;
+        }
+    }
+    return 0;
+}
+
 static char* pop_json_message(int sock)
 {
     while(1){
@@ -205,7 +220,11 @@ static void pool_dispatch_line(const char* line)
 static void pool_net_reader_thread(void)
 {
     while(g_net_reader_run.load()){
-        if(!net_wait_readable(tcp_sock, 100)) continue;
+        /* Drain buffered messages before waiting — pool often sends authorize
+         * ack + mining.notify back-to-back in one TCP segment. */
+        if(!net_buf_has_complete_json()){
+            if(!net_wait_readable(tcp_sock, 100)) continue;
+        }
         std::lock_guard<std::mutex> lk(g_net_mx);
         char* line = pop_json_message(tcp_sock);
         if(!line){
@@ -231,6 +250,7 @@ void cp_pool_disconnect(void)
         CP_SOCK_CLOSE(tcp_sock);
         tcp_sock = -1;
     }
+    net_pos = 0;
 }
 
 int cp_pool_socket(void)

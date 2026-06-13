@@ -5,6 +5,9 @@
 #   conda activate pearl
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -CudaArch 61
+#
+# The script snapshots and restores your shell environment on exit (success or failure),
+# so repeated builds in the same terminal do not require restarting it.
 
 param(
     [string]$CudaArch = "",
@@ -20,6 +23,26 @@ $B3Dir = Join-Path $BuildDir "b3"
 $OutExe = Join-Path $Root "cpminer.exe"
 $script:VcvarsBat = $null
 $script:ClExe = $null
+$script:OrigEnv = $null
+
+function Save-ShellEnvironment {
+    # Snapshot the caller's shell so vcvars/nvcc work cannot poison later builds.
+    $script:OrigEnv = @{}
+    Get-ChildItem Env: | ForEach-Object { $script:OrigEnv[$_.Name] = $_.Value }
+}
+
+function Restore-ShellEnvironment {
+    if (-not $script:OrigEnv) { return }
+    Get-ChildItem Env: | ForEach-Object {
+        if (-not $script:OrigEnv.ContainsKey($_.Name)) {
+            Remove-Item "env:$($_.Name)" -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($kv in $script:OrigEnv.GetEnumerator()) {
+        Set-Item -Path "env:$($kv.Key)" -Value $kv.Value
+    }
+    $script:OrigEnv = $null
+}
 
 function Get-SanitizedPathForNvcc {
     param([string]$PathValue)
@@ -53,22 +76,22 @@ function Initialize-MSVC {
     if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsPath" }
     $script:VcvarsBat = $vcvars
     Write-Host "=== MSVC: $vsPath ==="
+    # Resolve cl.exe in an isolated cmd session — do not import vcvars into this shell.
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $clOut = $null
     try {
-        cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>&1 | ForEach-Object {
-            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
-            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
-        }
+        $clOut = cmd /c "`"$vcvars`" >nul 2>&1 && where cl.exe" 2>&1
     } finally {
         $ErrorActionPreference = $prevEap
     }
-    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
-        throw "cl.exe not on PATH after vcvars64"
+    $script:ClExe = ($clOut | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+    } | Where-Object { $_ -and $_ -match 'cl\.exe' } | Select-Object -First 1)
+    if ($script:ClExe) { $script:ClExe = $script:ClExe.Trim() }
+    if (-not $script:ClExe) {
+        throw "cl.exe not found after vcvars64"
     }
-    $script:ClExe = (Get-Command cl.exe).Source
-    $env:CUDAHOSTCXX = $script:ClExe
-    $env:CUDAHOSTC = $script:ClExe
     Write-Host "=== cl.exe: $($script:ClExe) ==="
 }
 
@@ -170,10 +193,12 @@ function Invoke-Nvcc {
     $savedPath = $env:PATH
     $env:PATH = Get-SanitizedPathForNvcc -PathValue $env:PATH
     try {
+        # Clear stale MSVC/conda toolchain vars inherited by cmd, then apply vcvars once.
+        $envPreamble = "set INCLUDE=&& set LIB=&& set LIBPATH=&& set CC=&& set CXX=&& set CUDAHOSTC=&& set CUDAHOSTCXX=&& "
         if ($script:VcvarsBat) {
-            $cmdLine = "`"$script:VcvarsBat`" >nul 2>&1 && set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+            $cmdLine = "${envPreamble}`"$script:VcvarsBat`" >nul 2>&1 && `"$Nvcc`" $quoted"
         } else {
-            $cmdLine = "set CC=&& set CXX=&& `"$Nvcc`" $quoted"
+            $cmdLine = "${envPreamble}`"$Nvcc`" $quoted"
         }
         Invoke-External -Command { cmd /c $cmdLine } -FailureMessage "nvcc failed: $($NvccArgs -join ' ')"
     } finally {
@@ -181,104 +206,105 @@ function Invoke-Nvcc {
     }
 }
 
-Clear-CondaToolchainOverrides
-Initialize-MSVC
-$CudaRoot = Find-CudaRoot
-$Nvcc = Join-Path $CudaRoot "bin\nvcc.exe"
-$Arch = Get-GpuArch
-$NvccArch = "sm_$Arch"
-$Inc = @("-I$(Join-Path $Root 'include')", "-I$(Join-Path $Root 'src')", "-I$B3Dir")
-$HostOpenMP = @("-Xcompiler", "/openmp")
-$Nosimd = @("-DBLAKE3_NO_AVX512", "-DBLAKE3_NO_AVX2", "-DBLAKE3_NO_SSE41", "-DBLAKE3_NO_SSE2")
-
-Write-Host "=== CUDA: $CudaRoot  Arch: $NvccArch ==="
-New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-Ensure-Blake3
-$CutlassRoot = Ensure-Cutlass
-$Inc += "-I$(Join-Path $CutlassRoot 'include')"
-$Inc += "-I$(Join-Path $CutlassRoot 'examples/35_gemm_softmax')"
-
-Write-Host "=== Building cp-proof-ffi (Rust) ==="
-$RustDir = Join-Path $Root "rust\cp-proof-ffi"
-$PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
-if (-not (Test-Path $PearlBlake3)) {
-    throw "Vendored pearl-blake3 missing at third_party/pearl-blake3"
-}
-Push-Location $RustDir
+Save-ShellEnvironment
+$buildExitCode = 0
 try {
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        throw "Rust cargo not found. conda activate pearl (or install from https://rustup.rs)"
+    Clear-CondaToolchainOverrides
+    Initialize-MSVC
+    $CudaRoot = Find-CudaRoot
+    $Nvcc = Join-Path $CudaRoot "bin\nvcc.exe"
+    $Arch = Get-GpuArch
+    $NvccArch = "sm_$Arch"
+    $Inc = @("-I$(Join-Path $Root 'include')", "-I$(Join-Path $Root 'src')", "-I$B3Dir")
+    $HostOpenMP = @("-Xcompiler", "/openmp")
+    $Nosimd = @("-DBLAKE3_NO_AVX512", "-DBLAKE3_NO_AVX2", "-DBLAKE3_NO_SSE41", "-DBLAKE3_NO_SSE2")
+
+    Write-Host "=== CUDA: $CudaRoot  Arch: $NvccArch ==="
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    Ensure-Blake3
+    $CutlassRoot = Ensure-Cutlass
+    $Inc += "-I$(Join-Path $CutlassRoot 'include')"
+    $Inc += "-I$(Join-Path $CutlassRoot 'examples/35_gemm_softmax')"
+
+    Write-Host "=== Building cp-proof-ffi (Rust) ==="
+    $RustDir = Join-Path $Root "rust\cp-proof-ffi"
+    $PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
+    if (-not (Test-Path $PearlBlake3)) {
+        throw "Vendored pearl-blake3 missing at third_party/pearl-blake3"
     }
-    Invoke-External -Command { cargo build --release } -FailureMessage "cargo build failed"
+    Push-Location $RustDir
+    try {
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            throw "Rust cargo not found. conda activate pearl (or install from https://rustup.rs)"
+        }
+        Invoke-External -Command { cargo build --release } -FailureMessage "cargo build failed"
+    } finally {
+        Pop-Location
+    }
+    $RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
+    if (-not (Test-Path $RustLib)) { throw "Missing $RustLib" }
+    Write-Host "=== Rust lib: $RustLib ==="
+
+    foreach ($unit in @(
+        @{ src = "blake3.c"; extra = $Nosimd },
+        @{ src = "blake3_dispatch.c"; extra = $Nosimd },
+        @{ src = "blake3_portable.c"; extra = @() },
+        @{ src = "cp_noise.c"; extra = @(); path = (Join-Path $Root "src\cp_noise.c") }
+    )) {
+        $srcPath = if ($unit.path) { $unit.path } else { Join-Path $B3Dir $unit.src }
+        $obj = Join-Path $BuildDir ($unit.src -replace '\.c$', '.obj')
+        $flags = @("-c", $srcPath, "-o", $obj, "-O2") + $Inc + $unit.extra + $HostOpenMP
+        Invoke-Nvcc @flags
+    }
+
+    foreach ($unit in @("cp_util.cpp", "cp_pool.cpp", "cp_job_ctrl.cpp", "cp_mine.cpp", "cp_state.cpp", "main.cpp")) {
+        $srcPath = Join-Path $Root "src\$unit"
+        $obj = Join-Path $BuildDir ($unit -replace '\.cpp$', '.obj')
+        $flags = @("-c", $srcPath, "-o", $obj, "-O2") + $Inc + $HostOpenMP
+        Invoke-Nvcc @flags
+    }
+
+    $gpuFlags = @("-arch=$NvccArch", "-O3") + $HostOpenMP + $Inc + @(
+        "-c", (Join-Path $Root "src\cp_gpu.cu"),
+        "-o", (Join-Path $BuildDir "cp_gpu.obj")
+    )
+    Invoke-Nvcc @gpuFlags
+
+    Write-Host "=== Linking $OutExe ==="
+    $RustExtra = @(
+        $RustLib,
+        "cublas.lib",
+        "userenv.lib", "ws2_32.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib"
+    )
+    $linkArgs = @(
+        "-arch=$NvccArch", "-O3",
+        (Join-Path $BuildDir "main.obj"),
+        (Join-Path $BuildDir "cp_util.obj"),
+        (Join-Path $BuildDir "cp_pool.obj"),
+        (Join-Path $BuildDir "cp_job_ctrl.obj"),
+        (Join-Path $BuildDir "cp_mine.obj"),
+        (Join-Path $BuildDir "cp_state.obj"),
+        (Join-Path $BuildDir "cp_gpu.obj"),
+        (Join-Path $BuildDir "cp_noise.obj"),
+        (Join-Path $BuildDir "blake3.obj"),
+        (Join-Path $BuildDir "blake3_dispatch.obj"),
+        (Join-Path $BuildDir "blake3_portable.obj")
+    ) + $RustExtra + @("-o", $OutExe)
+    Invoke-Nvcc @linkArgs
+
+    Write-Host "=== Done: $OutExe ==="
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $OutExe --help 2>&1 | Select-Object -First 15 | ForEach-Object { Write-Host $_ }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+} catch {
+    Write-Host $_.Exception.Message
+    $buildExitCode = 1
 } finally {
-    Pop-Location
+    Restore-ShellEnvironment
+    if ($Error.Count -gt 0) { $Error.Clear() }
 }
-$RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
-if (-not (Test-Path $RustLib)) { throw "Missing $RustLib" }
-Write-Host "=== Rust lib: $RustLib ==="
-
-foreach ($unit in @(
-    @{ src = "blake3.c"; extra = $Nosimd },
-    @{ src = "blake3_dispatch.c"; extra = $Nosimd },
-    @{ src = "blake3_portable.c"; extra = @() },
-    @{ src = "cp_noise.c"; extra = @(); path = (Join-Path $Root "src\cp_noise.c") }
-)) {
-    $srcPath = if ($unit.path) { $unit.path } else { Join-Path $B3Dir $unit.src }
-    $obj = Join-Path $BuildDir ($unit.src -replace '\.c$', '.obj')
-    $flags = @("-c", $srcPath, "-o", $obj, "-O2") + $Inc + $unit.extra + $HostOpenMP
-    Invoke-Nvcc @flags
-}
-
-foreach ($unit in @("cp_util.cpp", "cp_pool.cpp", "cp_job_ctrl.cpp", "cp_mine.cpp", "cp_state.cpp", "main.cpp", "pp_tile_cell_map.cpp")) {
-    $srcPath = Join-Path $Root "src\$unit"
-    $obj = Join-Path $BuildDir ($unit -replace '\.cpp$', '.obj')
-    $flags = @("-c", $srcPath, "-o", $obj, "-O2") + $Inc + $HostOpenMP
-    Invoke-Nvcc @flags
-}
-
-$gpuFlags = @("-arch=$NvccArch", "-O3") + $HostOpenMP + $Inc + @(
-    "-c", (Join-Path $Root "src\cp_gpu.cu"),
-    "-o", (Join-Path $BuildDir "cp_gpu.obj")
-)
-Invoke-Nvcc @gpuFlags
-
-$cutlassFlags = @("-arch=$NvccArch", "-O3", "--std=c++17") + $HostOpenMP + $Inc + @(
-    "-c", (Join-Path $Root "src\pp_cutlass_gemm.cu"),
-    "-o", (Join-Path $BuildDir "pp_cutlass_gemm.obj")
-)
-Invoke-Nvcc @cutlassFlags
-
-Write-Host "=== Linking $OutExe ==="
-$RustExtra = @(
-    $RustLib,
-    "cublas.lib",
-    "userenv.lib", "ws2_32.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib"
-)
-$linkArgs = @(
-    "-arch=$NvccArch", "-O3",
-    (Join-Path $BuildDir "main.obj"),
-    (Join-Path $BuildDir "cp_util.obj"),
-    (Join-Path $BuildDir "cp_pool.obj"),
-    (Join-Path $BuildDir "cp_job_ctrl.obj"),
-    (Join-Path $BuildDir "cp_mine.obj"),
-    (Join-Path $BuildDir "cp_state.obj"),
-    (Join-Path $BuildDir "cp_gpu.obj"),
-    (Join-Path $BuildDir "pp_cutlass_gemm.obj"),
-    (Join-Path $BuildDir "pp_tile_cell_map.obj"),
-    (Join-Path $BuildDir "cp_noise.obj"),
-    (Join-Path $BuildDir "blake3.obj"),
-    (Join-Path $BuildDir "blake3_dispatch.obj"),
-    (Join-Path $BuildDir "blake3_portable.obj")
-) + $RustExtra + @("-o", $OutExe)
-Invoke-Nvcc @linkArgs
-
-Write-Host "=== Done: $OutExe ==="
-$prevEap = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-try {
-    & $OutExe --help 2>&1 | Select-Object -First 15 | ForEach-Object { Write-Host $_ }
-} finally {
-    $ErrorActionPreference = $prevEap
-}
-if ($Error.Count -gt 0) { $Error.Clear() }
-exit 0
+exit $buildExitCode
