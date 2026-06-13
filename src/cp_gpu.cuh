@@ -20,7 +20,7 @@ __device__ __forceinline__ void b3G(uint32_t* v,int a,int b,int c,int d,uint32_t
     v[c]+=v[d];   v[b]=d_rotr32(v[b]^v[c], 7);
 }
 
-__device__ void b3_compress64(const uint32_t* key8, const uint32_t* msg16,
+__device__ __forceinline__ void b3_compress64(const uint32_t* key8, const uint32_t* msg16,
                                uint32_t* out8)
 {
     uint32_t v[16]={

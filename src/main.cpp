@@ -30,7 +30,7 @@ static void print_usage(void)
            CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
            K_DIM, R_RANK);
-    printf("  --cutlass-fused      fused CUTLASS GEMM + per-thread tile XOR (Pascal SIMT)\n");
+    printf("  --cutlass-fused      fused CUTLASS GEMM + in-kernel jackpot (Pascal SIMT)\n");
     printf("  --cpu-gen            CPU BLAKE3 matrix gen (debug; default GPU random)\n");
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
@@ -295,7 +295,7 @@ int main(int argc, char** argv)
             printf("[mode] proof rows/cols: 16 A + 8 B^T (CUTLASS Case 7.1 offsets)\n");
         }
         printf("[mode] scan: %s\n",
-               cutlass_fused ? "CUTLASS fused GEMM + tile_xor jackpot"
+               cutlass_fused ? "CUTLASS fused GEMM + jackpot (mainloop tail)"
                : ((g_contiguous_tiles || no_period_gemm) ? "per-tile kernel"
                   : "period GEMM + batched jackpot"));
         if(!g_contiguous_tiles && !no_period_gemm){
@@ -303,9 +303,7 @@ int main(int argc, char** argv)
                    step_major_ap ? "step-major panels" : "row-major strided",
                    step_major_ap ? R_RANK : K_DIM);
             if(cutlass_fused){
-                printf("[mode] tile_xor/batch: ~%.1f KiB (fused; no C_hist)\n",
-                       (double)cp_cutlass_tile_xor_bytes(period_batch)
-                           / 1024.0);
+                printf("[mode] jackpot: fused in GEMM kernel (no tile_xor / C_hist)\n");
             } else {
                 printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
                        period_batch,

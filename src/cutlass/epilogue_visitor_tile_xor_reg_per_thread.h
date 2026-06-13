@@ -6,6 +6,7 @@
 
 #include <type_traits>
 
+#include "cp_cutlass_jackpot.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/scale_type.h"
 #include "cutlass/numeric_conversion.h"
@@ -51,19 +52,20 @@ public:
     int milestone_stride;
     bool store_output;
     bool serial_split_k;
+    bool fuse_jackpot;
 
     CUTLASS_HOST_DEVICE
     Arguments()
         : tile_cols(0), milestone_stride(0), store_output(false),
-          serial_split_k(false) {}
+          serial_split_k(false), fuse_jackpot(false) {}
 
     CUTLASS_HOST_DEVICE
     Arguments(typename ElementwiseFunctor::Params elementwise_, int tile_cols_,
               int milestone_stride_ = 0, bool store_output_ = false,
-              bool serial_split_k_ = false)
+              bool serial_split_k_ = false, bool fuse_jackpot_ = false)
         : elementwise(elementwise_), tile_cols(tile_cols_),
           milestone_stride(milestone_stride_), store_output(store_output_),
-          serial_split_k(serial_split_k_) {}
+          serial_split_k(serial_split_k_), fuse_jackpot(fuse_jackpot_) {}
   };
 
   struct Params {
@@ -72,17 +74,22 @@ public:
     int milestone_stride;
     bool store_output;
     bool serial_split_k;
+    bool fuse_jackpot;
+    uint32_t *jackpot_words;
+    int milestone_index;
 
     CUTLASS_HOST_DEVICE
     Params()
         : tile_cols(0), milestone_stride(0), store_output(false),
-          serial_split_k(false) {}
+          serial_split_k(false), fuse_jackpot(false), jackpot_words(nullptr),
+          milestone_index(0) {}
 
     CUTLASS_HOST_DEVICE
     Params(Arguments const &args)
         : elementwise(args.elementwise), tile_cols(args.tile_cols),
           milestone_stride(args.milestone_stride), store_output(args.store_output),
-          serial_split_k(args.serial_split_k) {}
+          serial_split_k(args.serial_split_k), fuse_jackpot(args.fuse_jackpot),
+          jackpot_words(nullptr), milestone_index(0) {}
   };
 
   struct SharedStorage {};
@@ -206,6 +213,12 @@ public:
 
   CUTLASS_DEVICE
   void end_epilogue() {
+    if (params_.fuse_jackpot && params_.jackpot_words != nullptr) {
+      cp_cutlass_jackpot_fold_step(params_.jackpot_words, params_.milestone_index,
+                                   partial_xor_);
+      return;
+    }
+
     if (ptr_tile_xor_ == nullptr) {
       return;
     }

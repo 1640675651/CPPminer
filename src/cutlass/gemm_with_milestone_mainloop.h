@@ -3,6 +3,7 @@
 // Case 3 (kPersistentAccumAcrossMilestones): register-held prefix, no global |C|.
 #pragma once
 
+#include "cp_cutlass_jackpot.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/gemm/gemm.h"
@@ -46,6 +47,26 @@ public:
   using ElementNorm = typename EpilogueVisitor::ElementNorm;
   using ElementSum = typename EpilogueVisitor::ElementSum;
 
+  struct JackpotParams {
+    const uint32_t *ptr_a_key8;
+    uint32_t bound[8];
+    int *ptr_found;
+    int *ptr_out_t_rows;
+    int *ptr_out_t_cols;
+    int row_period;
+    int col_period0;
+    bool enabled;
+
+    CUTLASS_HOST_DEVICE
+    JackpotParams()
+        : ptr_a_key8(nullptr), ptr_found(nullptr), ptr_out_t_rows(nullptr),
+          ptr_out_t_cols(nullptr), row_period(0), col_period0(0), enabled(false) {
+      for (int i = 0; i < 8; ++i) {
+        bound[i] = 0u;
+      }
+    }
+  };
+
   struct Arguments {
     GemmUniversalMode mode;
     GemmCoord problem_size;
@@ -65,6 +86,7 @@ public:
     int milestone_k;
 
     typename EpilogueVisitor::Arguments epilogue_visitor;
+    JackpotParams jackpot;
 
     Arguments()
         : mode(GemmUniversalMode::kGemm), batch_count(1), ptr_Max(nullptr),
@@ -75,12 +97,13 @@ public:
               TensorRefA ref_A_, TensorRefB ref_B_, TensorRefC ref_C_,
               TensorRefC ref_D_, ElementNorm *ptr_Max_, ElementSum *ptr_Sum_,
               int64_t batch_stride_A_, int64_t batch_stride_B_, int milestone_k_,
-              typename EpilogueVisitor::Arguments epilogue_visitor_)
+              typename EpilogueVisitor::Arguments epilogue_visitor_,
+              JackpotParams jackpot_ = JackpotParams())
         : mode(mode_), problem_size(problem_size_), batch_count(batch_count_),
           ref_A(ref_A_), ref_B(ref_B_), ref_C(ref_C_), ref_D(ref_D_),
           ptr_Max(ptr_Max_), ptr_Sum(ptr_Sum_), batch_stride_A(batch_stride_A_),
           batch_stride_B(batch_stride_B_), milestone_k(milestone_k_),
-          epilogue_visitor(epilogue_visitor_) {}
+          epilogue_visitor(epilogue_visitor_), jackpot(jackpot_) {}
   };
 
   struct Params {
@@ -106,6 +129,7 @@ public:
     int64_t batch_stride_B;
 
     typename EpilogueVisitor::Params epilogue_visitor;
+    JackpotParams jackpot;
 
     CUTLASS_HOST_DEVICE
     Params()
@@ -123,7 +147,7 @@ public:
           milestone_k(args.milestone_k),
           batch_stride_A(args.batch_stride_A),
           batch_stride_B(args.batch_stride_B),
-          epilogue_visitor(args.epilogue_visitor) {
+          epilogue_visitor(args.epilogue_visitor), jackpot(args.jackpot) {
       ThreadblockSwizzle threadblock_swizzle;
       grid_tiled_shape = threadblock_swizzle.get_tiled_shape(
           args.problem_size,
@@ -194,6 +218,11 @@ public:
       return;
     }
 
+    if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
+        *params.jackpot.ptr_found != 0) {
+      return;
+    }
+
     int const thread_idx = threadIdx.x;
     int const warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     int const lane_idx = threadIdx.x % 32;
@@ -227,6 +256,11 @@ public:
         params.batch_stride_B != 0
             ? static_cast<size_t>(params.batch_stride_B)
             : static_cast<size_t>(milestone_k) * static_cast<size_t>(problem_n);
+
+    uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS];
+    for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i) {
+      jackpot_words[i] = 0u;
+    }
 
     for (int m = 0; m < num_milestones; ++m) {
       if (!kPersistentAccumAcrossMilestones) {
@@ -286,6 +320,8 @@ public:
               static_cast<size_t>(params.epilogue_visitor.milestone_stride);
 
       typename EpilogueVisitor::Params visitor_params = params.epilogue_visitor;
+      visitor_params.jackpot_words = jackpot_words;
+      visitor_params.milestone_index = m;
       ElementC *ptr_C = nullptr;
       ElementC *ptr_D = nullptr;
       if (kPersistentAccumAcrossMilestones) {
@@ -312,6 +348,17 @@ public:
       epilogue(epilogue_visitor, accumulators);
 
       __syncthreads();
+    }
+
+    if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
+        params.jackpot.ptr_a_key8 != nullptr &&
+        *params.jackpot.ptr_found == 0) {
+      const int batch_idx = threadblock_tile_offset.n();
+      cp_cutlass_jackpot_try(
+          jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
+          params.jackpot.row_period, params.jackpot.col_period0, batch_idx,
+          thread_idx, params.jackpot.ptr_found, params.jackpot.ptr_out_t_rows,
+          params.jackpot.ptr_out_t_cols);
     }
   }
 };

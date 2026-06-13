@@ -21,7 +21,6 @@
 #include "cp_cutlass.h"
 #include "plain_proof_kernel.cuh"
 #include "plain_proof_period.cuh"
-#include "plain_proof_period_cutlass.cuh"
 
 #define CU_CHECK(call) do { \
     cudaError_t _e = (call); \
@@ -350,13 +349,8 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     }
     {
         if(g->use_cutlass_fused){
-            size_t xor_need = cp_cutlass_tile_xor_bytes(g_period_batch);
-            if(xor_need > g->tile_xor_cap){
-                if(g->d_tile_xor) cudaFree(g->d_tile_xor);
-                CU_CHECK(cudaMalloc(&g->d_tile_xor, xor_need));
-                g->tile_xor_cap = xor_need;
-            }
-        } else {
+        /* Jackpot runs in CUTLASS mainloop tail; no tile_xor buffer. */
+    } else {
             size_t hist_need = pp_hist_batch_bytes(g_period_batch);
             if(hist_need > g->C_hist_cap){
                 if(g->d_C_hist) cudaFree(g->d_C_hist);
@@ -552,14 +546,24 @@ static void gpu_period_gemm_cuda_batch(
 }
 
 static void gpu_period_gemm_batch(
-    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count)
+    GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count,
+    const uint32_t bound[8])
 {
     if(g->use_cutlass_fused){
         const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(batch_count);
+        CpCutlassJackpotLaunch jp;
+        for(int i = 0; i < 8; i++)
+            jp.bound[i] = bound[i];
+        jp.d_a_key8 = g->d_a_key8;
+        jp.d_found = g->d_found;
+        jp.d_out_t_rows = g->d_out_t_rows;
+        jp.d_out_t_cols = g->d_out_t_cols;
+        jp.row_period = row_period;
+        jp.col_period0 = col_period0;
         if(cp_cutlass_period_batch(
                g->dev, g->d_Ap, g->d_BpT, m, n, row_period, col_period0,
-               batch_count, g_step_major_ap, g->d_tile_xor,
-               tiles_per_batch) != 0){
+               batch_count, g_step_major_ap, nullptr, tiles_per_batch,
+               &jp) != 0){
             fprintf(stderr, "[cutlass] period batch failed\n");
             exit(1);
         }
@@ -906,33 +910,21 @@ static void launch_jackpot_batch(
     GpuCtx* g, int batch_count, int rpi, int cpi0, int m, int n,
     const uint32_t bound[8])
 {
+    if(g->use_cutlass_fused)
+        return;
+
     const int num_blocks = batch_count * PP_TILES_PER_PERIOD;
-    if(g->use_cutlass_fused){
-        const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(batch_count);
-        plain_proof_period_cutlass_jackpot_kernel<<<num_blocks, 1>>>(
-            g->d_tile_xor,
-            tiles_per_batch,
-            batch_count,
-            K_DIM / R_RANK,
-            rpi, cpi0,
-            m, n,
-            bound[0], bound[1], bound[2], bound[3],
-            bound[4], bound[5], bound[6], bound[7],
-            g->d_a_key8,
-            g->d_out_t_rows, g->d_out_t_cols, g->d_found);
-    } else {
-        const dim3 block(PP_HASH_W, PP_HASH_H);
-        plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
-            g->d_C_hist,
-            batch_count,
-            K_DIM, R_RANK,
-            rpi, cpi0,
-            m, n,
-            bound[0], bound[1], bound[2], bound[3],
-            bound[4], bound[5], bound[6], bound[7],
-            g->d_a_key8,
-            g->d_out_t_rows, g->d_out_t_cols, g->d_found);
-    }
+    const dim3 block(PP_HASH_W, PP_HASH_H);
+    plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
+        g->d_C_hist,
+        batch_count,
+        K_DIM, R_RANK,
+        rpi, cpi0,
+        m, n,
+        bound[0], bound[1], bound[2], bound[3],
+        bound[4], bound[5], bound[6], bound[7],
+        g->d_a_key8,
+        g->d_out_t_rows, g->d_out_t_cols, g->d_found);
     CU_CHECK(cudaGetLastError());
 }
 
@@ -956,17 +948,21 @@ static PeriodBatchTimes profile_period_batch_timed(
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
     } else {
         CU_CHECK(cudaEventRecord(ev[0]));
-        gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count);
+        gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
     }
 
     CU_CHECK(cudaEventRecord(ev[1]));
-    launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
-    CU_CHECK(cudaEventRecord(ev[2]));
-    CU_CHECK(cudaEventSynchronize(ev[2]));
-    CU_CHECK(cudaEventElapsedTime(&t.jackpot_ms, ev[1], ev[2]));
+    if(g->use_cutlass_fused){
+        t.jackpot_ms = 0.f;
+    } else {
+        launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
+        CU_CHECK(cudaEventRecord(ev[2]));
+        CU_CHECK(cudaEventSynchronize(ev[2]));
+        CU_CHECK(cudaEventElapsedTime(&t.jackpot_ms, ev[1], ev[2]));
+    }
 
     CU_CHECK(cudaEventRecord(ev[3]));
     CU_CHECK(cudaDeviceSynchronize());
@@ -985,7 +981,7 @@ static float profile_period_batch_cuda_ms(
     const uint32_t bound[8], cudaEvent_t e0, cudaEvent_t e1)
 {
     CU_CHECK(cudaEventRecord(e0));
-    gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count);
+    gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
     launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
@@ -1258,7 +1254,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaEventRecord(batch_tm.batch_start));
 
-                gpu_period_gemm_batch(g, m, n, rpi, cpi0, bc);
+                gpu_period_gemm_batch(g, m, n, rpi, cpi0, bc, bound);
                 launch_jackpot_batch(g, bc, rpi, cpi0, m, n, bound);
 
                 CU_CHECK(cudaEventRecord(batch_tm.post_launch));
@@ -1357,7 +1353,7 @@ static int gpu_scan_device_period(
             for(int i = 0; i < g_ngpu; i++){
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count);
+                gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count, bound);
                 launch_jackpot_batch(g, batch_count, rpi, cpi0, m, n, bound);
             }
 
@@ -1379,7 +1375,7 @@ static int gpu_scan_device_period(
 
             tiles_scanned += (uint64_t)batch_tiles;
         }
-        if((rpi % 16) == 0 && !found){
+        if((rpi % 128) == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
             if(scan_sec < 1e-9) scan_sec = 1e-9;
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);

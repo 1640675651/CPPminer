@@ -49,7 +49,8 @@ size_t cp_cutlass_tile_xor_bytes(int batch_count)
 int cp_cutlass_period_batch(
     int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m, int n,
     int row_period, int col_period0, int batch_count, int step_major,
-    uint32_t* d_tile_xor, size_t tiles_per_batch)
+    uint32_t* d_tile_xor, size_t tiles_per_batch,
+    const CpCutlassJackpotLaunch* jackpot)
 {
   if (cudaSetDevice(dev) != cudaSuccess) {
     return -1;
@@ -75,12 +76,12 @@ int cp_cutlass_period_batch(
   if (step_major) {
     CP_CUTLASS_CHECK(g_fused_step_major.initialize(
         M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count));
+        d_tile_xor, cta_cols, tile_count, jackpot));
     st = g_fused_step_major();
   } else {
     CP_CUTLASS_CHECK(g_fused_row_major.initialize(
         M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count));
+        d_tile_xor, cta_cols, tile_count, jackpot));
     st = g_fused_row_major();
   }
   if (st != cutlass::Status::kSuccess) {

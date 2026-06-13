@@ -1,6 +1,7 @@
 /* CUTLASS fused int8 GEMM + per-thread scattered tile XOR (Case 7.1 / 7.2 style). */
 #pragma once
 
+#include "cp_cutlass.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/threadblock/epilogue_with_visitor.h"
@@ -77,7 +78,8 @@ struct FusedMilestoneGemmOp {
   cutlass::Status initialize(int M, int N, int K, int full_M, int full_N,
                                ElementInput* d_A, ElementInput* d_B,
                                uint32_t* d_tile_xor, int tile_cols,
-                               size_t tile_count) {
+                               size_t tile_count,
+                               const CpCutlassJackpotLaunch* jackpot) {
     cutlass::gemm::GemmCoord problem_size(M, N, K);
     typename GemmTypesT::EpilogueOpT::Params linear{ElementCompute(1),
                                                     ElementCompute(0)};
@@ -96,6 +98,20 @@ struct FusedMilestoneGemmOp {
       batch_stride_b =
           static_cast<int64_t>(full_N) * static_cast<int64_t>(kMilestoneK);
     }
+    const bool fuse_jackpot = jackpot != nullptr;
+    typename GemmTypesT::GemmKernel::JackpotParams jp;
+    if (fuse_jackpot) {
+      jp.enabled = true;
+      jp.ptr_a_key8 = jackpot->d_a_key8;
+      jp.ptr_found = jackpot->d_found;
+      jp.ptr_out_t_rows = jackpot->d_out_t_rows;
+      jp.ptr_out_t_cols = jackpot->d_out_t_cols;
+      jp.row_period = jackpot->row_period;
+      jp.col_period0 = jackpot->col_period0;
+      for (int i = 0; i < 8; ++i) {
+        jp.bound[i] = jackpot->bound[i];
+      }
+    }
     typename GemmTypesT::GemmKernel::Arguments args(
         cutlass::gemm::GemmUniversalMode::kGemm, problem_size, 1,
         cutlass::TensorRef<ElementInput, LayoutA>(d_A, layout_a),
@@ -104,7 +120,9 @@ struct FusedMilestoneGemmOp {
         cutlass::TensorRef<ElementOutput, LayoutC>(nullptr, layout_c),
         nullptr, d_tile_xor, batch_stride_a, batch_stride_b, kMilestoneK,
         typename GemmTypesT::EpilogueVisitor::Arguments(
-            linear, tile_cols, static_cast<int>(tile_count), false, false));
+            linear, tile_cols, static_cast<int>(tile_count), false, false,
+            fuse_jackpot),
+        jp);
     cutlass::Status st = GemmTypesT::GemmKernel::can_implement(args);
     if (st != cutlass::Status::kSuccess) {
       return st;
