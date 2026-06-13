@@ -15,6 +15,7 @@
 
 #include "cp_gpu.cuh"
 #include "cp_gpu_gen.cuh"
+#include "cp_merkle_tree.cuh"
 #include "cp_noise.h"
 #include "cp_cutlass.h"
 #include "plain_proof_kernel.cuh"
@@ -45,12 +46,11 @@ typedef struct {
     int8_t*   d_Bt_sig;
     uint32_t* d_e_ar;
     uint32_t* d_e_bl;
-    uint8_t*  d_chunk_cvs;
-    uint8_t*  h_chunk_cvs;
+    uint8_t*  d_merkle_roots;
+    size_t    merkle_roots_cap;
     uint8_t*  d_seed_a;
     uint8_t*  d_seed_b;
     uint8_t*  d_job_key;
-    size_t    chunk_cv_cap;
     int*      d_found;
     int*      d_out_t_rows;
     int*      d_out_t_cols;
@@ -273,13 +273,11 @@ void cp_gpu_shutdown(void)
         if(g->d_Bt_sig) cudaFree(g->d_Bt_sig);
         if(g->d_e_ar) cudaFree(g->d_e_ar);
         if(g->d_e_bl) cudaFree(g->d_e_bl);
-        if(g->d_chunk_cvs) cudaFree(g->d_chunk_cvs);
+        if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
         if(g->d_seed_a) cudaFree(g->d_seed_a);
         if(g->d_seed_b) cudaFree(g->d_seed_b);
         if(g->d_job_key) cudaFree(g->d_job_key);
-        free(g->h_chunk_cvs);
-        g->h_chunk_cvs = NULL;
-        g->chunk_cv_cap = 0;
+        g->merkle_roots_cap = 0;
         if(g->d_found) cudaFree(g->d_found);
         if(g->d_out_t_rows) cudaFree(g->d_out_t_rows);
         if(g->d_out_t_cols) cudaFree(g->d_out_t_cols);
@@ -301,7 +299,9 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     size_t pad_b = (raw_b + 1023) / 1024 * 1024;
     size_t chunks_a = pad_a / 1024;
     size_t chunks_b = pad_b / 1024;
-    size_t cv_need = (chunks_a > chunks_b ? chunks_a : chunks_b) * 32;
+    size_t chunks_max = chunks_a > chunks_b ? chunks_a : chunks_b;
+    size_t merkle_need = ((chunks_max + CP_MT_THREADS - 1) / CP_MT_THREADS) * 32;
+    if(merkle_need < 32) merkle_need = 32;
 
     CU_CHECK(cudaSetDevice(g->dev));
     if(!g->d_Ap){
@@ -316,16 +316,10 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         CU_CHECK(cudaMalloc(&g->d_seed_b, 32));
         CU_CHECK(cudaMalloc(&g->d_job_key, 32));
     }
-    if(cv_need > g->chunk_cv_cap){
-        if(g->d_chunk_cvs) cudaFree(g->d_chunk_cvs);
-        free(g->h_chunk_cvs);
-        CU_CHECK(cudaMalloc(&g->d_chunk_cvs, cv_need));
-        g->h_chunk_cvs = (uint8_t*)malloc(cv_need);
-        if(!g->h_chunk_cvs){
-            fprintf(stderr, "[gpu] OOM chunk CV host buffer\n");
-            exit(1);
-        }
-        g->chunk_cv_cap = cv_need;
+    if(merkle_need > g->merkle_roots_cap){
+        if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
+        CU_CHECK(cudaMalloc(&g->d_merkle_roots, merkle_need));
+        g->merkle_roots_cap = merkle_need;
     }
     {
         if(g->use_cutlass_fused){
@@ -530,6 +524,23 @@ static void gpu_period_gemm_batch(
         gpu_period_gemm_cuda_batch(g, m, n, row_period, col_period0, batch_count);
 }
 
+static void cp_gpu_merkle_finish_root(
+    const uint8_t* d_job_key, uint8_t* d_roots, int num_subroots)
+{
+    const int smem = CP_MT_SMEM_BYTES;
+    int num_mt_blocks = (num_subroots + CP_MT_THREADS - 1) / CP_MT_THREADS;
+    if(num_mt_blocks == 1){
+        cp_compute_blake_mt_kernel<CP_MT_THREADS, true>
+            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+    }else{
+        cp_compute_blake_mt_kernel<CP_MT_THREADS, false>
+            <<<num_mt_blocks, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+        cp_reduce_roots_kernel<CP_MT_THREADS>
+            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_mt_blocks);
+    }
+    CU_CHECK(cudaGetLastError());
+}
+
 static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
                                  size_t raw_len, size_t pad_len,
                                  const uint8_t job_key[32], uint8_t out[32])
@@ -546,17 +557,16 @@ static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
     }
     CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
     {
-        const int tpb = 256;
-        int grid = (num_chunks + tpb - 1) / tpb;
-        cp_keyed_chunk_cv_kernel<<<grid, tpb>>>(
+        int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
+        cp_keyed_chunk_roots_kernel<<<num_subroots, CP_MT_THREADS, CP_MT_SMEM_BYTES>>>(
             (const uint8_t*)d_mat, raw_len, pad_len, g->d_job_key,
-            g->d_chunk_cvs, num_chunks);
+            g->d_merkle_roots, num_chunks);
+        CU_CHECK(cudaGetLastError());
+        cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots);
     }
-    CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
-    size_t cv_bytes = (size_t)num_chunks * 32;
-    CU_CHECK(cudaMemcpy(g->h_chunk_cvs, g->d_chunk_cvs, cv_bytes, cudaMemcpyDeviceToHost));
-    return pearl_root_from_chunk_cvs(g->h_chunk_cvs, num_chunks, job_key, out);
+    CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    return 0;
 }
 
 static uint64_t cp_gpu_fresh_rng_seed(void)
@@ -582,37 +592,57 @@ static int gpu_prepare_noisy_matrices(
     int total_a = m * K_DIM;
     int total_b = n * K_DIM;
     uint8_t hash_a[32], hash_b[32], b_seed[32];
+    double t_step, t_total;
 
     CU_CHECK(cudaSetDevice(g->dev));
 
+    t_total = cp_now_sec();
+
+    t_step = cp_now_sec();
     cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
         rng_seed, 0, total_a, g->d_A_sig);
     cp_gen_random_matrix_kernel<<<(total_b + tpb - 1) / tpb, tpb>>>(
         rng_seed, 1, total_b, g->d_Bt_sig);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] random A/B gen %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
 
     if(cp_job_should_cancel()) return -1;
 
-    /* Keyed commitment hash: GPU computes per-chunk CVs; D2H ~16 MiB/matrix
-     * 512MiB matrix size / 1KiB chunk size = 524288 chunks
-     * (524288 chunks x 32 B at prod) for CPU Merkle root; then 32-byte hash_a/b. */
+    t_step = cp_now_sec();
     if(gpu_matrix_keyed_hash(g, g->d_A_sig, szAp, pad_a, job_key, hash_a) != 0) return -1;
+    printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    t_step = cp_now_sec();
     if(gpu_matrix_keyed_hash(g, g->d_Bt_sig, szBpT, pad_b, job_key, hash_b) != 0) return -1;
+    printf("[gpu-prep] keyed hash B %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
 
+    t_step = cp_now_sec();
     pearl_derive_noise_seeds(job_key, hash_a, hash_b, b_seed, a_key_out);
-
     CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice));
+    printf("[gpu-prep] noise seeds + H2D %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
 
+    t_step = cp_now_sec();
     cp_build_perm_pairs_kernel<<<1, 1>>>(0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
     cp_build_perm_pairs_kernel<<<1, 1>>>(1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
     CU_CHECK(cudaGetLastError());
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] perm pairs A/B %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
 
-    /* d_Ap/d_BpT: fuse noisy mats (row-major default, or step-major with --step-major). */
+    t_step = cp_now_sec();
     gpu_fuse_noisy_mats(g, m, n);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] fuse noisy A/B %.3fs\n", cp_now_sec() - t_step);
+    printf("[gpu-prep] total %.3fs\n", cp_now_sec() - t_total);
+    fflush(stdout);
+
     return cp_job_should_cancel() ? -1 : 0;
 }
 
