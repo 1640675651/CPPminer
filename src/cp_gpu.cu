@@ -15,6 +15,7 @@
 
 #include "cp_gpu.cuh"
 #include "cp_gpu_gen.cuh"
+#include "cp_noise_phase.cuh"
 #include "cp_merkle_tree.cuh"
 #include "cp_noise.h"
 #include "cp_cutlass.h"
@@ -46,6 +47,10 @@ typedef struct {
     int8_t*   d_Bt_sig;
     uint32_t* d_e_ar;
     uint32_t* d_e_bl;
+    int8_t*   d_eal;
+    int8_t*   d_ebr;
+    size_t    noise_m_cap;
+    size_t    noise_n_cap;
     uint8_t*  d_merkle_roots;
     size_t    merkle_roots_cap;
     uint8_t*  d_seed_a;
@@ -273,6 +278,10 @@ void cp_gpu_shutdown(void)
         if(g->d_Bt_sig) cudaFree(g->d_Bt_sig);
         if(g->d_e_ar) cudaFree(g->d_e_ar);
         if(g->d_e_bl) cudaFree(g->d_e_bl);
+        if(g->d_eal) cudaFree(g->d_eal);
+        if(g->d_ebr) cudaFree(g->d_ebr);
+        g->noise_m_cap = 0;
+        g->noise_n_cap = 0;
         if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
         if(g->d_seed_a) cudaFree(g->d_seed_a);
         if(g->d_seed_b) cudaFree(g->d_seed_b);
@@ -312,6 +321,10 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         CU_CHECK(cudaMalloc(&g->d_Bt_sig, szBpT));
         CU_CHECK(cudaMalloc(&g->d_e_ar, (size_t)K_DIM * 2 * sizeof(uint32_t)));
         CU_CHECK(cudaMalloc(&g->d_e_bl, (size_t)K_DIM * 2 * sizeof(uint32_t)));
+        CU_CHECK(cudaMalloc(&g->d_eal, (size_t)m * R_RANK));
+        CU_CHECK(cudaMalloc(&g->d_ebr, (size_t)n * R_RANK));
+        g->noise_m_cap = (size_t)m * R_RANK;
+        g->noise_n_cap = (size_t)n * R_RANK;
         CU_CHECK(cudaMalloc(&g->d_seed_a, 32));
         CU_CHECK(cudaMalloc(&g->d_seed_b, 32));
         CU_CHECK(cudaMalloc(&g->d_job_key, 32));
@@ -320,6 +333,20 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
         CU_CHECK(cudaMalloc(&g->d_merkle_roots, merkle_need));
         g->merkle_roots_cap = merkle_need;
+    }
+    {
+        size_t eal_need = (size_t)m * R_RANK;
+        size_t ebr_need = (size_t)n * R_RANK;
+        if(eal_need > g->noise_m_cap){
+            if(g->d_eal) cudaFree(g->d_eal);
+            CU_CHECK(cudaMalloc(&g->d_eal, eal_need));
+            g->noise_m_cap = eal_need;
+        }
+        if(ebr_need > g->noise_n_cap){
+            if(g->d_ebr) cudaFree(g->d_ebr);
+            CU_CHECK(cudaMalloc(&g->d_ebr, ebr_need));
+            g->noise_n_cap = ebr_need;
+        }
     }
     {
         if(g->use_cutlass_fused){
@@ -345,19 +372,39 @@ static size_t pp_ap_step_plane(int dim)
     return (size_t)dim * (size_t)R_RANK;
 }
 
-static void gpu_fuse_noisy_mats(GpuCtx* g, int m, int n)
+static void gpu_noise_generate(GpuCtx* g, int m, int n)
 {
     const int tpb = 256;
+    const int tpr = R_RANK / 32;
+    const int rows_per_block = tpb / tpr;
+    const int perm_blocks = (K_DIM + CP_B3_LINES * tpb - 1) / (CP_B3_LINES * tpb);
+
+    cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb>>>(
+        0, m, R_RANK, g->d_seed_a, g->d_eal);
+    cp_gen_dense_noise_kernel<<<(n + rows_per_block - 1) / rows_per_block, tpb>>>(
+        1, n, R_RANK, g->d_seed_b, g->d_ebr);
+    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
+        0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
+    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
+        1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
+    CU_CHECK(cudaGetLastError());
+}
+
+static void gpu_noise_apply(GpuCtx* g, int m, int n)
+{
+    const int tpb = 256;
+    const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
+
     if(g_step_major_ap){
-        cp_fuse_noise_a_kernel<<<m, tpb, (size_t)K_DIM>>>(
-            g->d_A_sig, g->d_Ap, m, K_DIM, R_RANK, g->d_seed_a, g->d_e_ar);
-        cp_fuse_noise_b_kernel<<<n, tpb, (size_t)K_DIM>>>(
-            g->d_Bt_sig, g->d_BpT, n, K_DIM, R_RANK, g->d_seed_b, g->d_e_bl);
+        cp_apply_noise_a_kernel<<<m, tpb, smem>>>(
+            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
+        cp_apply_noise_b_kernel<<<n, tpb, smem>>>(
+            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
     } else {
-        cp_fuse_noise_a_rowmajor_kernel<<<m, tpb, (size_t)K_DIM>>>(
-            g->d_A_sig, g->d_Ap, m, K_DIM, R_RANK, g->d_seed_a, g->d_e_ar);
-        cp_fuse_noise_b_rowmajor_kernel<<<n, tpb, (size_t)K_DIM>>>(
-            g->d_Bt_sig, g->d_BpT, n, K_DIM, R_RANK, g->d_seed_b, g->d_e_bl);
+        cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem>>>(
+            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
+        cp_apply_noise_b_rowmajor_kernel<<<n, tpb, smem>>>(
+            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
     }
     CU_CHECK(cudaGetLastError());
 }
@@ -628,18 +675,17 @@ static int gpu_prepare_noisy_matrices(
     fflush(stdout);
 
     t_step = cp_now_sec();
-    cp_build_perm_pairs_kernel<<<1, 1>>>(0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
-    cp_build_perm_pairs_kernel<<<1, 1>>>(1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
+    gpu_noise_generate(g, m, n);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
-    printf("[gpu-prep] perm pairs A/B %.3fs\n", cp_now_sec() - t_step);
+    printf("[gpu-prep] noise gen (EAL/EBR/perm) %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
     t_step = cp_now_sec();
-    gpu_fuse_noisy_mats(g, m, n);
+    gpu_noise_apply(g, m, n);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
-    printf("[gpu-prep] fuse noisy A/B %.3fs\n", cp_now_sec() - t_step);
+    printf("[gpu-prep] noise apply (matvec+fuse) %.3fs\n", cp_now_sec() - t_step);
     printf("[gpu-prep] total %.3fs\n", cp_now_sec() - t_total);
     fflush(stdout);
 
@@ -762,8 +808,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     }
 
     CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed_gpu, 32, cudaMemcpyHostToDevice));
-    cp_build_perm_pairs_kernel<<<1, 1>>>(0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
-    cp_build_perm_pairs_kernel<<<1, 1>>>(1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
+    gpu_noise_generate(g, m, n);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
 
@@ -796,9 +841,9 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     fflush(stdout);
 
     t0 = cp_now_sec();
-    gpu_fuse_noisy_mats(g, m, n);
+    gpu_noise_apply(g, m, n);
     CU_CHECK(cudaDeviceSynchronize());
-    printf("[align-test-prod] GPU noise fuse %.1fs\n", cp_now_sec() - t0);
+    printf("[align-test-prod] GPU noise apply %.1fs\n", cp_now_sec() - t0);
     fflush(stdout);
 
     {
