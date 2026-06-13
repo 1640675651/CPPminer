@@ -1,13 +1,43 @@
 //! Build plain_proof base64 for CPminer (stock pearl-blake3 + zk-pow-compatible bincode).
 
+mod mining_config;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use mining_config::{mining_config_bytes, validate_tile_anchor};
 use pearl_blake3::{blake3_digest, pad_to_chunk_boundary, MerkleProof, MerkleTree};
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
+/// BzMiner production hash tile (8x16 scattered cells within 128x256 period).
 const SCATTERED_ROWS: [usize; 8] = [0, 8, 32, 40, 64, 72, 96, 104];
 const SCATTERED_COLS: [usize; 16] = [
     0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225,
 ];
+
+/// CUTLASS Case 7.1 epilogue scatter (128x256 CTA, 128 cells/thread = 16x8 unique rows/cols).
+/// Must match `ScatteredThreadTile128x256` in src/cutlass/scattered_thread_tile.h.
+const CUTLASS_ROWS: [usize; 16] = [
+    0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
+];
+const CUTLASS_COLS: [usize; 8] = [0, 32, 64, 96, 128, 160, 192, 224];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TileLayout {
+    Scattered = 0,
+    Contiguous = 1,
+    Cutlass = 2,
+}
+
+impl TileLayout {
+    fn from_i32(v: i32) -> Result<Self, String> {
+        match v {
+            0 => Ok(Self::Scattered),
+            1 => Ok(Self::Contiguous),
+            2 => Ok(Self::Cutlass),
+            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, or 2)")),
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MatrixMerkleProof {
@@ -32,11 +62,14 @@ fn job_key(header: &[u8], mining_config: &[u8]) -> [u8; 32] {
     blake3_digest(&buf, None)
 }
 
-fn row_patterns(contiguous: bool) -> (&'static [usize], &'static [usize]) {
-    if contiguous {
-        (&[0, 1, 2, 3, 4, 5, 6, 7], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
-    } else {
-        (&SCATTERED_ROWS, &SCATTERED_COLS)
+fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
+    match layout {
+        TileLayout::Scattered => (&SCATTERED_ROWS, &SCATTERED_COLS),
+        TileLayout::Contiguous => (
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        ),
+        TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
     }
 }
 
@@ -73,7 +106,7 @@ fn build_plain_proof_b64(
     rank: usize,
     t_rows: usize,
     t_cols: usize,
-    contiguous: bool,
+    layout: TileLayout,
 ) -> Result<String, String> {
     if mining_config.len() != 52 {
         return Err(format!(
@@ -88,8 +121,25 @@ fn build_plain_proof_b64(
         return Err(format!("B^T size mismatch: need {} got {}", n * k, bt.len()));
     }
 
+    let (rows_pat, cols_pat) = row_patterns(layout);
+    let row_offsets: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
+    let col_offsets: Vec<u32> = cols_pat.iter().map(|&o| o as u32).collect();
+    validate_tile_anchor(
+        &row_offsets,
+        &col_offsets,
+        t_rows as u32,
+        t_cols as u32,
+    )?;
+
+    let expected_cfg =
+        mining_config_bytes(k as u32, rank as u16, &row_offsets, &col_offsets)?;
+    if expected_cfg != mining_config {
+        return Err(
+            "mining_config bytes do not match tile_layout row/col patterns".into(),
+        );
+    }
+
     let key = job_key(header, mining_config);
-    let (rows_pat, cols_pat) = row_patterns(contiguous);
     let a_rows: Vec<usize> = rows_pat.iter().map(|o| t_rows + o).collect();
     let bt_rows: Vec<usize> = cols_pat.iter().map(|o| t_cols + o).collect();
 
@@ -118,7 +168,8 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 
 /// Build plain_proof base64. Returns 0 on success, -1 on error.
 ///
-/// `mining_config` must be 52 bytes (scattered or contiguous MiningConfiguration.to_bytes()).
+/// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS 128x256 scatter.
+/// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_build(
     header: *const u8,
@@ -133,7 +184,7 @@ pub unsafe extern "C" fn cp_proof_build(
     rank: i32,
     t_rows: i32,
     t_cols: i32,
-    contiguous_tiles: i32,
+    tile_layout: i32,
     out_b64: *mut u8,
     out_cap: usize,
     err: *mut u8,
@@ -156,6 +207,11 @@ pub unsafe extern "C" fn cp_proof_build(
     if m <= 0 || n <= 0 || k <= 0 || rank <= 0 {
         return fail("invalid dimensions".into());
     }
+    let layout = match TileLayout::from_i32(tile_layout) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
+
     let m = m as usize;
     let n = n as usize;
     let k = k as usize;
@@ -177,7 +233,7 @@ pub unsafe extern "C" fn cp_proof_build(
         rank,
         t_rows as usize,
         t_cols as usize,
-        contiguous_tiles != 0,
+        layout,
     ) {
         Ok(s) => s,
         Err(e) => return fail(e),
@@ -197,6 +253,123 @@ pub unsafe extern "C" fn cp_proof_build(
     0
 }
 
+/// Verify plain_proof base64 against a Stratum pool target (32-byte big-endian U256).
+/// Returns 0 on success, -1 on error (message written to `err`).
+#[no_mangle]
+pub unsafe extern "C" fn cp_proof_verify(
+    header: *const u8,
+    header_len: usize,
+    proof_b64: *const u8,
+    proof_b64_len: usize,
+    pool_target_be: *const u8,
+    err: *mut u8,
+    err_cap: usize,
+) -> i32 {
+    use std::str;
+    use zk_pow::api::proof::IncompleteBlockHeader;
+    use zk_pow::api::verify;
+    use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
+
+    let err_slice = if err.is_null() || err_cap == 0 {
+        None
+    } else {
+        Some(std::slice::from_raw_parts_mut(err, err_cap))
+    };
+
+    let fail = |msg: String| {
+        write_err(err_slice, &msg);
+        -1
+    };
+
+    if header.is_null() || proof_b64.is_null() || pool_target_be.is_null() {
+        return fail("null pointer".into());
+    }
+    if header_len != IncompleteBlockHeader::SERIALIZED_SIZE {
+        return fail(format!(
+            "header must be {} bytes, got {}",
+            IncompleteBlockHeader::SERIALIZED_SIZE,
+            header_len
+        ));
+    }
+
+    let header_slice = std::slice::from_raw_parts(header, header_len);
+    let block_header = match IncompleteBlockHeader::from_bytes(header_slice) {
+        Ok(h) => h,
+        Err(e) => return fail(format!("invalid header: {e}")),
+    };
+
+    let b64_slice = std::slice::from_raw_parts(proof_b64, proof_b64_len);
+    let b64 = match str::from_utf8(b64_slice) {
+        Ok(s) => s.trim(),
+        Err(e) => return fail(format!("proof_b64 is not UTF-8: {e}")),
+    };
+
+    let raw = match STANDARD.decode(b64) {
+        Ok(b) => b,
+        Err(e) => return fail(format!("base64 decode: {e}")),
+    };
+
+    let plain_proof: ZkPlainProof = match bincode::deserialize(&raw) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("bincode deserialize: {e}")),
+    };
+
+    let mut target_arr = [0u8; 32];
+    std::ptr::copy_nonoverlapping(pool_target_be, target_arr.as_mut_ptr(), 32);
+    let pool_target = U256::from_big_endian(&target_arr);
+
+    match verify::verify_plain_proof_with_pool_target(&block_header, &plain_proof, pool_target) {
+        Ok(()) => 0,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("Jackpot condition not satisfied") {
+                if let Ok(detail) =
+                    jackpot_verify_detail(&block_header, &plain_proof, pool_target)
+                {
+                    return fail(detail);
+                }
+            }
+            fail(msg)
+        }
+    }
+}
+
+fn jackpot_verify_detail(
+    block_header: &zk_pow::api::proof::IncompleteBlockHeader,
+    plain_proof: &zk_pow::ffi::plain_proof::PlainProof,
+    pool_target: U256,
+) -> Result<String, String> {
+    use zk_pow::api::proof_utils::{
+        compute_jackpot_hash, CompiledPublicParams,
+    };
+    use zk_pow::api::sanity_checks::extract_difficulty_bound_from_base;
+    use zk_pow::circuit::chip::compute_jackpot;
+    use zk_pow::circuit::pearl_noise::compute_noise;
+    use zk_pow::ffi::plain_proof::parse_plain_proof;
+
+    let (private, public) =
+        parse_plain_proof(*block_header, plain_proof).map_err(|e| e.to_string())?;
+    let compiled = CompiledPublicParams::from(&public);
+    let noise = compute_noise(&compiled);
+    let jackpot = compute_jackpot(&compiled, &private.s_a, &private.s_b, &noise);
+    let hash = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
+    let bound = extract_difficulty_bound_from_base(pool_target, &public.mining_config);
+    let hash_u = U256::from_little_endian(&hash);
+    let msg_hex: String = jackpot
+        .iter()
+        .map(|w| format!("{:08x}", w))
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(format!(
+        "Jackpot hash 0x{:064x} exceeds bound 0x{:064x} (scaled work factor h*w*k_eff={}; recomputed msg={msg_hex})",
+        hash_u,
+        bound,
+        (public.mining_config.rows_pattern.size() as usize)
+            * (public.mining_config.cols_pattern.size() as usize)
+            * public.dot_product_length(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,9 +382,23 @@ mod tests {
         let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
         let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
         let header = [0u8; 76];
-        let config = [0u8; 52];
-        let b64 = build_plain_proof_b64(&header, &config, &a, &bt, m, n, k, 256, 0, 0, true)
-            .expect("build");
+        let row_offsets: Vec<u32> = (0..8).map(|i| i as u32).collect();
+        let col_offsets: Vec<u32> = (0..16).map(|i| i as u32).collect();
+        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            &bt,
+            m,
+            n,
+            k,
+            256,
+            0,
+            0,
+            TileLayout::Contiguous,
+        )
+        .expect("build");
         assert!(b64.len() > 64);
         let raw = STANDARD.decode(&b64).unwrap();
         let pp: PlainProof = bincode::deserialize(&raw).unwrap();
@@ -219,5 +406,77 @@ mod tests {
         assert_eq!(pp.k, k);
         assert_eq!(pp.a.row_indices.len(), 8);
         assert_eq!(pp.bt.row_indices.len(), 16);
+    }
+
+    #[test]
+    fn cutlass_proof_row_counts() {
+        let m = 128;
+        let n = 256;
+        let k = 256;
+        let a: Vec<i8> = vec![0; m * k];
+        let bt: Vec<i8> = vec![0; n * k];
+        let header = [0u8; 76];
+        let row_offsets: Vec<u32> = CUTLASS_ROWS.iter().map(|&o| o as u32).collect();
+        let col_offsets: Vec<u32> = CUTLASS_COLS.iter().map(|&o| o as u32).collect();
+        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            &bt,
+            m,
+            n,
+            k,
+            256,
+            36,
+            4,
+            TileLayout::Cutlass,
+        )
+        .expect("cutlass build");
+        let raw = STANDARD.decode(&b64).unwrap();
+        let pp: PlainProof = bincode::deserialize(&raw).unwrap();
+        assert_eq!(pp.a.row_indices.len(), 16);
+        assert_eq!(pp.bt.row_indices.len(), 8);
+        assert_eq!(pp.a.row_indices[0], 36);
+        assert_eq!(pp.bt.row_indices[0], 4);
+    }
+
+    #[test]
+    fn build_then_verify_round_trip() {
+        use zk_pow::api::proof::IncompleteBlockHeader;
+        use zk_pow::api::verify;
+        use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
+
+        let m = 4;
+        let n = 4;
+        let k = 256;
+        let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
+        let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
+        let header = [0u8; 76];
+        let row_offsets: Vec<u32> = (0..8).map(|i| i as u32).collect();
+        let col_offsets: Vec<u32> = (0..16).map(|i| i as u32).collect();
+        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            &bt,
+            m,
+            n,
+            k,
+            256,
+            0,
+            0,
+            TileLayout::Contiguous,
+        )
+        .expect("build");
+
+        let block_header = IncompleteBlockHeader::from_bytes(&header).unwrap();
+        let raw = STANDARD.decode(&b64).unwrap();
+        let pp: ZkPlainProof = bincode::deserialize(&raw).unwrap();
+        // Easiest valid target: accept any hash (max U256).
+        let pool_target = U256::MAX;
+        verify::verify_plain_proof_with_pool_target(&block_header, &pp, pool_target)
+            .expect("verify with max target");
     }
 }

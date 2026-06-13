@@ -9,13 +9,17 @@ This repo contains only the production plain_proof path: C noise generation, CUD
 - NVIDIA GPU + CUDA Toolkit 12.x
 - MSVC (Windows) or GCC/Clang (Linux)
 - **Rust toolchain** (`rustup`) for in-process proof building
-- Python 3 + `pearl_mining` — **only** if using `--verify` (optional pre-submit check)
+- Python 3 + `numpy` + `blake3` — **only** if using `--verify` or the standalone `plain_proof_host.py build` command (optional)
 
-## Vendored `pearl-blake3`
+## cp-proof-ffi (Rust)
 
-Proof assembly uses a **vendored copy** of [`pearl-blake3`](third_party/pearl-blake3/) from the Pearl repo (`pearl/pearl-blake3`). CPminer does not submodule Pearl; the crate is copied in so the miner builds standalone.
+Proof build and optional `--verify` use `rust/cp-proof-ffi` (pearl-blake3 Merkle + zk-pow verify). `build.ps1` runs `cargo build --release`, producing `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (used by `scripts/plain_proof_host.py`).
 
-When updating Merkle/proof wire format upstream, refresh the vendored tree:
+Set `CP_PROOF_FFI` to override the shared library path.
+
+## pearl-blake3 source
+
+Proof assembly uses [`pearl/pearl-blake3`](../pearl/pearl-blake3) via a path dependency in `cp-proof-ffi`. A vendored copy may also exist under `third_party/pearl-blake3` for reference; keep it in sync when updating Merkle wire format:
 
 ```powershell
 Remove-Item -Recurse -Force third_party\pearl-blake3
@@ -65,8 +69,8 @@ cmake --build . --config Release
 | `--contiguous-tiles` | Debug tile layout (contiguous 8×16 blocks vs production scattered) |
 | `--cpu-gen` | CPU BLAKE3 matrix gen + noise (debug; default is full GPU path) |
 | `--max-nonce N` | Stop after N attempts per job |
-| `--dry-run` | Build/verify proofs without submitting |
-| `--no-verify` | Skip Python verify before submit (recommended; proof build is native Rust) |
+| `--dry-run` | Build proof without submitting |
+| `--verify` | Run Python verify before submit (off by default; needs cp_proof_ffi.dll) |
 | `--python` | Python for optional `--verify` only (`CP_PYTHON` env) |
 | `--host-bridge` | `plain_proof_host.py` for optional verify only |
 

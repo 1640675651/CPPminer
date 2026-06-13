@@ -12,6 +12,79 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int cp_verify_proof_file(
+    const char* hdr_path,
+    const char* target_hex,
+    const char* proof_path)
+{
+    uint8_t header[INCOMPLETE_HEADER_BYTES];
+    uint8_t target_be[32];
+    char errbuf[4096];
+    char* b64 = NULL;
+    size_t cap = 0;
+    size_t n = 0;
+    FILE* pf = NULL;
+    int rc = -1;
+
+    if(!target_hex[0]) return -1;
+
+    FILE* hf = fopen(hdr_path, "rb");
+    if(!hf){
+        perror("verify: header open");
+        return -1;
+    }
+    if(fread(header, 1, sizeof(header), hf) != sizeof(header)){
+        fprintf(stderr, "verify: header must be %d bytes\n", INCOMPLETE_HEADER_BYTES);
+        fclose(hf);
+        return -1;
+    }
+    fclose(hf);
+
+    if(cp_hex_to_bytes(target_hex, target_be, 32) != 32){
+        fprintf(stderr, "verify: invalid target hex\n");
+        return -1;
+    }
+
+    pf = fopen(proof_path, "rb");
+    if(!pf){
+        perror("verify: proof open");
+        return -1;
+    }
+    fseek(pf, 0, SEEK_END);
+    long fsz = ftell(pf);
+    fseek(pf, 0, SEEK_SET);
+    if(fsz <= 0 || fsz > (long)PLAIN_PROOF_B64_MAX){
+        fprintf(stderr, "verify: invalid proof size %ld\n", fsz);
+        fclose(pf);
+        return -1;
+    }
+    cap = (size_t)fsz + 1;
+    b64 = (char*)malloc(cap);
+    if(!b64){
+        fclose(pf);
+        return -1;
+    }
+    n = fread(b64, 1, (size_t)fsz, pf);
+    fclose(pf);
+    if(n != (size_t)fsz){
+        free(b64);
+        return -1;
+    }
+    while(n > 0 && (b64[n - 1] == '\n' || b64[n - 1] == '\r'))
+        b64[--n] = 0;
+
+    errbuf[0] = 0;
+    if(cp_proof_verify(header, sizeof(header), (const uint8_t*)b64, n,
+                       target_be, errbuf, sizeof(errbuf)) != 0){
+        fprintf(stderr, "verify FAIL: %s\n", errbuf[0] ? errbuf : "unknown");
+        free(b64);
+        return -1;
+    }
+    free(b64);
+    rc = 0;
+    return rc;
+}
+
 void cp_mine_init_host_buffers(void)
 {
     size_t szAp  = (size_t)g_m_active * K_DIM;
@@ -82,7 +155,6 @@ int cp_mine_job(
     double elapsed = 0.0;
     double hs = 0.0;
     double last_report = 0.0;
-    char subcmd[8192];
     char* b64 = NULL;
 
     FILE* hf = fopen(hdr_path, "wb");
@@ -223,15 +295,24 @@ int cp_mine_job(
         }
 
         {
-            const uint8_t* mining_cfg = g_contiguous_tiles
-                ? PEARL_CONTIGUOUS_CONFIG : PEARL_SCATTERED_CONFIG;
+            int tile_layout = CP_TILE_LAYOUT_SCATTERED;
+            if(g_cutlass_fused)
+                tile_layout = CP_TILE_LAYOUT_CUTLASS;
+            else if(g_contiguous_tiles)
+                tile_layout = CP_TILE_LAYOUT_CONTIGUOUS;
+
+            const uint8_t* mining_cfg = PEARL_SCATTERED_CONFIG;
+            if(g_cutlass_fused)
+                mining_cfg = PEARL_CUTLASS_CONFIG;
+            else if(g_contiguous_tiles)
+                mining_cfg = PEARL_CONTIGUOUS_CONFIG;
             char errbuf[512];
             int prc = cp_proof_build(
                 header, (size_t)hlen,
                 mining_cfg, 52,
                 h_Ap_global, h_BpT_global,
                 g_m_active, g_n_active, K_DIM, R_RANK,
-                t_rows, t_cols, g_contiguous_tiles,
+                t_rows, t_cols, tile_layout,
                 b64, PLAIN_PROOF_B64_MAX,
                 errbuf, sizeof(errbuf));
             if(prc != 0){
@@ -270,10 +351,7 @@ int cp_mine_job(
         }
 
         if(g_plain_verify && target_hex[0]){
-            snprintf(subcmd, sizeof(subcmd),
-                "verify --header \"%s\" --target-hex \"%s\" --proof-file \"%s\"",
-                hdr_path, target_hex, proof_path);
-            if(cp_run_python(subcmd) != 0){
+            if(cp_verify_proof_file(hdr_path, target_hex, proof_path) != 0){
                 printf("[plain] verify failed (nonce=%llu), continuing job\n",
                        (unsigned long long)nonce);
                 fflush(stdout);

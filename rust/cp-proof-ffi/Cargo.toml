@@ -2,15 +2,18 @@
 name = "cp-proof-ffi"
 version = "0.1.0"
 edition = "2021"
-description = "C FFI: build LuckyPool plain_proof base64 (pearl-blake3 Merkle + bincode)"
+description = "C FFI: build and verify LuckyPool plain_proof base64 (pearl-blake3 + zk-pow)"
 
 [lib]
 name = "cp_proof_ffi"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]
-pearl-blake3 = { path = "../../third_party/pearl-blake3", features = ["serde"] }
+pearl-blake3 = { path = "../../../pearl/pearl-blake3", features = ["serde"] }
+zk-pow = { path = "../../../pearl/zk-pow" }
 blake3 = "1.8"
 bincode = "1.3.3"
 base64 = "0.21"
 serde = { version = "1.0", features = ["derive"] }
+primitive-types = "0.12"
+anyhow = "1.0"

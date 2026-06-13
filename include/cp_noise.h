@@ -9,6 +9,10 @@ extern "C" {
 
 extern const uint8_t PEARL_SCATTERED_CONFIG[52];
 extern const uint8_t PEARL_CONTIGUOUS_CONFIG[52];
+/* Case 7.1 epilogue scatter: 16 A rows x 8 B cols per hash tile. */
+extern const uint8_t PEARL_CUTLASS_CONFIG[52];
+
+void pearl_set_cutlass_fused(int on);
 
 extern const uint8_t PEARL_SEED_LABEL_A[32];
 extern const uint8_t PEARL_SEED_LABEL_B[32];

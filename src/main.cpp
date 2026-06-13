@@ -2,6 +2,7 @@
  * CPminer — cross-platform LuckyPool plain_proof GPU miner.
  */
 #include "cp_config.h"
+#include "cp_cutlass.h"
 #include "cp_gpu.h"
 #include "cp_mine.h"
 #include "cp_noise.h"
@@ -29,12 +30,13 @@ static void print_usage(void)
            CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
            K_DIM, R_RANK);
+    printf("  --cutlass-fused      fused CUTLASS GEMM + per-thread tile XOR (Pascal SIMT)\n");
     printf("  --cpu-gen            CPU BLAKE3 matrix gen (debug; default GPU random)\n");
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
-    printf("  --dry-run            build/verify proof but do not submit\n");
-    printf("  --no-verify          skip verify before submit\n");
+    printf("  --dry-run            build proof but do not submit\n");
+    printf("  --verify             run in-process zk-pow verify before submit\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
            M_DIM);
@@ -118,6 +120,7 @@ int main(int argc, char** argv)
     int no_period_gemm = 0;
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
     int step_major_ap = 1;
+    int cutlass_fused = 0;
     int profile_scan = 0;
     int profile_runs = 10;
 
@@ -158,6 +161,8 @@ int main(int argc, char** argv)
             step_major_ap = 0;
         } else if(!strcmp(argv[i], "--step-major")){
             step_major_ap = 1;
+        } else if(!strcmp(argv[i], "--cutlass-fused")){
+            cutlass_fused = 1;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
@@ -176,8 +181,8 @@ int main(int argc, char** argv)
             agent_global[sizeof(agent_global) - 1] = 0;
         } else if(!strcmp(argv[i], "--dry-run")){
             g_dry_run = 1;
-        } else if(!strcmp(argv[i], "--no-verify")){
-            g_plain_verify = 0;
+        } else if(!strcmp(argv[i], "--verify")){
+            g_plain_verify = 1;
         } else if(!strcmp(argv[i], "--align-test")){
             align_test = 1;
         } else if(!strcmp(argv[i], "--align-test-prod")){
@@ -203,6 +208,9 @@ int main(int argc, char** argv)
         cp_gpu_set_period_gemm(!no_period_gemm);
         cp_gpu_set_period_batch(period_batch);
         cp_gpu_set_step_major_ap(step_major_ap);
+        cp_gpu_set_cutlass_fused(cutlass_fused);
+        pearl_set_cutlass_fused(cutlass_fused);
+        g_cutlass_fused = cutlass_fused;
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
             if(pearl_run_alignment_tests_prod(M_DIM, M_DIM, K_DIM) != 0) return 1;
@@ -223,6 +231,8 @@ int main(int argc, char** argv)
         cp_gpu_set_period_gemm(1);
         cp_gpu_set_period_batch(period_batch);
         cp_gpu_set_step_major_ap(step_major_ap);
+        cp_gpu_set_cutlass_fused(cutlass_fused);
+        pearl_set_cutlass_fused(cutlass_fused);
         int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
         int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
         if(g_dev_dims){
@@ -242,6 +252,19 @@ int main(int argc, char** argv)
     cp_gpu_set_period_gemm(!no_period_gemm);
     cp_gpu_set_period_batch(period_batch);
     cp_gpu_set_step_major_ap(step_major_ap);
+    cp_gpu_set_cutlass_fused(cutlass_fused);
+    pearl_set_cutlass_fused(cutlass_fused);
+    g_cutlass_fused = cutlass_fused;
+
+    if(cutlass_fused){
+        if(g_contiguous_tiles || no_period_gemm){
+            fprintf(stderr, "--cutlass-fused requires period GEMM (omit --contiguous-tiles and --no-period-gemm)\n");
+            return 1;
+        }
+        fprintf(stderr,
+            "[warn] --cutlass-fused uses a non-BzMiner 16x8 hash tile; pool must accept this layout.\n"
+            "       For production LuckyPool mining, omit --cutlass-fused (default BzMiner 8x16).\n");
+    }
 
     if(g_dev_dims){
         g_m_active = DEV_M_DIM;
@@ -265,19 +288,31 @@ int main(int argc, char** argv)
                g_m_active, g_n_active, K_DIM, R_RANK,
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n",
-               g_contiguous_tiles ? "contiguous 8x16 blocks" : "periodic scattered 8x16");
+               cutlass_fused ? "CUTLASS epilogue scatter (16x8 / 128 cells per thread)"
+               : (g_contiguous_tiles ? "contiguous 8x16 blocks"
+                                     : "BzMiner periodic scattered 8x16"));
+        if(cutlass_fused){
+            printf("[mode] proof rows/cols: 16 A + 8 B^T (CUTLASS Case 7.1 offsets)\n");
+        }
         printf("[mode] scan: %s\n",
-               (g_contiguous_tiles || no_period_gemm) ? "per-tile kernel"
-               : "period GEMM + batched jackpot");
+               cutlass_fused ? "CUTLASS fused GEMM + tile_xor jackpot"
+               : ((g_contiguous_tiles || no_period_gemm) ? "per-tile kernel"
+                  : "period GEMM + batched jackpot"));
         if(!g_contiguous_tiles && !no_period_gemm){
             printf("[mode] Ap/BpT layout: %s (cuBLAS lda=%d)\n",
                    step_major_ap ? "step-major panels" : "row-major strided",
                    step_major_ap ? R_RANK : K_DIM);
-            printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
-                   period_batch,
-                   (double)period_batch * (double)(K_DIM / R_RANK)
-                   * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
-                   * (double)sizeof(int32_t) / (1024.0 * 1024.0));
+            if(cutlass_fused){
+                printf("[mode] tile_xor/batch: ~%.1f KiB (fused; no C_hist)\n",
+                       (double)cp_cutlass_tile_xor_bytes(period_batch)
+                           / 1024.0);
+            } else {
+                printf("[mode] period_batch=%d (~%.0f MiB C_hist/GPU)\n",
+                       period_batch,
+                       (double)period_batch * (double)(K_DIM / R_RANK)
+                       * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
+                       * (double)sizeof(int32_t) / (1024.0 * 1024.0));
+            }
         }
         printf("[mode] hash_tiles=%dx%d (%d total)\n",
                row_parts, col_parts, row_parts * col_parts);

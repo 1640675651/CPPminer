@@ -223,6 +223,9 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
     $CutlassRoot = Ensure-Cutlass
+    $CutlassOverride = Join-Path $Root "third_party\cutlass_override"
+    $Inc += "-I$(Join-Path $Root 'src\cutlass')"
+    $Inc += "-I$CutlassOverride"
     $Inc += "-I$(Join-Path $CutlassRoot 'include')"
     $Inc += "-I$(Join-Path $CutlassRoot 'examples/35_gemm_softmax')"
 
@@ -230,7 +233,10 @@ try {
     $RustDir = Join-Path $Root "rust\cp-proof-ffi"
     $PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
     if (-not (Test-Path $PearlBlake3)) {
-        throw "Vendored pearl-blake3 missing at third_party/pearl-blake3"
+        $PearlBlake3 = Join-Path (Split-Path $Root -Parent) "pearl\pearl-blake3\Cargo.toml"
+    }
+    if (-not (Test-Path $PearlBlake3)) {
+        throw "pearl-blake3 not found (third_party/pearl-blake3 or ../pearl/pearl-blake3)"
     }
     Push-Location $RustDir
     try {
@@ -270,6 +276,12 @@ try {
     )
     Invoke-Nvcc @gpuFlags
 
+    $cutlassFlags = @("-arch=$NvccArch", "-O3") + $HostOpenMP + $Inc + @(
+        "-c", (Join-Path $Root "src\cp_cutlass_gemm.cu"),
+        "-o", (Join-Path $BuildDir "cp_cutlass_gemm.obj")
+    )
+    Invoke-Nvcc @cutlassFlags
+
     Write-Host "=== Linking $OutExe ==="
     $RustExtra = @(
         $RustLib,
@@ -285,6 +297,7 @@ try {
         (Join-Path $BuildDir "cp_mine.obj"),
         (Join-Path $BuildDir "cp_state.obj"),
         (Join-Path $BuildDir "cp_gpu.obj"),
+        (Join-Path $BuildDir "cp_cutlass_gemm.obj"),
         (Join-Path $BuildDir "cp_noise.obj"),
         (Join-Path $BuildDir "blake3.obj"),
         (Join-Path $BuildDir "blake3_dispatch.obj"),

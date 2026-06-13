@@ -16,8 +16,10 @@
 #include "cp_gpu.cuh"
 #include "cp_gpu_gen.cuh"
 #include "cp_noise.h"
+#include "cp_cutlass.h"
 #include "plain_proof_kernel.cuh"
 #include "plain_proof_period.cuh"
+#include "plain_proof_period_cutlass.cuh"
 
 #define CU_CHECK(call) do { \
     cudaError_t _e = (call); \
@@ -55,8 +57,11 @@ typedef struct {
     uint32_t* d_a_key8;
     int32_t*  d_C_hist;
     size_t    C_hist_cap;
+    uint32_t* d_tile_xor;
+    size_t    tile_xor_cap;
     cublasHandle_t cublas;
     int       use_cublas_period;
+    int       use_cutlass_fused;
 } GpuCtx;
 
 static GpuCtx g_gpus[MAX_GPUS];
@@ -65,6 +70,7 @@ static int g_contiguous = 0;
 static int g_period_gemm = 1;
 static int g_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 1;
+static int g_cutlass_fused = 0;
 
 static size_t pp_hist_batch_int32s(int batch_count)
 {
@@ -217,6 +223,13 @@ void cp_gpu_set_step_major_ap(int on)
     if(g_ngpu > 0) sync_ap_layout();
 }
 
+void cp_gpu_set_cutlass_fused(int on)
+{
+    g_cutlass_fused = on ? 1 : 0;
+    for(int i = 0; i < g_ngpu; i++)
+        g_gpus[i].use_cutlass_fused = g_cutlass_fused;
+}
+
 void cp_gpu_init(int* devs, int ndev)
 {
     g_ngpu = ndev;
@@ -226,14 +239,23 @@ void cp_gpu_init(int* devs, int ndev)
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
         CU_CHECK(cudaSetDevice(g->dev));
+        if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
+            fprintf(stderr,
+                    "[gpu] GPU%d: --cutlass-fused needs Pascal SIMT (compute capability <= 7.5)\n",
+                    g->dev);
+            exit(1);
+        }
         CU_CHECK(cudaMalloc(&g->d_found, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
         CUBLAS_CHECK(cublasCreate(&g->cublas));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
-        printf("[gpu] GPU%d OK (period GEMM: %s)\n", g->dev,
-               g->use_cublas_period ? "cuBLAS int8 fat" : "CUDA __dp4a");
+        g->use_cutlass_fused = g_cutlass_fused;
+        printf("[gpu] GPU%d OK (%s)\n", g->dev,
+               g->use_cutlass_fused ? "CUTLASS fused period GEMM"
+               : (g->use_cublas_period ? "cuBLAS int8 period GEMM"
+                                       : "CUDA period GEMM"));
         fflush(stdout);
     }
     sync_tile_config();
@@ -263,6 +285,7 @@ void cp_gpu_shutdown(void)
         if(g->d_out_t_cols) cudaFree(g->d_out_t_cols);
         if(g->d_a_key8) cudaFree(g->d_a_key8);
         if(g->d_C_hist) cudaFree(g->d_C_hist);
+        if(g->d_tile_xor) cudaFree(g->d_tile_xor);
         if(g->cublas){ cublasDestroy(g->cublas); g->cublas = NULL; }
     }
     g_ngpu = 0;
@@ -305,11 +328,20 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         g->chunk_cv_cap = cv_need;
     }
     {
-        size_t hist_need = pp_hist_batch_bytes(g_period_batch);
-        if(hist_need > g->C_hist_cap){
-            if(g->d_C_hist) cudaFree(g->d_C_hist);
-            CU_CHECK(cudaMalloc(&g->d_C_hist, hist_need));
-            g->C_hist_cap = hist_need;
+        if(g->use_cutlass_fused){
+            size_t xor_need = cp_cutlass_tile_xor_bytes(g_period_batch);
+            if(xor_need > g->tile_xor_cap){
+                if(g->d_tile_xor) cudaFree(g->d_tile_xor);
+                CU_CHECK(cudaMalloc(&g->d_tile_xor, xor_need));
+                g->tile_xor_cap = xor_need;
+            }
+        } else {
+            size_t hist_need = pp_hist_batch_bytes(g_period_batch);
+            if(hist_need > g->C_hist_cap){
+                if(g->d_C_hist) cudaFree(g->d_C_hist);
+                CU_CHECK(cudaMalloc(&g->d_C_hist, hist_need));
+                g->C_hist_cap = hist_need;
+            }
         }
     }
 }
@@ -481,6 +513,17 @@ static void gpu_period_gemm_cuda_batch(
 static void gpu_period_gemm_batch(
     GpuCtx* g, int m, int n, int row_period, int col_period0, int batch_count)
 {
+    if(g->use_cutlass_fused){
+        const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(batch_count);
+        if(cp_cutlass_period_batch(
+               g->dev, g->d_Ap, g->d_BpT, m, n, row_period, col_period0,
+               batch_count, g_step_major_ap, g->d_tile_xor,
+               tiles_per_batch) != 0){
+            fprintf(stderr, "[cutlass] period batch failed\n");
+            exit(1);
+        }
+        return;
+    }
     if(g->use_cublas_period)
         gpu_period_gemm_cublas_batch(g, m, n, row_period, col_period0, batch_count);
     else
@@ -789,17 +832,32 @@ static void launch_jackpot_batch(
     const uint32_t bound[8])
 {
     const int num_blocks = batch_count * PP_TILES_PER_PERIOD;
-    const dim3 block(PP_HASH_W, PP_HASH_H);
-    plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
-        g->d_C_hist,
-        batch_count,
-        K_DIM, R_RANK,
-        rpi, cpi0,
-        m, n,
-        bound[0], bound[1], bound[2], bound[3],
-        bound[4], bound[5], bound[6], bound[7],
-        g->d_a_key8,
-        g->d_out_t_rows, g->d_out_t_cols, g->d_found);
+    if(g->use_cutlass_fused){
+        const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(batch_count);
+        plain_proof_period_cutlass_jackpot_kernel<<<num_blocks, 1>>>(
+            g->d_tile_xor,
+            tiles_per_batch,
+            batch_count,
+            K_DIM / R_RANK,
+            rpi, cpi0,
+            m, n,
+            bound[0], bound[1], bound[2], bound[3],
+            bound[4], bound[5], bound[6], bound[7],
+            g->d_a_key8,
+            g->d_out_t_rows, g->d_out_t_cols, g->d_found);
+    } else {
+        const dim3 block(PP_HASH_W, PP_HASH_H);
+        plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
+            g->d_C_hist,
+            batch_count,
+            K_DIM, R_RANK,
+            rpi, cpi0,
+            m, n,
+            bound[0], bound[1], bound[2], bound[3],
+            bound[4], bound[5], bound[6], bound[7],
+            g->d_a_key8,
+            g->d_out_t_rows, g->d_out_t_cols, g->d_found);
+    }
     CU_CHECK(cudaGetLastError());
 }
 
@@ -811,13 +869,19 @@ static PeriodBatchTimes profile_period_batch_timed(
     int zero = 0;
     CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
 
-    if(g->use_cublas_period){
+    if(g->use_cublas_period && !g->use_cutlass_fused){
         PeriodCublasBreakdown cb = gpu_period_gemm_cublas_batch_timed(
             g, m, n, rpi, cpi0, batch_count);
         t.gemm_ex_ms = cb.gemm_ex_ms;
-    } else {
+    } else if(!g->use_cutlass_fused) {
         CU_CHECK(cudaEventRecord(ev[0]));
         gpu_period_gemm_cuda_batch(g, m, n, rpi, cpi0, batch_count);
+        CU_CHECK(cudaEventRecord(ev[1]));
+        CU_CHECK(cudaEventSynchronize(ev[1]));
+        CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
+    } else {
+        CU_CHECK(cudaEventRecord(ev[0]));
+        gpu_period_gemm_batch(g, m, n, rpi, cpi0, batch_count);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
@@ -1061,7 +1125,9 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
         CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
     }
 
-    const char* gemm_mode = g->use_cublas_period ? "cuBLAS int8 fat" : "CUDA period GEMM";
+    const char* gemm_mode = g->use_cutlass_fused ? "CUTLASS fused GEMM"
+                            : (g->use_cublas_period ? "cuBLAS int8 fat"
+                                                    : "CUDA period GEMM");
     const int rpi = 0;
     const int cpi0 = 0;
 
