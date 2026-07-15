@@ -147,42 +147,6 @@ void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *ti
     }
 }
 
-void compute_tile_milestone_xor_naive(const int8_t *a_rowmajor, const int8_t *b_colmajor,
-                                      int M, int N, int K, int t_rows, int t_cols,
-                                      int num_milestones, int milestone_k,
-                                      uint32_t *milestone_xor_out) {
-    int32_t partial[kMR * kNR] = {};
-    for (int ms = 0; ms < num_milestones; ++ms) {
-        const int k0 = ms * milestone_k;
-        for (int j = 0; j < kNR; ++j) {
-            const int col = t_cols + j;
-            if (col >= N) {
-                continue;
-            }
-            for (int i = 0; i < kMR; ++i) {
-                const int row = t_rows + i;
-                if (row >= M) {
-                    continue;
-                }
-                int32_t acc = partial[j * kMR + i];
-                for (int k = k0; k < k0 + milestone_k; ++k) {
-                    acc += static_cast<int32_t>(
-                                   a_rowmajor[static_cast<size_t>(row) * K + k]) *
-                           static_cast<int32_t>(
-                                   b_colmajor[static_cast<size_t>(k) +
-                                              static_cast<size_t>(col) * K]);
-                }
-                partial[j * kMR + i] = acc;
-            }
-        }
-        uint32_t x = 0u;
-        for (int idx = 0; idx < kMR * kNR; ++idx) {
-            x ^= static_cast<uint32_t>(partial[idx]);
-        }
-        milestone_xor_out[ms] = x;
-    }
-}
-
 void prepack_b_all(const int8_t *b, int N, int K, int blocks_k, int tile_cols,
                    std::vector<int8_t> *out) {
     out->assign(static_cast<size_t>(tile_cols) * static_cast<size_t>(blocks_k) *

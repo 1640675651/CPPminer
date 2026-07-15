@@ -48,8 +48,6 @@ struct ZeroBCache {
 
     std::vector<int8_t> B_noisy;
 
-    std::vector<int8_t> A_noisy;
-
 } g_zero_b;
 
 
@@ -184,10 +182,6 @@ static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len,
 
 
 
-    g_zero_b.A_noisy = std::move(a_noisy);
-
-
-
     return 0;
 
 }
@@ -280,8 +274,6 @@ extern "C" void cp_opencl_worker_shutdown(void) {
 
     g_zero_b.B_noisy.clear();
 
-    g_zero_b.A_noisy.clear();
-
     g_context_ready = 0;
 
 }
@@ -326,11 +318,9 @@ extern "C" int cp_opencl_worker_mine_attempt(
 
     (void)h_Bt_sig;
 
+    (void)h_A_noisy;
 
-
-    const int8_t *scan_a = h_A_noisy;
-
-    const int8_t *scan_b = h_B_noisy;
+    (void)h_B_noisy;
 
 
 
@@ -389,20 +379,6 @@ extern "C" int cp_opencl_worker_mine_attempt(
         }
 
         scan_key = a_key_local;
-
-        scan_a = g_zero_b.A_noisy.data();
-
-        scan_b = g_zero_b.B_noisy.data();
-
-    }
-
-
-
-    if (!scan_a || !scan_b) {
-
-        fprintf(stderr, "[ocl] mine_attempt missing noisy matrices for host validation\n");
-
-        return -2;
 
     }
 
@@ -556,9 +532,7 @@ extern "C" int cp_opencl_worker_mine_attempt(
 
             []() -> bool { return cp_job_should_cancel() != 0; },
 
-            [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); },
-
-            scan_a, scan_b);
+            [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); });
 
 
 

@@ -3,7 +3,6 @@
 #include "case32_layout.hpp"
 #include "case32_prepack.hpp"
 #include "cp_config.h"
-#include "cp_jackpot.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -377,9 +376,7 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
                                    int *out_found, int *out_t_rows, int *out_t_cols,
                                    uint64_t *out_tiles_scanned,
                                    const std::function<bool()> &should_cancel,
-                                   const std::function<void(uint64_t)> &on_progress,
-                                   const int8_t *host_a_rowmajor,
-                                   const int8_t *host_b_colmajor) {
+                                   const std::function<void(uint64_t)> &on_progress) {
     if (!available_ || !a_key8 || !bound) {
         return false;
     }
@@ -412,7 +409,6 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
 
     uint64_t tiles_scanned = 0;
     int found = 0;
-    const bool host_validate = host_a_rowmajor != nullptr && host_b_colmajor != nullptr;
 
     for (int mb0 = 0; mb0 < macro_blocks_ && !found; mb0 += macro_batch_) {
         if (should_cancel && should_cancel()) {
@@ -427,8 +423,7 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
         }
         clFinish(ocl_.queue);
 
-        int batch_found = 0;
-        if (!ocl_.read_buffer(found_buf_, &batch_found, sizeof(int))) {
+        if (!ocl_.read_buffer(found_buf_, &found, sizeof(int))) {
             return false;
         }
         tiles_scanned += static_cast<uint64_t>(batch_count) * case32::kMacroWorkItems;
@@ -438,71 +433,26 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
         if (on_progress) {
             on_progress(tiles_scanned);
         }
-
-        if (!batch_found) {
-            continue;
-        }
-
-        for (;;) {
-            int t_rows = -1;
-            int t_cols = -1;
-            if (!ocl_.read_buffer(out_rows_buf_, &t_rows, sizeof(int)) ||
-                !ocl_.read_buffer(out_cols_buf_, &t_cols, sizeof(int))) {
-                return false;
-            }
-
-            bool accept = true;
-            if (host_validate) {
-                uint32_t milestone_xor[case32::kNumMilestones] = {};
-                case32::compute_tile_milestone_xor_naive(
-                        host_a_rowmajor, host_b_colmajor, M_, N_, K_, t_rows, t_cols,
-                        num_milestones_, milestone_k_, milestone_xor);
-                accept = cp_jackpot::tile_beats_target(milestone_xor, num_milestones_, a_key8,
-                                                       bound);
-                if (!accept) {
-                    std::fprintf(stderr,
-                                 "[ocl] device jackpot false positive at t_rows=%d t_cols=%d, "
-                                 "rescanning batch\n",
-                                 t_rows, t_cols);
-                }
-            }
-
-            if (accept) {
-                found = 1;
-                if (out_found) {
-                    *out_found = 1;
-                }
-                if (out_t_rows) {
-                    *out_t_rows = t_rows;
-                }
-                if (out_t_cols) {
-                    *out_t_cols = t_cols;
-                }
-                break;
-            }
-
-            if (!ocl_.write_buffer(found_buf_, &zero, sizeof(int))) {
-                return false;
-            }
-            if (!run_macro_batch_(mb0, batch_count)) {
-                return false;
-            }
-            clFinish(ocl_.queue);
-
-            batch_found = 0;
-            if (!ocl_.read_buffer(found_buf_, &batch_found, sizeof(int))) {
-                return false;
-            }
-            if (!batch_found) {
-                break;
-            }
-        }
     }
 
-    if (!found) {
-        if (out_found) {
-            *out_found = 0;
+    if (found) {
+        int t_rows = -1;
+        int t_cols = -1;
+        if (!ocl_.read_buffer(out_rows_buf_, &t_rows, sizeof(int)) ||
+            !ocl_.read_buffer(out_cols_buf_, &t_cols, sizeof(int))) {
+            return false;
         }
+        if (out_found) {
+            *out_found = 1;
+        }
+        if (out_t_rows) {
+            *out_t_rows = t_rows;
+        }
+        if (out_t_cols) {
+            *out_t_cols = t_cols;
+        }
+    } else if (out_found) {
+        *out_found = 0;
     }
 
     return true;

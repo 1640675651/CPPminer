@@ -42,12 +42,6 @@ void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *ti
                                   int M, int N, int K, int num_milestones,
                                   int milestone_k, size_t tile_count);
 
-/* Naive signed GEMM milestone XOR for one 8x16 hash tile (pool/proof reference). */
-void compute_tile_milestone_xor_naive(const int8_t *a_rowmajor, const int8_t *b_colmajor,
-                                      int M, int N, int K, int t_rows, int t_cols,
-                                      int num_milestones, int milestone_k,
-                                      uint32_t *milestone_xor_out);
-
 void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre,
                                         uint32_t *tile_xor, int N, int blocks_k,
                                         int blocks_per_milestone, int num_milestones,

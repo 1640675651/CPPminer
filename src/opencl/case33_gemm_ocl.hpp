@@ -50,13 +50,10 @@ struct Case33GemmOcl {
 
      * found_flag (+ t_rows/t_cols only on hit). */
 
-    /* Optional host matrices for naive jackpot revalidation (pool/proof semantics). */
     bool scan_for_share(const uint32_t a_key8[8], const uint32_t bound[8], int *out_found,
                         int *out_t_rows, int *out_t_cols, uint64_t *out_tiles_scanned,
                         const std::function<bool()> &should_cancel = {},
-                        const std::function<void(uint64_t)> &on_progress = {},
-                        const int8_t *host_a_rowmajor = nullptr,
-                        const int8_t *host_b_colmajor = nullptr);
+                        const std::function<void(uint64_t)> &on_progress = {});
 
 
 
