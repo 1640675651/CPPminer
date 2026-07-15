@@ -85,6 +85,17 @@ void pearl_fuse_noise_row_b(int col, int k, int rank,
                             const uint32_t* pairs, const int8_t* signal_row,
                             int8_t* noisy_row);
 
+/* el_buf[rank], nr_buf[k] — no heap alloc (for fused noise+prepack). */
+void pearl_fuse_noise_row_a_buf(int row, int k, int rank,
+                                const uint8_t a_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf);
+/* signal_row may be NULL (zero signal, zero-B path). */
+void pearl_fuse_noise_row_b_buf(int col, int k, int rank,
+                                const uint8_t b_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf);
+
 int pearl_precompute_noise(int m, int n, int k, int rank,
                            const uint8_t b_noise_seed[32],
                            const uint8_t a_noise_seed[32],

@@ -36,6 +36,15 @@ void cp_worker_set_row_period_batch(int batch);
 void cp_worker_set_col_period_batch(int batch);
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
+
+typedef enum {
+    CP_PREPACK_SEPARATE = 0, /* row-major noisy + persistent a_pre_/b_pre_ */
+    CP_PREPACK_REUSE    = 1, /* row-major noisy + prepack swap into scan buf */
+    CP_PREPACK_FUSED    = 2, /* noise injection directly into scan/prepack layout */
+} CpPrepackMode;
+
+void cp_worker_set_prepack_mode(CpPrepackMode mode);
+/* Legacy alias for CP_PREPACK_REUSE. */
 void cp_worker_set_inplace_prepack(int on);
 
 /* Prefer host matrix path when non-zero (CPU backend always uses host matrices). */

@@ -6,6 +6,12 @@
 #include <functional>
 #include <vector>
 
+enum class Case33PrepackMode {
+    Separate,     /* row-major noisy + persistent a_pre_/b_pre_ */
+    ReuseScanBuf, /* row-major noisy + prepack swap into scan buffer */
+    Fused,        /* noise injection directly into scan/prepack layout */
+};
+
 // Case 3.3: Case 3.2 8x16 AVX2 ukernel + milestoned 8x16 tile XOR.
 // tile_xor[milestone * tile_count + spatial_tile_id]
 struct Case33GemmXor {
@@ -19,14 +25,21 @@ struct Case33GemmXor {
     static constexpr int kMacroN = Case32Gemm::kMacroN;
 
     void set_int8_mode(Case32Int8Mode mode) { int8_mode_ = mode; }
-    void set_inplace_prepack(bool on) { inplace_prepack_ = on; }
-    /* Reuse noisy vectors as scan buffers (out-of-place prepack + swap; ~2 GiB steady). */
-    bool inplace_prepack() const { return inplace_prepack_; }
+    void set_prepack_mode(Case33PrepackMode mode) { prepack_mode_ = mode; }
+    Case33PrepackMode prepack_mode() const { return prepack_mode_; }
+    void set_inplace_prepack(bool on) {
+        prepack_mode_ = on ? Case33PrepackMode::ReuseScanBuf : Case33PrepackMode::Separate;
+    }
+    bool inplace_prepack() const {
+        return prepack_mode_ != Case33PrepackMode::Separate;
+    }
 
     bool init(int M, int N, int K, const int8_t *a, const int8_t *b);
-    /* Zero-B CPU: prepack B once per job, A each attempt (reuses a_pre_/b_pre_). */
-    bool prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_noisy);
-    bool prepare_attempt_a(std::vector<int8_t> *a_noisy);
+    /* Zero-B CPU: B once per job, A each attempt. */
+    bool prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_buf,
+                       const int8_t *b_signal, const uint8_t *b_noise_seed, int rank);
+    bool prepare_attempt_a(std::vector<int8_t> *a_buf, const int8_t *a_signal,
+                           const uint8_t *a_noise_seed, int rank);
     void reset();
 
     bool available() const { return available_; }
@@ -34,9 +47,6 @@ struct Case33GemmXor {
     void run();
     void run_gemm_only();
 
-    /* Online jackpot scan: no milestone×tile buffer. Contiguous 8×16 tile origins.
-     * on_tile(milestone_xor[16], t_rows, t_cols) → true to keep scanning, false to stop.
-     * Returns false if unavailable / cancelled before any tile. */
     bool scan_tiles(const std::function<bool(const uint32_t *milestone_xor, int t_rows,
                                              int t_cols)> &on_tile,
                     const std::function<bool()> &should_cancel = {});
@@ -50,10 +60,14 @@ struct Case33GemmXor {
 private:
     bool setup_dims_(int M, int N, int K);
     void update_backend_label_();
+    bool fused_noisy_prepack_a_(const int8_t *a_signal, const uint8_t *a_noise_seed,
+                                int rank, std::vector<int8_t> *scan);
+    bool fused_noisy_prepack_b_(const int8_t *b_signal, const uint8_t *b_noise_seed,
+                                int rank, std::vector<int8_t> *scan);
 
     bool available_ = false;
     bool b_job_ready_ = false;
-    bool inplace_prepack_ = false;
+    Case33PrepackMode prepack_mode_ = Case33PrepackMode::Separate;
     const char *backend_ = "unavailable";
     int num_threads_ = 1;
     Case32Int8Mode int8_mode_ = Case32Int8Mode::FastU8S8;
@@ -75,7 +89,8 @@ private:
     std::vector<int8_t> b_pre_;
     std::vector<int32_t> b_comp_ms_;
     std::vector<uint32_t> tile_xor_;
-    char backend_buf_[160] = {};
+    char backend_buf_[192] = {};
 };
 
 int case33_test_inplace_prepack(int M, int N, int K);
+int case33_test_fused_prepack(int M, int N, int K, int rank);

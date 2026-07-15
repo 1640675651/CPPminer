@@ -207,14 +207,19 @@ extern "C" void cp_worker_set_cutlass_fused(int on)
 #endif
 }
 
-extern "C" void cp_worker_set_inplace_prepack(int on)
+extern "C" void cp_worker_set_prepack_mode(CpPrepackMode mode)
 {
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
-        cp_cpu_worker_set_inplace_prepack(on);
+        cp_cpu_worker_set_prepack_mode(mode);
 #else
-    (void)on;
+    (void)mode;
 #endif
+}
+
+extern "C" void cp_worker_set_inplace_prepack(int on)
+{
+    cp_worker_set_prepack_mode(on ? CP_PREPACK_REUSE : CP_PREPACK_SEPARATE);
 }
 
 extern "C" int cp_worker_prefers_host_matrices(void)

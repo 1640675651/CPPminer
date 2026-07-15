@@ -554,6 +554,30 @@ void pearl_build_perm_pairs_b(const uint8_t noise_seed[32], int k, int rank,
     generate_permutation_matrix(PEARL_SEED_LABEL_B, noise_seed, k, rank, pairs_out);
 }
 
+void pearl_fuse_noise_row_a_buf(int row, int k, int rank,
+                                const uint8_t a_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf)
+{
+    generate_uniform_row(row, rank, PEARL_SEED_LABEL_A, a_noise_seed, el_buf);
+    matvec_sparse_perm(pairs, k, el_buf, nr_buf);
+    for(int l = 0; l < k; l++)
+        noisy_row[l] = (int8_t)((int32_t)signal_row[l] + (int32_t)nr_buf[l]);
+}
+
+void pearl_fuse_noise_row_b_buf(int col, int k, int rank,
+                                const uint8_t b_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf)
+{
+    generate_uniform_row(col, rank, PEARL_SEED_LABEL_B, b_noise_seed, el_buf);
+    matvec_sparse_perm(pairs, k, el_buf, nr_buf);
+    for(int l = 0; l < k; l++){
+        int32_t sig = signal_row ? (int32_t)signal_row[l] : 0;
+        noisy_row[l] = (int8_t)(sig + (int32_t)nr_buf[l]);
+    }
+}
+
 void pearl_fuse_noise_row_a(int row, int k, int rank,
                             const uint8_t a_noise_seed[32],
                             const uint32_t* pairs, const int8_t* signal_row,
@@ -563,10 +587,8 @@ void pearl_fuse_noise_row_a(int row, int k, int rank,
     int8_t* nr = (int8_t*)malloc((size_t)k);
     if(!nr) return;
     if(rank > (int)sizeof(el)){ free(nr); return; }
-    generate_uniform_row(row, rank, PEARL_SEED_LABEL_A, a_noise_seed, el);
-    matvec_sparse_perm(pairs, k, el, nr);
-    for(int l = 0; l < k; l++)
-        noisy_row[l] = (int8_t)((int32_t)signal_row[l] + (int32_t)nr[l]);
+    pearl_fuse_noise_row_a_buf(row, k, rank, a_noise_seed, pairs, signal_row,
+                               noisy_row, el, nr);
     free(nr);
 }
 
@@ -579,10 +601,8 @@ void pearl_fuse_noise_row_b(int col, int k, int rank,
     int8_t* nr = (int8_t*)malloc((size_t)k);
     if(!nr) return;
     if(rank > (int)sizeof(br)){ free(nr); return; }
-    generate_uniform_row(col, rank, PEARL_SEED_LABEL_B, b_noise_seed, br);
-    matvec_sparse_perm(pairs, k, br, nr);
-    for(int l = 0; l < k; l++)
-        noisy_row[l] = (int8_t)((int32_t)signal_row[l] + (int32_t)nr[l]);
+    pearl_fuse_noise_row_b_buf(col, k, rank, b_noise_seed, pairs, signal_row,
+                               noisy_row, br, nr);
     free(nr);
 }
 

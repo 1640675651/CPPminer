@@ -65,7 +65,8 @@ static void print_usage(void)
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
-    printf("  --inplace-prepack    CPU: reuse noisy buffers as scan layout (~2 GiB steady)\n");
+    printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
+    printf("  --inplace-prepack    alias for --prepack reuse\n");
 }
 
 static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -147,7 +148,7 @@ int main(int argc, char** argv)
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = 1;
     int cutlass_fused = 0;
-    int inplace_prepack = 0;
+    CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     int profile_scan = 0;
     int profile_runs = 10;
     CpBackendId backend_sel = CP_BACKEND_NONE;
@@ -209,7 +210,19 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
-            inplace_prepack = 1;
+            prepack_mode = CP_PREPACK_REUSE;
+        } else if(!strcmp(argv[i], "--prepack") && i + 1 < argc){
+            const char* mode = argv[++i];
+            if(!strcmp(mode, "separate"))
+                prepack_mode = CP_PREPACK_SEPARATE;
+            else if(!strcmp(mode, "reuse") || !strcmp(mode, "inplace"))
+                prepack_mode = CP_PREPACK_REUSE;
+            else if(!strcmp(mode, "fused"))
+                prepack_mode = CP_PREPACK_FUSED;
+            else {
+                fprintf(stderr, "unknown --prepack mode %s (separate|reuse|fused)\n", mode);
+                return 1;
+            }
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
@@ -323,7 +336,7 @@ int main(int argc, char** argv)
     cp_worker_set_cutlass_fused(cutlass_fused);
     pearl_set_cutlass_fused(cutlass_fused);
     g_cutlass_fused = cutlass_fused;
-    cp_worker_set_inplace_prepack(inplace_prepack);
+    cp_worker_set_prepack_mode(prepack_mode);
 
     if(cutlass_fused){
         if(no_period_gemm){
@@ -364,8 +377,11 @@ int main(int argc, char** argv)
                              : "BzMiner periodic scattered 8x16"));
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
             printf("[mode] scan: Case 3.3 fused GEMM + XOR + host jackpot\n");
-            if(inplace_prepack)
-                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (reuse-scan prepack)\n",
+            if(prepack_mode == CP_PREPACK_FUSED)
+                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (fused prepack)\n",
+                       host_mib * 2.0);
+            else if(prepack_mode == CP_PREPACK_REUSE)
+                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (reuse prepack)\n",
                        host_mib * 2.0);
             else
                 printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",

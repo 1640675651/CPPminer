@@ -26,10 +26,34 @@ struct ZeroBCache {
     std::vector<int8_t> B_noisy;
 } g_zero_b;
 
-/* Single copies: A_noisy row-major; a_pre_/b_pre_ live in g_gemm. */
+/* Single copies: A scan buf; a_pre_/b_pre_ only in separate prepack mode. */
 static std::vector<int8_t> g_A_noisy;
 static Case33GemmXor g_gemm;
-static int g_inplace_prepack = 0;
+static CpPrepackMode g_prepack_mode = CP_PREPACK_SEPARATE;
+
+static void apply_prepack_mode_to_gemm(void)
+{
+    switch(g_prepack_mode){
+    case CP_PREPACK_REUSE:
+        g_gemm.set_prepack_mode(Case33PrepackMode::ReuseScanBuf);
+        break;
+    case CP_PREPACK_FUSED:
+        g_gemm.set_prepack_mode(Case33PrepackMode::Fused);
+        break;
+    default:
+        g_gemm.set_prepack_mode(Case33PrepackMode::Separate);
+        break;
+    }
+}
+
+static const char* prepack_mode_name(CpPrepackMode mode)
+{
+    switch(mode){
+    case CP_PREPACK_REUSE: return "reuse";
+    case CP_PREPACK_FUSED: return "fused";
+    default: return "separate";
+    }
+}
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
 {
@@ -51,23 +75,32 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
 
     g_gemm.reset();
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
-    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
+    apply_prepack_mode_to_gemm();
 
     if(log_step) t_step = cp_now_sec();
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
     if(log_step)
         printf("[gen]   zero-B b_noise_seed done in %.1fs\n", cp_now_sec() - t_step);
 
-    if(pearl_build_noisy_b(n, K_DIM, R_RANK, g_zero_b.b_noise_seed,
-                          NULL, g_zero_b.B_noisy.data()) != 0){
-        g_zero_b.ready = 0;
-        return cp_job_should_cancel() ? -1 : -2;
-    }
+    if(g_prepack_mode == CP_PREPACK_FUSED){
+        if(!g_gemm.prepare_job_b(m, n, K_DIM, &g_zero_b.B_noisy, NULL,
+                                g_zero_b.b_noise_seed, R_RANK)){
+            g_zero_b.ready = 0;
+            fprintf(stderr, "[cpu] prepare_job_b (fused) failed\n");
+            return -2;
+        }
+    } else {
+        if(pearl_build_noisy_b(n, K_DIM, R_RANK, g_zero_b.b_noise_seed,
+                              NULL, g_zero_b.B_noisy.data()) != 0){
+            g_zero_b.ready = 0;
+            return cp_job_should_cancel() ? -1 : -2;
+        }
 
-    if(!g_gemm.prepare_job_b(m, n, K_DIM, &g_zero_b.B_noisy)){
-        g_zero_b.ready = 0;
-        fprintf(stderr, "[cpu] prepare_job_b failed\n");
-        return -2;
+        if(!g_gemm.prepare_job_b(m, n, K_DIM, &g_zero_b.B_noisy, NULL, NULL, R_RANK)){
+            g_zero_b.ready = 0;
+            fprintf(stderr, "[cpu] prepare_job_b failed\n");
+            return -2;
+        }
     }
 
     if(log_step)
@@ -103,14 +136,21 @@ static int zero_b_prepare_attempt(
     pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,
                               h_A_sig, m, K_DIM, a_key_out);
 
-    if(pearl_build_noisy_a(m, K_DIM, R_RANK, a_key_out,
-                           h_A_sig, g_A_noisy.data()) != 0){
-        return cp_job_should_cancel() ? -1 : -2;
-    }
+    if(g_prepack_mode == CP_PREPACK_FUSED){
+        if(!g_gemm.prepare_attempt_a(&g_A_noisy, h_A_sig, a_key_out, R_RANK)){
+            fprintf(stderr, "[cpu] prepare_attempt_a (fused) failed\n");
+            return -2;
+        }
+    } else {
+        if(pearl_build_noisy_a(m, K_DIM, R_RANK, a_key_out,
+                               h_A_sig, g_A_noisy.data()) != 0){
+            return cp_job_should_cancel() ? -1 : -2;
+        }
 
-    if(!g_gemm.prepare_attempt_a(&g_A_noisy)){
-        fprintf(stderr, "[cpu] prepare_attempt_a failed\n");
-        return -2;
+        if(!g_gemm.prepare_attempt_a(&g_A_noisy, NULL, NULL, R_RANK)){
+            fprintf(stderr, "[cpu] prepare_attempt_a failed\n");
+            return -2;
+        }
     }
 
     return 0;
@@ -127,25 +167,35 @@ extern "C" void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n)
 {
     g_zero_b.ready = 0;
     if(zero_b_prepare_job(job_key, m, n) == 0){
-        printf("[cpu] zero-B: cached %s for job (signal B^T = 0)\n",
-               g_inplace_prepack ? "noisy B scan buf" : "noisy B + b_pre");
+        const char* b_desc = "noisy B + b_pre";
+        if(g_prepack_mode == CP_PREPACK_FUSED || g_prepack_mode == CP_PREPACK_REUSE)
+            b_desc = "B scan buf";
+        printf("[cpu] zero-B: cached %s for job (signal B^T = 0, prepack=%s)\n",
+               b_desc, prepack_mode_name(g_prepack_mode));
         fflush(stdout);
     }
 }
 
+extern "C" void cp_cpu_worker_set_prepack_mode(CpPrepackMode mode)
+{
+    if(mode < CP_PREPACK_SEPARATE || mode > CP_PREPACK_FUSED)
+        mode = CP_PREPACK_SEPARATE;
+    g_prepack_mode = mode;
+    apply_prepack_mode_to_gemm();
+}
+
 extern "C" void cp_cpu_worker_set_inplace_prepack(int on)
 {
-    g_inplace_prepack = on ? 1 : 0;
-    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
+    cp_cpu_worker_set_prepack_mode(on ? CP_PREPACK_REUSE : CP_PREPACK_SEPARATE);
 }
 
 extern "C" void cp_cpu_worker_init(void)
 {
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
-    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
+    apply_prepack_mode_to_gemm();
     printf("[cpu] Case 3.3 fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
-    if(g_inplace_prepack)
-        printf("[cpu] in-place prepack enabled (~2 GiB matrix steady; brief 2x during prepack)\n");
+    if(g_prepack_mode != CP_PREPACK_SEPARATE)
+        printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
     fflush(stdout);
 }
 
@@ -192,7 +242,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
     } else {
         g_gemm.reset();
         g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
-        g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
+        apply_prepack_mode_to_gemm();
         if(!g_gemm.init(m, n, K_DIM, h_A_noisy, h_B_noisy)){
             fprintf(stderr, "[cpu] Case3.3 init failed (host matrices)\n");
             return -1;

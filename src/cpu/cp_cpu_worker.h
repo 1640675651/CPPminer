@@ -1,6 +1,8 @@
 #ifndef CP_CPU_WORKER_H
 #define CP_CPU_WORKER_H
 
+#include "cp_worker.h"
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -9,14 +11,10 @@ extern "C" {
 
 void cp_cpu_worker_init(void);
 void cp_cpu_worker_shutdown(void);
-
-/* Reuse noisy buffers as scan layout via prepack+swap (~2 GiB steady vs ~3 GiB). */
-void cp_cpu_worker_set_inplace_prepack(int on);
-
-/* Zero-B path: worker builds matrices; skip host gen in cp_mine when non-zero. */
 int cp_cpu_worker_handles_matrix_prep(void);
-
 void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n);
+void cp_cpu_worker_set_prepack_mode(CpPrepackMode mode);
+void cp_cpu_worker_set_inplace_prepack(int on);
 
 int cp_cpu_worker_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,
