@@ -22,6 +22,10 @@ void pearl_set_contiguous_tiles(int on);
 int pearl_generate_ab(const uint8_t* seed, int seed_len, int m, int n, int k,
                       int8_t* A_out, int8_t* Bt_out);
 
+/* Miner-chosen random A in [-64, 63] (CUDA cp_gen_random_matrix_kernel compatible). */
+int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
+                            int8_t* A_out);
+
 int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
                          uint8_t* out, int out_cap);
 
@@ -35,6 +39,10 @@ void pearl_commitment_seeds(const uint8_t job_key[32],
 void pearl_derive_noise_seeds(const uint8_t job_key[32],
                               const uint8_t hash_a[32], const uint8_t hash_b[32],
                               uint8_t b_noise_seed[32], uint8_t a_noise_seed[32]);
+
+void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
+                                const int8_t* Bt, int n, int k,
+                                uint8_t b_noise_seed[32]);
 
 void pearl_keyed_matrix_digest(const uint8_t* data, size_t len,
                                const uint8_t job_key[32], uint8_t out[32]);
@@ -80,6 +88,14 @@ int pearl_build_noisy_matrices(int m, int n, int k, int rank,
                                const uint8_t a_noise_seed[32],
                                const int8_t* A, const int8_t* Bt,
                                int8_t* A_out, int8_t* B_out);
+
+int pearl_build_noisy_a(int m, int k, int rank,
+                        const uint8_t a_noise_seed[32],
+                        const int8_t* A, int8_t* A_out);
+
+int pearl_build_noisy_b(int n, int k, int rank,
+                        const uint8_t b_noise_seed[32],
+                        const int8_t* Bt, int8_t* B_out);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,12 @@
+/target
+src/circuit/v2_cache.bin
+src/v1/v1_cache.bin
+
+# Auto-generated C header (cbindgen)
+bindings/go/zk_pow_ffi.h
+bindings/go/target/
+
+# Python bindings build artifacts
+bindings/python/target/
+bindings/python/.venv/
+bindings/python/uv.lock

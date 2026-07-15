@@ -1,93 +1,125 @@
 # CPminer
 
-Cross-platform GPU miner for **LuckyPool** plain_proof Pearl mining.
+Cross-platform miner for **LuckyPool** plain_proof Pearl mining.
 
-This repo contains only the production plain_proof path: C noise generation, CUDA jackpot scan, and in-process Rust proof building.
+Pool / job logistics live under `src/common/`. Each compute backend is a separate worker directory:
+
+| Backend | Directory | Status |
+|---------|-----------|--------|
+| CPU | `src/cpu/` | Case 3.3 fused GEMM+XOR (contiguous 8×16) |
+| CUDA | `src/cuda/` | CUTLASS / cuBLAS Pascal+ path |
+| OpenCL | — | Build flag reserved; not implemented yet |
 
 ## Requirements
 
-- NVIDIA GPU + CUDA Toolkit 12.x
 - MSVC (Windows) or GCC/Clang (Linux)
-- **Rust toolchain** (`rustup`) for in-process proof building
-- Python 3 + `numpy` + `blake3` — **only** if using `--verify` or the standalone `plain_proof_host.py build` command (optional)
+- **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
+- **CPU build:** AVX2-capable x86_64, OpenMP
+- **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`)
+- Python 3 + `numpy` + `blake3` — **only** if using `--verify` or `scripts/plain_proof_host.py`
 
-## cp-proof-ffi (Rust)
+## Build options (CMake)
 
-Proof build and optional `--verify` use `rust/cp-proof-ffi` (pearl-blake3 Merkle + zk-pow verify). `build.ps1` runs `cargo build --release`, producing `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (used by `scripts/plain_proof_host.py`).
-
-Set `CP_PROOF_FFI` to override the shared library path.
-
-## pearl-blake3 source
-
-Proof assembly uses [`pearl/pearl-blake3`](../pearl/pearl-blake3) via a path dependency in `cp-proof-ffi`. A vendored copy may also exist under `third_party/pearl-blake3` for reference; keep it in sync when updating Merkle wire format:
-
-```powershell
-Remove-Item -Recurse -Force third_party\pearl-blake3
-Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
+```bash
+cmake -S . -B build \
+  -DCP_ENABLE_CPU=ON \
+  -DCP_ENABLE_CUDA=OFF \
+  -DCP_ENABLE_OPENCL=OFF
+cmake --build build --config Release
 ```
 
-Then rebuild (`build.ps1` runs `cargo build` in `rust/cp-proof-ffi/`).
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `CP_ENABLE_CPU` | ON | Case 3.3 CPU worker |
+| `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
+| `CP_ENABLE_OPENCL` | OFF | Reserved (errors if ON) |
+| `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
+
+Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda`.
 
 ## Build (Windows)
 
+CPU-only (default — no CUDA Toolkit required):
+
 ```powershell
-conda activate pearl
 powershell -ExecutionPolicy Bypass -File build.ps1
-# optional: -CudaArch 61
+# equivalent: -Backend Cpu
 ```
 
-Produces `cpminer.exe` in the repo root. The script clears conda compiler overrides and strips MinGW from PATH during nvcc so MSVC works inside the pearl env.
+CUDA or both:
 
-## Build (CMake)
-
-```bash
-mkdir build && cd build
-cmake .. -DCP_CUDA_ARCH=61   # or native
-cmake --build . --config Release
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Both -CudaArch 75
 ```
+
+Produces `cpminer.exe` in the repo root.
 
 ## Run
 
 ```powershell
-.\cpminer.exe `
-  --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... `
-  --worker test `
-  --devices 0
+# CPU (contiguous 8×16 tiles; recommended --dev while testing)
+.\cpminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
+
+# CUDA (LuckyPool production layout: BzMiner scattered 8×16)
+.\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
+  --wallet prl1... --worker test --devices 0
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
+| `--backend` | `cpu` / `cuda` / `opencl` (must be compiled in) |
 | `--pool` | `stratum+tcp://host:port` |
 | `--wallet` | Wallet address (required) |
 | `--worker` | Worker name (default `rig01`) |
-| `--agent` | Agent string (default `cpminer/1.0`) |
-| `--devices` | CUDA device list, e.g. `0` or `0,1` |
+| `--devices` | CUDA device list |
 | `--dev` | Use 8192×8192 matrices for testing |
-| `--contiguous-tiles` | Debug tile layout (contiguous 8×16 blocks vs production scattered) |
-| `--cpu-gen` | CPU BLAKE3 matrix gen + noise (debug; default is full GPU path) |
+| `--cpu-gen` | Host matrix gen on CUDA path (debug) |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
-| `--verify` | Run Python verify before submit (off by default; needs cp_proof_ffi.dll) |
-| `--python` | Python for optional `--verify` only (`CP_PYTHON` env) |
-| `--host-bridge` | `plain_proof_host.py` for optional verify only |
+| `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
+
+## Vendored proof stack (`third_party/`)
+
+`cp-proof-ffi` is self-contained under this repo — no external `pearl/` checkout:
+
+| Crate | Path | Purpose |
+|-------|------|---------|
+| pearl-blake3 | `third_party/pearl-blake3` | Merkle proof build |
+| zk-pow | `third_party/zk-pow` | Jackpot verify (`--verify`) |
+| plonky2 | `third_party/plonky2` | zk-pow compile dependency |
+
+`build.ps1` runs `cargo build --release` in `rust/cp-proof-ffi/`, producing `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`).
+
+If any are missing, copy from the Pearl repo:
+
+```powershell
+Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
+Copy-Item -Recurse pearl\zk-pow       third_party\zk-pow
+Copy-Item -Recurse pearl\plonky2      third_party\plonky2
+```
+
+Set `CP_PROOF_FFI` to override the shared library path for Python verify.
 
 ## Layout
 
 ```
-include/     Public headers (config, pool, mine, gpu, util, proof)
-src/         Implementation (.cpp, .cu, .cuh)
-rust/        cp-proof-ffi (C FFI → pearl-blake3)
-third_party/ Vendored pearl-blake3 (from Pearl repo)
-scripts/     plain_proof_host.py (optional verify only)
+include/          Public headers (pool, mine, worker, …)
+src/common/       Pool, job loop, shared worker dispatch
+src/cpu/          CPU worker + Case 3.2/3.3 GEMM+XOR
+src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
+rust/             cp-proof-ffi (plain_proof Merkle + bincode)
+third_party/      blake3, pearl-blake3, zk-pow, plonky2, cutlass (CUDA)
+scripts/          plain_proof_host.py (optional verify)
 ```
 
 ## Modules
 
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
-- **cp_mine** — Job loop: A/B gen, noise fuse, Rust proof build, continue-after-share
-- **cp_proof** — In-process plain_proof Merkle + bincode (Rust FFI → stock `pearl-blake3`)
-- **cp_gpu** — CUDA plain_proof jackpot kernel
-- **cp_noise** — Matrix generation and pearl noise (from zk-pow reference)
+- **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
+- **cp_worker** — Backend selection (`cpu` / `cuda` / …)
+- **cp_cpu** — Case 3.3 fused GEMM+XOR + host BLAKE3 jackpot
+- **cp_gpu** — CUDA plain_proof path (under `src/cuda/`)
+- **cp_noise** — Matrix generation and pearl noise

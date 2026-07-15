@@ -1,0 +1,30 @@
+# cbindgen configuration for zk_pow_ffi
+
+language = "C"
+
+[defines]
+# No special defines needed
+
+[export]
+# Include these items in the generated header
+include = [
+    "IncompleteBlockHeader",
+    "MiningConfiguration",
+    "CMatrixMerkleProof",
+    "CPlainProof",
+    "CZKProof",
+    "PUBLICDATA_SIZE",
+    "PUBLICDATA_MAX_SIZE",
+]
+
+[export.rename]
+# Keep the names as-is
+
+[parse]
+# Parse dependencies to find types
+parse_deps = true
+include = ["zk-pow"]
+
+[enum]
+# Use plain integers for enums in C
+rename_variants = "None"

@@ -38,7 +38,8 @@ int cp_proof_build(
     char* err,
     size_t err_cap);
 
-/* Verify plain_proof base64 against pool target (32-byte BE U256). Returns 0 on ok, -1 on error. */
+/* Verify plain_proof base64 against pool share target (32-byte BE U256, unscaled).
+ * Returns 0 on ok. */
 int cp_proof_verify(
     const uint8_t* header,
     size_t header_len,

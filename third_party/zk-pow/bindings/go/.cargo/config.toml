@@ -1,0 +1,9 @@
+# Cargo configuration for macOS developers
+# Sets deployment target to match Go linker and suppress build warnings
+# 
+# This prevents "was built for newer 'macOS' version" warnings when linking
+# the Rust library with Go code. Only affects macOS builds - other platforms ignore this.
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "26.0"
+

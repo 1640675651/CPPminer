@@ -1,12 +1,14 @@
 //! Build plain_proof base64 for CPminer (stock pearl-blake3 + zk-pow-compatible bincode).
 
 mod mining_config;
+mod verify;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mining_config::{mining_config_bytes, validate_tile_anchor};
 use pearl_blake3::{blake3_digest, pad_to_chunk_boundary, MerkleProof, MerkleTree};
-use primitive_types::U256;
 use serde::{Deserialize, Serialize};
+use verify::{jackpot_verify_detail, verify_plain_proof_with_pool_target};
+use zk_pow::api::proof::MiningConfiguration;
 
 /// BzMiner production hash tile (8x16 scattered cells within 128x256 period).
 const SCATTERED_ROWS: [usize; 8] = [0, 8, 32, 40, 64, 72, 96, 104];
@@ -15,7 +17,7 @@ const SCATTERED_COLS: [usize; 16] = [
 ];
 
 /// CUTLASS Case 7.1 epilogue scatter (128x256 CTA, 128 cells/thread = 16x8 unique rows/cols).
-/// Must match `ScatteredThreadTile128x256` in src/cutlass/scattered_thread_tile.h.
+/// Must match `ScatteredThreadTile128x256` in src/cuda/cutlass/scattered_thread_tile.h.
 const CUTLASS_ROWS: [usize; 16] = [
     0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
 ];
@@ -60,6 +62,14 @@ fn job_key(header: &[u8], mining_config: &[u8]) -> [u8; 32] {
     buf.extend_from_slice(header);
     buf.extend_from_slice(mining_config);
     blake3_digest(&buf, None)
+}
+
+fn mining_config_for_layout(layout: TileLayout) -> Result<MiningConfiguration, String> {
+    let (rows_pat, cols_pat) = row_patterns(layout);
+    let row_offsets: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
+    let col_offsets: Vec<u32> = cols_pat.iter().map(|&o| o as u32).collect();
+    let bytes = mining_config_bytes(4096, 256, &row_offsets, &col_offsets)?;
+    MiningConfiguration::from_bytes(&bytes).map_err(|e| e.to_string())
 }
 
 fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
@@ -253,7 +263,7 @@ pub unsafe extern "C" fn cp_proof_build(
     0
 }
 
-/// Verify plain_proof base64 against a Stratum pool target (32-byte big-endian U256).
+/// Verify plain_proof base64 against pool target (32-byte BE U256).
 /// Returns 0 on success, -1 on error (message written to `err`).
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_verify(
@@ -267,8 +277,7 @@ pub unsafe extern "C" fn cp_proof_verify(
 ) -> i32 {
     use std::str;
     use zk_pow::api::proof::IncompleteBlockHeader;
-    use zk_pow::api::verify;
-    use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
+    use zk_pow::ffi::plain_proof::PlainProof;
 
     let err_slice = if err.is_null() || err_cap == 0 {
         None
@@ -309,22 +318,20 @@ pub unsafe extern "C" fn cp_proof_verify(
         Err(e) => return fail(format!("base64 decode: {e}")),
     };
 
-    let plain_proof: ZkPlainProof = match bincode::deserialize(&raw) {
+    let plain_proof: PlainProof = match PlainProof::deserialize_compat(&raw) {
         Ok(p) => p,
         Err(e) => return fail(format!("bincode deserialize: {e}")),
     };
 
     let mut target_arr = [0u8; 32];
     std::ptr::copy_nonoverlapping(pool_target_be, target_arr.as_mut_ptr(), 32);
-    let pool_target = U256::from_big_endian(&target_arr);
-
-    match verify::verify_plain_proof_with_pool_target(&block_header, &plain_proof, pool_target) {
+    match verify_plain_proof_with_pool_target(&block_header, &plain_proof, &target_arr) {
         Ok(()) => 0,
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("Jackpot condition not satisfied") {
                 if let Ok(detail) =
-                    jackpot_verify_detail(&block_header, &plain_proof, pool_target)
+                    jackpot_verify_detail(&block_header, &plain_proof, &target_arr)
                 {
                     return fail(detail);
                 }
@@ -332,42 +339,6 @@ pub unsafe extern "C" fn cp_proof_verify(
             fail(msg)
         }
     }
-}
-
-fn jackpot_verify_detail(
-    block_header: &zk_pow::api::proof::IncompleteBlockHeader,
-    plain_proof: &zk_pow::ffi::plain_proof::PlainProof,
-    pool_target: U256,
-) -> Result<String, String> {
-    use zk_pow::api::proof_utils::{
-        compute_jackpot_hash, CompiledPublicParams,
-    };
-    use zk_pow::api::sanity_checks::extract_difficulty_bound_from_base;
-    use zk_pow::circuit::chip::compute_jackpot;
-    use zk_pow::circuit::pearl_noise::compute_noise;
-    use zk_pow::ffi::plain_proof::parse_plain_proof;
-
-    let (private, public) =
-        parse_plain_proof(*block_header, plain_proof).map_err(|e| e.to_string())?;
-    let compiled = CompiledPublicParams::from(&public);
-    let noise = compute_noise(&compiled);
-    let jackpot = compute_jackpot(&compiled, &private.s_a, &private.s_b, &noise);
-    let hash = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-    let bound = extract_difficulty_bound_from_base(pool_target, &public.mining_config);
-    let hash_u = U256::from_little_endian(&hash);
-    let msg_hex: String = jackpot
-        .iter()
-        .map(|w| format!("{:08x}", w))
-        .collect::<Vec<_>>()
-        .join("");
-    Ok(format!(
-        "Jackpot hash 0x{:064x} exceeds bound 0x{:064x} (scaled work factor h*w*k_eff={}; recomputed msg={msg_hex})",
-        hash_u,
-        bound,
-        (public.mining_config.rows_pattern.size() as usize)
-            * (public.mining_config.cols_pattern.size() as usize)
-            * public.dot_product_length(),
-    ))
 }
 
 #[cfg(test)]
@@ -444,7 +415,6 @@ mod tests {
     #[test]
     fn build_then_verify_round_trip() {
         use zk_pow::api::proof::IncompleteBlockHeader;
-        use zk_pow::api::verify;
         use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
 
         let m = 4;
@@ -473,10 +443,8 @@ mod tests {
 
         let block_header = IncompleteBlockHeader::from_bytes(&header).unwrap();
         let raw = STANDARD.decode(&b64).unwrap();
-        let pp: ZkPlainProof = bincode::deserialize(&raw).unwrap();
-        // Easiest valid target: accept any hash (max U256).
-        let pool_target = U256::MAX;
-        verify::verify_plain_proof_with_pool_target(&block_header, &pp, pool_target)
-            .expect("verify with max target");
+        let pp: ZkPlainProof = ZkPlainProof::deserialize_compat(&raw).unwrap();
+        let pool_target = [0xffu8; 32];
+        verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target).expect("verify");
     }
 }

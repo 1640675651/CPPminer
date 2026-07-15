@@ -1,0 +1,694 @@
+#include "case33_gemm_xor.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+namespace {
+
+constexpr int kMR = Case33GemmXor::kMR;
+constexpr int kNR = Case33GemmXor::kNR;
+constexpr int kKR = Case33GemmXor::kKR;
+constexpr int kTileRows = Case33GemmXor::kTileRows;
+constexpr int kTileCols = Case33GemmXor::kTileCols;
+constexpr int kMacroM = Case33GemmXor::kMacroM;
+constexpr int kMacroN = Case33GemmXor::kMacroN;
+constexpr int kMicroPerMacroM = kMacroM / kMR;
+constexpr int kMicroPerMacroN = kMacroN / kNR;
+constexpr int kNumMilestones = Case33GemmXor::kNumMilestones;
+constexpr int kPanelA = kKR * kMR;
+constexpr int kPanelB = kKR * kNR;
+constexpr int kColsPerGroup = 8;
+constexpr int kRank = 4;
+
+bool cpu_has_avx2() {
+#if defined(__AVX2__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+int detect_thread_count() {
+#if defined(_OPENMP)
+    const int n = omp_get_max_threads();
+    return n > 0 ? n : 1;
+#else
+    return 1;
+#endif
+}
+
+void pack_a_panel(const int8_t *a, int row0, int k_base, int K, int8_t *a_tile,
+                  bool offset_a128) {
+    constexpr int kRowsPerVector = 8;
+    for (int rg = 0; rg < kMR / kRowsPerVector; ++rg) {
+        for (int kg = 0; kg < kKR / kRank; ++kg) {
+            int8_t *dst = a_tile + (rg * (kKR / kRank) + kg) * 32;
+            for (int r = 0; r < kRowsPerVector; ++r) {
+                for (int ko = 0; ko < kRank; ++ko) {
+                    int8_t v =
+                            a[static_cast<size_t>(row0 + rg * kRowsPerVector + r) *
+                                      static_cast<size_t>(K) +
+                              static_cast<size_t>(k_base + kg * kRank + ko)];
+                    if (offset_a128) {
+                        v = static_cast<int8_t>(static_cast<uint8_t>(v) + 128u);
+                    }
+                    dst[r * kRank + ko] = v;
+                }
+            }
+        }
+    }
+}
+
+void pack_b_panel(const int8_t *b, int col0, int k_base, int K, int8_t *b_tile) {
+    constexpr int kKGroups = kKR / kRank;
+    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
+        for (int kg = 0; kg < kKGroups; ++kg) {
+            int8_t *dst = b_tile + (jg * kKGroups + kg) * 32;
+            for (int c = 0; c < kColsPerGroup; ++c) {
+                for (int ko = 0; ko < kRank; ++ko) {
+                    dst[c * kRank + ko] =
+                            b[static_cast<size_t>(k_base + kg * kRank + ko) +
+                              static_cast<size_t>(col0 + jg * kColsPerGroup + c) *
+                                      static_cast<size_t>(K)];
+                }
+            }
+        }
+    }
+}
+
+void prepack_a_all(const int8_t *a, int M, int K, int blocks_k, bool offset_a128,
+                   std::vector<int8_t> *out) {
+    const int tile_rows = M / kMR;
+    out->assign(static_cast<size_t>(tile_rows) * static_cast<size_t>(blocks_k) *
+                        static_cast<size_t>(kPanelA),
+                0);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int tr = 0; tr < tile_rows; ++tr) {
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const size_t idx =
+                    (static_cast<size_t>(tr) * static_cast<size_t>(blocks_k) +
+                     static_cast<size_t>(kb)) *
+                    static_cast<size_t>(kPanelA);
+            pack_a_panel(a, tr * kMR, kb * kKR, K, out->data() + idx, offset_a128);
+        }
+    }
+}
+
+void prepack_b_all(const int8_t *b, int N, int K, int blocks_k, int tile_cols,
+                   std::vector<int8_t> *out) {
+    out->assign(static_cast<size_t>(tile_cols) * static_cast<size_t>(blocks_k) *
+                        static_cast<size_t>(kPanelB),
+                0);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int tc = 0; tc < tile_cols; ++tc) {
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const size_t idx =
+                    (static_cast<size_t>(tc) * static_cast<size_t>(blocks_k) +
+                     static_cast<size_t>(kb)) *
+                    static_cast<size_t>(kPanelB);
+            pack_b_panel(b, tc * kNR, kb * kKR, K, out->data() + idx);
+        }
+    }
+}
+
+void compute_b_compensation_milestones(const int8_t *b, int K, int N, int num_milestones,
+                                       int milestone_k, std::vector<int32_t> *out) {
+    out->assign(static_cast<size_t>(num_milestones) * static_cast<size_t>(N), 0);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int ms = 0; ms < num_milestones; ++ms) {
+        const int k0 = ms * milestone_k;
+        for (int j = 0; j < N; ++j) {
+            int32_t sum = 0;
+            for (int k = k0; k < k0 + milestone_k; ++k) {
+                sum += static_cast<int32_t>(
+                        b[static_cast<size_t>(k) + static_cast<size_t>(j) * K]);
+            }
+            (*out)[static_cast<size_t>(ms) * static_cast<size_t>(N) +
+                   static_cast<size_t>(j)] = -128 * sum;
+        }
+    }
+}
+
+uint32_t xor_tile(const int32_t *tile_c) {
+    uint32_t x = 0u;
+    for (int i = 0; i < kTileRows * kTileCols; ++i) {
+        x ^= static_cast<uint32_t>(tile_c[i]);
+    }
+    return x;
+}
+
+void scalar_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
+    constexpr int kKGroups = kKR / kRank;
+    for (int j = 0; j < kNR; ++j) {
+        for (int i = 0; i < kMR; ++i) {
+            for (int kk = 0; kk < kKR; ++kk) {
+                const int kg = kk / kRank;
+                const int ko = kk % kRank;
+                const size_t a_idx =
+                        static_cast<size_t>(kg) * 32 + static_cast<size_t>(i * kRank + ko);
+                vals[j * kMR + i] +=
+                        static_cast<int32_t>(a_tile[a_idx]) *
+                        static_cast<int32_t>(
+                                b_tile[(static_cast<size_t>(j / kColsPerGroup) *
+                                                static_cast<size_t>(kKGroups) +
+                                        static_cast<size_t>(kg)) *
+                                               32 +
+                                       static_cast<size_t>(j % kColsPerGroup) * 4 +
+                                       static_cast<size_t>(ko)]);
+            }
+        }
+    }
+}
+
+void scalar_micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int blocks_k,
+                                   int blocks_per_milestone, int num_milestones, int N,
+                                   int global_col0, size_t spatial_tile_id, size_t tile_count,
+                                   const int32_t *b_comp_ms, bool use_fast_u8s8,
+                                   bool xor_after_milestone, uint32_t *tile_xor_out) {
+    int32_t tile_c[kTileRows * kTileCols] = {};
+    int32_t vals[kNR * kMR] = {};
+    int ms = 0;
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        scalar_panel_accum(a_base + static_cast<size_t>(kb) * kPanelA,
+                           b_base + static_cast<size_t>(kb) * kPanelB, vals);
+
+        if ((kb + 1) % blocks_per_milestone != 0) {
+            continue;
+        }
+
+        const int32_t *b_comp_slice =
+                use_fast_u8s8 ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
+                              : nullptr;
+        for (int j = 0; j < kNR; ++j) {
+            const int32_t comp = b_comp_slice ? b_comp_slice[global_col0 + j] : 0;
+            for (int i = 0; i < kMR; ++i) {
+                tile_c[static_cast<size_t>(j) * kTileRows + i] +=
+                        vals[j * kMR + i] + comp;
+            }
+        }
+        if (xor_after_milestone) {
+            tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
+                    xor_tile(tile_c);
+        }
+        std::memset(vals, 0, sizeof(vals));
+        ++ms;
+    }
+    (void)num_milestones;
+}
+
+#if defined(__AVX2__)
+
+#if defined(_MSC_VER)
+#define CASE33_FORCEINLINE __forceinline
+#else
+#define CASE33_FORCEINLINE inline __attribute__((always_inline))
+#endif
+
+CASE33_FORCEINLINE __m256i rank4_maddubs(__m256i acc, __m256i ua, __m256i sb,
+                                         __m256i ones16) {
+    const __m256i pair16 = _mm256_maddubs_epi16(ua, sb);
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(pair16, ones16));
+}
+
+CASE33_FORCEINLINE __m256i broadcast_rank4_b(int32_t packed_b4) {
+    return _mm256_broadcastd_epi32(_mm_cvtsi32_si128(packed_b4));
+}
+
+CASE33_FORCEINLINE void rank4_kgroup_update8_fast(__m256i acc[kColsPerGroup], const __m256i ua,
+                                                  const int32_t *bp, __m256i ones16) {
+    const __m256i b0 = broadcast_rank4_b(bp[0]);
+    const __m256i b1 = broadcast_rank4_b(bp[1]);
+    const __m256i b2 = broadcast_rank4_b(bp[2]);
+    const __m256i b3 = broadcast_rank4_b(bp[3]);
+    const __m256i b4 = broadcast_rank4_b(bp[4]);
+    const __m256i b5 = broadcast_rank4_b(bp[5]);
+    const __m256i b6 = broadcast_rank4_b(bp[6]);
+    const __m256i b7 = broadcast_rank4_b(bp[7]);
+
+    acc[0] = rank4_maddubs(acc[0], ua, b0, ones16);
+    acc[1] = rank4_maddubs(acc[1], ua, b1, ones16);
+    acc[2] = rank4_maddubs(acc[2], ua, b2, ones16);
+    acc[3] = rank4_maddubs(acc[3], ua, b3, ones16);
+    acc[4] = rank4_maddubs(acc[4], ua, b4, ones16);
+    acc[5] = rank4_maddubs(acc[5], ua, b5, ones16);
+    acc[6] = rank4_maddubs(acc[6], ua, b6, ones16);
+    acc[7] = rank4_maddubs(acc[7], ua, b7, ones16);
+}
+
+CASE33_FORCEINLINE void rank4_kgroup_update8_exact(__m256i acc[kColsPerGroup], const __m256i abs_a,
+                                                   const __m256i va, const int32_t *bp,
+                                                   __m256i ones16) {
+    const __m256i b0 = broadcast_rank4_b(bp[0]);
+    const __m256i b1 = broadcast_rank4_b(bp[1]);
+    const __m256i b2 = broadcast_rank4_b(bp[2]);
+    const __m256i b3 = broadcast_rank4_b(bp[3]);
+    const __m256i b4 = broadcast_rank4_b(bp[4]);
+    const __m256i b5 = broadcast_rank4_b(bp[5]);
+    const __m256i b6 = broadcast_rank4_b(bp[6]);
+    const __m256i b7 = broadcast_rank4_b(bp[7]);
+
+    acc[0] = rank4_maddubs(acc[0], abs_a, _mm256_sign_epi8(b0, va), ones16);
+    acc[1] = rank4_maddubs(acc[1], abs_a, _mm256_sign_epi8(b1, va), ones16);
+    acc[2] = rank4_maddubs(acc[2], abs_a, _mm256_sign_epi8(b2, va), ones16);
+    acc[3] = rank4_maddubs(acc[3], abs_a, _mm256_sign_epi8(b3, va), ones16);
+    acc[4] = rank4_maddubs(acc[4], abs_a, _mm256_sign_epi8(b4, va), ones16);
+    acc[5] = rank4_maddubs(acc[5], abs_a, _mm256_sign_epi8(b5, va), ones16);
+    acc[6] = rank4_maddubs(acc[6], abs_a, _mm256_sign_epi8(b6, va), ones16);
+    acc[7] = rank4_maddubs(acc[7], abs_a, _mm256_sign_epi8(b7, va), ones16);
+}
+
+CASE33_FORCEINLINE __m256i accum_col_group_to_tile(const __m256i acc[kColsPerGroup],
+                                                   int32_t *tile_c, int local_row0,
+                                                   int global_col0, int local_col0,
+                                                   const int32_t *b_comp_ms,
+                                                   bool xor_epilogue) {
+    __m256i xor_vec = _mm256_setzero_si256();
+    for (int c = 0; c < kColsPerGroup; ++c) {
+        __m256i v = acc[c];
+        if (b_comp_ms) {
+            v = _mm256_add_epi32(v, _mm256_set1_epi32(b_comp_ms[global_col0 + c]));
+        }
+        int32_t *dst = tile_c + static_cast<size_t>(local_col0 + c) * kTileRows + local_row0;
+        v = _mm256_add_epi32(
+                v, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst)));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), v);
+        if (xor_epilogue) {
+            xor_vec = _mm256_xor_si256(xor_vec, v);
+        }
+    }
+    return xor_vec;
+}
+
+CASE33_FORCEINLINE uint32_t reduce_xor_epi32(__m256i v) {
+    v = _mm256_xor_si256(v, _mm256_permute2x128_si256(v, v, 0x01));
+    __m128i x = _mm256_castsi256_si128(v);
+    x = _mm_xor_si128(x, _mm_srli_si128(x, 8));
+    x = _mm_xor_si128(x, _mm_srli_si128(x, 4));
+    return static_cast<uint32_t>(_mm_cvtsi128_si32(x));
+}
+
+template <typename UpdateFn>
+CASE33_FORCEINLINE void avx2_micro_gemm_kgroups(__m256i acc0[kColsPerGroup],
+                                                __m256i acc1[kColsPerGroup],
+                                                const int8_t *a_tile, const int8_t *b_jg0,
+                                                const int8_t *b_jg1, UpdateFn update) {
+    constexpr int kKGroups = kKR / kRank;
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    int kg = 0;
+    for (; kg + 1 < kKGroups; kg += 2) {
+        const __m256i va0 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg * 32));
+        const int32_t *bp0_0 =
+                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg) * 32);
+        const int32_t *bp1_0 =
+                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg) * 32);
+        update(acc0, va0, bp0_0, ones16);
+        update(acc1, va0, bp1_0, ones16);
+
+        const int kg1 = kg + 1;
+        const __m256i va1 =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg1 * 32));
+        const int32_t *bp0_1 =
+                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg1) * 32);
+        const int32_t *bp1_1 =
+                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg1) * 32);
+        update(acc0, va1, bp0_1, ones16);
+        update(acc1, va1, bp1_1, ones16);
+    }
+    for (; kg < kKGroups; ++kg) {
+        const __m256i va =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg * 32));
+        const int32_t *bp0 =
+                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg) * 32);
+        const int32_t *bp1 =
+                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg) * 32);
+        update(acc0, va, bp0, ones16);
+        update(acc1, va, bp1, ones16);
+    }
+}
+
+CASE33_FORCEINLINE void zero_micro_acc(__m256i acc0[kColsPerGroup],
+                                       __m256i acc1[kColsPerGroup]) {
+    for (int col = 0; col < kColsPerGroup; ++col) {
+        acc0[col] = _mm256_setzero_si256();
+        acc1[col] = _mm256_setzero_si256();
+    }
+}
+
+void avx2_micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int blocks_k,
+                                 int blocks_per_milestone, int num_milestones, int N,
+                                 int global_col0, size_t spatial_tile_id, size_t tile_count,
+                                 const int32_t *b_comp_ms, bool use_fast_u8s8,
+                                 bool xor_after_milestone, uint32_t *tile_xor_out) {
+    constexpr int kKGroups = kKR / kRank;
+
+    int32_t tile_c[kTileRows * kTileCols] = {};
+    __m256i acc0[kColsPerGroup];
+    __m256i acc1[kColsPerGroup];
+    zero_micro_acc(acc0, acc1);
+
+    int ms = 0;
+    const auto milestone_epilogue = [&](const int32_t *b_comp_slice) {
+        const __m256i xor0 = accum_col_group_to_tile(
+                acc0, tile_c, 0, global_col0, 0, b_comp_slice, xor_after_milestone);
+        const __m256i xor1 = accum_col_group_to_tile(
+                acc1, tile_c, 0, global_col0 + kColsPerGroup, kColsPerGroup,
+                b_comp_slice, xor_after_milestone);
+        if (xor_after_milestone) {
+            tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
+                    reduce_xor_epi32(_mm256_xor_si256(xor0, xor1));
+        }
+        zero_micro_acc(acc0, acc1);
+        ++ms;
+    };
+
+    if (use_fast_u8s8) {
+        const auto update_fast = [](__m256i acc[kColsPerGroup], const __m256i ua,
+                                    const int32_t *bp, const __m256i ones16) {
+            rank4_kgroup_update8_fast(acc, ua, bp, ones16);
+        };
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
+            const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
+            avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
+                                    b_tile + static_cast<size_t>(kKGroups) * 32,
+                                    update_fast);
+            if ((kb + 1) % blocks_per_milestone == 0) {
+                const int32_t *b_comp_slice =
+                        b_comp_ms ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
+                                  : nullptr;
+                milestone_epilogue(b_comp_slice);
+            }
+        }
+    } else {
+        const auto update_exact = [](__m256i acc[kColsPerGroup], const __m256i va,
+                                     const int32_t *bp, const __m256i ones16) {
+            const __m256i abs_a = _mm256_sign_epi8(va, va);
+            rank4_kgroup_update8_exact(acc, abs_a, va, bp, ones16);
+        };
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
+            const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
+            avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
+                                    b_tile + static_cast<size_t>(kKGroups) * 32,
+                                    update_exact);
+            if ((kb + 1) % blocks_per_milestone == 0) {
+                milestone_epilogue(nullptr);
+            }
+        }
+    }
+    (void)num_milestones;
+}
+#undef CASE33_FORCEINLINE
+#endif
+
+void micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int blocks_k,
+                            int blocks_per_milestone, int num_milestones, int N,
+                            int global_col0, size_t spatial_tile_id, size_t tile_count,
+                            const int32_t *b_comp_ms, bool use_fast_u8s8, bool use_avx2,
+                            bool xor_after_milestone, uint32_t *tile_xor_out) {
+#if defined(__AVX2__)
+    if (use_avx2) {
+        avx2_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
+                                    num_milestones, N, global_col0, spatial_tile_id,
+                                    tile_count, b_comp_ms, use_fast_u8s8,
+                                    xor_after_milestone, tile_xor_out);
+        return;
+    }
+#else
+    (void)use_avx2;
+#endif
+    scalar_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
+                                  num_milestones, N, global_col0, spatial_tile_id,
+                                  tile_count, b_comp_ms, use_fast_u8s8, xor_after_milestone,
+                                  tile_xor_out);
+}
+
+void micro_gemm_xor_milestones(const int8_t *a_base, const int8_t *b_base, int blocks_k,
+                               int blocks_per_milestone, int num_milestones, int N,
+                               int global_col0, size_t spatial_tile_id, size_t tile_count,
+                               const int32_t *b_comp_ms, bool use_fast_u8s8, bool use_avx2,
+                               bool xor_after_milestone, uint32_t *tile_xor_out) {
+    micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone, num_milestones,
+                           N, global_col0, spatial_tile_id, tile_count, b_comp_ms,
+                           use_fast_u8s8, use_avx2, xor_after_milestone, tile_xor_out);
+}
+
+// Case 3.2 macro schedule: 2D OpenMP over macro blocks, tc outer / tr inner (B reuse).
+void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, int blocks_k,
+                             int blocks_per_milestone, int num_milestones, int macro_rows,
+                             int macro_cols, int tile_cols, size_t tile_count,
+                             const int32_t *b_comp_ms, bool use_fast_u8s8, bool use_avx2,
+                             bool xor_after_milestone, std::vector<uint32_t> *out) {
+    const size_t a_tile_stride =
+            static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelA);
+    const size_t b_tile_stride =
+            static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelB);
+    const int macro_blocks = macro_cols * macro_rows;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int mb = 0; mb < macro_blocks; ++mb) {
+        const int jm = mb / macro_rows;
+        const int im = mb % macro_rows;
+        const int col0 = jm * kMacroN;
+        const int tc0 = jm * kMicroPerMacroN;
+        const int row0 = im * kMacroM;
+        const int tr0 = im * kMicroPerMacroM;
+
+        for (int tc = 0; tc < kMicroPerMacroN; ++tc) {
+            const int tc_global = tc0 + tc;
+            const int micro_col0 = col0 + tc * kNR;
+            const int8_t *b_base =
+                    b_pre + static_cast<size_t>(tc_global) * b_tile_stride;
+
+            for (int tr = 0; tr < kMicroPerMacroM; ++tr) {
+                const int tr_global = tr0 + tr;
+                const int micro_row0 = row0 + tr * kMR;
+                const int8_t *a_base =
+                        a_pre + static_cast<size_t>(tr_global) * a_tile_stride;
+                const size_t spatial_tile_id =
+                        static_cast<size_t>(tr_global) * static_cast<size_t>(tile_cols) +
+                        static_cast<size_t>(tc_global);
+
+                micro_gemm_xor_milestones(
+                        a_base, b_base, blocks_k, blocks_per_milestone, num_milestones,
+                        N, micro_col0, spatial_tile_id, tile_count, b_comp_ms,
+                        use_fast_u8s8, use_avx2, xor_after_milestone, out->data());
+            }
+        }
+    }
+}
+
+void run_fused_impl(const int8_t *a_pre, const int8_t *b_pre, int N, int blocks_k,
+                    int blocks_per_milestone, int num_milestones, int macro_rows,
+                    int macro_cols, int tile_cols, size_t tile_count,
+                    const int32_t *b_comp_ms, bool use_fast_u8s8, bool use_avx2,
+                    bool xor_after_milestone, std::vector<uint32_t> *out) {
+    out->assign(static_cast<size_t>(num_milestones) * tile_count, 0u);
+    run_hardcoded_macro_xor(a_pre, b_pre, N, blocks_k, blocks_per_milestone, num_milestones,
+                            macro_rows, macro_cols, tile_cols, tile_count, b_comp_ms,
+                            use_fast_u8s8, use_avx2, xor_after_milestone, out);
+}
+
+bool run_online_tile_scan(
+        const int8_t *a_pre, const int8_t *b_pre, int N, int blocks_k,
+        int blocks_per_milestone, int num_milestones, int macro_rows, int macro_cols,
+        const int32_t *b_comp_ms, bool use_fast_u8s8, bool use_avx2,
+        const std::function<bool(const uint32_t *milestone_xor, int t_rows, int t_cols)>
+                &on_tile,
+        const std::function<bool()> &should_cancel) {
+    const size_t a_tile_stride =
+            static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelA);
+    const size_t b_tile_stride =
+            static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelB);
+    const int macro_blocks = macro_cols * macro_rows;
+    std::atomic<int> stop{0};
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int mb = 0; mb < macro_blocks; ++mb) {
+        if (stop.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        if (should_cancel && should_cancel()) {
+            stop.store(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        const int jm = mb / macro_rows;
+        const int im = mb % macro_rows;
+        const int col0 = jm * kMacroN;
+        const int tc0 = jm * kMicroPerMacroN;
+        const int row0 = im * kMacroM;
+        const int tr0 = im * kMicroPerMacroM;
+
+        for (int tc = 0; tc < kMicroPerMacroN && !stop.load(std::memory_order_relaxed);
+             ++tc) {
+            const int tc_global = tc0 + tc;
+            const int micro_col0 = col0 + tc * kNR;
+            const int8_t *b_base =
+                    b_pre + static_cast<size_t>(tc_global) * b_tile_stride;
+
+            for (int tr = 0; tr < kMicroPerMacroM; ++tr) {
+                if (stop.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (should_cancel && should_cancel()) {
+                    stop.store(1, std::memory_order_relaxed);
+                    break;
+                }
+
+                const int tr_global = tr0 + tr;
+                const int micro_row0 = row0 + tr * kMR;
+                const int8_t *a_base =
+                        a_pre + static_cast<size_t>(tr_global) * a_tile_stride;
+
+                uint32_t milestone_xor[kNumMilestones] = {};
+                micro_gemm_xor_milestones(
+                        a_base, b_base, blocks_k, blocks_per_milestone, num_milestones, N,
+                        micro_col0, /*spatial_tile_id=*/0, /*tile_count=*/1, b_comp_ms,
+                        use_fast_u8s8, use_avx2, true, milestone_xor);
+
+                if (!on_tile(milestone_xor, micro_row0, micro_col0)) {
+                    stop.store(1, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
+    return !(should_cancel && should_cancel());
+}
+
+} // namespace
+
+bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) {
+    available_ = false;
+    backend_ = "unavailable";
+    num_threads_ = detect_thread_count();
+
+    M_ = M;
+    N_ = N;
+    K_ = K;
+    milestone_k_ = K / kNumMilestones;
+    blocks_k_ = K / kKR;
+    blocks_per_milestone_ = milestone_k_ / kKR;
+    tile_cols_ = N / kTileCols;
+    tile_count_ = static_cast<size_t>(M / kTileRows) * static_cast<size_t>(tile_cols_);
+    macro_rows_ = M / kMacroM;
+    macro_cols_ = N / kMacroN;
+
+    if (M % kMacroM != 0 || N % kMacroN != 0) {
+        return false;
+    }
+    if (M % kTileRows != 0 || N % kTileCols != 0 || K % kNumMilestones != 0) {
+        return false;
+    }
+    if (milestone_k_ % kKR != 0) {
+        return false;
+    }
+
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    bool b_has_min_int8 = false;
+    if (!use_fast) {
+        for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
+            if (b[i] == INT8_MIN) {
+                b_has_min_int8 = true;
+                break;
+            }
+        }
+        if (b_has_min_int8) {
+            return false;
+        }
+    }
+
+    b_comp_ms_.clear();
+    if (use_fast) {
+        compute_b_compensation_milestones(b, K_, N_, kNumMilestones, milestone_k_,
+                                          &b_comp_ms_);
+        prepack_a_all(a, M_, K_, blocks_k_, true, &a_pre_);
+    } else {
+        prepack_a_all(a, M_, K_, blocks_k_, false, &a_pre_);
+    }
+    prepack_b_all(b, N_, K_, blocks_k_, N / kNR, &b_pre_);
+    tile_xor_.clear();
+
+    const bool avx2 = cpu_has_avx2();
+#if defined(_OPENMP)
+    const char *par = "OpenMP";
+#else
+    const char *par = "serial";
+#endif
+    if (avx2 && use_fast) {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K u8s8+XOR, AVX2 8x16 KR=%d",
+                      par, kMacroM, kMacroN, kKR);
+    } else if (avx2) {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, AVX2 8x16 KR=%d",
+                      par, kMacroM, kMacroN, kKR);
+    } else {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K scalar 8x16+XOR KR=%d", par,
+                      kMacroM, kMacroN, kKR);
+    }
+    backend_ = backend_buf_;
+    available_ = true;
+    return true;
+}
+
+void Case33GemmXor::run() {
+    if (!available_) {
+        return;
+    }
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    run_fused_impl(a_pre_.data(), b_pre_.data(), N_, blocks_k_, blocks_per_milestone_,
+                   kNumMilestones, macro_rows_, macro_cols_, tile_cols_, tile_count_,
+                   b_comp_ms_.data(), use_fast, cpu_has_avx2(), true, &tile_xor_);
+}
+
+bool Case33GemmXor::scan_tiles(
+        const std::function<bool(const uint32_t *milestone_xor, int t_rows, int t_cols)>
+                &on_tile,
+        const std::function<bool()> &should_cancel) {
+    if (!available_ || !on_tile) {
+        return false;
+    }
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    return run_online_tile_scan(a_pre_.data(), b_pre_.data(), N_, blocks_k_,
+                                blocks_per_milestone_, kNumMilestones, macro_rows_,
+                                macro_cols_, b_comp_ms_.data(), use_fast, cpu_has_avx2(),
+                                on_tile, should_cancel);
+}
+
+void Case33GemmXor::run_gemm_only() {
+    if (!available_) {
+        return;
+    }
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    run_fused_impl(a_pre_.data(), b_pre_.data(), N_, blocks_k_, blocks_per_milestone_,
+                   kNumMilestones, macro_rows_, macro_cols_, tile_cols_, tile_count_,
+                   b_comp_ms_.data(), use_fast, cpu_has_avx2(), false, &tile_xor_);
+}

@@ -179,7 +179,7 @@ impl MerkleTree {
 // ============================================================================
 
 /// Generic multi-leaf Merkle proof, domain-agnostic.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MerkleProof"))]
 #[cfg_attr(
     feature = "serde",

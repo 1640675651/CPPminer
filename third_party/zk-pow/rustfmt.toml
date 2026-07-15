@@ -1,0 +1,4 @@
+max_width = 130
+# Explicit import settings for consistency across IDE and CLI
+reorder_imports = true
+reorder_modules = true
