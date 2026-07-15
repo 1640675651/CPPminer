@@ -584,11 +584,7 @@ bool run_online_tile_scan(
 
 } // namespace
 
-bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) {
-    available_ = false;
-    backend_ = "unavailable";
-    num_threads_ = detect_thread_count();
-
+bool Case33GemmXor::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
@@ -609,32 +605,11 @@ bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) 
     if (milestone_k_ % kKR != 0) {
         return false;
     }
+    return true;
+}
 
+void Case33GemmXor::update_backend_label_() {
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
-    bool b_has_min_int8 = false;
-    if (!use_fast) {
-        for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
-            if (b[i] == INT8_MIN) {
-                b_has_min_int8 = true;
-                break;
-            }
-        }
-        if (b_has_min_int8) {
-            return false;
-        }
-    }
-
-    b_comp_ms_.clear();
-    if (use_fast) {
-        compute_b_compensation_milestones(b, K_, N_, kNumMilestones, milestone_k_,
-                                          &b_comp_ms_);
-        prepack_a_all(a, M_, K_, blocks_k_, true, &a_pre_);
-    } else {
-        prepack_a_all(a, M_, K_, blocks_k_, false, &a_pre_);
-    }
-    prepack_b_all(b, N_, K_, blocks_k_, N / kNR, &b_pre_);
-    tile_xor_.clear();
-
     const bool avx2 = cpu_has_avx2();
 #if defined(_OPENMP)
     const char *par = "OpenMP";
@@ -655,8 +630,70 @@ bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) 
                       kMacroM, kMacroN, kKR);
     }
     backend_ = backend_buf_;
+}
+
+void Case33GemmXor::reset() {
+    available_ = false;
+    b_job_ready_ = false;
+    backend_ = "unavailable";
+    a_pre_.clear();
+    b_pre_.clear();
+    b_comp_ms_.clear();
+    tile_xor_.clear();
+}
+
+bool Case33GemmXor::prepare_job_b(int M, int N, int K, const int8_t *b_noisy) {
+    available_ = false;
+    b_job_ready_ = false;
+    num_threads_ = detect_thread_count();
+
+    if (!b_noisy || !setup_dims_(M, N, K)) {
+        return false;
+    }
+
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    if (!use_fast) {
+        for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
+            if (b_noisy[i] == INT8_MIN) {
+                return false;
+            }
+        }
+    }
+
+    b_comp_ms_.clear();
+    if (use_fast) {
+        compute_b_compensation_milestones(b_noisy, K_, N_, kNumMilestones, milestone_k_,
+                                          &b_comp_ms_);
+    }
+    prepack_b_all(b_noisy, N_, K_, blocks_k_, N / kNR, &b_pre_);
+    tile_xor_.clear();
+    update_backend_label_();
+    b_job_ready_ = true;
+    return true;
+}
+
+bool Case33GemmXor::prepare_attempt_a(const int8_t *a_noisy) {
+    if (!b_job_ready_ || !a_noisy) {
+        return false;
+    }
+
+    const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    if (use_fast) {
+        prepack_a_all(a_noisy, M_, K_, blocks_k_, true, &a_pre_);
+    } else {
+        prepack_a_all(a_noisy, M_, K_, blocks_k_, false, &a_pre_);
+    }
     available_ = true;
     return true;
+}
+
+bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) {
+    reset();
+    set_int8_mode(int8_mode_);
+    if (!prepare_job_b(M, N, K, b)) {
+        return false;
+    }
+    return prepare_attempt_a(a);
 }
 
 void Case33GemmXor::run() {

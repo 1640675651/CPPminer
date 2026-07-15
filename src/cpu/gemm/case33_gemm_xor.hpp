@@ -21,6 +21,11 @@ struct Case33GemmXor {
     void set_int8_mode(Case32Int8Mode mode) { int8_mode_ = mode; }
 
     bool init(int M, int N, int K, const int8_t *a, const int8_t *b);
+    /* Zero-B CPU: prepack B once per job, A each attempt (reuses a_pre_/b_pre_). */
+    bool prepare_job_b(int M, int N, int K, const int8_t *b_noisy);
+    bool prepare_attempt_a(const int8_t *a_noisy);
+    void reset();
+
     bool available() const { return available_; }
 
     void run();
@@ -40,7 +45,11 @@ struct Case33GemmXor {
     int tile_cols() const { return tile_cols_; }
 
 private:
+    bool setup_dims_(int M, int N, int K);
+    void update_backend_label_();
+
     bool available_ = false;
+    bool b_job_ready_ = false;
     const char *backend_ = "unavailable";
     int num_threads_ = 1;
     Case32Int8Mode int8_mode_ = Case32Int8Mode::FastU8S8;

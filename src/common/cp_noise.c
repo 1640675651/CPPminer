@@ -843,10 +843,12 @@ int pearl_build_noisy_b(int n, int k, int rank,
                 if(aborted) continue;
                 generate_uniform_row(col, rank, PEARL_SEED_LABEL_B, b_noise_seed, br_local);
                 matvec_sparse_perm(e_bl, k, br_local, nr_local);
-                const int8_t* br = Bt + (size_t)col * (size_t)k;
+                const int8_t* br = Bt ? Bt + (size_t)col * (size_t)k : NULL;
                 int8_t* dst = B_out + (size_t)col * (size_t)k;
-                for(int l = 0; l < k; l++)
-                    dst[l] = (int8_t)((int32_t)br[l] + (int32_t)nr_local[l]);
+                for(int l = 0; l < k; l++){
+                    int32_t sig = br ? (int32_t)br[l] : 0;
+                    dst[l] = (int8_t)(sig + (int32_t)nr_local[l]);
+                }
             }
         }
         free(br_local);
@@ -860,10 +862,12 @@ int pearl_build_noisy_b(int n, int k, int rank,
         if((col & 255) == 0 && cp_job_should_cancel()){ aborted = 1; break; }
         generate_uniform_row(col, rank, PEARL_SEED_LABEL_B, b_noise_seed, br_row);
         matvec_sparse_perm(e_bl, k, br_row, nr);
-        const int8_t* br = Bt + (size_t)col * (size_t)k;
+        const int8_t* br = Bt ? Bt + (size_t)col * (size_t)k : NULL;
         int8_t* dst = B_out + (size_t)col * (size_t)k;
-        for(int l = 0; l < k; l++)
-            dst[l] = (int8_t)((int32_t)br[l] + (int32_t)nr[l]);
+        for(int l = 0; l < k; l++){
+            int32_t sig = br ? (int32_t)br[l] : 0;
+            dst[l] = (int8_t)(sig + (int32_t)nr[l]);
+        }
     }
     free(br_row);
     free(nr);

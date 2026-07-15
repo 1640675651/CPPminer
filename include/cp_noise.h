@@ -100,6 +100,7 @@ int pearl_build_noisy_a(int m, int k, int rank,
                         const uint8_t a_noise_seed[32],
                         const int8_t* A, int8_t* A_out);
 
+/* Bt may be NULL when signal B^T is all zeros. */
 int pearl_build_noisy_b(int n, int k, int rank,
                         const uint8_t b_noise_seed[32],
                         const int8_t* Bt, int8_t* B_out);

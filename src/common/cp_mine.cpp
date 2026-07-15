@@ -181,6 +181,9 @@ int cp_mine_job(
     }
 
     pearl_job_key(header, hlen, job_key_bytes);
+    if(cp_worker_worker_handles_matrix_prep()){
+        memset(h_BpT_global, 0, szBpT);
+    }
     cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active);
     tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles())
                       * cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
