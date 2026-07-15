@@ -29,6 +29,7 @@ struct ZeroBCache {
 /* Single copies: A_noisy row-major; a_pre_/b_pre_ live in g_gemm. */
 static std::vector<int8_t> g_A_noisy;
 static Case33GemmXor g_gemm;
+static int g_inplace_prepack = 0;
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
 {
@@ -50,6 +51,7 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
 
     g_gemm.reset();
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
+    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
 
     if(log_step) t_step = cp_now_sec();
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
@@ -62,7 +64,7 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
         return cp_job_should_cancel() ? -1 : -2;
     }
 
-    if(!g_gemm.prepare_job_b(m, n, K_DIM, g_zero_b.B_noisy.data())){
+    if(!g_gemm.prepare_job_b(m, n, K_DIM, &g_zero_b.B_noisy)){
         g_zero_b.ready = 0;
         fprintf(stderr, "[cpu] prepare_job_b failed\n");
         return -2;
@@ -106,7 +108,7 @@ static int zero_b_prepare_attempt(
         return cp_job_should_cancel() ? -1 : -2;
     }
 
-    if(!g_gemm.prepare_attempt_a(g_A_noisy.data())){
+    if(!g_gemm.prepare_attempt_a(&g_A_noisy)){
         fprintf(stderr, "[cpu] prepare_attempt_a failed\n");
         return -2;
     }
@@ -125,15 +127,25 @@ extern "C" void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n)
 {
     g_zero_b.ready = 0;
     if(zero_b_prepare_job(job_key, m, n) == 0){
-        printf("[cpu] zero-B: cached noisy B + b_pre for job (signal B^T = 0)\n");
+        printf("[cpu] zero-B: cached %s for job (signal B^T = 0)\n",
+               g_inplace_prepack ? "noisy B scan buf" : "noisy B + b_pre");
         fflush(stdout);
     }
+}
+
+extern "C" void cp_cpu_worker_set_inplace_prepack(int on)
+{
+    g_inplace_prepack = on ? 1 : 0;
+    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
 }
 
 extern "C" void cp_cpu_worker_init(void)
 {
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
+    g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
     printf("[cpu] Case 3.3 fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
+    if(g_inplace_prepack)
+        printf("[cpu] in-place prepack enabled (~2 GiB matrix steady; brief 2x during prepack)\n");
     fflush(stdout);
 }
 
@@ -180,6 +192,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
     } else {
         g_gemm.reset();
         g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
+        g_gemm.set_inplace_prepack(g_inplace_prepack != 0);
         if(!g_gemm.init(m, n, K_DIM, h_A_noisy, h_B_noisy)){
             fprintf(stderr, "[cpu] Case3.3 init failed (host matrices)\n");
             return -1;

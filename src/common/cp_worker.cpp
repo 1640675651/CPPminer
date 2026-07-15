@@ -207,6 +207,16 @@ extern "C" void cp_worker_set_cutlass_fused(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_inplace_prepack(int on)
+{
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+        cp_cpu_worker_set_inplace_prepack(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" int cp_worker_prefers_host_matrices(void)
 {
     return cp_worker_backend_id() == CP_BACKEND_CPU;

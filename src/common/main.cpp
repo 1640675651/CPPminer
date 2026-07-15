@@ -65,6 +65,7 @@ static void print_usage(void)
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
+    printf("  --inplace-prepack    CPU: reuse noisy buffers as scan layout (~2 GiB steady)\n");
 }
 
 static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -146,6 +147,7 @@ int main(int argc, char** argv)
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = 1;
     int cutlass_fused = 0;
+    int inplace_prepack = 0;
     int profile_scan = 0;
     int profile_runs = 10;
     CpBackendId backend_sel = CP_BACKEND_NONE;
@@ -206,6 +208,8 @@ int main(int argc, char** argv)
             cutlass_fused = 1;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
+        } else if(!strcmp(argv[i], "--inplace-prepack")){
+            inplace_prepack = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
@@ -319,6 +323,7 @@ int main(int argc, char** argv)
     cp_worker_set_cutlass_fused(cutlass_fused);
     pearl_set_cutlass_fused(cutlass_fused);
     g_cutlass_fused = cutlass_fused;
+    cp_worker_set_inplace_prepack(inplace_prepack);
 
     if(cutlass_fused){
         if(no_period_gemm){
@@ -359,6 +364,12 @@ int main(int argc, char** argv)
                              : "BzMiner periodic scattered 8x16"));
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
             printf("[mode] scan: Case 3.3 fused GEMM + XOR + host jackpot\n");
+            if(inplace_prepack)
+                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (reuse-scan prepack)\n",
+                       host_mib * 2.0);
+            else
+                printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
+                       host_mib, host_mib * 2.0);
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 16 A + 8 B^T (CUTLASS Case 7.1 offsets)\n");
             printf("[mode] scan: CUTLASS fused GEMM + jackpot (mainloop tail)\n");

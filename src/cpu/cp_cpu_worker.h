@@ -10,6 +10,9 @@ extern "C" {
 void cp_cpu_worker_init(void);
 void cp_cpu_worker_shutdown(void);
 
+/* Reuse noisy buffers as scan layout via prepack+swap (~2 GiB steady vs ~3 GiB). */
+void cp_cpu_worker_set_inplace_prepack(int on);
+
 /* Zero-B path: worker builds matrices; skip host gen in cp_mine when non-zero. */
 int cp_cpu_worker_handles_matrix_prep(void);
 

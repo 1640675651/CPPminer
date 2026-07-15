@@ -582,7 +582,47 @@ bool run_online_tile_scan(
     return !(should_cancel && should_cancel());
 }
 
+int case33_test_inplace_prepack_impl(int M, int N, int K) {
+    if (M % kMR != 0 || N % kNR != 0 || K % kKR != 0) {
+        return 2;
+    }
+    const int blocks_k = K / kKR;
+    const int tile_cols = N / kNR;
+
+    std::vector<int8_t> row_a(static_cast<size_t>(M) * static_cast<size_t>(K));
+    std::vector<int8_t> row_b(static_cast<size_t>(K) * static_cast<size_t>(N));
+    for (size_t i = 0; i < row_a.size(); ++i) {
+        row_a[i] = static_cast<int8_t>((i * 17u + 3u) & 0xffu);
+    }
+    for (size_t i = 0; i < row_b.size(); ++i) {
+        row_b[i] = static_cast<int8_t>((i * 31u + 7u) & 0xffu);
+    }
+
+    std::vector<int8_t> ref_a;
+    std::vector<int8_t> ref_b;
+    prepack_a_all(row_a.data(), M, K, blocks_k, true, &ref_a);
+    prepack_b_all(row_b.data(), N, K, blocks_k, tile_cols, &ref_b);
+
+    std::vector<int8_t> inp_a = row_a;
+    std::vector<int8_t> inp_b = row_b;
+    std::vector<int8_t> tmp_a;
+    std::vector<int8_t> tmp_b;
+    prepack_a_all(inp_a.data(), M, K, blocks_k, true, &tmp_a);
+    prepack_b_all(inp_b.data(), N, K, blocks_k, tile_cols, &tmp_b);
+    std::swap(inp_a, tmp_a);
+    std::swap(inp_b, tmp_b);
+
+    if (inp_a != ref_a || inp_b != ref_b) {
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
+
+int case33_test_inplace_prepack(int M, int N, int K) {
+    return case33_test_inplace_prepack_impl(M, N, K);
+}
 
 bool Case33GemmXor::setup_dims_(int M, int N, int K) {
     M_ = M;
@@ -618,16 +658,18 @@ void Case33GemmXor::update_backend_label_() {
 #endif
     if (avx2 && use_fast) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K u8s8+XOR, AVX2 8x16 KR=%d",
-                      par, kMacroM, kMacroN, kKR);
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K u8s8+XOR, AVX2 8x16 KR=%d%s",
+                      par, kMacroM, kMacroN, kKR,
+                      inplace_prepack_ ? " reuse-scan-buf" : "");
     } else if (avx2) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, AVX2 8x16 KR=%d",
-                      par, kMacroM, kMacroN, kKR);
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, AVX2 8x16 KR=%d%s",
+                      par, kMacroM, kMacroN, kKR,
+                      inplace_prepack_ ? " reuse-scan-buf" : "");
     } else {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K scalar 8x16+XOR KR=%d", par,
-                      kMacroM, kMacroN, kKR);
+                      "Case3.2 ukernel %s %dx%d 2D-par fused-K scalar 8x16+XOR KR=%d%s", par,
+                      kMacroM, kMacroN, kKR, inplace_prepack_ ? " reuse-scan-buf" : "");
     }
     backend_ = backend_buf_;
 }
@@ -636,25 +678,28 @@ void Case33GemmXor::reset() {
     available_ = false;
     b_job_ready_ = false;
     backend_ = "unavailable";
+    a_scan_ = nullptr;
+    b_scan_ = nullptr;
     a_pre_.clear();
     b_pre_.clear();
     b_comp_ms_.clear();
     tile_xor_.clear();
 }
 
-bool Case33GemmXor::prepare_job_b(int M, int N, int K, const int8_t *b_noisy) {
+bool Case33GemmXor::prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_noisy) {
     available_ = false;
     b_job_ready_ = false;
     num_threads_ = detect_thread_count();
 
-    if (!b_noisy || !setup_dims_(M, N, K)) {
+    if (!b_noisy || b_noisy->empty() || !setup_dims_(M, N, K)) {
         return false;
     }
 
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
+    const int8_t *b_row = b_noisy->data();
     if (!use_fast) {
         for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
-            if (b_noisy[i] == INT8_MIN) {
+            if (b_row[i] == INT8_MIN) {
                 return false;
             }
         }
@@ -662,26 +707,43 @@ bool Case33GemmXor::prepare_job_b(int M, int N, int K, const int8_t *b_noisy) {
 
     b_comp_ms_.clear();
     if (use_fast) {
-        compute_b_compensation_milestones(b_noisy, K_, N_, kNumMilestones, milestone_k_,
+        compute_b_compensation_milestones(b_row, K_, N_, kNumMilestones, milestone_k_,
                                           &b_comp_ms_);
     }
-    prepack_b_all(b_noisy, N_, K_, blocks_k_, N / kNR, &b_pre_);
+    if (inplace_prepack_) {
+        std::vector<int8_t> prepacked;
+        prepack_b_all(b_row, N_, K_, blocks_k_, N_ / kNR, &prepacked);
+        std::swap(*b_noisy, prepacked);
+        b_pre_.clear();
+        b_scan_ = b_noisy->data();
+    } else {
+        prepack_b_all(b_row, N_, K_, blocks_k_, N / kNR, &b_pre_);
+        b_scan_ = b_pre_.data();
+    }
     tile_xor_.clear();
     update_backend_label_();
     b_job_ready_ = true;
     return true;
 }
 
-bool Case33GemmXor::prepare_attempt_a(const int8_t *a_noisy) {
-    if (!b_job_ready_ || !a_noisy) {
+bool Case33GemmXor::prepare_attempt_a(std::vector<int8_t> *a_noisy) {
+    if (!b_job_ready_ || !a_noisy || a_noisy->empty()) {
         return false;
     }
 
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
-    if (use_fast) {
-        prepack_a_all(a_noisy, M_, K_, blocks_k_, true, &a_pre_);
+    if (inplace_prepack_) {
+        std::vector<int8_t> prepacked;
+        prepack_a_all(a_noisy->data(), M_, K_, blocks_k_, use_fast, &prepacked);
+        std::swap(*a_noisy, prepacked);
+        a_pre_.clear();
+        a_scan_ = a_noisy->data();
+    } else if (use_fast) {
+        prepack_a_all(a_noisy->data(), M_, K_, blocks_k_, true, &a_pre_);
+        a_scan_ = a_pre_.data();
     } else {
-        prepack_a_all(a_noisy, M_, K_, blocks_k_, false, &a_pre_);
+        prepack_a_all(a_noisy->data(), M_, K_, blocks_k_, false, &a_pre_);
+        a_scan_ = a_pre_.data();
     }
     available_ = true;
     return true;
@@ -690,10 +752,24 @@ bool Case33GemmXor::prepare_attempt_a(const int8_t *a_noisy) {
 bool Case33GemmXor::init(int M, int N, int K, const int8_t *a, const int8_t *b) {
     reset();
     set_int8_mode(int8_mode_);
-    if (!prepare_job_b(M, N, K, b)) {
+    if (!a || !b) {
         return false;
     }
-    return prepare_attempt_a(a);
+    const bool saved_inplace = inplace_prepack_;
+    inplace_prepack_ = false;
+
+    std::vector<int8_t> b_buf(static_cast<size_t>(K) * static_cast<size_t>(N));
+    memcpy(b_buf.data(), b, b_buf.size());
+    if (!prepare_job_b(M, N, K, &b_buf)) {
+        inplace_prepack_ = saved_inplace;
+        return false;
+    }
+
+    std::vector<int8_t> a_buf(static_cast<size_t>(M) * static_cast<size_t>(K));
+    memcpy(a_buf.data(), a, a_buf.size());
+    const bool ok = prepare_attempt_a(&a_buf);
+    inplace_prepack_ = saved_inplace;
+    return ok;
 }
 
 void Case33GemmXor::run() {
@@ -701,7 +777,7 @@ void Case33GemmXor::run() {
         return;
     }
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
-    run_fused_impl(a_pre_.data(), b_pre_.data(), N_, blocks_k_, blocks_per_milestone_,
+    run_fused_impl(a_scan_, b_scan_, N_, blocks_k_, blocks_per_milestone_,
                    kNumMilestones, macro_rows_, macro_cols_, tile_cols_, tile_count_,
                    b_comp_ms_.data(), use_fast, cpu_has_avx2(), true, &tile_xor_);
 }
@@ -710,11 +786,11 @@ bool Case33GemmXor::scan_tiles(
         const std::function<bool(const uint32_t *milestone_xor, int t_rows, int t_cols)>
                 &on_tile,
         const std::function<bool()> &should_cancel) {
-    if (!available_ || !on_tile) {
+    if (!available_ || !on_tile || !a_scan_ || !b_scan_) {
         return false;
     }
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
-    return run_online_tile_scan(a_pre_.data(), b_pre_.data(), N_, blocks_k_,
+    return run_online_tile_scan(a_scan_, b_scan_, N_, blocks_k_,
                                 blocks_per_milestone_, kNumMilestones, macro_rows_,
                                 macro_cols_, b_comp_ms_.data(), use_fast, cpu_has_avx2(),
                                 on_tile, should_cancel);
@@ -725,7 +801,7 @@ void Case33GemmXor::run_gemm_only() {
         return;
     }
     const bool use_fast = int8_mode_ == Case32Int8Mode::FastU8S8;
-    run_fused_impl(a_pre_.data(), b_pre_.data(), N_, blocks_k_, blocks_per_milestone_,
+    run_fused_impl(a_scan_, b_scan_, N_, blocks_k_, blocks_per_milestone_,
                    kNumMilestones, macro_rows_, macro_cols_, tile_cols_, tile_count_,
                    b_comp_ms_.data(), use_fast, cpu_has_avx2(), false, &tile_xor_);
 }

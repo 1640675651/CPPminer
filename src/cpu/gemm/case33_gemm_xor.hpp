@@ -19,11 +19,14 @@ struct Case33GemmXor {
     static constexpr int kMacroN = Case32Gemm::kMacroN;
 
     void set_int8_mode(Case32Int8Mode mode) { int8_mode_ = mode; }
+    void set_inplace_prepack(bool on) { inplace_prepack_ = on; }
+    /* Reuse noisy vectors as scan buffers (out-of-place prepack + swap; ~2 GiB steady). */
+    bool inplace_prepack() const { return inplace_prepack_; }
 
     bool init(int M, int N, int K, const int8_t *a, const int8_t *b);
     /* Zero-B CPU: prepack B once per job, A each attempt (reuses a_pre_/b_pre_). */
-    bool prepare_job_b(int M, int N, int K, const int8_t *b_noisy);
-    bool prepare_attempt_a(const int8_t *a_noisy);
+    bool prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_noisy);
+    bool prepare_attempt_a(std::vector<int8_t> *a_noisy);
     void reset();
 
     bool available() const { return available_; }
@@ -50,6 +53,7 @@ private:
 
     bool available_ = false;
     bool b_job_ready_ = false;
+    bool inplace_prepack_ = false;
     const char *backend_ = "unavailable";
     int num_threads_ = 1;
     Case32Int8Mode int8_mode_ = Case32Int8Mode::FastU8S8;
@@ -65,9 +69,13 @@ private:
     int macro_cols_ = 0;
     size_t tile_count_ = 0;
 
+    int8_t *a_scan_ = nullptr;
+    int8_t *b_scan_ = nullptr;
     std::vector<int8_t> a_pre_;
     std::vector<int8_t> b_pre_;
     std::vector<int32_t> b_comp_ms_;
     std::vector<uint32_t> tile_xor_;
     char backend_buf_[160] = {};
 };
+
+int case33_test_inplace_prepack(int M, int N, int K);

@@ -36,6 +36,7 @@ void cp_worker_set_row_period_batch(int batch);
 void cp_worker_set_col_period_batch(int batch);
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
+void cp_worker_set_inplace_prepack(int on);
 
 /* Prefer host matrix path when non-zero (CPU backend always uses host matrices). */
 int cp_worker_prefers_host_matrices(void);
