@@ -290,25 +290,18 @@ void pearl_commitment_seeds(const uint8_t job_key[32],
                             int m, int n, int k,
                             uint8_t b_noise_seed[32], uint8_t a_noise_seed[32])
 {
+    const int log_step = (m >= 65536) ? 1 : 0;
+    double t0 = 0.0;
+#ifdef _OPENMP
+    if(log_step) t0 = omp_get_wtime();
+#endif
+
     size_t raw_a = (size_t)m * (size_t)k;
     size_t raw_b = (size_t)n * (size_t)k;
-    size_t pad_a = padded_chunk_len(raw_a);
-    size_t pad_b = padded_chunk_len(raw_b);
-
-    uint8_t* pa = (uint8_t*)malloc(pad_a);
-    uint8_t* pb = (uint8_t*)malloc(pad_b);
-    if(!pa || !pb){ fprintf(stderr, "pearl_commitment_seeds: OOM\n"); exit(1); }
-
-    for(size_t i = 0; i < raw_a; i++) pa[i] = (uint8_t)A[i];
-    memset(pa + raw_a, 0, pad_a - raw_a);
-    for(size_t i = 0; i < raw_b; i++) pb[i] = (uint8_t)Bt[i];
-    memset(pb + raw_b, 0, pad_b - raw_b);
 
     uint8_t hash_a[32], hash_b[32];
-    blake3_digest(pa, pad_a, job_key, hash_a);
-    blake3_digest(pb, pad_b, job_key, hash_b);
-    free(pa);
-    free(pb);
+    pearl_keyed_digest_int8(A, raw_a, job_key, hash_a);
+    pearl_keyed_digest_int8(Bt, raw_b, job_key, hash_b);
 
     uint8_t b_in[64];
     memcpy(b_in, job_key, 32);
@@ -319,12 +312,21 @@ void pearl_commitment_seeds(const uint8_t job_key[32],
     memcpy(a_in, b_noise_seed, 32);
     memcpy(a_in + 32, hash_a, 32);
     blake3_digest(a_in, 64, NULL, a_noise_seed);
+
+    if(log_step){
+#ifdef _OPENMP
+        printf("[gen]   commitment seeds done in %.1fs\n", omp_get_wtime() - t0);
+#else
+        printf("[gen]   commitment seeds done\n");
+#endif
+    }
 }
 
 void pearl_keyed_matrix_digest(const uint8_t* data, size_t len,
                                const uint8_t job_key[32], uint8_t out[32])
 {
-    blake3_digest(data, len, job_key, out);
+    if(pearl_keyed_matrix_digest_chunks(data, len, len, job_key, out) != 0)
+        blake3_digest(data, len, job_key, out);
 }
 
 static void pearl_keyed_chunk_cv_cpu(const uint8_t key[32], uint64_t chunk_idx,
@@ -352,32 +354,53 @@ static void pearl_keyed_chunk_cv_cpu(const uint8_t key[32], uint64_t chunk_idx,
     store_cv_words(cv_out, cv);
 }
 
-static int pearl_keyed_matrix_root_via_chunks(const uint8_t* data, size_t pad_len,
-                                              const uint8_t job_key[32], uint8_t out[32])
+static int pearl_keyed_matrix_digest_chunks(const uint8_t* data, size_t raw_len,
+                                            size_t pad_len,
+                                            const uint8_t job_key[32], uint8_t out[32])
 {
     if(pad_len == 0 || (pad_len % B3_CHUNK) != 0) return -1;
     int num_chunks = (int)(pad_len / B3_CHUNK);
     if(num_chunks == 1){
-        blake3_digest(data, pad_len, job_key, out);
+        uint8_t chunk[B3_CHUNK];
+        memset(chunk, 0, B3_CHUNK);
+        if(data && raw_len > 0){
+            size_t n = raw_len;
+            if(n > B3_CHUNK) n = B3_CHUNK;
+            memcpy(chunk, data, n);
+        }
+        blake3_digest(chunk, pad_len, job_key, out);
         return 0;
     }
+
     uint8_t* cvs = (uint8_t*)malloc((size_t)num_chunks * BLAKE3_OUT_LEN);
     if(!cvs) return -1;
-    for(int i = 0; i < num_chunks; i++){
+
+    int i;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(i = 0; i < num_chunks; i++){
         uint8_t chunk[B3_CHUNK];
         size_t off = (size_t)i * B3_CHUNK;
         memset(chunk, 0, B3_CHUNK);
-        if(off < pad_len){
-            size_t n = pad_len - off;
+        if(data && off < raw_len){
+            size_t n = raw_len - off;
             if(n > B3_CHUNK) n = B3_CHUNK;
             memcpy(chunk, data + off, n);
         }
         pearl_keyed_chunk_cv_cpu(job_key, (uint64_t)i, chunk, B3_CHUNK,
                                  cvs + (size_t)i * BLAKE3_OUT_LEN);
     }
+
     int rc = pearl_root_from_chunk_cvs(cvs, num_chunks, job_key, out);
     free(cvs);
     return rc;
+}
+
+static int pearl_keyed_matrix_root_via_chunks(const uint8_t* data, size_t pad_len,
+                                              const uint8_t job_key[32], uint8_t out[32])
+{
+    return pearl_keyed_matrix_digest_chunks(data, pad_len, pad_len, job_key, out);
 }
 
 int pearl_test_keyed_matrix_root(int m, int n, int k)
@@ -469,19 +492,40 @@ void pearl_keyed_digest_int8(const int8_t* mat, size_t raw_len,
                              const uint8_t job_key[32], uint8_t out[32])
 {
     size_t pad_len = padded_chunk_len(raw_len);
-    if(pad_len == raw_len){
-        blake3_digest((const uint8_t*)mat, pad_len, job_key, out);
-        return;
-    }
-    uint8_t* buf = (uint8_t*)malloc(pad_len);
-    if(!buf){
-        fprintf(stderr, "pearl_keyed_digest_int8: OOM pad=%zu\n", pad_len);
+    if(pearl_keyed_matrix_digest_chunks((const uint8_t*)mat, raw_len, pad_len,
+                                        job_key, out) != 0){
+        fprintf(stderr, "pearl_keyed_digest_int8: digest failed pad=%zu\n", pad_len);
         exit(1);
     }
-    for(size_t i = 0; i < raw_len; i++) buf[i] = (uint8_t)mat[i];
-    memset(buf + raw_len, 0, pad_len - raw_len);
-    blake3_digest(buf, pad_len, job_key, out);
-    free(buf);
+}
+
+void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
+                               const uint8_t b_noise_seed[32],
+                               const int8_t* A, int m, int k,
+                               uint8_t a_noise_seed[32])
+{
+    const int log_step = (m >= 65536) ? 1 : 0;
+    double t0 = 0.0;
+#ifdef _OPENMP
+    if(log_step) t0 = omp_get_wtime();
+#endif
+
+    size_t raw_a = (size_t)m * (size_t)k;
+    uint8_t hash_a[32];
+    pearl_keyed_digest_int8(A, raw_a, job_key, hash_a);
+
+    uint8_t a_in[64];
+    memcpy(a_in, b_noise_seed, 32);
+    memcpy(a_in + 32, hash_a, 32);
+    blake3_digest(a_in, 64, NULL, a_noise_seed);
+
+    if(log_step){
+#ifdef _OPENMP
+        printf("[gen]   commitment seeds done in %.1fs (A-only)\n", omp_get_wtime() - t0);
+#else
+        printf("[gen]   commitment seeds done (A-only)\n");
+#endif
+    }
 }
 
 int pearl_run_alignment_tests_prod(int m, int n, int k)
@@ -670,13 +714,17 @@ void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
 {
     size_t raw_b = (size_t)n * (size_t)k;
     size_t pad_b = padded_chunk_len(raw_b);
-    uint8_t* pb = (uint8_t*)malloc(pad_b);
-    if(!pb){ fprintf(stderr, "pearl_b_noise_seed_from_bt: OOM\n"); exit(1); }
-    for(size_t i = 0; i < raw_b; i++) pb[i] = (uint8_t)Bt[i];
-    memset(pb + raw_b, 0, pad_b - raw_b);
     uint8_t hash_b[32];
-    blake3_digest(pb, pad_b, job_key, hash_b);
-    free(pb);
+    int rc;
+    if(Bt)
+        rc = pearl_keyed_matrix_digest_chunks((const uint8_t*)Bt, raw_b, pad_b,
+                                              job_key, hash_b);
+    else
+        rc = pearl_keyed_matrix_digest_chunks(NULL, 0, pad_b, job_key, hash_b);
+    if(rc != 0){
+        fprintf(stderr, "pearl_b_noise_seed_from_bt: digest failed\n");
+        exit(1);
+    }
 
     uint8_t b_in[64];
     memcpy(b_in, job_key, 32);

@@ -40,9 +40,16 @@ void pearl_derive_noise_seeds(const uint8_t job_key[32],
                               const uint8_t hash_a[32], const uint8_t hash_b[32],
                               uint8_t b_noise_seed[32], uint8_t a_noise_seed[32]);
 
+/* Bt may be NULL when signal B^T is all zeros (skips reading matrix bytes). */
 void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
                                 const int8_t* Bt, int n, int k,
                                 uint8_t b_noise_seed[32]);
+
+/* Zero-B fast path: hash A only, derive a_noise_seed from cached b_noise_seed. */
+void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
+                               const uint8_t b_noise_seed[32],
+                               const int8_t* A, int m, int k,
+                               uint8_t a_noise_seed[32]);
 
 void pearl_keyed_matrix_digest(const uint8_t* data, size_t len,
                                const uint8_t job_key[32], uint8_t out[32]);

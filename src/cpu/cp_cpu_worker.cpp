@@ -72,6 +72,14 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
 
 {
 
+    const int log_step = (m >= 65536 || n >= 65536) ? 1 : 0;
+
+    double t0 = 0.0, t_step = 0.0;
+
+    if(log_step) t0 = cp_now_sec();
+
+
+
     const size_t szB = (size_t)n * (size_t)K_DIM;
 
     g_zero_b.B_sig.assign(szB, 0);
@@ -86,8 +94,13 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
 
 
 
-    pearl_b_noise_seed_from_bt(job_key, g_zero_b.B_sig.data(), n, K_DIM,
+    if(log_step) t_step = cp_now_sec();
+
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM,
                                g_zero_b.b_noise_seed);
+
+    if(log_step)
+        printf("[gen]   zero-B b_noise_seed done in %.1fs\n", cp_now_sec() - t_step);
 
 
 
@@ -100,6 +113,11 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
         return cp_job_should_cancel() ? -1 : -2;
 
     }
+
+
+
+    if(log_step)
+        printf("[gen]   zero-B job setup done in %.1fs\n", cp_now_sec() - t0);
 
 
 
@@ -161,11 +179,9 @@ static int zero_b_prepare_attempt(
 
 
 
-    uint8_t b_seed_out[32];
+    pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,
 
-    pearl_commitment_seeds(job_key, A_sig.data(), g_zero_b.B_sig.data(),
-
-                           m, n, K_DIM, b_seed_out, a_key_out);
+                              A_sig.data(), m, K_DIM, a_key_out);
 
 
 
@@ -391,7 +407,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
 
         while(!scan_done.load(std::memory_order_relaxed)){
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
             if(scan_done.load(std::memory_order_relaxed)) break;
 
