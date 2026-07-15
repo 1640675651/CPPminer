@@ -10,7 +10,7 @@
 # The script snapshots and restores your shell environment on exit.
 
 param(
-    [ValidateSet("Cpu", "Cuda", "Both")]
+    [ValidateSet("Cpu", "Cuda", "Both", "OpenCl", "CpuOpenCl")]
     [string]$Backend = "Cpu",
     [string]$CudaArch = "",
     [string]$CudaRoot = ""
@@ -22,8 +22,9 @@ $Root = $PSScriptRoot
 $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
 $OutExe = Join-Path $Root "cpminer.exe"
-$EnableCpu = ($Backend -eq "Cpu" -or $Backend -eq "Both")
+$EnableCpu = ($Backend -eq "Cpu" -or $Backend -eq "Both" -or $Backend -eq "CpuOpenCl")
 $EnableCuda = ($Backend -eq "Cuda" -or $Backend -eq "Both")
+$EnableOpenCl = ($Backend -eq "OpenCl" -or $Backend -eq "CpuOpenCl")
 $script:VcvarsBat = $null
 $script:ClExe = $null
 $script:OrigEnv = $null
@@ -133,6 +134,49 @@ function Ensure-Cutlass {
     return $cutlassRoot
 }
 
+function Ensure-OpenClHeaders {
+    $hdrRoot = Join-Path $Root "third_party\opencl-headers"
+    if (-not (Test-Path (Join-Path $hdrRoot "CL\cl.h"))) {
+        Write-Host "=== Fetching Khronos OpenCL-Headers ==="
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "git required to fetch OpenCL headers into third_party/opencl-headers"
+        }
+        if (Test-Path $hdrRoot) { Remove-Item $hdrRoot -Recurse -Force }
+        Invoke-External -Command {
+            git clone --depth 1 --branch v2024.10.24 `
+                https://github.com/KhronosGroup/OpenCL-Headers.git $hdrRoot
+        } -FailureMessage "OpenCL-Headers clone failed"
+    }
+    if (-not (Test-Path (Join-Path $hdrRoot "CL\cl.h"))) {
+        throw "OpenCL headers missing at $hdrRoot"
+    }
+    return $hdrRoot
+}
+
+function Find-OpenClLib {
+    $candidates = @()
+    if ($env:ONEAPI_ROOT) {
+        $candidates += @(
+            (Join-Path $env:ONEAPI_ROOT "compiler\latest\windows\lib\OpenCL.lib"),
+            (Join-Path $env:ONEAPI_ROOT "windows\lib\OpenCL.lib")
+        )
+    }
+    foreach ($ver in @("2026.1", "2025.3", "2023.2.0")) {
+        $candidates += "C:\Program Files (x86)\Intel\oneAPI\compiler\$ver\windows\lib\OpenCL.lib"
+    }
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    throw "OpenCL.lib not found (install Intel oneAPI OpenCL runtime or AMD GPU driver OpenCL ICD)"
+}
+
+function Copy-OpenClKernels {
+    $kernelSrc = Join-Path $Root "src\opencl\kernels\case33_gemm_xor.cl"
+    $kernelDstDir = Join-Path $Root "kernels"
+    New-Item -ItemType Directory -Force -Path $kernelDstDir | Out-Null
+    Copy-Item $kernelSrc (Join-Path $kernelDstDir "case33_gemm_xor.cl") -Force
+}
+
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
     if (-not (Test-Path (Join-Path $b3Src "blake3.c"))) {
@@ -209,7 +253,7 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $Backend (CPU=$EnableCpu CUDA=$EnableCuda) ==="
+    Write-Host "=== Backend: $Backend (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl) ==="
 
     Write-Host "=== Building cp-proof-ffi (Rust) ==="
     $RustDir = Join-Path $Root "rust\cp-proof-ffi"
@@ -290,12 +334,87 @@ try {
         Invoke-Cl -ClArgs $linkArgs
     }
 
+    function Build-OpenClWithCl {
+        $oclHdr = Ensure-OpenClHeaders
+        $oclLib = Find-OpenClLib
+        Write-Host "=== Direct MSVC build (OpenCL, no cmake) ==="
+        Write-Host "=== OpenCL.lib: $oclLib ==="
+
+        $Inc = @(
+            "/I$(Join-Path $Root 'include')",
+            "/I$(Join-Path $Root 'src\common')",
+            "/I$(Join-Path $Root 'src\cpu')",
+            "/I$(Join-Path $Root 'src\opencl')",
+            "/I$oclHdr",
+            "/I$B3Dir"
+        )
+        $Defs = @(
+            "/DCP_ENABLE_CPU=$(if ($EnableCpu) { '1' } else { '0' })",
+            "/DCP_ENABLE_CUDA=0",
+            "/DCP_ENABLE_OPENCL=1",
+            "/DBLAKE3_NO_AVX512", "/DBLAKE3_NO_AVX2", "/DBLAKE3_NO_SSE41", "/DBLAKE3_NO_SSE2"
+        )
+        $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp") + $Inc + $Defs
+        if ($EnableCpu) { $Flags += "/arch:AVX2" }
+        $objs = @()
+
+        $cUnits = @(
+            @{ src = (Join-Path $B3Dir "blake3.c"); obj = "blake3.obj" },
+            @{ src = (Join-Path $B3Dir "blake3_dispatch.c"); obj = "blake3_dispatch.obj" },
+            @{ src = (Join-Path $B3Dir "blake3_portable.c"); obj = "blake3_portable.obj" },
+            @{ src = (Join-Path $Root "src\common\cp_noise.c"); obj = "cp_noise.obj" }
+        )
+        foreach ($u in $cUnits) {
+            $objPath = Join-Path $BuildDir $u.obj
+            $objs += $objPath
+            Invoke-Cl -ClArgs ($Flags + @("/TC", "/c", $u.src, "/Fo$objPath"))
+        }
+
+        $cppUnits = @(
+            "src\common\main.cpp",
+            "src\common\cp_util.cpp",
+            "src\common\cp_pool.cpp",
+            "src\common\cp_job_ctrl.cpp",
+            "src\common\cp_mine.cpp",
+            "src\common\cp_state.cpp",
+            "src\common\cp_worker.cpp",
+            "src\opencl\cp_opencl_worker.cpp",
+            "src\opencl\case33_gemm_ocl.cpp",
+            "src\opencl\case32_prepack.cpp",
+            "src\opencl\opencl_context.cpp"
+        )
+        if ($EnableCpu) {
+            $cppUnits += @(
+                "src\cpu\cp_cpu_worker.cpp",
+                "src\cpu\gemm\case33_gemm_xor.cpp"
+            )
+        }
+        if (-not (Test-Path $RustLib)) {
+            $cppUnits += "src\common\cp_proof_stub.cpp"
+        }
+        foreach ($rel in $cppUnits) {
+            $srcPath = Join-Path $Root $rel
+            $objName = [IO.Path]::GetFileNameWithoutExtension($rel) + ".obj"
+            $objPath = Join-Path $BuildDir $objName
+            $objs += $objPath
+            Invoke-Cl -ClArgs ($Flags + @("/c", $srcPath, "/Fo$objPath"))
+        }
+
+        $linkLibs = @("ws2_32.lib", $oclLib)
+        if (Test-Path $RustLib) {
+            $linkLibs += @($RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
+        }
+        $linkArgs = @("/nologo", "/Fe$OutExe") + $objs + $linkLibs
+        Invoke-Cl -ClArgs $linkArgs
+        Copy-OpenClKernels
+    }
+
     $hasCmake = [bool](Get-Command cmake -ErrorAction SilentlyContinue)
     if ($EnableCuda -and -not $hasCmake) {
         throw "CUDA build requires cmake on PATH (or use -Backend Cpu)."
     }
 
-    if ($hasCmake) {
+    if ($hasCmake -and ($EnableCuda -or $EnableOpenCl -or -not $EnableCpu)) {
         $CmakeBuild = Join-Path $BuildDir "cmake"
         New-Item -ItemType Directory -Force -Path $CmakeBuild | Out-Null
         $cmakeArgs = @(
@@ -303,7 +422,7 @@ try {
             "-B", $CmakeBuild,
             "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
             "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
-            "-DCP_ENABLE_OPENCL=OFF"
+            "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })"
         )
         if ($EnableCuda -and $CudaArch) {
             $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
@@ -325,9 +444,14 @@ try {
         ) | Where-Object { Test-Path $_ } | Select-Object -First 1
         if (-not $built) { throw "cpminer.exe not found under $CmakeBuild" }
         Copy-Item $built $OutExe -Force
+        if ($EnableOpenCl) {
+            Copy-OpenClKernels
+        }
+    } elseif ($EnableOpenCl -and -not $EnableCuda) {
+        Build-OpenClWithCl
     } else {
         if (-not $EnableCpu -or $EnableCuda) {
-            throw "Without cmake, only -Backend Cpu is supported."
+            throw "Without cmake, use -Backend Cpu, OpenCl, or CpuOpenCl."
         }
         Build-CpuWithCl
     }

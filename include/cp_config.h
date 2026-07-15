@@ -29,6 +29,10 @@
 #define CP_ROW_PERIOD_BATCH_DEFAULT 1
 #define CP_ROW_PERIOD_BATCH_MAX   1024 /* 131072 rows / 128 rows per period */
 
+/* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
+#define CP_MACRO_BATCH_DEFAULT 64
+#define CP_MACRO_BATCH_MAX     512
+
 #define CP_JOB_NONE       0
 #define CP_JOB_CANCELLED (-1)
 

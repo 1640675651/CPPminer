@@ -46,8 +46,8 @@ static void print_usage(void)
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (CUDA debug)\n");
-    printf("  --period-batch N     col-period batch size (default %d, max %d)\n",
-           CP_PERIOD_BATCH_DEFAULT, CP_PERIOD_BATCH_MAX);
+    printf("  --period-batch N     col-period batch (CUDA) / macro-block batch (OpenCL, default %d)\n",
+           CP_PERIOD_BATCH_DEFAULT);
     printf("  --col-period-batch N alias for --period-batch\n");
     printf("  --row-period-batch N row-period batch size (default %d, max %d)\n",
            CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
@@ -330,6 +330,12 @@ int main(int argc, char** argv)
 
     cp_worker_apply_backend_defaults();
     cp_worker_set_period_gemm(!no_period_gemm);
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL
+       && period_batch == CP_PERIOD_BATCH_DEFAULT){
+        period_batch = CP_MACRO_BATCH_DEFAULT;
+    }
+#endif
     cp_worker_set_period_batch(period_batch);
     cp_worker_set_row_period_batch(row_period_batch);
     cp_worker_set_step_major_ap(step_major_ap);
@@ -386,6 +392,11 @@ int main(int argc, char** argv)
             else
                 printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
                        host_mib, host_mib * 2.0);
+        } else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+            printf("[mode] scan: OpenCL Case 3.3 fused GEMM + XOR + device jackpot\n");
+            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
+                   period_batch, period_batch * 128);
+            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 16 A + 8 B^T (CUTLASS Case 7.1 offsets)\n");
             printf("[mode] scan: CUTLASS fused GEMM + jackpot (mainloop tail)\n");

@@ -1,0 +1,163 @@
+#pragma once
+
+
+
+#include "case32_gemm_ocl.hpp"
+
+#include "cp_config.h"
+
+#include "opencl_context.hpp"
+
+
+
+#include <cstdint>
+
+#include <functional>
+
+#include <string>
+
+#include <vector>
+
+
+
+struct Case33GemmOcl {
+
+    Case33GemmOcl() = default;
+
+    ~Case33GemmOcl();
+
+
+
+    void set_dpi_mode(Case32OclDpiMode mode) { dpi_mode_ = mode; }
+
+    void set_macro_batch(int batch);
+
+    int macro_batch() const { return macro_batch_; }
+
+
+
+    bool init_context(const char *kernel_cl_path, int device_index = -1);
+
+    bool prepare_job(int M, int N, int K, const int8_t *b_colmajor);
+
+    bool prepare_attempt_a(const int8_t *a_rowmajor);
+
+    bool available() const { return available_; }
+
+
+
+    /* Device-side jackpot scan: one batched kernel launch per macro batch; host readback is
+
+     * found_flag (+ t_rows/t_cols only on hit). */
+
+    /* Optional host matrices for naive jackpot revalidation (pool/proof semantics). */
+    bool scan_for_share(const uint32_t a_key8[8], const uint32_t bound[8], int *out_found,
+                        int *out_t_rows, int *out_t_cols, uint64_t *out_tiles_scanned,
+                        const std::function<bool()> &should_cancel = {},
+                        const std::function<void(uint64_t)> &on_progress = {},
+                        const int8_t *host_a_rowmajor = nullptr,
+                        const int8_t *host_b_colmajor = nullptr);
+
+
+
+    const char *backend() const { return backend_; }
+
+    const char *device_name() const { return device_name_.c_str(); }
+
+    const char *dpi_status() const { return dpi_status_; }
+
+
+
+private:
+
+    bool build_kernel_(const char *kernel_cl_path);
+
+    bool ensure_jackpot_bufs_();
+
+    bool run_macro_batch_(int mb_begin, int batch_count);
+
+
+
+    bool context_ready_ = false;
+
+    bool available_ = false;
+
+    OpenClContext ocl_;
+
+
+
+    int M_ = 0;
+
+    int N_ = 0;
+
+    int K_ = 0;
+
+    int milestone_k_ = 0;
+
+    int blocks_k_ = 0;
+
+    int blocks_per_milestone_ = 0;
+
+    int num_milestones_ = 0;
+
+    int macro_rows_ = 0;
+
+    int macro_cols_ = 0;
+
+    int tile_cols_ = 0;
+
+    size_t tile_count_ = 0;
+
+    int macro_blocks_ = 0;
+
+    int macro_batch_ = CP_MACRO_BATCH_DEFAULT;
+
+    Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
+
+
+
+    bool using_integer_dot_ = false;
+
+    bool using_asm_dot_ = false;
+
+    bool using_builtin_dot_ = false;
+
+
+
+    cl_kernel kernel_ = nullptr;
+
+    cl_mem a_buf_ = nullptr;
+
+    cl_mem b_buf_ = nullptr;
+
+    cl_mem dummy_buf_ = nullptr;
+
+    cl_mem a_key_buf_ = nullptr;
+
+    cl_mem bound_buf_ = nullptr;
+
+    cl_mem found_buf_ = nullptr;
+
+    cl_mem out_rows_buf_ = nullptr;
+
+    cl_mem out_cols_buf_ = nullptr;
+
+
+
+    std::vector<int8_t> a_pre_host_;
+
+    std::vector<int8_t> b_pre_host_;
+
+    std::string device_name_;
+
+    char backend_[192] = {};
+
+    char dpi_status_[128] = {};
+
+};
+
+
+
+std::string cp_ocl_resolve_kernel_path();
+
+

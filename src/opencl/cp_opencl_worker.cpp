@@ -1,0 +1,625 @@
+#include "cp_opencl_worker.h"
+
+
+
+#include "cp_config.h"
+
+#include "cp_job_ctrl.h"
+
+#include "cp_noise.h"
+
+#include "cp_util.h"
+
+#include "case33_gemm_ocl.hpp"
+
+#include "case32_layout.hpp"
+
+
+
+#include <atomic>
+
+#include <chrono>
+
+#include <cstdio>
+
+#include <cstring>
+
+#include <thread>
+
+#include <vector>
+
+
+
+namespace {
+
+
+
+struct ZeroBCache {
+
+    uint8_t job_key[32]{};
+
+    int m = 0;
+
+    int n = 0;
+
+    int ready = 0;
+
+    uint8_t b_noise_seed[32]{};
+
+    std::vector<int8_t> B_noisy;
+
+    std::vector<int8_t> A_noisy;
+
+} g_zero_b;
+
+
+
+static Case33GemmOcl g_gemm;
+
+static int g_device_index = 0;
+
+static int g_context_ready = 0;
+
+static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
+
+
+
+static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n) {
+
+    return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
+
+           memcmp(g_zero_b.job_key, job_key, 32) == 0;
+
+}
+
+
+
+static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n) {
+
+    const size_t szB = static_cast<size_t>(n) * static_cast<size_t>(K_DIM);
+
+    g_zero_b.B_noisy.resize(szB);
+
+    memcpy(g_zero_b.job_key, job_key, 32);
+
+    g_zero_b.m = m;
+
+    g_zero_b.n = n;
+
+
+
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
+
+    if (pearl_build_noisy_b(n, K_DIM, R_RANK, g_zero_b.b_noise_seed, NULL,
+
+                            g_zero_b.B_noisy.data()) != 0) {
+
+        g_zero_b.ready = 0;
+
+        return cp_job_should_cancel() ? -1 : -2;
+
+    }
+
+
+
+    if (!g_gemm.prepare_job(m, n, K_DIM, g_zero_b.B_noisy.data())) {
+
+        g_zero_b.ready = 0;
+
+        fprintf(stderr, "[ocl] prepare_job failed\n");
+
+        return -2;
+
+    }
+
+
+
+    g_zero_b.ready = 1;
+
+    return 0;
+
+}
+
+
+
+static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len,
+
+                                  const uint8_t job_key[32], int m, int n,
+
+                                  int8_t *h_A_sig, uint8_t a_key_out[32]) {
+
+    if (!h_A_sig) {
+
+        fprintf(stderr, "[ocl] zero-B requires h_Ap_global (A_sig buffer)\n");
+
+        return -2;
+
+    }
+
+
+
+    if (!zero_b_cache_matches(job_key, m, n)) {
+
+        if (zero_b_prepare_job(job_key, m, n) != 0) {
+
+            return -1;
+
+        }
+
+    }
+
+
+
+    if (pearl_generate_random_a(ab_seed, ab_seed_len, m, K_DIM, h_A_sig) != 0) {
+
+        return -1;
+
+    }
+
+
+
+    pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed, h_A_sig, m, K_DIM, a_key_out);
+
+
+
+    const size_t szA = static_cast<size_t>(m) * static_cast<size_t>(K_DIM);
+
+    std::vector<int8_t> a_noisy(szA);
+
+    if (pearl_build_noisy_a(m, K_DIM, R_RANK, a_key_out, h_A_sig, a_noisy.data()) != 0) {
+
+        return cp_job_should_cancel() ? -1 : -2;
+
+    }
+
+
+
+    if (!g_gemm.prepare_attempt_a(a_noisy.data())) {
+
+        fprintf(stderr, "[ocl] prepare_attempt_a failed\n");
+
+        return -2;
+
+    }
+
+
+
+    g_zero_b.A_noisy = std::move(a_noisy);
+
+
+
+    return 0;
+
+}
+
+
+
+} /* namespace */
+
+
+
+extern "C" int cp_opencl_worker_handles_matrix_prep(void) { return 1; }
+
+
+
+extern "C" void cp_opencl_worker_set_macro_batch(int batch) {
+
+    if (batch < 1) {
+
+        batch = 1;
+
+    }
+
+    if (batch > CP_MACRO_BATCH_MAX) {
+
+        batch = CP_MACRO_BATCH_MAX;
+
+    }
+
+    g_macro_batch = batch;
+
+    g_gemm.set_macro_batch(batch);
+
+}
+
+
+
+extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
+
+    if (devices && ndev > 0) {
+
+        g_device_index = devices[0];
+
+    } else {
+
+        g_device_index = 0;
+
+    }
+
+
+
+    const std::string kernel_path = cp_ocl_resolve_kernel_path();
+
+    g_gemm.set_macro_batch(g_macro_batch);
+
+    if (!g_gemm.init_context(kernel_path.c_str(), g_device_index)) {
+
+        fprintf(stderr, "[ocl] OpenCL init failed (kernel=%s)\n", kernel_path.c_str());
+
+        g_context_ready = 0;
+
+        return;
+
+    }
+
+
+
+    g_context_ready = 1;
+
+    printf("[ocl] device: %s\n", g_gemm.device_name());
+
+    printf("[ocl] %s\n", g_gemm.backend());
+
+    printf("[ocl] %s\n", g_gemm.dpi_status());
+
+    printf("[ocl] macro batch: %d blocks (%d tiles/launch)\n", g_gemm.macro_batch(),
+
+           g_gemm.macro_batch() * case32::kMacroWorkItems);
+
+    printf("[ocl] zero-B host noise + GPU fused GEMM+XOR+jackpot scan\n");
+
+    fflush(stdout);
+
+}
+
+
+
+extern "C" void cp_opencl_worker_shutdown(void) {
+
+    g_zero_b.ready = 0;
+
+    g_zero_b.B_noisy.clear();
+
+    g_zero_b.A_noisy.clear();
+
+    g_context_ready = 0;
+
+}
+
+
+
+extern "C" void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n) {
+
+    if (!g_context_ready) {
+
+        return;
+
+    }
+
+    g_zero_b.ready = 0;
+
+    if (zero_b_prepare_job(job_key, m, n) == 0) {
+
+        printf("[ocl] zero-B: cached B on device for job (signal B^T = 0)\n");
+
+        fflush(stdout);
+
+    }
+
+}
+
+
+
+extern "C" int cp_opencl_worker_mine_attempt(
+
+        const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
+
+        const uint32_t pool_tgt[8], int m, int n, int cpu_matrices,
+
+        const int8_t *h_A_noisy, const int8_t *h_B_noisy, const uint8_t *a_key,
+
+        int8_t *h_A_sig, int8_t *h_Bt_sig, int *out_t_rows, int *out_t_cols,
+
+        uint64_t *out_tiles_scanned) {
+
+    (void)cpu_matrices;
+
+    (void)h_Bt_sig;
+
+
+
+    const int8_t *scan_a = h_A_noisy;
+
+    const int8_t *scan_b = h_B_noisy;
+
+
+
+    if (!g_context_ready) {
+
+        fprintf(stderr, "[ocl] OpenCL not initialized\n");
+
+        return -1;
+
+    }
+
+
+
+    if (out_tiles_scanned) {
+
+        *out_tiles_scanned = 0;
+
+    }
+
+    if (out_t_rows) {
+
+        *out_t_rows = -1;
+
+    }
+
+    if (out_t_cols) {
+
+        *out_t_cols = -1;
+
+    }
+
+
+
+    uint8_t a_key_local[32];
+
+    const uint8_t *scan_key = a_key;
+
+
+
+    if (!scan_key) {
+
+        if (!h_A_sig) {
+
+            fprintf(stderr, "[ocl] mine_attempt requires h_Ap_global\n");
+
+            return -2;
+
+        }
+
+        if (zero_b_prepare_attempt(ab_seed, ab_seed_len, job_key, m, n, h_A_sig,
+
+                                   a_key_local) != 0) {
+
+            return cp_job_should_cancel() ? -1 : 0;
+
+        }
+
+        scan_key = a_key_local;
+
+        scan_a = g_zero_b.A_noisy.data();
+
+        scan_b = g_zero_b.B_noisy.data();
+
+    }
+
+
+
+    if (!scan_a || !scan_b) {
+
+        fprintf(stderr, "[ocl] mine_attempt missing noisy matrices for host validation\n");
+
+        return -2;
+
+    }
+
+
+
+    if (m % case32::kMacroM != 0 || n % case32::kMacroN != 0) {
+
+        fprintf(stderr, "[ocl] m,n must be multiples of %dx%d (got %dx%d)\n", case32::kMacroM,
+
+                case32::kMacroN, m, n);
+
+        return -1;
+
+    }
+
+
+
+    uint32_t bound[8];
+
+    cp_scale_jackpot_target(pool_tgt, bound);
+
+    uint32_t a_key8[8];
+
+    memcpy(a_key8, scan_key, 32);
+
+
+
+    const int row_parts = cp_pp_num_row_parts(m, 1);
+
+    const int col_parts = cp_pp_num_col_parts(n, 1);
+
+    const int total_tiles = row_parts * col_parts;
+
+    const double scan_t0 = cp_now_sec();
+
+
+
+    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n", row_parts,
+
+           col_parts, PP_HASH_H * PP_HASH_W * K_DIM);
+
+    printf("[ocl] GEMM %s\n", g_gemm.backend());
+
+    fflush(stdout);
+
+
+
+    std::atomic<uint64_t> tiles{0};
+
+    std::atomic<bool> scan_done{false};
+
+
+
+    std::thread progress_thread([&]() {
+
+        uint64_t last_tiles = 0;
+
+        double last_report = scan_t0;
+
+        while (!scan_done.load(std::memory_order_relaxed)) {
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+            if (scan_done.load(std::memory_order_relaxed)) {
+
+                break;
+
+            }
+
+
+
+            const uint64_t cur = tiles.load(std::memory_order_relaxed);
+
+            const double now = cp_now_sec();
+
+            if (cur == last_tiles && now - last_report < 1.0) {
+
+                continue;
+
+            }
+
+            if (now - last_report < 1.0 && cur - last_tiles < 4096) {
+
+                continue;
+
+            }
+
+
+
+            double scan_sec = now - scan_t0;
+
+            if (scan_sec < 1e-9) {
+
+                scan_sec = 1e-9;
+
+            }
+
+            int row_done = col_parts > 0
+
+                                   ? static_cast<int>((cur + static_cast<uint64_t>(col_parts) - 1) /
+
+                                                      static_cast<uint64_t>(col_parts))
+
+                                   : 0;
+
+            if (row_done > row_parts) {
+
+                row_done = row_parts;
+
+            }
+
+
+
+            char mac_buf[32];
+
+            cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(cur, scan_sec), mac_buf, sizeof(mac_buf));
+
+            printf("[ocl] plain_proof progress: row parts %d/%d tiles %llu/%d (%.1f%%) %s\n",
+
+                   row_done, row_parts, static_cast<unsigned long long>(cur), total_tiles,
+
+                   total_tiles > 0 ? 100.0 * static_cast<double>(cur) / total_tiles : 0.0,
+
+                   mac_buf);
+
+            fflush(stdout);
+
+            last_tiles = cur;
+
+            last_report = now;
+
+        }
+
+    });
+
+
+
+    int found = 0;
+
+    int hit_rows = -1;
+
+    int hit_cols = -1;
+
+    uint64_t tiles_scanned = 0;
+
+
+
+    const bool ok = g_gemm.scan_for_share(
+
+            a_key8, bound, &found, &hit_rows, &hit_cols, &tiles_scanned,
+
+            []() -> bool { return cp_job_should_cancel() != 0; },
+
+            [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); },
+
+            scan_a, scan_b);
+
+
+
+    scan_done.store(true, std::memory_order_relaxed);
+
+    if (progress_thread.joinable()) {
+
+        progress_thread.join();
+
+    }
+
+
+
+    if (out_tiles_scanned) {
+
+        *out_tiles_scanned = tiles_scanned;
+
+    }
+
+
+
+    if (cp_job_should_cancel()) {
+
+        return -1;
+
+    }
+
+    if (!ok) {
+
+        return -1;
+
+    }
+
+
+
+    if (found) {
+
+        printf("[ocl] plain_proof SHARE t_rows=%d t_cols=%d\n", hit_rows, hit_cols);
+
+        fflush(stdout);
+
+        if (out_t_rows) {
+
+            *out_t_rows = hit_rows;
+
+        }
+
+        if (out_t_cols) {
+
+            *out_t_cols = hit_cols;
+
+        }
+
+        return 1;
+
+    }
+
+
+
+    return 0;
+
+}
+
+

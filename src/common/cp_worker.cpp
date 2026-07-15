@@ -11,6 +11,9 @@
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_cuda_worker.h"
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+#include "cp_opencl_worker.h"
+#endif
 
 static CpBackendId g_backend = CP_BACKEND_NONE;
 
@@ -112,6 +115,11 @@ extern "C" void cp_worker_init(int* devices, int ndev)
         cp_cuda_worker_init(devices, ndev);
         return;
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL:
+        cp_opencl_worker_init(devices, ndev);
+        return;
+#endif
     default:
         fprintf(stderr, "[worker] no backend available\n");
         break;
@@ -127,6 +135,9 @@ extern "C" void cp_worker_shutdown(void)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     case CP_BACKEND_CUDA: cp_cuda_worker_shutdown(); break;
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL: cp_opencl_worker_shutdown(); break;
+#endif
     default: break;
     }
 }
@@ -139,6 +150,9 @@ extern "C" void cp_worker_apply_backend_defaults(void)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_contiguous_tiles(contiguous);
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    (void)contiguous;
 #endif
 }
 
@@ -162,9 +176,12 @@ extern "C" void cp_worker_set_period_batch(int batch)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_period_batch(batch);
-#else
-    (void)batch;
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        cp_opencl_worker_set_macro_batch(batch);
+#endif
+    (void)batch;
 }
 
 extern "C" void cp_worker_set_row_period_batch(int batch)
@@ -182,9 +199,12 @@ extern "C" void cp_worker_set_col_period_batch(int batch)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_col_period_batch(batch);
-#else
-    (void)batch;
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        cp_opencl_worker_set_macro_batch(batch);
+#endif
+    (void)batch;
 }
 
 extern "C" void cp_worker_set_step_major_ap(int on)
@@ -233,6 +253,10 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         return cp_cpu_worker_handles_matrix_prep();
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        return cp_opencl_worker_handles_matrix_prep();
+#endif
     return 0;
 }
 
@@ -241,16 +265,17 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n)
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         cp_cpu_worker_begin_job(job_key, m, n);
-#else
-    (void)job_key;
-    (void)m;
-    (void)n;
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        cp_opencl_worker_begin_job(job_key, m, n);
 #endif
 }
 
 extern "C" int cp_worker_default_tile_layout(void)
 {
-    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+    if(cp_worker_backend_id() == CP_BACKEND_CPU ||
+       cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return CP_TILE_LAYOUT_CONTIGUOUS;
     return CP_TILE_LAYOUT_SCATTERED;
 }
@@ -278,6 +303,13 @@ extern "C" int cp_worker_mine_attempt(
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     case CP_BACKEND_CUDA:
         return cp_cuda_worker_mine_attempt(
+            ab_seed, ab_seed_len, job_key, pool_tgt, m, n, cpu_matrices,
+            h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
+            out_t_rows, out_t_cols, out_tiles_scanned);
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL:
+        return cp_opencl_worker_mine_attempt(
             ab_seed, ab_seed_len, job_key, pool_tgt, m, n, cpu_matrices,
             h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
             out_t_rows, out_t_cols, out_tiles_scanned);
