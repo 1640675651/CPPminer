@@ -11,6 +11,9 @@
 #ifndef _WIN32
 #include <sys/time.h>
 #include <unistd.h>
+#else
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 double cp_now_sec(void)
@@ -26,6 +29,31 @@ double cp_now_sec(void)
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
 #endif
+}
+
+int cp_random_bytes(void* buf, size_t n)
+{
+    if(!buf || n == 0) return -1;
+#ifdef _WIN32
+    NTSTATUS st = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return BCRYPT_SUCCESS(st) ? 0 : -1;
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if(!f) return -1;
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    return (got == n) ? 0 : -1;
+#endif
+}
+
+int cp_random_u64(uint64_t* out)
+{
+    if(!out) return -1;
+    uint64_t v = 0;
+    if(cp_random_bytes(&v, sizeof(v)) != 0) return -1;
+    if(v == 0) v = 1;
+    *out = v;
+    return 0;
 }
 
 int cp_file_exists(const char* path)

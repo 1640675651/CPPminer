@@ -119,6 +119,8 @@ static int zero_b_prepare_attempt(
     int8_t* h_A_sig,
     uint8_t a_key_out[32])
 {
+    (void)ab_seed;
+    (void)ab_seed_len;
     if(!h_A_sig){
         fprintf(stderr, "[cpu] zero-B requires h_Ap_global (A_sig buffer)\n");
         return -2;
@@ -132,7 +134,13 @@ static int zero_b_prepare_attempt(
     const size_t szA = (size_t)m * (size_t)K_DIM;
     g_A_noisy.resize(szA);
 
-    if(pearl_generate_random_a(ab_seed, ab_seed_len, m, K_DIM, h_A_sig) != 0)
+    uint8_t a_rng[32];
+    if(cp_random_bytes(a_rng, sizeof(a_rng)) != 0){
+        fprintf(stderr, "[cpu] CSPRNG failed for random A\n");
+        return -2;
+    }
+
+    if(pearl_generate_random_a(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig) != 0)
         return -1;
 
     pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,

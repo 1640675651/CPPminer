@@ -93,6 +93,8 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n, int cpu_p
 static int zero_b_prepare_attempt_host(const uint8_t *ab_seed, int ab_seed_len,
                                        const uint8_t job_key[32], int m, int n,
                                        int8_t *h_A_sig, uint8_t a_key_out[32]) {
+    (void)ab_seed;
+    (void)ab_seed_len;
     if (!h_A_sig) {
         fprintf(stderr, "[ocl] zero-B requires h_Ap_global (A_sig buffer)\n");
         return -2;
@@ -104,7 +106,13 @@ static int zero_b_prepare_attempt_host(const uint8_t *ab_seed, int ab_seed_len,
         }
     }
 
-    if (pearl_generate_random_a(ab_seed, ab_seed_len, m, K_DIM, h_A_sig) != 0) {
+    uint8_t a_rng[32];
+    if (cp_random_bytes(a_rng, sizeof(a_rng)) != 0) {
+        fprintf(stderr, "[ocl] CSPRNG failed for random A\n");
+        return -2;
+    }
+
+    if (pearl_generate_random_a(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig) != 0) {
         return -1;
     }
 
@@ -127,13 +135,21 @@ static int zero_b_prepare_attempt_host(const uint8_t *ab_seed, int ab_seed_len,
 static int zero_b_prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                                         const uint8_t job_key[32], int m, int n,
                                         uint8_t a_key_out[32]) {
+    (void)ab_seed;
+    (void)ab_seed_len;
     if (!zero_b_cache_matches(job_key, m, n, 0)) {
         if (zero_b_prepare_job_gpu(job_key, m, n) != 0) {
             return -1;
         }
     }
 
-    if (!g_gemm.prepare_attempt_gpu(ab_seed, ab_seed_len, job_key, g_zero_b.b_noise_seed,
+    uint8_t a_rng[32];
+    if (cp_random_bytes(a_rng, sizeof(a_rng)) != 0) {
+        fprintf(stderr, "[ocl] CSPRNG failed for random A\n");
+        return -2;
+    }
+
+    if (!g_gemm.prepare_attempt_gpu(a_rng, (int)sizeof(a_rng), job_key, g_zero_b.b_noise_seed,
                                       a_key_out)) {
         fprintf(stderr, "[ocl] prepare_attempt_gpu failed\n");
         return -2;

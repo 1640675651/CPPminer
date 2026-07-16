@@ -662,7 +662,11 @@ static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
 
 static uint64_t cp_gpu_fresh_rng_seed(void)
 {
-    uint64_t s = (uint64_t)(cp_now_sec() * 1e9);
+    uint64_t s = 0;
+    if(cp_random_u64(&s) == 0)
+        return s;
+    /* Fallback if CSPRNG unavailable */
+    s = (uint64_t)(cp_now_sec() * 1e9);
 #ifdef _WIN32
     s ^= (uint64_t)GetTickCount64();
 #endif

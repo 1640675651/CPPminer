@@ -45,6 +45,11 @@ void cp_pp_fmt_mac_rate(double mac_s, char* out, size_t out_sz);
 void cp_log_attempt_timing(const char* tag, double prep_sec, double scan_sec, uint64_t tiles,
                            double post_sec);
 
+/* Fill buf with cryptographically secure random bytes. Returns 0 on success, -1 on failure. */
+int cp_random_bytes(void* buf, size_t n);
+/* Convenience: 64-bit CSPRNG value (never zero). Returns 0 on success, -1 on failure. */
+int cp_random_u64(uint64_t* out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -33,8 +33,9 @@ Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix gene
 
 | Backend | Signal A / B^T source | Proof on share |
 |---------|------------------------|----------------|
-| **CUDA** (default) | GPU random (`cp_gen_random_matrix_kernel` in `cp_gpu_gen.cuh`; fresh `cp_gpu_fresh_rng_seed()` per attempt in `gpu_prepare_noisy_matrices`) | `cudaMemcpy` from `d_A_sig` / `d_Bt_sig` → `h_Ap_global` / `h_BpT_global` |
-| **CPU** (default) | Zero signal `B^T`; random A per attempt (`pearl_generate_random_a`); B-noise cached per job | `h_BpT_global = 0`, random `h_Ap_global` |
+| **CUDA** (default) | GPU random (`cp_gen_random_matrix_kernel`; per-attempt CSPRNG via `cp_random_u64`) | `cudaMemcpy` from `d_A_sig` / `d_Bt_sig` → `h_Ap_global` / `h_BpT_global` |
+| **CPU** (default) | Zero signal `B^T`; random A per attempt (`pearl_generate_random_a` from **CSPRNG** bytes, not header/nonce) | `h_BpT_global = 0`, random `h_Ap_global` |
+| **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | D2H `d_A_sig_` on share |
 
 The zk-pow reference miner (`third_party/zk-pow/src/ffi/mine.rs`) also uses independent random A/B per attempt. `pearl_generate_ab()` is a **CPminer CPU convenience**, not a protocol rule.
 
@@ -219,7 +220,7 @@ Proofs commit the actual signal strips via Merkle (`cp_proof_build` takes `a` an
 
 1. **A-side noisy range unchanged.** Zero-B only tightens the **B** operand; **A** remains wide int8 after noise. Jackpot correctness still requires zk-pow’s int32 MAC `(s_a + n_a) * (s_b + n_b)`; FastU8S8 on CPU is only an approximation unless verified exactly.
 2. **Search space.** Fixing B = 0 changes which `(A, B)` pairs are explored; that is a mining strategy, not a protocol violation.
-3. **CPU default uses zero-B.** Signal `B^T = 0`; only A is randomized per attempt (`pearl_generate_random_a` from `ab_seed`).
+3. **CPU/OpenCL default uses zero-B.** Signal `B^T = 0`; only A is randomized per attempt from OS CSPRNG (`cp_random_bytes`), not from the stratum header/nonce.
 
 ### Compact dependency summary
 
