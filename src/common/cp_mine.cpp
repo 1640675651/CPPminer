@@ -131,8 +131,10 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
     const int zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
     const int handoff_bt = host_matrices || !zero_b_gpu;
-    /* Host A unused between GPU-prep attempts; reclaim only on share (or job end). */
-    const int defer_host_reclaim = !host_matrices && !g_cpu_matrix_gen;
+    /* Defer reclaim only when host A is unused between attempts (OpenCL/CUDA GPU prep).
+     * CPU writes h_Ap_global every nonce and must reclaim before the next attempt. */
+    const int defer_host_reclaim =
+            zero_b_gpu && !cp_worker_prefers_host_matrices();
 
     for (;;) {
         if (cp_job_should_cancel()) {
@@ -156,7 +158,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                            handoff_bt ? &h_BpT_global : NULL);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
                 fprintf(stderr, "[plain] host matrix buffers missing after reclaim\n");
-                rc = CP_JOB_CANCELLED;
+                rc = CP_JOB_NONE;
                 goto job_done;
             }
         }
@@ -222,9 +224,15 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         attempts++;
 
         if (found < 0) {
-            printf("[plain] job cancelled during %s scan\n", cp_worker_backend_name());
+            if (cp_job_should_cancel()) {
+                printf("[plain] job cancelled during %s scan\n", cp_worker_backend_name());
+                rc = CP_JOB_CANCELLED;
+            } else {
+                fprintf(stderr, "[plain] %s mine_attempt failed (rc=%d)\n",
+                        cp_worker_backend_name(), found);
+                rc = CP_JOB_NONE;
+            }
             fflush(stdout);
-            rc = CP_JOB_CANCELLED;
             goto job_done;
         }
         if (found == 0) {
