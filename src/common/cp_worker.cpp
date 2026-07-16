@@ -319,3 +319,26 @@ extern "C" int cp_worker_mine_attempt(
         return -1;
     }
 }
+
+extern "C" int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
+{
+    switch(cp_worker_backend_id()){
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    case CP_BACKEND_CPU:
+        (void)h_A_sig;
+        (void)h_Bt_sig;
+        return 0; /* already on host */
+#endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    case CP_BACKEND_CUDA:
+        return cp_cuda_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL:
+        return cp_opencl_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
+#endif
+    default:
+        fprintf(stderr, "[worker] fetch_share_signals: no backend\n");
+        return -1;
+    }
+}

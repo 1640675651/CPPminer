@@ -1,6 +1,7 @@
 #include "cp_gpu.h"
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <cuda_runtime.h>
@@ -1587,6 +1588,9 @@ int cp_gpu_mine_attempt(
     uint64_t* out_tiles_scanned)
 {
     if(g_ngpu <= 0) return -1;
+    (void)h_A_sig;
+    (void)h_Bt_sig;
+    const double attempt_t0 = cp_now_sec();
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
     uint8_t a_key_local[32];
@@ -1629,11 +1633,30 @@ int cp_gpu_mine_attempt(
         }
     }
 
+    const double prep_sec = cp_now_sec() - attempt_t0;
+    const double scan_t0 = cp_now_sec();
     int found = gpu_scan_device(scan_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned);
-    if(found == 1 && h_A_sig && h_Bt_sig && !cpu_matrices){
-        CU_CHECK(cudaSetDevice(g0->dev));
-        CU_CHECK(cudaMemcpy(h_A_sig, g0->d_A_sig, szAp, cudaMemcpyDeviceToHost));
+    const double scan_sec = cp_now_sec() - scan_t0;
+    /* Device→host download deferred to cp_gpu_fetch_share_signals after host buffer reclaim. */
+    const uint64_t tiles_done = out_tiles_scanned ? *out_tiles_scanned : 0;
+    cp_log_attempt_timing("gpu", prep_sec, scan_sec, tiles_done, 0.0);
+    return found;
+}
+
+int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
+{
+    if(g_ngpu <= 0 || !h_A_sig) return -1;
+    GpuCtx* g0 = &g_gpus[0];
+    if(!g0->d_A_sig) return -1;
+    const int m = g_m_active;
+    const int n = g_n_active;
+    if(m <= 0 || n <= 0) return -1;
+    size_t szAp = (size_t)m * K_DIM;
+    size_t szBpT = (size_t)n * K_DIM;
+    CU_CHECK(cudaSetDevice(g0->dev));
+    CU_CHECK(cudaMemcpy(h_A_sig, g0->d_A_sig, szAp, cudaMemcpyDeviceToHost));
+    if(h_Bt_sig && g0->d_Bt_sig){
         CU_CHECK(cudaMemcpy(h_Bt_sig, g0->d_Bt_sig, szBpT, cudaMemcpyDeviceToHost));
     }
-    return found;
+    return 0;
 }

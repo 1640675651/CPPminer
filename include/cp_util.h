@@ -42,6 +42,8 @@ int cp_pp_num_col_periods(int n, int contiguous);
 double cp_pp_macs_per_hash_tile(void);
 double cp_pp_mac_rate_from_tiles(uint64_t tiles_scanned, double elapsed_sec);
 void cp_pp_fmt_mac_rate(double mac_s, char* out, size_t out_sz);
+void cp_log_attempt_timing(const char* tag, double prep_sec, double scan_sec, uint64_t tiles,
+                           double post_sec);
 
 #ifdef __cplusplus
 }

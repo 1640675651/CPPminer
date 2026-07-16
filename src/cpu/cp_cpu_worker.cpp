@@ -9,9 +9,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -222,6 +224,8 @@ extern "C" int cp_cpu_worker_mine_attempt(
     (void)cpu_matrices;
     (void)h_Bt_sig;
 
+    const double attempt_t0 = cp_now_sec();
+
     if(out_tiles_scanned) *out_tiles_scanned = 0;
     if(out_t_rows) *out_t_rows = -1;
     if(out_t_cols) *out_t_cols = -1;
@@ -268,6 +272,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
     const int row_parts = cp_pp_num_row_parts(m, 1);
     const int col_parts = cp_pp_num_col_parts(n, 1);
     const int total_tiles = row_parts * col_parts;
+    const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
     printf("[cpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n",
@@ -280,26 +285,45 @@ extern "C" int cp_cpu_worker_mine_attempt(
     std::atomic<int> hit_rows{-1};
     std::atomic<int> hit_cols{-1};
     std::atomic<bool> scan_done{false};
+    std::mutex progress_mu;
+    std::condition_variable progress_cv;
+    constexpr auto kProgressInterval = std::chrono::seconds(2);
 
     std::thread progress_thread([&]() {
         uint64_t last_tiles = 0;
         double last_report = scan_t0;
-        while(!scan_done.load(std::memory_order_relaxed)){
-            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            if(scan_done.load(std::memory_order_relaxed)) break;
-            if(found.load(std::memory_order_relaxed)) break;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(progress_mu);
+                if (progress_cv.wait_for(lock, kProgressInterval, [&] {
+                        return scan_done.load(std::memory_order_relaxed);
+                    })) {
+                    break;
+                }
+            }
+            if (found.load(std::memory_order_relaxed)) {
+                break;
+            }
 
             const uint64_t cur = tiles.load(std::memory_order_relaxed);
             const double now = cp_now_sec();
-            if(cur == last_tiles && now - last_report < 1.0) continue;
-            if(now - last_report < 1.0 && cur - last_tiles < 4096) continue;
+            if (cur == last_tiles && now - last_report < 1.0) {
+                continue;
+            }
+            if (now - last_report < 1.0 && cur - last_tiles < 4096) {
+                continue;
+            }
 
             double scan_sec = now - scan_t0;
-            if(scan_sec < 1e-9) scan_sec = 1e-9;
+            if (scan_sec < 1e-9) {
+                scan_sec = 1e-9;
+            }
             int row_done = col_parts > 0
                 ? (int)((cur + (uint64_t)col_parts - 1) / (uint64_t)col_parts)
                 : 0;
-            if(row_done > row_parts) row_done = row_parts;
+            if (row_done > row_parts) {
+                row_done = row_parts;
+            }
 
             char mac_buf[32];
             cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(cur, scan_sec),
@@ -332,13 +356,29 @@ extern "C" int cp_cpu_worker_mine_attempt(
         },
         []() -> bool { return cp_job_should_cancel() != 0; });
 
-    scan_done.store(true, std::memory_order_relaxed);
-    if(progress_thread.joinable()) progress_thread.join();
+    const double scan_sec = cp_now_sec() - scan_t0;
+    {
+        std::lock_guard<std::mutex> lock(progress_mu);
+        scan_done.store(true, std::memory_order_relaxed);
+    }
+    progress_cv.notify_all();
+    if (progress_thread.joinable()) {
+        progress_thread.join();
+    }
 
-    if(out_tiles_scanned) *out_tiles_scanned = tiles.load();
+    const uint64_t tiles_done = tiles.load();
+    if (out_tiles_scanned) {
+        *out_tiles_scanned = tiles_done;
+    }
 
-    if(cp_job_should_cancel()) return -1;
-    if(!ok && found.load() == 0) return -1;
+    if(cp_job_should_cancel()){
+        cp_log_attempt_timing("cpu", prep_sec, scan_sec, tiles_done, 0.0);
+        return -1;
+    }
+    if(!ok && found.load() == 0){
+        cp_log_attempt_timing("cpu", prep_sec, scan_sec, tiles_done, 0.0);
+        return -1;
+    }
 
     if(found.load()){
         const int tr = hit_rows.load();
@@ -347,8 +387,10 @@ extern "C" int cp_cpu_worker_mine_attempt(
         fflush(stdout);
         if(out_t_rows) *out_t_rows = tr;
         if(out_t_cols) *out_t_cols = tc;
+        cp_log_attempt_timing("cpu", prep_sec, scan_sec, tiles_done, 0.0);
         return 1;
     }
 
+    cp_log_attempt_timing("cpu", prep_sec, scan_sec, tiles_done, 0.0);
     return 0;
 }

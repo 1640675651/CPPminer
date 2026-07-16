@@ -387,3 +387,18 @@ void cp_pp_fmt_mac_rate(double mac_s, char* out, size_t out_sz)
     else
         snprintf(out, out_sz, "%.0f MAC/s", mac_s);
 }
+
+void cp_log_attempt_timing(const char* tag, double prep_sec, double scan_sec, uint64_t tiles,
+                           double post_sec)
+{
+    char mac_buf[32];
+    double scan_d = scan_sec < 1e-9 ? 1e-9 : scan_sec;
+    cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles, scan_d), mac_buf, sizeof(mac_buf));
+    if(post_sec >= 1e-3)
+        printf("[%s] attempt timing: prep=%.3fs scan=%.3fs post=%.3fs %s\n",
+               tag, prep_sec, scan_sec, post_sec, mac_buf);
+    else
+        printf("[%s] attempt timing: prep=%.3fs scan=%.3fs %s\n",
+               tag, prep_sec, scan_sec, mac_buf);
+    fflush(stdout);
+}

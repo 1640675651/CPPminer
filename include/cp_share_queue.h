@@ -23,9 +23,12 @@ typedef struct CpShareHit {
     uint64_t nonce;
     int t_rows;
     int t_cols;
-    uint64_t tiles_at_hit;
-    double hit_elapsed_sec;
-    int copy_bt;
+    /* Tiles scanned since the previous share (or job start for the first). */
+    uint64_t tiles_since_prev;
+    /* Wall seconds since the previous share (or job start for the first). */
+    double interval_sec;
+    /* If non-zero, also hand off B (bt_io). Zero-B GPU paths leave B shared as zeros. */
+    int handoff_bt;
 } CpShareHit;
 
 CpShareQueue *cp_share_queue_create(int max_depth);
@@ -34,11 +37,21 @@ void cp_share_queue_destroy(CpShareQueue *q);
 void cp_share_queue_begin_job(CpShareQueue *q, const CpShareJobCtx *ctx, const char *job_key);
 void cp_share_queue_end_job(CpShareQueue *q);
 
-/* Copies signal A (and optionally B) then enqueues proof work. Blocks if queue is full. */
+/*
+ * Hands off host signal matrices to the proof worker (no memcpy).
+ * Takes ownership of *a_io (required) and *bt_io when hit->handoff_bt.
+ * Sets handed-off pointers to NULL. Blocks if a prior handoff is still in use
+ * (single-slot / depth-1 ownership).
+ */
 int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit, const uint8_t *header,
                                int hlen, const char *job_id, const char *target_hex,
-                               const int8_t *a_src, size_t sz_a, const int8_t *bt_src,
-                               size_t sz_bt);
+                               int8_t **a_io, size_t sz_a, int8_t **bt_io, size_t sz_bt);
+
+/*
+ * Waits until any loaned matrices are returned, then restores them into *a_io / *bt_io
+ * when those pointers are NULL. No-op if the miner already holds the buffers.
+ */
+void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io);
 
 #ifdef __cplusplus
 }

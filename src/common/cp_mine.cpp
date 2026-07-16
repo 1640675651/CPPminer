@@ -25,7 +25,8 @@ void cp_mine_init_host_buffers(void)
         exit(1);
     }
     if (!g_share_queue) {
-        g_share_queue = cp_share_queue_create(2);
+        /* Depth 1: single host A/B handoff slot (no snapshot memcpy). */
+        g_share_queue = cp_share_queue_create(1);
         if (!g_share_queue) {
             fprintf(stderr, "OOM share proof queue\n");
             exit(1);
@@ -86,7 +87,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     uint64_t nonce = 0;
     uint64_t attempts = 0;
     uint64_t tiles_scanned_total = 0;
+    uint64_t tiles_at_prev_share = 0;
     double last_report = 0.0;
+    double t_prev_share = 0.0;
 
     FILE *hf = fopen(hdr_path, "wb");
     if (!hf) {
@@ -117,6 +120,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
                         cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
     last_report = cp_now_sec();
+    t_prev_share = t0;
+    tiles_at_prev_share = 0;
 
     if (g_share_queue) {
         const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, hdr_path,
@@ -125,7 +130,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     }
 
     const int zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
-    const int snapshot_bt = host_matrices || !zero_b_gpu;
+    const int handoff_bt = host_matrices || !zero_b_gpu;
+    /* Host A unused between GPU-prep attempts; reclaim only on share (or job end). */
+    const int defer_host_reclaim = !host_matrices && !g_cpu_matrix_gen;
 
     for (;;) {
         if (cp_job_should_cancel()) {
@@ -139,6 +146,19 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             fflush(stdout);
             rc = CP_JOB_NONE;
             goto job_done;
+        }
+
+        /* Reclaim host matrices when this attempt will write them (CPU / host-gen).
+         * GPU prep defers reclaim until a share hit so scanning can continue while
+         * proof holds the single A buffer. */
+        if (g_share_queue && !defer_host_reclaim) {
+            cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
+                                           handoff_bt ? &h_BpT_global : NULL);
+            if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
+                fprintf(stderr, "[plain] host matrix buffers missing after reclaim\n");
+                rc = CP_JOB_CANCELLED;
+                goto job_done;
+            }
         }
 
         ab_len = pearl_effective_seed(header, hlen, nonce, ab_seed, (int)sizeof(ab_seed));
@@ -241,20 +261,44 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         {
-            double hit_elapsed = cp_now_sec() - t0;
-            if (hit_elapsed < 1e-3) {
-                hit_elapsed = 1e-3;
+            const double now_hit = cp_now_sec();
+            double interval_sec = now_hit - t_prev_share;
+            if (interval_sec < 1e-3) {
+                interval_sec = 1e-3;
+            }
+            const uint64_t tiles_since_prev = tiles_scanned_total - tiles_at_prev_share;
+
+            if (g_share_queue) {
+                cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
+                                               handoff_bt ? &h_BpT_global : NULL);
+            }
+            if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
+                fprintf(stderr, "[plain] host matrix buffers missing before proof handoff\n");
+                nonce++;
+                continue;
+            }
+            if (defer_host_reclaim) {
+                if (cp_worker_fetch_share_signals(h_Ap_global,
+                                                  handoff_bt ? h_BpT_global : NULL) != 0) {
+                    fprintf(stderr, "[plain] failed to fetch signal matrices nonce=%llu\n",
+                            (unsigned long long)nonce);
+                    nonce++;
+                    continue;
+                }
             }
             const CpShareHit hit = {nonce,
                                     t_rows,
                                     t_cols,
-                                    tiles_scanned_total,
-                                    hit_elapsed,
-                                    snapshot_bt};
+                                    tiles_since_prev,
+                                    interval_sec,
+                                    handoff_bt};
             if (cp_share_queue_enqueue_hit(g_share_queue, &hit, header, hlen, job_id, target_hex,
-                                           h_Ap_global, szAp, h_BpT_global, szBpT) != 0) {
+                                           &h_Ap_global, szAp, &h_BpT_global, szBpT) != 0) {
                 fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
                         (unsigned long long)nonce);
+            } else {
+                tiles_at_prev_share = tiles_scanned_total;
+                t_prev_share = now_hit;
             }
         }
 
@@ -264,6 +308,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 job_done:
     if (g_share_queue) {
         cp_share_queue_end_job(g_share_queue);
+        cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global, &h_BpT_global);
     }
     free(h_A_scan);
     free(h_B_scan);

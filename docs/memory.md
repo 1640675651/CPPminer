@@ -1,7 +1,19 @@
-# Memory footprint (CPU zero-B path)
+# Memory footprint
 
 Production dimensions (`cp_config.h`): **m = n = 131072**, **k = 4096**, **r = 256**.  
 Dev (`--dev`): **m = n = 8192**.
+
+Each full matrix (signal or coalesced prepack) is:
+
+| Size | Production | `--dev` |
+|------|------------:|--------:|
+| m × k or n × k | **512 MiB** | **32 MiB** |
+
+Host signal slots `h_Ap_global` / `h_BpT_global` are always allocated in `cp_mine_init_host_buffers()` (**1 GiB** production) for every backend.
+
+---
+
+# CPU zero-B path
 
 ## Per-buffer sizes
 
@@ -24,8 +36,6 @@ General formulas:
 |B|  = n × k
 |b_comp_ms_| = 64 × n   (16 milestones × int32 per column)
 ```
-
-With `--dev` (8192²), each matrix buffer is **32 MiB** instead of 512 MiB.
 
 ## CPU zero-B layout
 
@@ -94,7 +104,7 @@ No full-matrix temporary. Extra memory is OpenMP thread-local stripes plus a **~
 
 **Recommended** for production mining when RAM is tight.
 
-## Transient allocations (all modes)
+## Transient allocations (all CPU modes)
 
 | When | What | Size (production) |
 |------|------|-------------------|
@@ -112,9 +122,7 @@ If matrix prep is not handled by the worker (`--cpu-gen` or non-CPU backend with
 
 - `h_A_scan`, `h_B_scan` — another **m×k + n×k** if host noisy matrices are materialized
 
-CUDA backend uses device buffers (not covered here); host signal buffers `h_Ap_global` / `h_BpT_global` are still allocated.
-
-## Quick reference
+## CPU quick reference
 
 ```text
 # lowest steady RAM (~2 GiB matrices + 1 GiB signal)
@@ -128,3 +136,142 @@ cpminer.exe --backend cpu --prepack reuse ...
 ```
 
 At startup, `[mode]` logs print estimated matrix MiB for the active prepack mode.
+
+---
+
+# OpenCL zero-B path
+
+OpenCL always handles matrix prep in the worker (`cp_opencl_worker_handles_matrix_prep`). Two modes:
+
+| Mode | CLI | Prep | Typical footprint |
+|------|-----|------|-------------------|
+| **GPU prep** (default) | `--backend opencl` | Device random A + hash + fused prepack | **~1 GiB host + ~1.5 GiB VRAM** |
+| **Host prep** | `--backend opencl --cpu-gen` | CPU noisy + coalesced prepack → H2D | **~2.5–3 GiB host + ~1 GiB VRAM** |
+
+Scan does **not** allocate a device C matrix: GEMM, tile XOR, and jackpot are fused; host only reads a found-flag (+ coords on hit).
+
+## Per-buffer sizes (OpenCL)
+
+### Host
+
+| Buffer | Bytes | Production | GPU prep | `--cpu-gen` |
+|--------|------:|-----------:|:--------:|:-----------:|
+| Signal A (`h_Ap_global`) | m × k | 512 MiB | yes (filled on share D2H) | yes (each nonce) |
+| Signal B^T (`h_BpT_global`, zero) | n × k | 512 MiB | yes (zeros; not handed off) | yes |
+| `g_zero_b.B_noisy` | n × k | 512 MiB | cleared / unused | yes (once/job) |
+| `Case33GemmOcl::a_pre_host_` | m × k | 512 MiB | no | yes (after prepack) |
+| `Case33GemmOcl::b_pre_host_` | n × k | 512 MiB | no | yes (after prepack) |
+| Transient `a_noisy` (attempt) | m × k | 512 MiB | no | peak only |
+
+### Device (`Case33GemmOcl` + `Case33OclPrep`)
+
+| Buffer | Bytes | Production | GPU prep | `--cpu-gen` |
+|--------|------:|-----------:|:--------:|:-----------:|
+| `a_buf_` (coalesced A) | m × k | 512 MiB | yes | yes |
+| `b_buf_` (coalesced B) | n × k | 512 MiB | yes | yes |
+| `d_A_sig_` (device signal A) | m × k | 512 MiB | yes | no |
+| `d_pairs_` | K × 2 × 4 | 32 KiB | yes | yes (prep init) |
+| `d_merkle_roots_` | see below | ~64 KiB | yes | no |
+| Jackpot (`a_key`, `bound`, `found`, coords) | tens of bytes | ~0 | yes | yes |
+| `dummy_buf_` | 4 B | ~0 | yes | yes |
+
+Merkle workspace:
+
+```
+raw_max   = max(m, n) × K
+pad_max   = ceil(raw_max / 1024) × 1024
+chunks    = pad_max / 1024
+merkle    = ceil(chunks / 256) × 32     (~64 KiB at production)
+```
+
+Coalesced `a_buf_` / `b_buf_` byte count equals row-major `m×k` / `n×k` (`case32_layout.hpp` macro blocking).
+
+## OpenCL GPU prep (default)
+
+Steady state (production):
+
+```
+HOST
+  h_Ap_global           512 MiB   reclaimed / D2H only on share
+  h_BpT_global          512 MiB   zeros; proof may read this (not copied)
+DEVICE
+  a_buf_                512 MiB   GEMM A
+  b_buf_                512 MiB   GEMM B (job)
+  d_A_sig_              512 MiB   random A + hash source + D2H on hit
+  d_pairs_ / merkle     ~0.1 MiB
+─────────────────────────────────────
+host                    ~1024 MiB
+VRAM                    ~1536 MiB
+combined                ~2.5 GiB
+```
+
+Flow:
+
+1. Job: GPU builds noisy B into `b_buf_` (and keeps `d_A_sig_` capacity).
+2. Each nonce: GPU random A → keyed hash → fused prepack into `a_buf_` (source stays in `d_A_sig_`).
+3. Scan: fused GEMM+XOR+jackpot; no full tile-XOR buffer.
+4. Share: reclaim host A slot → D2H `d_A_sig_` → **handoff** pointer to proof thread (no host memcpy of A). B^T stays the shared zero `h_BpT_global`.
+
+`g_zero_b.B_noisy` is cleared on the GPU-prep path. `h_A_scan` / `h_B_scan` are not allocated (OpenCL handles prep).
+
+## OpenCL `--cpu-gen` (host prep)
+
+Steady / peak (production):
+
+```
+HOST STEADY
+  h_Ap_global           512 MiB
+  h_BpT_global          512 MiB
+  g_zero_b.B_noisy      512 MiB
+  a_pre_host_           512 MiB
+  b_pre_host_           512 MiB
+                        ─────
+                        2560 MiB
+HOST PEAK (a_noisy live during attempt)
+  + a_noisy             512 MiB  → ~3072 MiB
+DEVICE
+  a_buf_ + b_buf_      1024 MiB   (no d_A_sig_)
+─────────────────────────────────────
+steady combined         ~3.5 GiB
+peak combined           ~4.0 GiB
+```
+
+Matches the startup hint: `--cpu-gen` for host prep (**~1 GiB VRAM** = scan A+B only).
+
+On share, both A and B^T may be handed off (`handoff_bt=1`); reclaim runs every attempt because host A is rewritten each nonce.
+
+## Share handoff and proof (OpenCL)
+
+| Item | Behavior |
+|------|----------|
+| Queue depth | **1** (single ownership slot) |
+| GPU prep | Hand off **A only**; proof uses zero `h_BpT_global` for B |
+| `--cpu-gen` | Hand off **A and B^T** |
+| Copy | **None** — pointer move; mining waits if the next hit arrives before proof returns the buffer |
+| Proof scratch | up to **512 KiB** `PLAIN_PROOF_B64_MAX` on the proof thread |
+
+Peak host matrix RAM does **not** double during proof on the GPU-prep path.
+
+## OpenCL quick reference
+
+```text
+# default: ~1 GiB host signal + ~1.5 GiB VRAM
+cpminer.exe --backend opencl ...
+
+# host matrix gen: ~2.5–3 GiB host + ~1 GiB VRAM
+cpminer.exe --backend opencl --cpu-gen ...
+
+# small matrices for bring-up
+cpminer.exe --backend opencl --dev ...
+```
+
+## Code map (OpenCL)
+
+| Area | Location |
+|------|----------|
+| Host signal / handoff flags | `src/common/cp_mine.cpp` |
+| Worker GPU vs `--cpu-gen` | `src/opencl/cp_opencl_worker.cpp` |
+| Scan buffers `a_buf_` / `b_buf_` | `src/opencl/case33_gemm_ocl.cpp` |
+| Prep `d_A_sig_` / merkle / pairs | `src/opencl/case33_ocl_prep.cpp` |
+| Layout / block sizes | `src/opencl/case32_layout.hpp` |
+| Share ownership | `src/common/cp_share_queue.cpp` |

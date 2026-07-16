@@ -60,7 +60,8 @@ int cp_worker_default_tile_layout(void);
 /*
  * One matrix attempt: prepare noisy A/B (host or device), scan for jackpot.
  * Returns 1 on share, 0 on miss, -1 on cancel/error.
- * On share with device-generated matrices, copies signal A/B^T to h_A_sig/h_Bt_sig.
+ * On share with device-generated matrices, signal download may be deferred via
+ * cp_worker_fetch_share_signals when h_A_sig was NULL (buffer loaned to proof).
  */
 int cp_worker_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,
@@ -73,6 +74,9 @@ int cp_worker_mine_attempt(
     int8_t* h_A_sig, int8_t* h_Bt_sig,
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned);
+
+/* Device → host signal matrices after a share (no-op for CPU / already-host paths). */
+int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
 
 #ifdef __cplusplus
 }

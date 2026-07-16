@@ -10,8 +10,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -212,6 +214,7 @@ extern "C" int cp_opencl_worker_mine_attempt(
     (void)h_A_noisy;
     (void)h_B_noisy;
 
+    const double attempt_t0 = cp_now_sec();
     const int cpu_prep = cpu_matrices || g_cpu_matrix_gen;
 
     if (!g_context_ready) {
@@ -264,6 +267,7 @@ extern "C" int cp_opencl_worker_mine_attempt(
     const int row_parts = cp_pp_num_row_parts(m, 1);
     const int col_parts = cp_pp_num_col_parts(n, 1);
     const int total_tiles = row_parts * col_parts;
+    const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
     printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n", row_parts,
@@ -273,14 +277,21 @@ extern "C" int cp_opencl_worker_mine_attempt(
 
     std::atomic<uint64_t> tiles{0};
     std::atomic<bool> scan_done{false};
+    std::mutex progress_mu;
+    std::condition_variable progress_cv;
+    constexpr auto kProgressInterval = std::chrono::seconds(2);
 
     std::thread progress_thread([&]() {
         uint64_t last_tiles = 0;
         double last_report = scan_t0;
-        while (!scan_done.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            if (scan_done.load(std::memory_order_relaxed)) {
-                break;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(progress_mu);
+                if (progress_cv.wait_for(lock, kProgressInterval, [&] {
+                        return scan_done.load(std::memory_order_relaxed);
+                    })) {
+                    break;
+                }
             }
 
             const uint64_t cur = tiles.load(std::memory_order_relaxed);
@@ -326,7 +337,12 @@ extern "C" int cp_opencl_worker_mine_attempt(
             []() -> bool { return cp_job_should_cancel() != 0; },
             [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); });
 
-    scan_done.store(true, std::memory_order_relaxed);
+    const double scan_sec = cp_now_sec() - scan_t0;
+    {
+        std::lock_guard<std::mutex> lock(progress_mu);
+        scan_done.store(true, std::memory_order_relaxed);
+    }
+    progress_cv.notify_all();
     if (progress_thread.joinable()) {
         progress_thread.join();
     }
@@ -335,10 +351,14 @@ extern "C" int cp_opencl_worker_mine_attempt(
         *out_tiles_scanned = tiles_scanned;
     }
 
+    double post_sec = 0.0;
+
     if (cp_job_should_cancel()) {
+        cp_log_attempt_timing("ocl", prep_sec, scan_sec, tiles_scanned, post_sec);
         return -1;
     }
     if (!ok) {
+        cp_log_attempt_timing("ocl", prep_sec, scan_sec, tiles_scanned, post_sec);
         return -1;
     }
 
@@ -351,13 +371,24 @@ extern "C" int cp_opencl_worker_mine_attempt(
         if (out_t_cols) {
             *out_t_cols = hit_cols;
         }
-        if (!cpu_prep && h_A_sig) {
-            if (!g_gemm.read_A_sig(h_A_sig)) {
-                fprintf(stderr, "[ocl] failed to read A_sig for proof\n");
-            }
-        }
+        /* Device→host A download is deferred to cp_worker_fetch_share_signals after
+         * the mine loop reclaims the host buffer (single-buffer handoff). */
+        cp_log_attempt_timing("ocl", prep_sec, scan_sec, tiles_scanned, post_sec);
         return 1;
     }
 
+    cp_log_attempt_timing("ocl", prep_sec, scan_sec, tiles_scanned, post_sec);
+    return 0;
+}
+
+extern "C" int cp_opencl_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig) {
+    (void)h_Bt_sig;
+    if (!h_A_sig) {
+        return -1;
+    }
+    if (!g_gemm.read_A_sig(h_A_sig)) {
+        fprintf(stderr, "[ocl] failed to read A_sig for proof\n");
+        return -1;
+    }
     return 0;
 }

@@ -44,6 +44,9 @@ int cp_gpu_mine_attempt(
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned);
 
+/* Device → host signal A/B after a share (for deferred handoff). */
+int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
+
 #ifdef __cplusplus
 }
 #endif

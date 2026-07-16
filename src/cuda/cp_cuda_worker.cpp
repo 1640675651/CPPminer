@@ -63,3 +63,8 @@ extern "C" int cp_cuda_worker_mine_attempt(
         h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
         out_t_rows, out_t_cols, out_tiles_scanned);
 }
+
+extern "C" int cp_cuda_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
+{
+    return cp_gpu_fetch_share_signals(h_A_sig, h_Bt_sig);
+}

@@ -20,6 +20,8 @@ int cp_opencl_worker_mine_attempt(
         int8_t *h_A_sig, int8_t *h_Bt_sig, int *out_t_rows, int *out_t_cols,
         uint64_t *out_tiles_scanned);
 
+int cp_opencl_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig);
+
 #ifdef __cplusplus
 }
 #endif
