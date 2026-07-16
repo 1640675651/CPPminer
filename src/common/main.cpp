@@ -15,6 +15,10 @@
 #include "cp_cutlass.h"
 #endif
 
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+#include "cp_opencl_align.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,7 +58,7 @@ static void print_usage(void)
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
            K_DIM, R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + in-kernel jackpot (Pascal SIMT)\n");
-    printf("  --cpu-gen            CPU BLAKE3 matrix gen (CUDA debug; default GPU random)\n");
+    printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
            M_DIM);
@@ -267,10 +271,18 @@ int main(int argc, char** argv)
 
     cp_worker_apply_backend_defaults();
 
-#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+#if (defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA) || (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL)
     if(align_test){
-        if(cp_worker_backend_id() != CP_BACKEND_CUDA){
-            fprintf(stderr, "--align-test requires CUDA backend\n");
+        const CpBackendId bid = cp_worker_backend_id();
+        int gpu_ok = 0;
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+        if(bid == CP_BACKEND_CUDA) gpu_ok = 1;
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        if(bid == CP_BACKEND_OPENCL) gpu_ok = 1;
+#endif
+        if(!gpu_ok){
+            fprintf(stderr, "--align-test requires CUDA or OpenCL backend\n");
             return 1;
         }
         if(!ndev){ devs[0] = 0; ndev = 1; }
@@ -284,13 +296,27 @@ int main(int argc, char** argv)
         g_cutlass_fused = cutlass_fused;
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
-            if(pearl_run_alignment_tests_prod(M_DIM, M_DIM, K_DIM) != 0) return 1;
-            if(cp_gpu_run_alignment_tests(devs[0], M_DIM, N_DIM) != 0) return 1;
+            const int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
+            const int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
+            if(g_dev_dims){
+                printf("[align-test-prod] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
+            }
+            if(pearl_run_alignment_tests_prod(pm, pm, K_DIM) != 0) return 1;
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+            if(bid == CP_BACKEND_CUDA &&
+               cp_gpu_run_alignment_tests(devs[0], pm, pn) != 0) return 1;
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+            if(bid == CP_BACKEND_OPENCL &&
+               cp_opencl_run_alignment_tests(devs[0], pm, pn) != 0) return 1;
+#endif
         }
         printf("[align-test] all tests passed\n");
         return 0;
     }
+#endif
 
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(profile_scan){
         if(cp_worker_backend_id() != CP_BACKEND_CUDA){
             fprintf(stderr, "--profile-scan requires CUDA backend\n");
@@ -316,9 +342,22 @@ int main(int argc, char** argv)
         return cp_gpu_run_scan_profile(devs[0], pm, pn, 2, profile_runs) != 0;
     }
 #else
-    (void)align_test;
-    (void)align_test_prod;
     (void)profile_scan;
+    (void)profile_runs;
+#endif
+
+#if !((defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA) || (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL))
+    if(align_test){
+        fprintf(stderr, "--align-test requires CUDA or OpenCL backend (rebuild with -Backend Cuda/OpenCl)\n");
+        return 1;
+    }
+    (void)align_test_prod;
+#endif
+#if !(defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA)
+    if(profile_scan){
+        fprintf(stderr, "--profile-scan requires CUDA backend\n");
+        return 1;
+    }
     (void)profile_runs;
 #endif
 

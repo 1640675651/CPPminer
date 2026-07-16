@@ -147,6 +147,8 @@ if(CP_ENABLE_OPENCL)
     list(APPEND CP_SOURCES
         src/opencl/cp_opencl_worker.cpp
         src/opencl/case33_gemm_ocl.cpp
+        src/opencl/case33_ocl_prep.cpp
+        src/opencl/cp_ocl_align_test.cpp
         src/opencl/case32_prepack.cpp
         src/opencl/opencl_context.cpp
     )
@@ -169,6 +171,15 @@ if(CP_ENABLE_OPENCL)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/case33_gemm_xor.cl"
             "$<TARGET_FILE_DIR:cpminer>/kernels/case33_gemm_xor.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_blake3.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_merkle.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_prep.cl"
         COMMENT "Copy OpenCL kernels next to cpminer")
 endif()
 

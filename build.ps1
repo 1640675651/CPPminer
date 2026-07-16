@@ -171,10 +171,17 @@ function Find-OpenClLib {
 }
 
 function Copy-OpenClKernels {
-    $kernelSrc = Join-Path $Root "src\opencl\kernels\case33_gemm_xor.cl"
+    $kernelSrcDir = Join-Path $Root "src\opencl\kernels"
     $kernelDstDir = Join-Path $Root "kernels"
     New-Item -ItemType Directory -Force -Path $kernelDstDir | Out-Null
-    Copy-Item $kernelSrc (Join-Path $kernelDstDir "case33_gemm_xor.cl") -Force
+    foreach ($name in @(
+        "case33_gemm_xor.cl",
+        "cp_ocl_blake3.cl",
+        "cp_ocl_merkle.cl",
+        "cp_ocl_prep.cl"
+    )) {
+        Copy-Item (Join-Path $kernelSrcDir $name) (Join-Path $kernelDstDir $name) -Force
+    }
 }
 
 function Ensure-Blake3 {
@@ -380,6 +387,8 @@ try {
             "src\common\cp_worker.cpp",
             "src\opencl\cp_opencl_worker.cpp",
             "src\opencl\case33_gemm_ocl.cpp",
+            "src\opencl\case33_ocl_prep.cpp",
+            "src\opencl\cp_ocl_align_test.cpp",
             "src\opencl\case32_prepack.cpp",
             "src\opencl\opencl_context.cpp"
         )

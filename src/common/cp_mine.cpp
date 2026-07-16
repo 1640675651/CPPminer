@@ -249,10 +249,12 @@ int cp_mine_job(
         }
 
         uint64_t scan_tiles = 0;
+        const int worker_cpu_prep =
+                cp_worker_worker_handles_matrix_prep() ? g_cpu_matrix_gen : host_matrices;
         found = cp_worker_mine_attempt(
             ab_seed, ab_len, job_key_bytes, pool_tgt,
             g_m_active, g_n_active,
-            host_matrices,
+            worker_cpu_prep,
             host_matrices ? h_A_scan : NULL,
             host_matrices ? h_B_scan : NULL,
             host_matrices ? a_key : NULL,

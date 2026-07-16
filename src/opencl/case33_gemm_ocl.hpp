@@ -4,6 +4,7 @@
 
 #include "case32_gemm_ocl.hpp"
 
+#include "case33_ocl_prep.hpp"
 #include "cp_config.h"
 
 #include "opencl_context.hpp"
@@ -40,6 +41,13 @@ struct Case33GemmOcl {
 
     bool prepare_job(int M, int N, int K, const int8_t *b_colmajor);
 
+    /* GPU prep path: noise + coalesced prepack directly into device GEMM buffers. */
+    bool prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]);
+    bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
+                             const uint8_t job_key[32], const uint8_t b_noise_seed[32],
+                             uint8_t a_key_out[32]);
+    bool read_A_sig(int8_t *h_A_sig);
+
     bool prepare_attempt_a(const int8_t *a_rowmajor);
 
     bool available() const { return available_; }
@@ -68,6 +76,8 @@ struct Case33GemmOcl {
 private:
 
     bool build_kernel_(const char *kernel_cl_path);
+
+    bool setup_dims_(int M, int N, int K);
 
     bool ensure_jackpot_bufs_();
 
@@ -144,6 +154,8 @@ private:
     std::vector<int8_t> a_pre_host_;
 
     std::vector<int8_t> b_pre_host_;
+
+    Case33OclPrep prep_;
 
     std::string device_name_;
 

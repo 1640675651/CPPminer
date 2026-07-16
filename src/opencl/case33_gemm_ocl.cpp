@@ -218,18 +218,17 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index) {
     if (!ensure_jackpot_bufs_()) {
         return false;
     }
+    if (!prep_.init(&ocl_, cp_ocl_kernel_dir())) {
+        std::fprintf(stderr, "[ocl] prep kernel init failed\n");
+        return false;
+    }
     device_name_ = ocl_.device_name;
     std::snprintf(backend_, sizeof(backend_), "OpenCL Case3.3 context ready");
     context_ready_ = true;
     return true;
 }
 
-bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
-    available_ = false;
-    if (!context_ready_ || !kernel_ || !b_colmajor) {
-        return false;
-    }
-
+bool Case33GemmOcl::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
@@ -250,6 +249,18 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
     if (K % num_milestones_ != 0 || milestone_k_ % case32::kKR != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
+    available_ = false;
+    if (!context_ready_ || !kernel_ || !b_colmajor) {
+        return false;
+    }
+
+    if (!setup_dims_(M, N, K)) {
         return false;
     }
 
@@ -294,6 +305,78 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
                   case32::kKR, dot_kind);
     available_ = true;
     return true;
+}
+
+bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]) {
+    available_ = false;
+    if (!context_ready_ || !kernel_ || !b_noise_seed || !prep_.ready()) {
+        return false;
+    }
+    if (!setup_dims_(M, N, K)) {
+        return false;
+    }
+    if (!prep_.ensure_buffers(M, N, K)) {
+        return false;
+    }
+
+    if (b_buf_) {
+        clReleaseMemObject(b_buf_);
+        b_buf_ = nullptr;
+    }
+    if (a_buf_) {
+        clReleaseMemObject(a_buf_);
+        a_buf_ = nullptr;
+    }
+
+    const size_t b_bytes = static_cast<size_t>(macro_cols_) * static_cast<size_t>(blocks_k_) *
+                           static_cast<size_t>(case32::kMacroKbBlockB);
+    const size_t a_bytes = static_cast<size_t>(macro_rows_) * static_cast<size_t>(blocks_k_) *
+                           static_cast<size_t>(case32::kMacroKbBlockA);
+
+    b_buf_ = ocl_.alloc_buffer(b_bytes, CL_MEM_READ_ONLY);
+    a_buf_ = ocl_.alloc_buffer(a_bytes, CL_MEM_READ_ONLY);
+    if (!dummy_buf_) {
+        dummy_buf_ = ocl_.alloc_buffer(sizeof(uint32_t), CL_MEM_READ_WRITE);
+    }
+    if (!b_buf_ || !a_buf_ || !dummy_buf_) {
+        return false;
+    }
+
+    if (!prep_.prepare_job_b(b_buf_, b_noise_seed, N_, K_, blocks_k_, macro_cols_)) {
+        return false;
+    }
+
+    const char *dot_kind = "scalar";
+    if (using_asm_dot_) {
+        dot_kind = "asm v_dot4c";
+    } else if (using_builtin_dot_) {
+        dot_kind = "builtin sdot4";
+    } else if (using_integer_dot_) {
+        dot_kind = "dot_acc_sat";
+    }
+    std::snprintf(backend_, sizeof(backend_),
+                  "OpenCL Case3.3 %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8 GPU-prep",
+                  case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
+                  case32::kKR, dot_kind);
+    available_ = true;
+    return true;
+}
+
+bool Case33GemmOcl::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
+                                        const uint8_t job_key[32],
+                                        const uint8_t b_noise_seed[32], uint8_t a_key_out[32]) {
+    if (!available_ || !a_buf_ || !prep_.ready()) {
+        return false;
+    }
+    return prep_.prepare_attempt_a(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
+                                   blocks_k_, macro_rows_, a_key_out);
+}
+
+bool Case33GemmOcl::read_A_sig(int8_t *h_A_sig) {
+    if (!h_A_sig || M_ <= 0 || K_ <= 0) {
+        return false;
+    }
+    return prep_.read_A_sig(h_A_sig, static_cast<size_t>(M_) * static_cast<size_t>(K_));
 }
 
 bool Case33GemmOcl::prepare_attempt_a(const int8_t *a_rowmajor) {
