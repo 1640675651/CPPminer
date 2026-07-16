@@ -17,6 +17,7 @@
 
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_opencl_align.h"
+#include "cp_opencl_prep_profile.h"
 #endif
 
 #include <stdio.h>
@@ -63,6 +64,9 @@ static void print_usage(void)
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
            M_DIM);
     printf("  --profile-scan [N]   time GEMM vs jackpot per period batch (default N=10)\n");
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
     printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
@@ -155,6 +159,8 @@ int main(int argc, char** argv)
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     int profile_scan = 0;
     int profile_runs = 10;
+    int profile_prep = 0;
+    int profile_prep_runs = 3;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     for(int i = 1; i < argc; i++){
@@ -257,6 +263,15 @@ int main(int argc, char** argv)
             else if(i + 1 < argc && argv[i + 1][0] != '-')
                 profile_runs = atoi(argv[++i]);
             if(profile_runs < 1) profile_runs = 1;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        } else if(!strncmp(argv[i], "--profile-prep", 14)){
+            profile_prep = 1;
+            const char* v = argv[i] + 14;
+            if(*v == '=') profile_prep_runs = atoi(v + 1);
+            else if(i + 1 < argc && argv[i + 1][0] != '-')
+                profile_prep_runs = atoi(argv[++i]);
+            if(profile_prep_runs < 1) profile_prep_runs = 1;
+#endif
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
@@ -346,6 +361,26 @@ int main(int argc, char** argv)
     (void)profile_runs;
 #endif
 
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(profile_prep){
+        if(cp_worker_backend_id() != CP_BACKEND_OPENCL){
+            fprintf(stderr, "--profile-prep requires OpenCL backend\n");
+            return 1;
+        }
+        if(!ndev){ devs[0] = 0; ndev = 1; }
+        int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
+        int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
+        if(g_dev_dims){
+            printf("[profile-prep] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
+        }
+        const int warmup = profile_prep_runs > 1 ? 1 : 0;
+        return cp_opencl_run_prep_profile(devs[0], pm, pn, warmup, profile_prep_runs) != 0;
+    }
+#else
+    (void)profile_prep;
+    (void)profile_prep_runs;
+#endif
+
 #if !((defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA) || (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL))
     if(align_test){
         fprintf(stderr, "--align-test requires CUDA or OpenCL backend (rebuild with -Backend Cuda/OpenCl)\n");
@@ -359,6 +394,13 @@ int main(int argc, char** argv)
         return 1;
     }
     (void)profile_runs;
+#endif
+#if !(defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL)
+    if(profile_prep){
+        fprintf(stderr, "--profile-prep requires OpenCL backend (rebuild with -Backend OpenCl)\n");
+        return 1;
+    }
+    (void)profile_prep_runs;
 #endif
 
     if(!wallet){ fprintf(stderr, "--wallet required\n"); return 1; }

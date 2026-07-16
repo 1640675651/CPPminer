@@ -317,6 +317,7 @@ try {
             "src\common\cp_pool.cpp",
             "src\common\cp_job_ctrl.cpp",
             "src\common\cp_mine.cpp",
+            "src\common\cp_share_queue.cpp",
             "src\common\cp_state.cpp",
             "src\common\cp_worker.cpp",
             "src\cpu\cp_cpu_worker.cpp",
@@ -383,12 +384,14 @@ try {
             "src\common\cp_pool.cpp",
             "src\common\cp_job_ctrl.cpp",
             "src\common\cp_mine.cpp",
+            "src\common\cp_share_queue.cpp",
             "src\common\cp_state.cpp",
             "src\common\cp_worker.cpp",
             "src\opencl\cp_opencl_worker.cpp",
             "src\opencl\case33_gemm_ocl.cpp",
             "src\opencl\case33_ocl_prep.cpp",
             "src\opencl\cp_ocl_align_test.cpp",
+            "src\opencl\cp_ocl_prep_profile.cpp",
             "src\opencl\case32_prepack.cpp",
             "src\opencl\opencl_context.cpp"
         )

@@ -470,10 +470,18 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
         return false;
     }
 
+    return fused_prepack_a(a_buf, m, K, blocks_k, macro_rows);
+}
+
+bool Case33OclPrep::fused_prepack_a(cl_mem a_buf, int m, int K, int blocks_k, int macro_rows) {
+    if (!ready_ || !a_buf || m <= 0 || K <= 0 || blocks_k <= 0 || macro_rows <= 0) {
+        return false;
+    }
+
     const int is_b = 0;
     const int rank = R_RANK;
     const int pair_groups = (K + 7) / 8;
-    err = CL_SUCCESS;
+    cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(k_build_pairs_, 0, sizeof(int), &is_b);
     err |= clSetKernelArg(k_build_pairs_, 1, sizeof(cl_mem), &d_noise_seed_);
     err |= clSetKernelArg(k_build_pairs_, 2, sizeof(int), &K);
@@ -518,6 +526,13 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
     }
     clFinish(ocl_->queue);
     return true;
+}
+
+bool Case33OclPrep::write_noise_seed(const uint8_t seed[32]) {
+    if (!ready_ || !seed) {
+        return false;
+    }
+    return ocl_->write_buffer(d_noise_seed_, seed, 32);
 }
 
 bool Case33OclPrep::read_A_sig(int8_t *h_A_sig, size_t bytes) const {

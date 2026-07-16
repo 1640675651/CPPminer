@@ -20,6 +20,11 @@ struct Case33OclPrep {
                            const uint8_t job_key[32], const uint8_t b_noise_seed[32], int m,
                            int K, int blocks_k, int macro_rows, uint8_t a_key_out[32]);
 
+    /* Noise perm pairs + fused coalesced A prepack (d_noise_seed_ and d_A_sig_ must be set). */
+    bool fused_prepack_a(cl_mem a_buf, int m, int K, int blocks_k, int macro_rows);
+
+    bool write_noise_seed(const uint8_t seed[32]);
+
     bool read_A_sig(int8_t *h_A_sig, size_t bytes) const;
 
     /* OpenCL --align-test helpers (GPU vs CPU reference). */
