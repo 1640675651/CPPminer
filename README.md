@@ -8,7 +8,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 |---------|-----------|--------|
 | CPU | `src/cpu/` | Case 3.3 fused GEMM+XOR (contiguous 8×16) |
 | CUDA | `src/cuda/` | CUTLASS / cuBLAS Pascal+ path |
-| OpenCL | — | Build flag reserved; not implemented yet |
+| OpenCL | `src/opencl/` | Case 3.3 fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 
 ## Requirements
 
@@ -32,10 +32,10 @@ cmake --build build --config Release
 |--------|---------|---------|
 | `CP_ENABLE_CPU` | ON | Case 3.3 CPU worker |
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
-| `CP_ENABLE_OPENCL` | OFF | Reserved (errors if ON) |
+| `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
-Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda`.
+Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda|opencl`.
 
 ## Build (Windows)
 
@@ -46,10 +46,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 # equivalent: -Backend Cpu
 ```
 
-CUDA or both:
+CUDA, OpenCL, or combinations:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend CpuOpenCl
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Both -CudaArch 75
 ```
 
@@ -64,6 +65,10 @@ Produces `cpminer.exe` in the repo root.
 # CUDA (LuckyPool production layout: BzMiner scattered 8×16)
 .\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
+
+# OpenCL (1D macro-block batches; see --period-batch below)
+.\cpminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
+  --wallet prl1... --worker test --period-batch 1024
 ```
 
 ### Options
@@ -76,10 +81,36 @@ Produces `cpminer.exe` in the repo root.
 | `--worker` | Worker name (default `rig01`) |
 | `--devices` | CUDA device list |
 | `--dev` | Use 8192×8192 matrices for testing |
-| `--cpu-gen` | Host matrix gen on CUDA path (debug) |
+| `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
+| `--period-batch N` | Batch size for scan launches (backend-specific; see below) |
+| `--col-period-batch N` | Alias for `--period-batch` |
+| `--row-period-batch N` | CUDA only: row-period batch (default 1, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
+
+### Scan batching (`--period-batch`)
+
+Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
+
+**OpenCL — 1D macro slicing**
+
+Macros are a 2D grid (`macro_rows × macro_cols`, each 128×128), walked as a flat index `mb`. `--period-batch N` is how many **macro blocks** each kernel launch covers (`CP_MACRO_BATCH_*` in `include/cp_config.h`).
+
+- Default: `1024` (one full macro-row at production `m=n=131072`)
+- Max: `1048576` (full matrix: `1024×1024` macros)
+- `--row-period-batch` is ignored on OpenCL
+
+**CUDA — 2D period window**
+
+Uses period tiles (`PP_ROW_PERIOD=128`, `PP_COL_PERIOD=256`):
+
+| Flag | Role | Default | Max |
+|------|------|---------|-----|
+| `--row-period-batch` | Row periods per launch | 1 | 1024 |
+| `--period-batch` / `--col-period-batch` | Col periods per launch | 32 | 512 |
+
+A launch covers `row_batch × col_batch` periods (and sizes the period GEMM / `C_hist` window).
 
 ## Vendored proof stack (`third_party/`)
 
@@ -110,6 +141,7 @@ include/          Public headers (pool, mine, worker, …)
 src/common/       Pool, job loop, shared worker dispatch
 src/cpu/          CPU worker + Case 3.2/3.3 GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
+src/opencl/       OpenCL Case 3.3 fused path + kernels
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
 third_party/      blake3, pearl-blake3, zk-pow, plonky2, cutlass (CUDA)
 scripts/          plain_proof_host.py (optional verify)
@@ -119,7 +151,8 @@ scripts/          plain_proof_host.py (optional verify)
 
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
 - **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
-- **cp_worker** — Backend selection (`cpu` / `cuda` / …)
+- **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl`)
 - **cp_cpu** — Case 3.3 fused GEMM+XOR + host BLAKE3 jackpot
 - **cp_gpu** — CUDA plain_proof path (under `src/cuda/`)
+- **cp_opencl** — OpenCL plain_proof path (under `src/opencl/`)
 - **cp_noise** — Matrix generation and pearl noise
