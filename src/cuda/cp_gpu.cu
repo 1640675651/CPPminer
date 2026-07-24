@@ -281,6 +281,10 @@ void cp_gpu_init(int* devs, int ndev)
     g_ngpu = ndev;
     printf("[gpu] Initializing %d GPU(s)...\n", ndev);
     fflush(stdout);
+    /* Blocking sync: large period-batch kernels sleep the CPU instead of
+     * spin-waiting in cudaDeviceSynchronize (default WDDM schedule).
+     * Set before any device is current so flags apply at primary-context init. */
+    CU_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
     for(int i = 0; i < ndev; i++){
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
@@ -298,7 +302,7 @@ void cp_gpu_init(int* devs, int ndev)
         CUBLAS_CHECK(cublasCreate(&g->cublas));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
         g->use_cutlass_fused = g_cutlass_fused;
-        printf("[gpu] GPU%d OK (%s)\n", g->dev,
+        printf("[gpu] GPU%d OK (%s, blocking sync)\n", g->dev,
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
                : (g->use_cublas_period ? "cuBLAS int8 period GEMM"
                                        : "CUDA period GEMM"));
