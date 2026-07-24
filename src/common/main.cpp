@@ -59,7 +59,8 @@ static void print_usage(void)
            CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
            K_DIM, R_RANK);
-    printf("  --cutlass-fused      fused CUTLASS GEMM + in-kernel jackpot (Pascal SIMT)\n");
+    printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+    printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
@@ -159,7 +160,8 @@ int main(int argc, char** argv)
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = 1;
-    int cutlass_fused = 0;
+    /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
+    int cutlass_fused = -1;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     int profile_scan = 0;
     int profile_runs = 10;
@@ -221,6 +223,9 @@ int main(int argc, char** argv)
             step_major_ap = 1;
         } else if(!strcmp(argv[i], "--cutlass-fused")){
             cutlass_fused = 1;
+        } else if(!strcmp(argv[i], "--cublas-period") ||
+                  !strcmp(argv[i], "--no-cutlass-fused")){
+            cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
@@ -289,7 +294,9 @@ int main(int argc, char** argv)
 
     if(cp_worker_select(backend_sel) != 0) return 1;
 
-    if(cp_worker_backend_id() == CP_BACKEND_CPU){
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA){
+        if(cutlass_fused < 0) cutlass_fused = 1;
+    } else {
         cutlass_fused = 0;
     }
 
@@ -449,12 +456,9 @@ int main(int argc, char** argv)
 
     if(cutlass_fused){
         if(no_period_gemm){
-            fprintf(stderr, "--cutlass-fused requires period GEMM (omit --no-period-gemm)\n");
+            fprintf(stderr, "CUTLASS fused path requires period GEMM (omit --no-period-gemm)\n");
             return 1;
         }
-        fprintf(stderr,
-            "[warn] --cutlass-fused uses a non-BzMiner 16x8 hash tile; pool must accept this layout.\n"
-            "       For production LuckyPool mining, omit --cutlass-fused (default BzMiner 8x16).\n");
     }
 
     if(g_dev_dims){
@@ -511,7 +515,7 @@ int main(int argc, char** argv)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
         if(cp_worker_backend_id() == CP_BACKEND_CUDA
            && !contiguous && !no_period_gemm){
-            printf("[mode] Ap/BpT layout: %s (cuBLAS lda=%d)\n",
+            printf("[mode] Ap/BpT layout: %s (lda=%d)\n",
                    step_major_ap ? "step-major panels" : "row-major strided",
                    step_major_ap ? R_RANK : K_DIM);
             if(cutlass_fused){
@@ -519,6 +523,7 @@ int main(int argc, char** argv)
                 printf("[mode] period batch: row=%d col=%d\n",
                        row_period_batch, period_batch);
             } else {
+                printf("[mode] jackpot: separate XOR kernel (cuBLAS period GEMM)\n");
                 printf("[mode] period batch: row=%d col=%d (~%.0f MiB C_hist/GPU)\n",
                        row_period_batch, period_batch,
                        (double)row_period_batch * (double)period_batch

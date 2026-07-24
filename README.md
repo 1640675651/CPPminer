@@ -62,15 +62,20 @@ Produces `cpminer.exe` in the repo root.
 # CPU (contiguous 8×16 tiles; recommended --dev while testing)
 .\cpminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
 
-# CUDA (LuckyPool production layout: BzMiner scattered 8×16)
+# CUDA (CUTLASS fused GEMM+jackpot; Case 7.1 tile / milestone-major A,B)
 .\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
+  --wallet prl1... --worker test --devices 0
+
+# CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (BzMiner 8x16)
+.\cpminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
 # OpenCL (LuckyPool production layout)
 .\cpminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker test --period-batch 1024
+  --wallet prl1... --worker test
 
 # Offline mock: first share + zk-pow verify (no pool; use --dev for a quick run)
+.\cpminer.exe --backend cuda --dev --mock
 .\cpminer.exe --backend opencl --dev --mock
 .\cpminer.exe --backend cpu --dev --mock
 ```
@@ -86,7 +91,9 @@ Produces `cpminer.exe` in the repo root.
 | `--devices` | CUDA device list |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
-| `--period-batch N` | Batch size for scan launches (backend-specific; see below) |
+| `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
+| `--cublas-period` | CUDA debug: cuBLAS period GEMM + separate XOR/jackpot |
+| `--period-batch N` | Batch size for scan launches (default 1024; see below) |
 | `--col-period-batch N` | Alias for `--period-batch` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 1, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
@@ -114,9 +121,9 @@ Uses period tiles (`PP_ROW_PERIOD=128`, `PP_COL_PERIOD=256`):
 | Flag | Role | Default | Max |
 |------|------|---------|-----|
 | `--row-period-batch` | Row periods per launch | 1 | 1024 |
-| `--period-batch` / `--col-period-batch` | Col periods per launch | 32 | 512 |
+| `--period-batch` / `--col-period-batch` | Col periods per launch | 1024 | 1024 |
 
-A launch covers `row_batch × col_batch` periods (and sizes the period GEMM / `C_hist` window).
+A launch covers `row_batch × col_batch` periods (clipped to remaining periods). CUTLASS fused (default) needs no `C_hist`; `--cublas-period` sizes a period GEMM / `C_hist` window.
 
 ## Vendored proof stack (`third_party/`)
 
