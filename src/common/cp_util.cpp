@@ -316,6 +316,20 @@ int cp_be_target_hex_to_le_words(const char* hex, uint32_t tgt[8])
     return 1;
 }
 
+void cp_le_words_to_be_target_hex(const uint32_t tgt[8], char hex[65])
+{
+    uint8_t b[32];
+    for(int i = 0; i < 8; i++){
+        const uint32_t w = tgt[7 - i];
+        const int o = i * 4;
+        b[o] = (uint8_t)(w >> 24);
+        b[o + 1] = (uint8_t)(w >> 16);
+        b[o + 2] = (uint8_t)(w >> 8);
+        b[o + 3] = (uint8_t)w;
+    }
+    cp_bin_to_hex(b, 32, hex);
+}
+
 void cp_scale_target_le(uint32_t tgt[8], uint64_t factor)
 {
     if(factor <= 1) return;

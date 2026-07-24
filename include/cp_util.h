@@ -29,6 +29,8 @@ double cp_json_num(const char* json, const char* key);
 
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8]);
 int cp_be_target_hex_to_le_words(const char* hex, uint32_t tgt[8]);
+/* Inverse of cp_be_target_hex_to_le_words. Writes 64 hex chars + NUL into hex[65]. */
+void cp_le_words_to_be_target_hex(const uint32_t tgt[8], char hex[65]);
 void cp_scale_target_le(uint32_t tgt[8], uint64_t factor);
 void cp_scale_jackpot_target(const uint32_t pool_tgt[8], uint32_t bound[8]);
 

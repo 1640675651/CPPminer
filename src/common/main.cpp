@@ -6,6 +6,7 @@
 #include "cp_noise.h"
 #include "cp_pool.h"
 #include "cp_platform.h"
+#include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
 #include "cp_worker.h"
@@ -73,6 +74,9 @@ static void print_usage(void)
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
+    printf("  --mock / -mock       offline: fixed job, mine until first share, verify, exit\n");
+    printf("  --mock-diff D        mock difficulty (default %.0f; higher = longer before share)\n",
+           g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
 }
@@ -251,6 +255,11 @@ int main(int argc, char** argv)
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--verify")){
             g_plain_verify = 1;
+        } else if(!strcmp(argv[i], "--mock") || !strcmp(argv[i], "-mock")){
+            g_mock = 1;
+        } else if(!strcmp(argv[i], "--mock-diff") && i + 1 < argc){
+            g_mock_diff = atof(argv[++i]);
+            if(g_mock_diff < 1.0) g_mock_diff = 1.0;
         } else if(!strcmp(argv[i], "--align-test")){
             align_test = 1;
         } else if(!strcmp(argv[i], "--align-test-prod")){
@@ -403,8 +412,21 @@ int main(int argc, char** argv)
     (void)profile_prep_runs;
 #endif
 
-    if(!wallet){ fprintf(stderr, "--wallet required\n"); return 1; }
+    if(!wallet){
+        if(g_mock){
+            wallet = "mock-wallet";
+        } else {
+            fprintf(stderr, "--wallet required\n");
+            return 1;
+        }
+    }
     if(!ndev){ devs[0] = 0; ndev = 1; }
+
+    if(g_mock){
+        /* Offline self-test: no pool submit; always verify the first share. */
+        g_dry_run = 1;
+        g_plain_verify = 1;
+    }
 
     strncpy(wallet_global, wallet, sizeof(wallet_global) - 1);
     wallet_global[sizeof(wallet_global) - 1] = 0;
@@ -513,13 +535,64 @@ int main(int argc, char** argv)
                (g_cpu_matrix_gen || cp_worker_prefers_host_matrices())
                    ? "host BLAKE3 + noise"
                    : "device random + commitment/noise");
-        printf("[mode] verify=%d dry_run=%d max_nonce=%d\n",
-               g_plain_verify, g_dry_run, g_max_nonce);
+        printf("[mode] verify=%d dry_run=%d max_nonce=%d mock=%d\n",
+               g_plain_verify, g_dry_run, g_max_nonce, g_mock);
     }
     fflush(stdout);
 
     cp_worker_init(devs, ndev);
     cp_mine_init_host_buffers();
+
+    if(g_mock){
+        /* Fixed legal stratum-style job id + deterministic 76-byte incomplete header. */
+        static const char k_mock_job_id[] = "00000000-0000-4000-8000-000000000001";
+        uint8_t header[INCOMPLETE_HEADER_BYTES];
+        memset(header, 0, sizeof(header));
+        /* Minimal non-zero fields so the blob is not all-zero (version + tag). */
+        header[0] = 0x01;
+        header[1] = 0x00;
+        header[2] = 0x00;
+        header[3] = 0x00;
+        memcpy(header + 4, "CPMOCK", 6);
+        header[10] = 0x01; /* mock revision */
+
+        /* Mock difficulty → pool target (same path as mining.set_difficulty). */
+        uint32_t tgt[8];
+        cp_target_from_difficulty(g_mock_diff, tgt);
+        char target_hex[65];
+        cp_le_words_to_be_target_hex(tgt, target_hex);
+
+        printf("[mock] job_id=%s (offline, no pool)\n", k_mock_job_id);
+        printf("[mock] difficulty=%.1f target=%.16s...\n", g_mock_diff, target_hex);
+        printf("[mock] mining until first share + zk-pow verify...\n");
+        fflush(stdout);
+
+        const int rc = cp_mine_job(header, INCOMPLETE_HEADER_BYTES, k_mock_job_id, target_hex, tgt,
+                                   -1, NULL);
+        const int outcome = cp_mine_last_share_outcome();
+        cp_mine_free_host_buffers();
+        cp_worker_shutdown();
+
+        if(rc == CP_JOB_CANCELLED){
+            fprintf(stderr, "[mock] cancelled before share\n");
+            return 1;
+        }
+        if(outcome == CP_SHARE_OUTCOME_OK){
+            printf("[mock] PASS: first share built and verified\n");
+            fflush(stdout);
+            return 0;
+        }
+        if(outcome == CP_SHARE_OUTCOME_NONE){
+            fprintf(stderr, "[mock] FAIL: no share produced\n");
+        } else if(outcome == CP_SHARE_OUTCOME_VERIFY_FAIL){
+            fprintf(stderr, "[mock] FAIL: share verify failed\n");
+        } else if(outcome == CP_SHARE_OUTCOME_PROOF_FAIL){
+            fprintf(stderr, "[mock] FAIL: proof build failed\n");
+        } else {
+            fprintf(stderr, "[mock] FAIL: share outcome=%d\n", outcome);
+        }
+        return 1;
+    }
 
     char cur_job_key[320] = {0};
     int msg_id = 1;

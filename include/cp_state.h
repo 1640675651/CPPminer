@@ -24,6 +24,8 @@ extern char worker_global[64];
 extern char agent_global[64];
 extern int g_dry_run;
 extern int g_plain_verify;
+extern int g_mock;
+extern double g_mock_diff;
 extern int g_cpu_matrix_gen;
 extern int g_max_nonce;
 

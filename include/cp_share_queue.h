@@ -31,11 +31,19 @@ typedef struct CpShareHit {
     int handoff_bt;
 } CpShareHit;
 
+/* Last processed share outcome (after end_job / drain). */
+#define CP_SHARE_OUTCOME_NONE         0
+#define CP_SHARE_OUTCOME_OK           1
+#define CP_SHARE_OUTCOME_PROOF_FAIL  (-1)
+#define CP_SHARE_OUTCOME_VERIFY_FAIL (-2)
+#define CP_SHARE_OUTCOME_DROPPED     (-3)
+
 CpShareQueue *cp_share_queue_create(int max_depth);
 void cp_share_queue_destroy(CpShareQueue *q);
 
 void cp_share_queue_begin_job(CpShareQueue *q, const CpShareJobCtx *ctx, const char *job_key);
 void cp_share_queue_end_job(CpShareQueue *q);
+int cp_share_queue_last_outcome(const CpShareQueue *q);
 
 /*
  * Hands off host signal matrices to the proof worker (no memcpy).

@@ -14,5 +14,9 @@ char worker_global[64] = "rig01";
 char agent_global[64] = "cpminer/1.0";
 int g_dry_run = 0;
 int g_plain_verify = 0;
+int g_mock = 0;
+/* Mock scan difficulty (cp_target_from_difficulty). Higher = rarer shares / longer run.
+ * ~58 is typically a few–tens of seconds on --dev before the first share. */
+double g_mock_diff = 58.0;
 int g_cpu_matrix_gen = 0;
 int g_max_nonce = 0;

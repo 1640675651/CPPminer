@@ -126,10 +126,12 @@ struct CpShareQueueImpl {
     int8_t *returned_bt = nullptr;
     CpShareJobCtx job_ctx{};
     char job_key[320]{};
+    int last_outcome = CP_SHARE_OUTCOME_NONE;
 
     void worker_main();
     void process_snapshot(ShareSnapshot *snap);
     void return_snapshot_matrices(ShareSnapshot *snap);
+    void set_outcome(int outcome);
 };
 
 /* Move snapshot matrices into the reclaim slot (or free on shutdown). Does not delete snap. */
@@ -184,6 +186,10 @@ static const int8_t *share_bt_for_proof(const ShareSnapshot *snap) {
     return h_BpT_global;
 }
 
+void CpShareQueueImpl::set_outcome(int outcome) {
+    last_outcome = outcome;
+}
+
 void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (!snap) {
         return;
@@ -193,6 +199,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         printf("[plain] stale share nonce=%llu dropped (job changed)\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_DROPPED);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
         return;
@@ -206,6 +213,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (!b64) {
         fprintf(stderr, "[plain] OOM proof b64 buffer (nonce=%llu)\n",
                 (unsigned long long)snap->nonce);
+        set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
         return;
@@ -233,6 +241,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         printf("[plain] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
                errbuf[0] ? errbuf : "unknown");
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -243,6 +252,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (bn < 32) {
         printf("[plain] proof too short (%d) nonce=%llu\n", bn, (unsigned long long)snap->nonce);
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -261,6 +271,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         printf("[plain] stale share nonce=%llu dropped before verify/submit\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_DROPPED);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -271,6 +282,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path) != 0) {
             printf("[plain] verify failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
             fflush(stdout);
+            set_outcome(CP_SHARE_OUTCOME_VERIFY_FAIL);
             free(b64);
             return_snapshot_matrices(snap);
             share_snapshot_delete(snap);
@@ -296,6 +308,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         printf("[plain] dry-run: proof saved to %s (nonce=%llu)\n", job_ctx.proof_path,
                (unsigned long long)snap->nonce);
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_OK);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -303,6 +316,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     if (!job_ctx.msg_id) {
+        set_outcome(CP_SHARE_OUTCOME_OK);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -313,6 +327,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, b64, hs)) {
         printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
         fflush(stdout);
+        set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -324,6 +339,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     cp_pool_log_share_submit_outcome();
     fflush(stdout);
 
+    set_outcome(CP_SHARE_OUTCOME_OK);
     free(b64);
     return_snapshot_matrices(snap);
     share_snapshot_delete(snap);
@@ -407,6 +423,7 @@ extern "C" void cp_share_queue_begin_job(CpShareQueue *q, const CpShareJobCtx *c
     strncpy(q->impl.job_key, job_key, sizeof(q->impl.job_key) - 1);
     q->impl.job_key[sizeof(q->impl.job_key) - 1] = '\0';
     q->impl.job_active = true;
+    q->impl.last_outcome = CP_SHARE_OUTCOME_NONE;
 }
 
 extern "C" void cp_share_queue_end_job(CpShareQueue *q) {
@@ -418,6 +435,13 @@ extern "C" void cp_share_queue_end_job(CpShareQueue *q) {
     q->impl.cv.wait(lock, [&] {
         return q->impl.pending.empty() && q->impl.in_flight == 0 && !q->impl.matrices_loaned;
     });
+}
+
+extern "C" int cp_share_queue_last_outcome(const CpShareQueue *q) {
+    if (!q) {
+        return CP_SHARE_OUTCOME_NONE;
+    }
+    return q->impl.last_outcome;
 }
 
 extern "C" void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io) {

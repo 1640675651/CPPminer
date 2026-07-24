@@ -66,9 +66,13 @@ Produces `cpminer.exe` in the repo root.
 .\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
-# OpenCL (1D macro-block batches; see --period-batch below)
+# OpenCL (LuckyPool production layout)
 .\cpminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker test --period-batch 1024
+
+# Offline mock: first share + zk-pow verify (no pool; use --dev for a quick run)
+.\cpminer.exe --backend opencl --dev --mock
+.\cpminer.exe --backend cpu --dev --mock
 ```
 
 ### Options
@@ -77,7 +81,7 @@ Produces `cpminer.exe` in the repo root.
 |------|-------------|
 | `--backend` | `cpu` / `cuda` / `opencl` (must be compiled in) |
 | `--pool` | `stratum+tcp://host:port` |
-| `--wallet` | Wallet address (required) |
+| `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--devices` | CUDA device list |
 | `--dev` | Use 8192×8192 matrices for testing |
@@ -88,6 +92,8 @@ Produces `cpminer.exe` in the repo root.
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
+| `--mock` / `-mock` | Offline: fixed job id, mine until first share, verify, exit (implies dry-run+verify) |
+| `--mock-diff D` | Mock pool difficulty (default 58; higher = longer before first share) |
 
 ### Scan batching (`--period-batch`)
 
