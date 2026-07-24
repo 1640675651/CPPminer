@@ -11,8 +11,8 @@ extern "C" {
 /* Returns 0 if CUTLASS fused GEMM can run on the current device. */
 int cp_cutlass_device_ok(int dev);
 
-/* Fused GEMM + per-thread tile XOR for one period batch panel.
- * Panel covers row_batch_count x col_batch_count hash periods (128x256 cells each).
+/* Fused GEMM + in-register milestone XOR for one period batch panel.
+ * Panel covers row_batch x col_batch CTAs of 128x128 (Case 9).
  * When jackpot is non-NULL, BLAKE3/target check runs in the GEMM kernel tail
  * and d_tile_xor may be NULL. */
 typedef struct {

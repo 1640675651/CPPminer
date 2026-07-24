@@ -1,4 +1,5 @@
-/* CUTLASS fused int8 GEMM + per-thread scattered tile XOR (Case 7.1 / 7.2 style). */
+/* CUTLASS fused int8 GEMM + in-register milestone XOR (Case 9 style).
+ * CTA 128x128, Warp 32x64; MMA lane 8x8 tiles; reuse Mma + wind_down. */
 #pragma once
 
 #include "cp_cutlass.h"
@@ -9,13 +10,15 @@
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/layout/matrix.h"
 
-#include "epilogue_visitor_tile_xor_reg_per_thread.h"
+#include "epilogue_visitor_store_c.h"
 #include "epilogue_with_visitor_visit_batch.h"
 #include "gemm_with_milestone_mainloop.h"
 
 namespace cp_cutlass {
 
 constexpr int kMilestoneK = 256;
+constexpr int kCtaM = 128;
+constexpr int kCtaN = 128;
 
 using ElementInput = int8_t;
 using ElementOutput = int32_t;
@@ -27,9 +30,8 @@ using LayoutC = cutlass::layout::RowMajor;
 
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
           typename WarpShape, typename InstructionShape, int Stages,
-          bool PersistentAccumAcrossMilestones,
-          bool UseMilestoneMajorStorage, bool UsePerThreadTileXor>
-struct GemmTypesFused {
+          bool PersistentAccumAcrossMilestones, bool UseMilestoneMajorStorage>
+struct GemmTypesCase9 {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, 1, ElementAccumulator, ElementCompute>;
   using ThreadblockSwizzle =
@@ -43,7 +45,7 @@ struct GemmTypesFused {
       cutlass::gemm::SharedMemoryClearOption::kNone>::GemmKernel;
 
   using EpilogueVisitor =
-      cutlass::epilogue::threadblock::EpilogueVisitorTileXorRegPerThread<
+      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
           typename DefaultGemmKernel::Mma::Shape,
           DefaultGemmKernel::kThreadCount,
           typename DefaultGemmKernel::Epilogue::OutputTileIterator,
@@ -53,33 +55,34 @@ struct GemmTypesFused {
       EpilogueWithVisitorFromExistingEpilogueSelect<
           EpilogueVisitor, typename DefaultGemmKernel::Epilogue, 1>::Epilogue;
 
+  /* Case 9: persistent accum, milestone-major optional, inline XOR, reuse Mma. */
   using GemmKernel = cutlass::gemm::kernel::GemmWithMilestoneMainloop<
       typename DefaultGemmKernel::Mma, Epilogue, ThreadblockSwizzle,
-      PersistentAccumAcrossMilestones, UseMilestoneMajorStorage>;
+      PersistentAccumAcrossMilestones, UseMilestoneMajorStorage,
+      /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
 
-/* 128x256 CTA, persistent accum, per-thread 128-cell XOR tiles. */
-using Gemm128x256StepMajor = GemmTypesFused<
+using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
-    cutlass::gemm::GemmShape<128, 256, 32>,
-    cutlass::gemm::GemmShape<32, 128, 32>, cutlass::gemm::GemmShape<1, 1, 4>,
-    2, true, true, true>;
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
+    true, true>;
 
-using Gemm128x256RowMajor = GemmTypesFused<
+using Gemm128x128RowMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
-    cutlass::gemm::GemmShape<128, 256, 32>,
-    cutlass::gemm::GemmShape<32, 128, 32>, cutlass::gemm::GemmShape<1, 1, 4>,
-    2, true, false, true>;
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
+    true, false>;
 
 template <typename GemmTypesT>
 struct FusedMilestoneGemmOp {
   typename GemmTypesT::GemmKernel::Params params;
 
   cutlass::Status initialize(int M, int N, int K, int full_M, int full_N,
-                               ElementInput* d_A, ElementInput* d_B,
-                               uint32_t* d_tile_xor, int tile_cols,
+                               ElementInput *d_A, ElementInput *d_B,
+                               uint32_t *d_tile_xor, int tile_cols,
                                size_t tile_count,
-                               const CpCutlassJackpotLaunch* jackpot) {
+                               const CpCutlassJackpotLaunch *jackpot) {
     cutlass::gemm::GemmCoord problem_size(M, N, K);
     typename GemmTypesT::EpilogueOpT::Params linear{ElementCompute(1),
                                                     ElementCompute(0)};
@@ -108,10 +111,10 @@ struct FusedMilestoneGemmOp {
       jp.ptr_out_t_cols = jackpot->d_out_t_cols;
       jp.row_period0 = jackpot->row_period0;
       jp.col_period0 = jackpot->col_period0;
-      for (int i = 0; i < 8; ++i) {
+      for (int i = 0; i < 8; ++i)
         jp.bound[i] = jackpot->bound[i];
-      }
     }
+    (void)fuse_jackpot;
     typename GemmTypesT::GemmKernel::Arguments args(
         cutlass::gemm::GemmUniversalMode::kGemm, problem_size, 1,
         cutlass::TensorRef<ElementInput, LayoutA>(d_A, layout_a),
@@ -120,13 +123,11 @@ struct FusedMilestoneGemmOp {
         cutlass::TensorRef<ElementOutput, LayoutC>(nullptr, layout_c),
         nullptr, d_tile_xor, batch_stride_a, batch_stride_b, kMilestoneK,
         typename GemmTypesT::EpilogueVisitor::Arguments(
-            linear, tile_cols, static_cast<int>(tile_count), false, false,
-            fuse_jackpot),
+            linear, tile_cols, static_cast<int>(tile_count), false, false),
         jp);
     cutlass::Status st = GemmTypesT::GemmKernel::can_implement(args);
-    if (st != cutlass::Status::kSuccess) {
+    if (st != cutlass::Status::kSuccess)
       return st;
-    }
     params = typename GemmTypesT::GemmKernel::Params(args);
     return cutlass::Status::kSuccess;
   }

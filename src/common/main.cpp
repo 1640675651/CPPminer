@@ -57,8 +57,10 @@ static void print_usage(void)
     printf("  --col-period-batch N alias for --period-batch\n");
     printf("  --row-period-batch N row-period batch size (default %d, max %d)\n",
            CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
-    printf("  --row-major-ap       row-major Ap/BpT (lda=%d; default step-major lda=%d)\n",
-           K_DIM, R_RANK);
+    printf("  --row-major-ap       row-major Ap/BpT (lda=%d; CUTLASS Case 9 default)\n",
+           K_DIM);
+    printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
+           R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
@@ -159,7 +161,7 @@ int main(int argc, char** argv)
     int no_period_gemm = 0;
     int period_batch = CP_PERIOD_BATCH_DEFAULT;
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
-    int step_major_ap = 1;
+    int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
@@ -299,6 +301,10 @@ int main(int argc, char** argv)
     } else {
         cutlass_fused = 0;
     }
+    /* Case 9 assumes contiguous K (row-major Ap/BpT). Step-major is the old
+     * cuBLAS period / Case 7.2 packing. */
+    if(step_major_ap < 0)
+        step_major_ap = cutlass_fused ? 0 : 1;
 
     cp_worker_apply_backend_defaults();
 
@@ -485,7 +491,7 @@ int main(int argc, char** argv)
                g_m_active, g_n_active, K_DIM, R_RANK,
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n",
-               cutlass_fused ? "CUTLASS epilogue scatter (16x8 / 128 cells per thread)"
+               cutlass_fused ? "CUTLASS Case 9 MMA lane 8x8 interleaved (128x128 CTA)"
                : (contiguous ? "contiguous 8x16 blocks"
                              : "BzMiner periodic scattered 8x16"));
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
@@ -505,8 +511,8 @@ int main(int argc, char** argv)
                    period_batch, period_batch * 128);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cutlass_fused){
-            printf("[mode] proof rows/cols: 16 A + 8 B^T (CUTLASS Case 7.1 offsets)\n");
-            printf("[mode] scan: CUTLASS fused GEMM + jackpot (mainloop tail)\n");
+            printf("[mode] proof rows/cols: 8 A + 8 B^T (Case 9 interleaved 4x4)\n");
+            printf("[mode] scan: CUTLASS Case 9 fused GEMM + in-register XOR jackpot\n");
         } else {
             printf("[mode] scan: %s\n",
                    (contiguous || no_period_gemm) ? "per-tile kernel"

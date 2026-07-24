@@ -17,9 +17,9 @@
     }                                                                          \
   } while (0)
 
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256StepMajor>
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajor>
     g_fused_step_major;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256RowMajor>
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajor>
     g_fused_row_major;
 
 int cp_cutlass_device_ok(int dev)
@@ -36,8 +36,7 @@ size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)
 {
   return static_cast<size_t>(row_batch_count) *
          static_cast<size_t>(col_batch_count) *
-         static_cast<size_t>(cp_cutlass::CutlassScatteredTile128x256::
-                                 kThreadsPerCta);
+         static_cast<size_t>(MmaLaneTile128x128::kThreadsPerCta);
 }
 
 size_t cp_cutlass_tile_xor_bytes(int row_batch_count, int col_batch_count)
@@ -57,8 +56,8 @@ int cp_cutlass_period_batch(
     return -1;
   }
 
-  const int M = row_batch_count * PP_ROW_PERIOD;
-  const int N_fat = col_batch_count * PP_COL_PERIOD;
+  const int M = row_batch_count * CP_CUTLASS_CTA_M;
+  const int N_fat = col_batch_count * CP_CUTLASS_CTA_N;
   const int K = K_DIM;
   const int cta_cols = col_batch_count;
   const size_t tile_count = tiles_per_batch;
@@ -66,11 +65,11 @@ int cp_cutlass_period_batch(
   const int8_t* d_A = d_Ap;
   const int8_t* d_B = d_BpT;
   if (step_major) {
-    d_A = d_Ap + (size_t)row_period0 * PP_ROW_PERIOD * R_RANK;
-    d_B = d_BpT + (size_t)col_period0 * PP_COL_PERIOD * R_RANK;
+    d_A = d_Ap + (size_t)row_period0 * CP_CUTLASS_CTA_M * R_RANK;
+    d_B = d_BpT + (size_t)col_period0 * CP_CUTLASS_CTA_N * R_RANK;
   } else {
-    d_A = d_Ap + (size_t)row_period0 * PP_ROW_PERIOD * K_DIM;
-    d_B = d_BpT + (size_t)col_period0 * PP_COL_PERIOD * K_DIM;
+    d_A = d_Ap + (size_t)row_period0 * CP_CUTLASS_CTA_M * K_DIM;
+    d_B = d_BpT + (size_t)col_period0 * CP_CUTLASS_CTA_N * K_DIM;
   }
 
   cutlass::Status st = cutlass::Status::kErrorInternal;

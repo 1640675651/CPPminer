@@ -1,6 +1,5 @@
-// CUTLASS GEMM kernel: K-serial milestone mainloop with epilogue visitor per slice.
-// One launch over MxN. Case 2: per-milestone accum + global |C| prefix (beta=1).
-// Case 3 (kPersistentAccumAcrossMilestones): register-held prefix, no global |C|.
+// CUTLASS GEMM: K-serial milestone mainloop (Case 8/9).
+// Case 9: reuse one Mma + wind_down; in-register XOR of FragmentC after mma().
 #pragma once
 
 #include "cp_cutlass_jackpot.cuh"
@@ -8,7 +7,6 @@
 #include "cutlass/fast_math.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/matrix_coord.h"
-#include "cutlass/trace.h"
 
 namespace cutlass {
 namespace gemm {
@@ -16,12 +14,16 @@ namespace kernel {
 
 template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
           bool kPersistentAccumAcrossMilestones_ = false,
-          bool kMilestoneMajorStorage_ = false>
+          bool kMilestoneMajorStorage_ = false,
+          bool kInlineXor_ = false,
+          bool kReuseMmaAcrossMilestones_ = false>
 struct GemmWithMilestoneMainloop {
 public:
   static bool const kPersistentAccumAcrossMilestones =
       kPersistentAccumAcrossMilestones_;
   static bool const kMilestoneMajorStorage = kMilestoneMajorStorage_;
+  static bool const kInlineXor = kInlineXor_;
+  static bool const kReuseMmaAcrossMilestones = kReuseMmaAcrossMilestones_;
 
   using Mma = Mma_;
   using Epilogue = Epilogue_;
@@ -60,10 +62,10 @@ public:
     CUTLASS_HOST_DEVICE
     JackpotParams()
         : ptr_a_key8(nullptr), ptr_found(nullptr), ptr_out_t_rows(nullptr),
-          ptr_out_t_cols(nullptr), row_period0(0), col_period0(0), enabled(false) {
-      for (int i = 0; i < 8; ++i) {
+          ptr_out_t_cols(nullptr), row_period0(0), col_period0(0),
+          enabled(false) {
+      for (int i = 0; i < 8; ++i)
         bound[i] = 0u;
-      }
     }
   };
 
@@ -71,20 +73,15 @@ public:
     GemmUniversalMode mode;
     GemmCoord problem_size;
     int batch_count;
-
     TensorRefA ref_A;
     TensorRefB ref_B;
     TensorRefC ref_C;
     TensorRefC ref_D;
-
     ElementNorm *ptr_Max;
     ElementSum *ptr_Sum;
-
     int64_t batch_stride_A;
     int64_t batch_stride_B;
-
     int milestone_k;
-
     typename EpilogueVisitor::Arguments epilogue_visitor;
     JackpotParams jackpot;
 
@@ -110,24 +107,19 @@ public:
     GemmCoord problem_size;
     GemmCoord grid_tiled_shape;
     int swizzle_log_tile;
-
     typename Mma::IteratorA::Params params_A;
     typename Mma::IteratorB::Params params_B;
     typename EpilogueVisitor::OutputTileIterator::Params params_C;
     typename EpilogueVisitor::OutputTileIterator::Params params_D;
-
     void *ptr_A;
     void *ptr_B;
     ElementC *ptr_C;
     ElementC *ptr_D;
-
     ElementNorm *ptr_Max;
     ElementSum *ptr_Sum;
-
     int milestone_k;
     int64_t batch_stride_A;
     int64_t batch_stride_B;
-
     typename EpilogueVisitor::Params epilogue_visitor;
     JackpotParams jackpot;
 
@@ -144,14 +136,14 @@ public:
           ptr_A(args.ref_A.data()), ptr_B(args.ref_B.data()),
           ptr_C(args.ref_C.data()), ptr_D(args.ref_D.data()),
           ptr_Max(args.ptr_Max), ptr_Sum(args.ptr_Sum),
-          milestone_k(args.milestone_k),
-          batch_stride_A(args.batch_stride_A),
+          milestone_k(args.milestone_k), batch_stride_A(args.batch_stride_A),
           batch_stride_B(args.batch_stride_B),
           epilogue_visitor(args.epilogue_visitor), jackpot(args.jackpot) {
       ThreadblockSwizzle threadblock_swizzle;
       grid_tiled_shape = threadblock_swizzle.get_tiled_shape(
           args.problem_size,
-          {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK}, 1);
+          {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
+          1);
       swizzle_log_tile = threadblock_swizzle.get_log_tile(grid_tiled_shape);
     }
   };
@@ -171,32 +163,25 @@ public:
     static int const kAlignmentA = Mma::IteratorA::AccessType::kElements;
     static int const kAlignmentB = Mma::IteratorB::AccessType::kElements;
     static int const kAlignmentC = EpilogueVisitor::kElementsPerAccess;
-
-    if (milestone_k <= 0 || problem_size.k() % milestone_k != 0) {
+    if (milestone_k <= 0 || problem_size.k() % milestone_k != 0)
       return Status::kErrorInvalidProblem;
-    }
-    if (milestone_k % Mma::Shape::kK != 0) {
+    if (milestone_k % Mma::Shape::kK != 0)
       return Status::kErrorInvalidProblem;
-    }
-
     if (platform::is_same<LayoutA, layout::RowMajor>::value) {
-      int const k_align_a =
+      int const k_align =
           kMilestoneMajorStorage ? milestone_k : problem_size.k();
-      if (k_align_a % kAlignmentA) {
+      if (k_align % kAlignmentA)
         return Status::kErrorMisalignedOperand;
-      }
     }
     if (platform::is_same<LayoutB, layout::ColumnMajor>::value) {
-      int const k_align_b =
+      int const k_align =
           kMilestoneMajorStorage ? milestone_k : problem_size.k();
-      if (k_align_b % kAlignmentB) {
+      if (k_align % kAlignmentB)
         return Status::kErrorMisalignedOperand;
-      }
     }
     if (platform::is_same<LayoutC, layout::RowMajor>::value) {
-      if (problem_size.n() % kAlignmentC) {
+      if (problem_size.n() % kAlignmentC)
         return Status::kErrorMisalignedOperand;
-      }
     }
     return Status::kSuccess;
   }
@@ -205,8 +190,6 @@ public:
     return can_implement(args.problem_size, args.milestone_k);
   }
 
-  // Case 2/3 GPU kernel entry: one CTA runs K milestones (MMA + epilogue each).
-  // Case 2: clear accum each m, beta=1 prefix in global C. Case 3: persistent accum.
   CUTLASS_DEVICE
   void operator()(Params const &params, SharedStorage &shared_storage) {
     ThreadblockSwizzle threadblock_swizzle;
@@ -234,8 +217,6 @@ public:
     ElementA *ptr_A = static_cast<ElementA *>(params.ptr_A);
     ElementB *ptr_B = static_cast<ElementB *>(params.ptr_B);
 
-    using ElementCompute = typename EpilogueVisitor::ElementwiseFunctor::ElementCompute;
-
     int const milestone_k = params.milestone_k;
     int const num_milestones = params.problem_size.k() / milestone_k;
 
@@ -246,8 +227,6 @@ public:
 
     int const problem_m = params.problem_size.m();
     int const problem_n = params.problem_size.n();
-    /* Step-major Ap/BpT panels are spaced by full matrix height/width, not the
-     * local 128x256 CTA slice. batch_stride_* is set from full m/n in initialize(). */
     size_t const stride_A_milestone =
         params.batch_stride_A != 0
             ? static_cast<size_t>(params.batch_stride_A)
@@ -258,16 +237,22 @@ public:
             : static_cast<size_t>(milestone_k) * static_cast<size_t>(problem_n);
 
     uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS];
-    for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i) {
+    for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i)
       jackpot_words[i] = 0u;
-    }
+
+    /* Case 9 only: reuse Mma + inline XOR. kInlineXor and kReuseMma must be true. */
+    static_assert(kInlineXor && kReuseMmaAcrossMilestones,
+                  "CPminer fused path requires Case 9 (inline XOR + reuse Mma)");
+
+    Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
 
     for (int m = 0; m < num_milestones; ++m) {
       if (!kPersistentAccumAcrossMilestones) {
         accumulators.clear();
       }
-
-      Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+      if (m > 0) {
+        mma.wind_down();
+      }
 
       ElementA *ptr_A_m = ptr_A;
       ElementB *ptr_B_m = ptr_B;
@@ -281,71 +266,57 @@ public:
         ptr_B_m = ptr_B + m * stride_B_milestone;
         gemm_k_iterations =
             (milestone_k + Mma::Shape::kK - 1) / Mma::Shape::kK;
-        tb_offset_A = MatrixCoord(
-            threadblock_tile_offset.m() * Mma::Shape::kM, 0);
-        tb_offset_B = MatrixCoord(
-            0, threadblock_tile_offset.n() * Mma::Shape::kN);
+        tb_offset_A =
+            MatrixCoord(threadblock_tile_offset.m() * Mma::Shape::kM, 0);
+        tb_offset_B =
+            MatrixCoord(0, threadblock_tile_offset.n() * Mma::Shape::kN);
         problem_size_ab = GemmCoord(problem_m, problem_n, milestone_k);
       } else {
         int const offset_k = m * milestone_k;
         int const problem_size_k = offset_k + milestone_k;
         gemm_k_iterations =
             (problem_size_k - offset_k + Mma::Shape::kK - 1) / Mma::Shape::kK;
-        tb_offset_A = MatrixCoord(
-            threadblock_tile_offset.m() * Mma::Shape::kM, offset_k);
+        tb_offset_A = MatrixCoord(threadblock_tile_offset.m() * Mma::Shape::kM,
+                                  offset_k);
         tb_offset_B = MatrixCoord(
             offset_k, threadblock_tile_offset.n() * Mma::Shape::kN);
-        problem_size_ab =
-            GemmCoord(problem_m, problem_n, problem_size_k);
+        problem_size_ab = GemmCoord(problem_m, problem_n, problem_size_k);
       }
 
       typename Mma::IteratorA iterator_A(
-          params.params_A, ptr_A_m,
-          {problem_size_ab.m(), problem_size_ab.k()}, thread_idx, tb_offset_A);
+          params.params_A, ptr_A_m, {problem_size_ab.m(), problem_size_ab.k()},
+          thread_idx, tb_offset_A);
 
       typename Mma::IteratorB iterator_B(
-          params.params_B, ptr_B_m,
-          {problem_size_ab.k(), problem_size_ab.n()}, thread_idx, tb_offset_B);
+          params.params_B, ptr_B_m, {problem_size_ab.k(), problem_size_ab.n()},
+          thread_idx, tb_offset_B);
 
       mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
 
       __syncthreads();
 
-      Epilogue epilogue(shared_storage.epilogue.epilogue, thread_idx, warp_idx,
-                        lane_idx);
-
-      ElementSum *ptr_tile_xor_m =
-          params.ptr_Sum +
-          static_cast<size_t>(m) *
-              static_cast<size_t>(params.epilogue_visitor.milestone_stride);
-
-      typename EpilogueVisitor::Params visitor_params = params.epilogue_visitor;
-      visitor_params.jackpot_words = jackpot_words;
-      visitor_params.milestone_index = m;
-      ElementC *ptr_C = nullptr;
-      ElementC *ptr_D = nullptr;
-      if (kPersistentAccumAcrossMilestones) {
-        visitor_params.elementwise =
-            typename EpilogueVisitor::ElementwiseFunctor::Params(
-                ElementCompute(1), ElementCompute(0));
-        visitor_params.serial_split_k = false;
-      } else {
-        visitor_params.elementwise =
-            typename EpilogueVisitor::ElementwiseFunctor::Params(
-                ElementCompute(1), ElementCompute(m == 0 ? 0 : 1));
-        visitor_params.serial_split_k = true;
-        ptr_C = (m > 0) ? params.ptr_D : params.ptr_C;
-        ptr_D = params.ptr_D;
+      uint32_t xor_val = 0u;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < Mma::FragmentC::kElements; ++i) {
+        xor_val ^= static_cast<uint32_t>(accumulators[i]);
       }
-
-      EpilogueVisitor epilogue_visitor(
-          visitor_params, shared_storage.epilogue.visitor,
-          params.problem_size.mn(), thread_idx, warp_idx, lane_idx,
-          params.params_C, params.params_D, ptr_C, ptr_D, params.ptr_Max,
-          ptr_tile_xor_m, threadblock_offset,
-          blockIdx.y * params.problem_size.m());
-
-      epilogue(epilogue_visitor, accumulators);
+      if (params.jackpot.enabled) {
+        cp_cutlass_jackpot_fold_step(jackpot_words, m, xor_val);
+      }
+      if (params.ptr_Sum != nullptr) {
+        ElementSum *ptr_tile_xor_m =
+            params.ptr_Sum +
+            static_cast<size_t>(m) *
+                static_cast<size_t>(params.epilogue_visitor.milestone_stride);
+        int cta_r = threadblock_offset.row() / Mma::Shape::kM;
+        int cta_c = threadblock_offset.column() / Mma::Shape::kN;
+        size_t tile_id =
+            (static_cast<size_t>(cta_r) * params.epilogue_visitor.tile_cols +
+             cta_c) *
+                kThreadCount +
+            thread_idx;
+        ptr_tile_xor_m[tile_id] = xor_val;
+      }
 
       __syncthreads();
     }
@@ -359,9 +330,8 @@ public:
           params.jackpot.col_period0 + threadblock_tile_offset.n();
       cp_cutlass_jackpot_try(
           jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
-          row_period_eff, col_period_eff, thread_idx,
-          params.jackpot.ptr_found, params.jackpot.ptr_out_t_rows,
-          params.jackpot.ptr_out_t_cols);
+          row_period_eff, col_period_eff, thread_idx, params.jackpot.ptr_found,
+          params.jackpot.ptr_out_t_rows, params.jackpot.ptr_out_t_cols);
     }
   }
 };

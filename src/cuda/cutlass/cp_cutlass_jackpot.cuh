@@ -1,14 +1,14 @@
-/* In-kernel jackpot finalize for CUTLASS fused period GEMM (mainloop tail). */
+/* In-kernel jackpot finalize for CUTLASS Case 9 fused period GEMM. */
 #pragma once
 
 #include "cp_config.h"
 #include "cp_gpu.cuh"
-#include "scattered_thread_tile.h"
+#include "mma_lane_tile.h"
 
 #define CP_CUTLASS_JACKPOT_WORDS 16
 #define CP_CUTLASS_JACKPOT_LROT 13
 
-using CutlassJackpotTile = ScatteredThreadTile<128, 256, 8, 16, 8>;
+using CutlassJackpotTile = MmaLaneTile128x128;
 
 __device__ __forceinline__ uint32_t cp_cutlass_rotl32(uint32_t x, int s)
 {
@@ -37,12 +37,12 @@ __device__ __forceinline__ void cp_cutlass_tile_origin(
     int row_period, int col_period, int thread_idx,
     int* out_t_rows, int* out_t_cols)
 {
-    const int cta_row0 = row_period * PP_ROW_PERIOD;
-    const int cta_col0 = col_period * PP_COL_PERIOD;
+    const int cta_row0 = row_period * CP_CUTLASS_CTA_M;
+    const int cta_col0 = col_period * CP_CUTLASS_CTA_N;
     int row = 0;
     int col = 0;
     CutlassJackpotTile::thread_cell_global(
-        cta_row0, cta_col0, thread_idx, 0, 0, row, col);
+        cta_row0, cta_col0, thread_idx, row, col);
     *out_t_rows = row;
     *out_t_cols = col;
 }

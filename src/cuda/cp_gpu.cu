@@ -75,7 +75,7 @@ static int g_contiguous = 0;
 static int g_period_gemm = 1;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
-static int g_step_major_ap = 1;
+static int g_step_major_ap = 0; /* Case 9 default; main sets 1 for cuBLAS period */
 static int g_cutlass_fused = 0;
 
 static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)
@@ -107,6 +107,18 @@ static int pp_clamp_col_period_batch(int batch)
 static int pp_batch_hash_tiles(int row_batch_count, int col_batch_count)
 {
     return row_batch_count * col_batch_count * PP_TILES_PER_PERIOD;
+}
+
+static int gpu_num_row_periods(int m)
+{
+    if(g_cutlass_fused) return m / CP_CUTLASS_CTA_M;
+    return cp_pp_num_row_periods(m, g_contiguous);
+}
+
+static int gpu_num_col_periods(int n)
+{
+    if(g_cutlass_fused) return n / CP_CUTLASS_CTA_N;
+    return cp_pp_num_col_periods(n, g_contiguous);
 }
 
 static const char* cublas_status_str(cublasStatus_t st)
@@ -1205,8 +1217,8 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     memset(pool_tgt, 0, sizeof(uint32_t) * 8);
     cp_scale_jackpot_target(pool_tgt, bound);
 
-    const int col_periods = cp_pp_num_col_periods(n, g_contiguous);
-    const int row_periods = cp_pp_num_row_periods(m, g_contiguous);
+    const int col_periods = gpu_num_col_periods(n);
+    const int row_periods = gpu_num_row_periods(m);
     int row_batch_count = g_row_period_batch;
     int col_batch_count = g_col_period_batch;
     if(row_batch_count > row_periods) row_batch_count = row_periods;
@@ -1285,8 +1297,8 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
      * so profile numbers are directly comparable to live mining.
      */
     {
-        const int row_periods = cp_pp_num_row_periods(m, g_contiguous);
-        const int col_periods = cp_pp_num_col_periods(n, g_contiguous);
+        const int row_periods = gpu_num_row_periods(m);
+        const int col_periods = gpu_num_col_periods(n);
         const int row_parts = cp_pp_num_row_parts(m, g_contiguous);
         const int col_parts = cp_pp_num_col_parts(n, g_contiguous);
         const int total_tiles = row_parts * col_parts;
@@ -1381,8 +1393,8 @@ static int gpu_scan_device_period(
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
 
-    const int row_periods = cp_pp_num_row_periods(m, g_contiguous);
-    const int col_periods = cp_pp_num_col_periods(n, g_contiguous);
+    const int row_periods = gpu_num_row_periods(m);
+    const int col_periods = gpu_num_col_periods(n);
     const int row_parts = cp_pp_num_row_parts(m, g_contiguous);
     const int col_parts = cp_pp_num_col_parts(n, g_contiguous);
     const int total_tiles = row_parts * col_parts;
@@ -1395,7 +1407,9 @@ static int gpu_scan_device_period(
     printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
            "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %d\n",
            row_periods, col_periods, g_row_period_batch, g_col_period_batch,
-           total_tiles, PP_HASH_H * PP_HASH_W * K_DIM);
+           total_tiles,
+           (g_cutlass_fused ? CP_CUTLASS_HASH_H * CP_CUTLASS_HASH_W
+                            : PP_HASH_H * PP_HASH_W) * K_DIM);
     fflush(stdout);
 
     for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch){

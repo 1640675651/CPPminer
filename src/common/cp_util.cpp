@@ -279,11 +279,21 @@ double cp_json_num(const char* json, const char* key)
     return atof(p);
 }
 
+static int cp_active_hash_h(void)
+{
+    return g_cutlass_fused ? CP_CUTLASS_HASH_H : PP_HASH_H;
+}
+
+static int cp_active_hash_w(void)
+{
+    return g_cutlass_fused ? CP_CUTLASS_HASH_W : PP_HASH_W;
+}
+
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
 {
     memset(tgt, 0, 8 * sizeof(uint32_t));
     long double exp_val = 256.0L - (long double)difficulty
-        + log2l((long double)(R_RANK * PP_HASH_H * PP_HASH_W));
+        + log2l((long double)(R_RANK * cp_active_hash_h() * cp_active_hash_w()));
     if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val > 0.0L){
@@ -346,7 +356,8 @@ void cp_scale_target_le(uint32_t tgt[8], uint64_t factor)
 
 void cp_scale_jackpot_target(const uint32_t pool_tgt[8], uint32_t bound[8])
 {
-    uint64_t factor = (uint64_t)PP_HASH_H * PP_HASH_W * (uint64_t)K_DIM;
+    uint64_t factor = (uint64_t)cp_active_hash_h() * (uint64_t)cp_active_hash_w()
+                    * (uint64_t)K_DIM;
     memcpy(bound, pool_tgt, 8 * sizeof(uint32_t));
     cp_scale_target_le(bound, factor);
 }
@@ -381,31 +392,35 @@ int cp_send_json(int sock, const char* json)
 
 int cp_pp_num_row_parts(int m, int contiguous)
 {
+    if(g_cutlass_fused) return m / CP_CUTLASS_HASH_H;
     if(contiguous) return m / PP_HASH_H;
     return (m / 128) * 16;
 }
 
 int cp_pp_num_col_parts(int n, int contiguous)
 {
+    if(g_cutlass_fused) return n / CP_CUTLASS_HASH_W;
     if(contiguous) return n / PP_HASH_W;
     return (n / 256) * 16;
 }
 
 int cp_pp_num_row_periods(int m, int contiguous)
 {
+    if(g_cutlass_fused) return m / CP_CUTLASS_CTA_M;
     if(contiguous) return m / PP_HASH_H;
     return m / 128;
 }
 
 int cp_pp_num_col_periods(int n, int contiguous)
 {
+    if(g_cutlass_fused) return n / CP_CUTLASS_CTA_N;
     if(contiguous) return n / PP_HASH_W;
     return n / 256;
 }
 
 double cp_pp_macs_per_hash_tile(void)
 {
-    return (double)PP_HASH_H * (double)PP_HASH_W * (double)K_DIM;
+    return (double)cp_active_hash_h() * (double)cp_active_hash_w() * (double)K_DIM;
 }
 
 double cp_pp_mac_rate_from_tiles(uint64_t tiles_scanned, double elapsed_sec)

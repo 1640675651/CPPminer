@@ -16,12 +16,10 @@ const SCATTERED_COLS: [usize; 16] = [
     0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225,
 ];
 
-/// CUTLASS Case 7.1 epilogue scatter (128x256 CTA, 128 cells/thread = 16x8 unique rows/cols).
-/// Must match `ScatteredThreadTile128x256` in src/cuda/cutlass/scattered_thread_tile.h.
-const CUTLASS_ROWS: [usize; 16] = [
-    0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
-];
-const CUTLASS_COLS: [usize; 8] = [0, 32, 64, 96, 128, 160, 192, 224];
+/// CUTLASS Case 9 MMA lane tile (128x128 CTA). FragmentC maps to four 4x4 blocks
+/// (row stride 16, col stride 32). Must match `MmaLaneTile128x128`.
+const CUTLASS_ROWS: [usize; 8] = [0, 1, 2, 3, 16, 17, 18, 19];
+const CUTLASS_COLS: [usize; 8] = [0, 1, 2, 3, 32, 33, 34, 35];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileLayout {
@@ -178,7 +176,7 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 
 /// Build plain_proof base64. Returns 0 on success, -1 on error.
 ///
-/// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS 128x256 scatter.
+/// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8.
 /// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_build(
@@ -382,7 +380,7 @@ mod tests {
     #[test]
     fn cutlass_proof_row_counts() {
         let m = 128;
-        let n = 256;
+        let n = 128;
         let k = 256;
         let a: Vec<i8> = vec![0; m * k];
         let bt: Vec<i8> = vec![0; n * k];
@@ -399,17 +397,17 @@ mod tests {
             n,
             k,
             256,
-            36,
-            4,
+            8,
+            16,
             TileLayout::Cutlass,
         )
         .expect("cutlass build");
         let raw = STANDARD.decode(&b64).unwrap();
         let pp: PlainProof = bincode::deserialize(&raw).unwrap();
-        assert_eq!(pp.a.row_indices.len(), 16);
+        assert_eq!(pp.a.row_indices.len(), 8);
         assert_eq!(pp.bt.row_indices.len(), 8);
-        assert_eq!(pp.a.row_indices[0], 36);
-        assert_eq!(pp.bt.row_indices[0], 4);
+        assert_eq!(pp.a.row_indices[0], 8);
+        assert_eq!(pp.bt.row_indices[0], 16);
     }
 
     #[test]
