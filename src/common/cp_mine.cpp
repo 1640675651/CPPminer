@@ -138,11 +138,13 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     }
 
     const int zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
+    /* CUDA GPU prep uses random A/B (not zero-B); hand off both signal mats.
+     * CPU/OpenCL zero-B keeps shared zero B^T and only hands off A. */
     const int handoff_bt = host_matrices || !zero_b_gpu;
-    /* Defer reclaim only when host A is unused between attempts (OpenCL/CUDA GPU prep).
-     * CPU writes h_Ap_global every nonce and must reclaim before the next attempt. */
-    const int defer_host_reclaim =
-            zero_b_gpu && !cp_worker_prefers_host_matrices();
+    /* GPU-prep paths leave host A/B unused between attempts; reclaim + D2H only
+     * on share so scanning can continue while proof holds the single slot.
+     * Must not gate on zero_b_gpu: CUDA returns worker_handles_matrix_prep=0. */
+    const int defer_host_reclaim = !host_matrices && !g_cpu_matrix_gen;
 
     for (;;) {
         if (cp_job_should_cancel()) {
@@ -294,8 +296,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 continue;
             }
             if (defer_host_reclaim) {
-                if (cp_worker_fetch_share_signals(h_Ap_global,
-                                                  handoff_bt ? h_BpT_global : NULL) != 0) {
+                if (cp_worker_fetch_share_signals(
+                            h_Ap_global, handoff_bt ? h_BpT_global : NULL) != 0) {
                     fprintf(stderr, "[plain] failed to fetch signal matrices nonce=%llu\n",
                             (unsigned long long)nonce);
                     nonce++;
