@@ -223,7 +223,7 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index) {
         return false;
     }
     device_name_ = ocl_.device_name;
-    std::snprintf(backend_, sizeof(backend_), "OpenCL Case3.3 context ready");
+    std::snprintf(backend_, sizeof(backend_), "OpenCL context ready");
     context_ready_ = true;
     return true;
 }
@@ -300,7 +300,7 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL Case3.3 %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
                   case32::kKR, dot_kind);
     available_ = true;
@@ -355,7 +355,7 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL Case3.3 %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8 GPU-prep",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
                   case32::kKR, dot_kind);
     available_ = true;

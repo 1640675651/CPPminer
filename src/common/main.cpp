@@ -57,7 +57,7 @@ static void print_usage(void)
     printf("  --col-period-batch N alias for --period-batch\n");
     printf("  --row-period-batch N row-period batch size (default %d, max %d)\n",
            CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
-    printf("  --row-major-ap       row-major Ap/BpT (lda=%d; CUTLASS Case 9 default)\n",
+    printf("  --row-major-ap       row-major Ap/BpT (lda=%d; CUTLASS default)\n",
            K_DIM);
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
@@ -491,11 +491,11 @@ int main(int argc, char** argv)
                g_m_active, g_n_active, K_DIM, R_RANK,
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n",
-               cutlass_fused ? "CUTLASS Case 9 MMA lane 8x8 interleaved (128x128 CTA)"
+               cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
                : (contiguous ? "contiguous 8x16 blocks"
                              : "BzMiner periodic scattered 8x16"));
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
-            printf("[mode] scan: Case 3.3 fused GEMM + XOR + host jackpot\n");
+            printf("[mode] scan: fused GEMM + XOR + host jackpot\n");
             if(prepack_mode == CP_PREPACK_FUSED)
                 printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (fused prepack)\n",
                        host_mib * 2.0);
@@ -506,13 +506,13 @@ int main(int argc, char** argv)
                 printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
                        host_mib, host_mib * 2.0);
         } else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
-            printf("[mode] scan: OpenCL Case 3.3 fused GEMM + XOR + device jackpot\n");
+            printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
                    period_batch, period_batch * 128);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cutlass_fused){
-            printf("[mode] proof rows/cols: 8 A + 8 B^T (Case 9 interleaved 4x4)\n");
-            printf("[mode] scan: CUTLASS Case 9 fused GEMM + in-register XOR jackpot\n");
+            printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
+            printf("[mode] scan: CUTLASS fused GEMM + in-register XOR jackpot\n");
         } else {
             printf("[mode] scan: %s\n",
                    (contiguous || no_period_gemm) ? "per-tile kernel"

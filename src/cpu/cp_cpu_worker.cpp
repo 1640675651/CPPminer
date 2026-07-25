@@ -203,7 +203,7 @@ extern "C" void cp_cpu_worker_init(void)
 {
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     apply_prepack_mode_to_gemm();
-    printf("[cpu] Case 3.3 fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
+    printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
     if(g_prepack_mode != CP_PREPACK_SEPARATE)
         printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
     fflush(stdout);
@@ -256,7 +256,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
         g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
         apply_prepack_mode_to_gemm();
         if(!g_gemm.init(m, n, K_DIM, h_A_noisy, h_B_noisy)){
-            fprintf(stderr, "[cpu] Case3.3 init failed (host matrices)\n");
+            fprintf(stderr, "[cpu] GEMM init failed (host matrices)\n");
             return -1;
         }
     }

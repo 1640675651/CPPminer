@@ -727,15 +727,15 @@ void Case33GemmXor::update_backend_label_() {
 #endif
     if (avx2 && use_fast) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K u8s8+XOR, AVX2 8x16 KR=%d%s",
+                      "ukernel %s %dx%d 2D-par fused-K u8s8+XOR, AVX2 8x16 KR=%d%s",
                       par, kMacroM, kMacroN, kKR, prepack);
     } else if (avx2) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, AVX2 8x16 KR=%d%s",
+                      "ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, AVX2 8x16 KR=%d%s",
                       par, kMacroM, kMacroN, kKR, prepack);
     } else {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "Case3.2 ukernel %s %dx%d 2D-par fused-K scalar 8x16+XOR KR=%d%s", par,
+                      "ukernel %s %dx%d 2D-par fused-K scalar 8x16+XOR KR=%d%s", par,
                       kMacroM, kMacroN, kKR, prepack);
     }
     backend_ = backend_buf_;
