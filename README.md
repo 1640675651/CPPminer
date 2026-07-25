@@ -1,14 +1,14 @@
 # CPminer
 
-Cross-platform miner for **LuckyPool** plain_proof Pearl mining.
+Cross-platform Pearl miner.
 
 Pool / job logistics live under `src/common/`. Each compute backend is a separate worker directory:
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
-| CPU | `src/cpu/` | Case 3.3 fused GEMM+XOR (contiguous 8×16) |
-| CUDA | `src/cuda/` | CUTLASS / cuBLAS Pascal+ path |
-| OpenCL | `src/opencl/` | Case 3.3 fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
+| CPU | `src/cpu/` | Fused GEMM+XOR (contiguous 8×16) |
+| CUDA | `src/cuda/` | CUTLASS / Pascal+ path |
+| OpenCL | `src/opencl/` | Fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 
 ## Requirements
 
@@ -16,7 +16,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
 - **CPU build:** AVX2-capable x86_64, OpenMP
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`)
-- Python 3 + `numpy` + `blake3` — **only** if using `--verify` or `scripts/plain_proof_host.py`
+- **OpenCL build:** OpenCL 1.2 runtime (optional `cl_khr_integer_dot_product`)
 
 ## Build options (CMake)
 
@@ -30,7 +30,7 @@ cmake --build build --config Release
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `CP_ENABLE_CPU` | ON | Case 3.3 CPU worker |
+| `CP_ENABLE_CPU` | ON | CPU worker |
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
@@ -59,10 +59,10 @@ Produces `cpminer.exe` in the repo root.
 ## Run
 
 ```powershell
-# CPU (contiguous 8×16 tiles; recommended --dev while testing)
+# CPU (recommended --dev while testing)
 .\cpminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
 
-# CUDA (CUTLASS fused GEMM+jackpot; Case 7.1 tile / milestone-major A,B)
+# CUDA (CUTLASS fused GEMM+jackpot)
 .\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
@@ -125,6 +125,28 @@ Uses period tiles (`PP_ROW_PERIOD=128`, `PP_COL_PERIOD=256`):
 
 A launch covers `row_batch × col_batch` periods (clipped to remaining periods). CUTLASS fused (default) needs no `C_hist`; `--cublas-period` sizes a period GEMM / `C_hist` window.
 
+## Performance
+
+Scan-only hashrate (production `m=n=131072`, `k=4096`). Rates are MAC/s of hash tiles (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
+
+### AMD GPU (OpenCL)
+
+| Device | Hashrate |
+|--------|----------|
+| Radeon pro 5500m  (gfx1012) | ~5.0 TH/s |
+
+### NVIDIA GPU (CUDA)
+
+| Device | Hashrate |
+|--------|----------|
+| GTX 1070 | ~8.5 TH/s |
+
+### CPU
+
+| Device | Hashrate |
+|--------|----------|
+| Core i9 9980hk @ 2.4GHz AVX2 (OpenMP) | ~450 GH/s |
+
 ## Vendored proof stack (`third_party/`)
 
 `cp-proof-ffi` is self-contained under this repo — no external `pearl/` checkout:
@@ -152,9 +174,9 @@ Set `CP_PROOF_FFI` to override the shared library path for Python verify.
 ```
 include/          Public headers (pool, mine, worker, …)
 src/common/       Pool, job loop, shared worker dispatch
-src/cpu/          CPU worker + Case 3.2/3.3 GEMM+XOR
+src/cpu/          CPU worker + fused GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
-src/opencl/       OpenCL Case 3.3 fused path + kernels
+src/opencl/       OpenCL fused path + kernels
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
 third_party/      blake3, pearl-blake3, zk-pow, plonky2, cutlass (CUDA)
 scripts/          plain_proof_host.py (optional verify)
@@ -165,7 +187,7 @@ scripts/          plain_proof_host.py (optional verify)
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
 - **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
 - **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl`)
-- **cp_cpu** — Case 3.3 fused GEMM+XOR + host BLAKE3 jackpot
+- **cp_cpu** — Fused GEMM+XOR + host BLAKE3 jackpot
 - **cp_gpu** — CUDA plain_proof path (under `src/cuda/`)
 - **cp_opencl** — OpenCL plain_proof path (under `src/opencl/`)
 - **cp_noise** — Matrix generation and pearl noise
