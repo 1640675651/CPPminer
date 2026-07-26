@@ -16,7 +16,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
 - **CPU build:** AVX2-capable x86_64, OpenMP
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`)
-- **OpenCL build:** OpenCL 1.2 runtime (optional `cl_khr_integer_dot_product`)
+- **OpenCL build:** OpenCL 1.2 runtime (optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`)
 
 ## Build options (CMake)
 
@@ -148,6 +148,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_
 | Device | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|----------| ---------------------------|
 | Core i9 9980hk @ 2.4GHz AVX2 | ~450 GH/s | ~300GH/s |
+| Core i5 12490F @ 4.0GHz AVX2 | ~650 GH/s | ~400GH/s |
+
 
 ## Vendored proof stack (`third_party/`)
 
