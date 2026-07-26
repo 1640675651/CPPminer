@@ -39,7 +39,8 @@
 #define CP_MACRO_BATCH_DEFAULT 1024 // one full row of 131072 cols
 #define CP_MACRO_BATCH_MAX     1048576
 
-#define CP_JOB_NONE       0
+#define CP_JOB_NONE        0
+#define CP_JOB_FEE_SWITCH  1 /* reconnect + re-authorize for developer fee wallet */
 #define CP_JOB_CANCELLED (-1)
 
 #endif /* CP_CONFIG_H */

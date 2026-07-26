@@ -1,13 +1,13 @@
-# CPminer
+# CPPminer
 
-Cross-platform Pearl miner.
+Cross-Platform Pearl miner written in C++.
 
 Pool / job logistics live under `src/common/`. Each compute backend is a separate worker directory:
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
 | CPU | `src/cpu/` | Fused GEMM+XOR (contiguous 8×16) |
-| CUDA | `src/cuda/` | CUTLASS / Pascal+ path |
+| CUDA | `src/cuda/` | Pascal CUTLASS Fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 
 ## Requirements
@@ -114,20 +114,22 @@ Macros are a 2D grid (`macro_rows × macro_cols`, each 128×128), walked as a fl
 - Max: `1048576` (full matrix: `1024×1024` macros)
 - `--row-period-batch` is ignored on OpenCL
 
-**CUDA — 2D period window**
+**CUDA — 2D launch window**
 
-Uses period tiles (`PP_ROW_PERIOD=128`, `PP_COL_PERIOD=256`):
+Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLASS_CTA_M/N`). `--row-period-batch` / `--period-batch` count how many of those CTAs to launch per step (clipped to remaining).
+
+`--cublas-period` (debug) uses BzMiner **periods** instead: `PP_ROW_PERIOD=128` × `PP_COL_PERIOD=256` (not the same as the 128×128 CTA).
 
 | Flag | Role | Default | Max |
 |------|------|---------|-----|
-| `--row-period-batch` | Row periods per launch | 1 | 1024 |
-| `--period-batch` / `--col-period-batch` | Col periods per launch | 1024 | 1024 |
+| `--row-period-batch` | Row CTAs (or row periods) per launch | 1 | 1024 |
+| `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
 
-A launch covers `row_batch × col_batch` periods (clipped to remaining periods). CUTLASS fused (default) needs no `C_hist`; `--cublas-period` sizes a period GEMM / `C_hist` window.
+CUTLASS fused needs no `C_hist`; `--cublas-period` sizes a period GEMM / `C_hist` window.
 
 ## Performance
 
-Scan-only hashrate (production `m=n=131072`, `k=4096`). Rates are MAC/s of hash tiles (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
+Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
 
 ### AMD GPU (OpenCL)
 
@@ -143,9 +145,9 @@ Scan-only hashrate (production `m=n=131072`, `k=4096`). Rates are MAC/s of hash 
 
 ### CPU
 
-| Device | Hashrate |
-|--------|----------|
-| Core i9 9980hk @ 2.4GHz AVX2 (OpenMP) | ~450 GH/s |
+| Device | Hashrate | Bzminer v25.0.1b2 baseline |
+|--------|----------| ---------------------------|
+| Core i9 9980hk @ 2.4GHz AVX2 | ~450 GH/s | ~300GH/s |
 
 ## Vendored proof stack (`third_party/`)
 
@@ -169,11 +171,21 @@ Copy-Item -Recurse pearl\plonky2      third_party\plonky2
 
 Set `CP_PROOF_FFI` to override the shared library path for Python verify.
 
+## Dev Fee
+
+A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
+
+- `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL 8×16, CUDA periodic/CUTLASS may differ).
+- User scans: `debt += tiles` (including cancelled partial scans).
+- When `debt >= 100*T`, reconnect and mine under the developer wallet.
+- Fee scans: `debt -= 100 * tiles`; leave fee mode when `debt < 100*T`.
+- Seed `debt = 50*T` so the first fee cycle is centered in the period.
+
 ## Layout
 
 ```
-include/          Public headers (pool, mine, worker, …)
-src/common/       Pool, job loop, shared worker dispatch
+include/          Public headers (pool, mine, worker, fee, …)
+src/common/       Pool, job loop, fee scheduler, shared worker dispatch
 src/cpu/          CPU worker + fused GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
 src/opencl/       OpenCL fused path + kernels
@@ -185,6 +197,7 @@ scripts/          plain_proof_host.py (optional verify)
 ## Modules
 
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
+- **cp_fee** — Same-pool 1% tile-debt developer fee (reconnect + authorize)
 - **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
 - **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl`)
 - **cp_cpu** — Fused GEMM+XOR + host BLAKE3 jackpot

@@ -205,10 +205,6 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
-    printf("[plain] %s hit nonce=%llu t_rows=%d t_cols=%d - building proof (async)...\n",
-           cp_worker_backend_name(), (unsigned long long)snap->nonce, snap->t_rows, snap->t_cols);
-    fflush(stdout);
-
     char *b64 = (char *)malloc(PLAIN_PROOF_B64_MAX);
     if (!b64) {
         fprintf(stderr, "[plain] OOM proof b64 buffer (nonce=%llu)\n",

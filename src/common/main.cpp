@@ -2,6 +2,7 @@
  * CPminer — cross-platform LuckyPool plain_proof miner (CPU / CUDA / …).
  */
 #include "cp_config.h"
+#include "cp_fee.h"
 #include "cp_mine.h"
 #include "cp_noise.h"
 #include "cp_pool.h"
@@ -84,7 +85,7 @@ static void print_usage(void)
     printf("  --inplace-prepack    alias for --prepack reuse\n");
 }
 
-static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
+static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
 {
     char job_id[128] = {0};
     char header_hex[320] = {0};
@@ -93,14 +94,14 @@ static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
                             header_hex, sizeof(header_hex),
                             target_hex, sizeof(target_hex))){
         printf("[pool] mining.notify parse failed\n"); fflush(stdout);
-        return;
+        return CP_JOB_NONE;
     }
 
     char job_key[320];
     snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
     if(!strcmp(job_key, cur_job_key)){
         printf("[pool] duplicate notify ignored job=%s\n", job_id); fflush(stdout);
-        return;
+        return CP_JOB_NONE;
     }
     strncpy(cur_job_key, job_key, sizeof(cur_job_key) - 1);
     cur_job_key[319] = 0;
@@ -110,7 +111,7 @@ static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     if(hlen != INCOMPLETE_HEADER_BYTES){
         printf("[pool] bad header length %d (need %d)\n", hlen, INCOMPLETE_HEADER_BYTES);
         fflush(stdout);
-        return;
+        return CP_JOB_NONE;
     }
 
     uint32_t tgt[8];
@@ -125,9 +126,15 @@ static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     }
     fflush(stdout);
 
-    printf("[plain] mining job=%s...\n", job_id); fflush(stdout);
+    printf("[plain] mining job=%s%s...\n", job_id,
+           cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+    fflush(stdout);
     int rc = cp_mine_job(header, hlen, job_id, target_hex, tgt,
                          cp_pool_socket(), msg_id);
+    if(rc == CP_JOB_FEE_SWITCH){
+        printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
+        return rc;
+    }
     if(rc == CP_JOB_CANCELLED){
         printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
     } else if(rc == CP_JOB_NONE){
@@ -138,15 +145,22 @@ static void handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     while(rc == CP_JOB_CANCELLED && cp_pool_take_pending_job(&pj)){
         strncpy(cur_job_key, pj.job_key, 320);
         cur_job_key[319] = 0;
-        printf("[plain] mining queued job=%s...\n", pj.job_id); fflush(stdout);
+        printf("[plain] mining queued job=%s%s...\n", pj.job_id,
+               cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+        fflush(stdout);
         rc = cp_mine_job(pj.header, INCOMPLETE_HEADER_BYTES, pj.job_id,
                          pj.target_hex, pj.tgt, cp_pool_socket(), msg_id);
+        if(rc == CP_JOB_FEE_SWITCH){
+            printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
+            return rc;
+        }
         if(rc == CP_JOB_CANCELLED){
             printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
         } else if(rc == CP_JOB_NONE){
             printf("[plain] job stopped (max_nonce or error)\n"); fflush(stdout);
         }
     }
+    return rc;
 }
 
 int main(int argc, char** argv)
@@ -444,6 +458,9 @@ int main(int argc, char** argv)
     strncpy(wallet_global, wallet, sizeof(wallet_global) - 1);
     wallet_global[sizeof(wallet_global) - 1] = 0;
 
+    /* Offline mock skips the pool; no fee reconnects. */
+    cp_fee_init(wallet_global, g_mock ? 0 : 1);
+
     cp_worker_apply_backend_defaults();
     cp_worker_set_period_gemm(!no_period_gemm);
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -548,10 +565,20 @@ int main(int argc, char** argv)
                    : "device random + commitment/noise");
         printf("[mode] verify=%d dry_run=%d max_nonce=%d mock=%d\n",
                g_plain_verify, g_dry_run, g_max_nonce, g_mock);
+        if(cp_fee_enabled()){
+            printf("[mode] dev fee: 1%%\n");
+        }
     }
     fflush(stdout);
 
     cp_worker_init(devs, ndev);
+    {
+        const int contiguous = cp_worker_uses_contiguous_tiles();
+        const uint64_t t_tiles =
+            (uint64_t)cp_pp_num_row_parts(g_m_active, contiguous) *
+            (uint64_t)cp_pp_num_col_parts(g_n_active, contiguous);
+        cp_fee_set_tiles_per_matrix(t_tiles);
+    }
     cp_mine_init_host_buffers();
 
     if(g_mock){
@@ -621,8 +648,16 @@ reconnect:
         cp_sleep(5);
     }
 
-    if(!cp_pool_send_authorize(msg_id++, wallet_global, worker_global, agent_global))
+    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
+    cp_fee_on_authorized();
+    if(cp_fee_enabled()){
+        printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
+               cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
+               (unsigned long long)cp_fee_debt(),
+               (unsigned long long)cp_fee_threshold());
+        fflush(stdout);
+    }
 
     cp_pool_reader_start();
 
@@ -636,8 +671,8 @@ reconnect:
         if(got == 0) continue;
 
         if(strstr(line_buf, "mining.notify")){
-            handle_notify_line(line_buf, &msg_id, cur_job_key);
-            if(cp_pool_conn_lost()) goto reconnect;
+            int rc = handle_notify_line(line_buf, &msg_id, cur_job_key);
+            if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
         }
 
