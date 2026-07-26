@@ -1,17 +1,18 @@
-# Build cpminer on Windows.
+# Build cppminer on Windows.
 # Default: CPU backend only (no CUDA Toolkit required).
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Both -CudaArch 75
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
 #
 # The script snapshots and restores your shell environment on exit.
 
 param(
-    [ValidateSet("Cpu", "Cuda", "Both", "OpenCl", "CpuOpenCl")]
-    [string]$Backend = "Cpu",
+    [ValidateSet("Cpu", "Cuda", "OpenCl")]
+    [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = ""
 )
@@ -21,10 +22,18 @@ if ($Error.Count -gt 0) { $Error.Clear() }
 $Root = $PSScriptRoot
 $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
-$OutExe = Join-Path $Root "cpminer.exe"
-$EnableCpu = ($Backend -eq "Cpu" -or $Backend -eq "Both" -or $Backend -eq "CpuOpenCl")
-$EnableCuda = ($Backend -eq "Cuda" -or $Backend -eq "Both")
-$EnableOpenCl = ($Backend -eq "OpenCl" -or $Backend -eq "CpuOpenCl")
+$OutExe = Join-Path $Root "cppminer.exe"
+
+$BackendList = @($Backend | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Unique)
+if ($BackendList.Count -eq 0) {
+    $BackendList = @("Cpu")
+}
+$EnableCpu = $BackendList -contains "Cpu"
+$EnableCuda = $BackendList -contains "Cuda"
+$EnableOpenCl = $BackendList -contains "OpenCl"
+if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl)) {
+    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl"
+}
 $script:VcvarsBat = $null
 $script:ClExe = $null
 $script:OrigEnv = $null
@@ -99,7 +108,7 @@ function Find-CudaRoot {
         $latest = Get-ChildItem $base -Directory | Sort-Object Name -Descending | Select-Object -First 1
         if ($latest) { return $latest.FullName }
     }
-    throw "CUDA Toolkit not found (needed for -Backend Cuda/Both)."
+    throw "CUDA Toolkit not found (needed when -Backend includes Cuda)."
 }
 
 function Get-GpuArch {
@@ -260,7 +269,7 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $Backend (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl) ==="
 
     Write-Host "=== Building cp-proof-ffi (Rust) ==="
     $RustDir = Join-Path $Root "rust\cp-proof-ffi"
@@ -425,7 +434,7 @@ try {
 
     $hasCmake = [bool](Get-Command cmake -ErrorAction SilentlyContinue)
     if ($EnableCuda -and -not $hasCmake) {
-        throw "CUDA build requires cmake on PATH (or use -Backend Cpu)."
+        throw "CUDA build requires cmake on PATH (or omit Cuda from -Backend)."
     }
 
     if ($hasCmake -and ($EnableCuda -or $EnableOpenCl -or -not $EnableCpu)) {
@@ -453,10 +462,10 @@ try {
         Invoke-External -Command { cmake --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
 
         $built = @(
-            (Join-Path $CmakeBuild "Release\cpminer.exe"),
-            (Join-Path $CmakeBuild "cpminer.exe")
+            (Join-Path $CmakeBuild "Release\cppminer.exe"),
+            (Join-Path $CmakeBuild "cppminer.exe")
         ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (-not $built) { throw "cpminer.exe not found under $CmakeBuild" }
+        if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
         Copy-Item $built $OutExe -Force
         if ($EnableOpenCl) {
             Copy-OpenClKernels
@@ -465,7 +474,7 @@ try {
         Build-OpenClWithCl
     } else {
         if (-not $EnableCpu -or $EnableCuda) {
-            throw "Without cmake, use -Backend Cpu, OpenCl, or CpuOpenCl."
+            throw "Without cmake, use -Backend Cpu and/or OpenCl (Cuda requires cmake)."
         }
         Build-CpuWithCl
     }

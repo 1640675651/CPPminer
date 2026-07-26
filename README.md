@@ -46,38 +46,38 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 # equivalent: -Backend Cpu
 ```
 
-CUDA, OpenCL, or combinations:
+CUDA, OpenCL, or combinations (comma-separated list):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
-powershell -ExecutionPolicy Bypass -File build.ps1 -Backend CpuOpenCl
-powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Both -CudaArch 75
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
 ```
 
-Produces `cpminer.exe` in the repo root.
+Produces `cppminer.exe` in the repo root.
 
 ## Run
 
 ```powershell
 # CPU (recommended --dev while testing)
-.\cpminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
+.\cppminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
 
 # CUDA (CUTLASS fused GEMM+jackpot)
-.\cpminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
+.\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
 # CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (BzMiner 8x16)
-.\cpminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
+.\cppminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
 # OpenCL (LuckyPool production layout)
-.\cpminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
+.\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker test
 
 # Offline mock: first share + zk-pow verify (no pool; use --dev for a quick run)
-.\cpminer.exe --backend cuda --dev --mock
-.\cpminer.exe --backend opencl --dev --mock
-.\cpminer.exe --backend cpu --dev --mock
+.\cppminer.exe --backend cuda --dev --mock
+.\cppminer.exe --backend opencl --dev --mock
+.\cppminer.exe --backend cpu --dev --mock
 ```
 
 ### Options

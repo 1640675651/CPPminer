@@ -161,6 +161,7 @@ else()
 endif()
 
 add_executable(cpminer ${CP_SOURCES})
+set_target_properties(cpminer PROPERTIES OUTPUT_NAME cppminer)
 target_include_directories(cpminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)
@@ -183,7 +184,7 @@ if(CP_ENABLE_OPENCL)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
             "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_prep.cl"
-        COMMENT "Copy OpenCL kernels next to cpminer")
+        COMMENT "Copy OpenCL kernels next to cppminer")
 endif()
 
 # Optional in-process proof FFI (built by build.ps1 / cargo).
@@ -233,4 +234,4 @@ if(WIN32)
     target_link_libraries(cpminer PRIVATE ws2_32)
 endif()
 
-message(STATUS "CPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL}")
