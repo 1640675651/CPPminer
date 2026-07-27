@@ -63,7 +63,16 @@ static void print_usage(void)
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
+#endif
+    printf("  --no-cutlass-fused   debug: non-CUTLASS period path (CUDA GEMM%s)\n",
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
+           " or cuBLAS if probed"
+#else
+           ""
+#endif
+           );
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
@@ -239,8 +248,16 @@ int main(int argc, char** argv)
             step_major_ap = 1;
         } else if(!strcmp(argv[i], "--cutlass-fused")){
             cutlass_fused = 1;
-        } else if(!strcmp(argv[i], "--cublas-period") ||
-                  !strcmp(argv[i], "--no-cutlass-fused")){
+        } else if(!strcmp(argv[i], "--cublas-period")){
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
+            cutlass_fused = 0;
+#else
+            fprintf(stderr,
+                    "--cublas-period requires rebuild with -DCP_ENABLE_CUBLAS=ON "
+                    "(or build.ps1 -EnableCublas)\n");
+            return 1;
+#endif
+        } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
@@ -546,7 +563,7 @@ int main(int argc, char** argv)
                 printf("[mode] period batch: row=%d col=%d\n",
                        row_period_batch, period_batch);
             } else {
-                printf("[mode] jackpot: separate XOR kernel (cuBLAS period GEMM)\n");
+                printf("[mode] jackpot: separate XOR kernel (period GEMM)\n");
                 printf("[mode] period batch: row=%d col=%d (~%.0f MiB C_hist/GPU)\n",
                        row_period_batch, period_batch,
                        (double)row_period_batch * (double)period_batch

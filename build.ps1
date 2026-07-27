@@ -7,6 +7,7 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
 #
 # The script snapshots and restores your shell environment on exit.
 
@@ -14,7 +15,8 @@ param(
     [ValidateSet("Cpu", "Cuda", "OpenCl")]
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
-    [string]$CudaRoot = ""
+    [string]$CudaRoot = "",
+    [switch]$EnableCublas
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,8 +36,12 @@ $EnableOpenCl = $BackendList -contains "OpenCl"
 if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl)) {
     throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl"
 }
+if ($EnableCublas -and -not $EnableCuda) {
+    throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
+}
 $script:VcvarsBat = $null
 $script:ClExe = $null
+$script:CmakeExe = $null
 $script:OrigEnv = $null
 
 function Save-ShellEnvironment {
@@ -99,6 +105,39 @@ function Initialize-MSVC {
     if ($script:ClExe) { $script:ClExe = $script:ClExe.Trim() }
     if (-not $script:ClExe) { throw "cl.exe not found after vcvars64" }
     Write-Host "=== cl.exe: $($script:ClExe) ==="
+}
+
+function Find-CMake {
+    $cmd = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+        return $cmd.Source
+    }
+
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $hits = @(& $vswhere -latest -products * -find "**/CMake/CMake/bin/cmake.exe" 2>$null)
+        foreach ($hit in $hits) {
+            if ($hit -and (Test-Path $hit)) { return $hit }
+        }
+        $hits = @(& $vswhere -latest -products * -find "**/cmake.exe" 2>$null)
+        foreach ($hit in $hits) {
+            if ($hit -and $hit -match '[\\/]CMake[\\/]bin[\\/]cmake\.exe$' -and (Test-Path $hit)) {
+                return $hit
+            }
+        }
+    }
+
+    foreach ($p in @(
+        "${env:ProgramFiles}\CMake\bin\cmake.exe",
+        "${env:ProgramFiles(x86)}\CMake\bin\cmake.exe",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
 }
 
 function Find-CudaRoot {
@@ -278,10 +317,18 @@ $buildExitCode = 0
 try {
     Clear-CondaToolchainOverrides
     Initialize-MSVC
+    $script:CmakeExe = Find-CMake
+    if ($script:CmakeExe) {
+        $cmakeBin = Split-Path -Parent $script:CmakeExe
+        if ($env:PATH -notlike "*$cmakeBin*") {
+            $env:PATH = "$cmakeBin;$env:PATH"
+        }
+        Write-Host "=== cmake: $($script:CmakeExe) ==="
+    }
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl CUBLAS=$EnableCublas) ==="
 
     Write-Host "=== Building cp-proof-ffi (Rust) ==="
     $RustDir = Join-Path $Root "rust\cp-proof-ffi"
@@ -444,9 +491,9 @@ try {
         Copy-OpenClKernels
     }
 
-    $hasCmake = [bool](Get-Command cmake -ErrorAction SilentlyContinue)
+    $hasCmake = [bool]$script:CmakeExe
     if ($EnableCuda -and -not $hasCmake) {
-        throw "CUDA build requires cmake on PATH (or omit Cuda from -Backend)."
+        throw "CUDA build requires cmake (install VS 'CMake tools for Windows' component, or add cmake to PATH)."
     }
 
     if ($hasCmake -and ($EnableCuda -or $EnableOpenCl -or -not $EnableCpu)) {
@@ -457,7 +504,8 @@ try {
             "-B", $CmakeBuild,
             "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
             "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
-            "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })"
+            "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
+            "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
         )
         if ($EnableCuda -and $CudaArch) {
             $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
@@ -469,9 +517,9 @@ try {
         }
 
         Write-Host "=== CMake configure ==="
-        Invoke-External -Command { cmake @cmakeArgs } -FailureMessage "cmake configure failed"
+        Invoke-External -Command { & $script:CmakeExe @cmakeArgs } -FailureMessage "cmake configure failed"
         Write-Host "=== CMake build ==="
-        Invoke-External -Command { cmake --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
+        Invoke-External -Command { & $script:CmakeExe --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
 
         $built = @(
             (Join-Path $CmakeBuild "Release\cppminer.exe"),

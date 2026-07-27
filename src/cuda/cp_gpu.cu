@@ -5,7 +5,9 @@
 #include "cp_util.h"
 
 #include <cuda_runtime.h>
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
 #include <cublas_v2.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,7 @@
     } \
 } while(0)
 
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
 #define CUBLAS_CHECK(call) do { \
     cublasStatus_t _e = (call); \
     if(_e != CUBLAS_STATUS_SUCCESS){ \
@@ -38,6 +41,7 @@
         exit(1); \
     } \
 } while(0)
+#endif
 
 typedef struct {
     int       dev;
@@ -64,7 +68,9 @@ typedef struct {
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
     size_t    tile_xor_cap;
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     cublasHandle_t cublas;
+#endif
     int       use_cublas_period;
     int       use_cutlass_fused;
 } GpuCtx;
@@ -121,6 +127,7 @@ static int gpu_num_col_periods(int n)
     return cp_pp_num_col_periods(n, g_contiguous);
 }
 
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
 static const char* cublas_status_str(cublasStatus_t st)
 {
     switch(st){
@@ -199,6 +206,7 @@ static int gpu_probe_cublas_int8(GpuCtx* g)
     }
     return 1;
 }
+#endif /* CP_ENABLE_CUBLAS */
 
 static void sync_ap_layout(void)
 {
@@ -299,8 +307,12 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         CUBLAS_CHECK(cublasCreate(&g->cublas));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
+#else
+        g->use_cublas_period = 0;
+#endif
         g->use_cutlass_fused = g_cutlass_fused;
         printf("[gpu] GPU%d OK (%s, blocking sync)\n", g->dev,
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
@@ -338,7 +350,9 @@ void cp_gpu_shutdown(void)
         if(g->d_a_key8) cudaFree(g->d_a_key8);
         if(g->d_C_hist) cudaFree(g->d_C_hist);
         if(g->d_tile_xor) cudaFree(g->d_tile_xor);
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         if(g->cublas){ cublasDestroy(g->cublas); g->cublas = NULL; }
+#endif
     }
     g_ngpu = 0;
 }
@@ -490,6 +504,7 @@ static void gpu_period_gemm_panel_ptrs(
     }
 }
 
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
 /*
  * cuBLAS: one fat GemmEx per rank step into C_hist[step] (rank partials only).
  * Jackpot cumulates partials across steps (no plane_add).
@@ -576,6 +591,7 @@ static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
 
     return out;
 }
+#endif /* CP_ENABLE_CUBLAS */
 
 static void gpu_period_gemm_cuda_batch(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
@@ -623,10 +639,12 @@ static void gpu_period_gemm_batch(
         }
         return;
     }
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     if(g->use_cublas_period)
         gpu_period_gemm_cublas_batch(
             g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
     else
+#endif
         gpu_period_gemm_cuda_batch(
             g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
 }
@@ -997,11 +1015,14 @@ static PeriodBatchTimes profile_period_batch_timed(
     int zero = 0;
     CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
 
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     if(g->use_cublas_period && !g->use_cutlass_fused){
         PeriodCublasBreakdown cb = gpu_period_gemm_cublas_batch_timed(
             g, m, n, rpi0, cpi0, row_batch_count, col_batch_count);
         t.gemm_ex_ms = cb.gemm_ex_ms;
-    } else if(!g->use_cutlass_fused) {
+    } else
+#endif
+    if(!g->use_cutlass_fused) {
         CU_CHECK(cudaEventRecord(ev[0]));
         gpu_period_gemm_cuda_batch(
             g, m, n, rpi0, cpi0, row_batch_count, col_batch_count);

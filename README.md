@@ -15,7 +15,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 - MSVC (Windows) or GCC/Clang (Linux)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
 - **CPU build:** AVX2-capable x86_64, OpenMP
-- **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`)
+- **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`). Production CUTLASS path links only `cudart` (no cuBLAS). Optional `-EnableCublas` / `-DCP_ENABLE_CUBLAS=ON` for `--cublas-period`.
 - **OpenCL build:** OpenCL 1.2 runtime (optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`)
 
 ## Build options (CMake)
@@ -33,6 +33,7 @@ cmake --build build --config Release
 | `CP_ENABLE_CPU` | ON | CPU worker |
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
+| `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
 Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda|opencl`.
@@ -52,6 +53,8 @@ CUDA, OpenCL, or combinations (comma-separated list):
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
+# Optional debug: link cuBLAS (large DLLs; not needed for production CUTLASS path)
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
 Produces `cppminer.exe` in the repo root.
@@ -66,7 +69,7 @@ Produces `cppminer.exe` in the repo root.
 .\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
-# CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (BzMiner 8x16)
+# CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (requires -EnableCublas build)
 .\cppminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker test --devices 0
 
@@ -92,7 +95,8 @@ Produces `cppminer.exe` in the repo root.
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
-| `--cublas-period` | CUDA debug: cuBLAS period GEMM + separate XOR/jackpot |
+| `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
+| `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
 | `--period-batch N` | Batch size for scan launches (default 1024; see below) |
 | `--col-period-batch N` | Alias for `--period-batch` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 1, max 1024) |
