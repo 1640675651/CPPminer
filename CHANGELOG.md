@@ -1,0 +1,38 @@
+# Changelog
+
+## v0.1
+
+First public release of **CPPminer** — a cross-platform Pearl (LuckyPool plain_proof) miner in C++.
+
+### Package contents
+
+| Binary | Backends | Notes |
+|--------|----------|--------|
+| `cppminer_all.exe` | CUDA + OpenCL + CPU | Pick at runtime with `--backend` |
+| `cppminer_opencl.exe` | OpenCL + CPU | AMD / OpenCL GPUs |
+| `cppminer_cpu.exe` | CPU only | AVX2 x86_64 |
+
+Also ship next to the CUDA-capable binary:
+
+- `cudart64_12.dll` (CUDA runtime)
+
+CUDA Toolkit is **not** required to run.
+
+### Hardware support
+
+- **Legacy NVIDIA** — Pascal cards via the CUDA CUTLASS fused kernel (e.g. GTX 10-series).
+- **AMD GPUs** — OpenCL worker.
+- **CPU** — AVX2 OpenMP worker.
+
+### Basic usage
+
+```powershell
+# CPU
+.\cppminer_cpu.exe --backend cpu --pool stratum+tcp://HOST:PORT --wallet prl1... --worker rig01
+
+# NVIDIA (CUDA) — use cppminer_all.exe
+.\cppminer_all.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 --wallet prl1... --worker rig01
+
+# AMD / OpenCL
+.\cppminer_opencl.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 --wallet prl1... --worker rig01
+```

@@ -50,9 +50,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 CUDA, OpenCL, or combinations (comma-separated list):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
-powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 # Optional debug: link cuBLAS (large DLLs; not needed for production CUTLASS path)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
@@ -62,8 +61,8 @@ Produces `cppminer.exe` in the repo root.
 ## Run
 
 ```powershell
-# CPU (recommended --dev while testing)
-.\cppminer.exe --backend cpu --dev --wallet prl1... --worker test --dry-run --max-nonce 1
+# CPU
+.\cppminer.exe --backend cpu --wallet prl1... --worker test --dry-run --max-nonce 1
 
 # CUDA (CUTLASS fused GEMM+jackpot)
 .\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
@@ -77,10 +76,10 @@ Produces `cppminer.exe` in the repo root.
 .\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker test
 
-# Offline mock: first share + zk-pow verify (no pool; use --dev for a quick run)
-.\cppminer.exe --backend cuda --dev --mock
-.\cppminer.exe --backend opencl --dev --mock
-.\cppminer.exe --backend cpu --dev --mock
+# Offline mock: first share + zk-pow verify (no pool)
+.\cppminer.exe --backend cuda --mock
+.\cppminer.exe --backend opencl --mock
+.\cppminer.exe --backend cpu --mock
 ```
 
 ### Options
@@ -151,8 +150,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_
 
 | Device | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|----------| ---------------------------|
-| Core i9 9980hk @ 2.4GHz AVX2 | ~450 GH/s | ~300GH/s |
-| Core i5 12490F @ 4.0GHz AVX2 | ~650 GH/s | ~400GH/s |
+| Core i9 9980hk @ 2.4GHz AVX2 | ~440 GH/s | ~300GH/s |
+| Core i5 12490F @ 4.0GHz AVX2 | ~640 GH/s | ~400GH/s |
 
 
 ## Vendored proof stack (`third_party/`)
