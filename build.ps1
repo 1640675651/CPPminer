@@ -164,6 +164,18 @@ function Ensure-OpenClHeaders {
 
 function Find-OpenClLib {
     $candidates = @()
+    # NVIDIA CUDA Toolkit ships OpenCL.lib (ICD import lib); runtime is System32\OpenCL.dll.
+    foreach ($cudaRoot in @($env:CUDA_PATH, $env:CUDA_PATH_V12_5, $env:CUDA_PATH_V12_6, $env:CUDA_PATH_V12_4, $env:CUDA_PATH_V12_3, $env:CUDA_PATH_V12_2, $env:CUDA_PATH_V12_1, $env:CUDA_PATH_V12_0)) {
+        if ($cudaRoot) {
+            $candidates += (Join-Path $cudaRoot "lib\x64\OpenCL.lib")
+        }
+    }
+    $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    if (Test-Path $cudaBase) {
+        Get-ChildItem $cudaBase -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { $candidates += (Join-Path $_.FullName "lib\x64\OpenCL.lib") }
+    }
     if ($env:ONEAPI_ROOT) {
         $candidates += @(
             (Join-Path $env:ONEAPI_ROOT "compiler\latest\windows\lib\OpenCL.lib"),
@@ -176,7 +188,7 @@ function Find-OpenClLib {
     foreach ($p in $candidates) {
         if ($p -and (Test-Path $p)) { return $p }
     }
-    throw "OpenCL.lib not found (install Intel oneAPI OpenCL runtime or AMD GPU driver OpenCL ICD)"
+    throw "OpenCL.lib not found (CUDA Toolkit lib\x64, Intel oneAPI, or AMD OpenCL SDK)"
 }
 
 function Copy-OpenClKernels {

@@ -128,11 +128,18 @@ if(CP_ENABLE_OPENCL)
     if(NOT OpenCL_FOUND)
         set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
         if(EXISTS "${_OCL_HDR}/CL/cl.h")
-            find_library(OpenCL_LIBRARY NAMES OpenCL
-                HINTS
-                    "C:/Program Files (x86)/Intel/oneAPI/compiler/2023.2.0/windows/lib"
-                    "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/windows/lib"
-                    "C:/Program Files (x86)/Intel/oneAPI/compiler/2026.1/windows/lib")
+            set(_OCL_LIB_HINTS
+                "C:/Program Files (x86)/Intel/oneAPI/compiler/2023.2.0/windows/lib"
+                "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/windows/lib"
+                "C:/Program Files (x86)/Intel/oneAPI/compiler/2026.1/windows/lib")
+            if(DEFINED ENV{CUDA_PATH})
+                list(APPEND _OCL_LIB_HINTS "$ENV{CUDA_PATH}/lib/x64")
+            endif()
+            file(GLOB _cuda_roots "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*")
+            foreach(_root IN LISTS _cuda_roots)
+                list(APPEND _OCL_LIB_HINTS "${_root}/lib/x64")
+            endforeach()
+            find_library(OpenCL_LIBRARY NAMES OpenCL HINTS ${_OCL_LIB_HINTS})
             if(OpenCL_LIBRARY)
                 add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
                 set_target_properties(OpenCL::OpenCL PROPERTIES
