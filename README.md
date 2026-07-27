@@ -16,7 +16,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
 - **CPU build:** AVX2-capable x86_64, OpenMP
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`). Production CUTLASS path links only `cudart` (no cuBLAS). Optional `-EnableCublas` / `-DCP_ENABLE_CUBLAS=ON` for `--cublas-period`.
-- **OpenCL build:** OpenCL 1.2 runtime (optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`)
+- **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 
 ## Build options (CMake)
 
@@ -196,7 +196,7 @@ src/cpu/          CPU worker + fused GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
 src/opencl/       OpenCL fused path + kernels
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
-third_party/      blake3, pearl-blake3, zk-pow, plonky2, cutlass (CUDA)
+third_party/      blake3, pearl-blake3, zk-pow, plonky2, opencl (+headers), cutlass (CUDA)
 scripts/          plain_proof_host.py (optional verify)
 ```
 

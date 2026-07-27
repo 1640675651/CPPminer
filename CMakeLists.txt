@@ -103,61 +103,29 @@ else()
 endif()
 
 if(CP_ENABLE_OPENCL)
-    find_package(OpenCL QUIET)
-    if(NOT OpenCL_FOUND)
-        set(_ONEAPI_CANDIDATES)
-        if(DEFINED ENV{ONEAPI_ROOT})
-            list(APPEND _ONEAPI_CANDIDATES "$ENV{ONEAPI_ROOT}/compiler/latest"
-                 "$ENV{ONEAPI_ROOT}")
-        endif()
-        foreach(_ver IN ITEMS 2026.1 2025.3 2023.2.0)
-            list(APPEND _ONEAPI_CANDIDATES
-                 "C:/Program Files (x86)/Intel/oneAPI/compiler/${_ver}")
-        endforeach()
-        foreach(_root IN LISTS _ONEAPI_CANDIDATES)
-            if(NOT OpenCL_FOUND AND EXISTS "${_root}")
-                find_path(OpenCL_INCLUDE_DIR CL/cl.h
-                    HINTS "${_root}/windows/include/sycl"
-                          "${_root}/include/sycl"
-                          "${_root}/windows/lib/oclfpga/host/include"
-                    NO_DEFAULT_PATH)
-                find_library(OpenCL_LIBRARY NAMES OpenCL
-                    HINTS "${_root}/windows/lib" "${_root}/lib"
-                    NO_DEFAULT_PATH)
-                if(OpenCL_INCLUDE_DIR AND OpenCL_LIBRARY)
-                    add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
-                    set_target_properties(OpenCL::OpenCL PROPERTIES
-                        IMPORTED_LOCATION "${OpenCL_LIBRARY}"
-                        INTERFACE_INCLUDE_DIRECTORIES "${OpenCL_INCLUDE_DIR}")
-                    set(OpenCL_FOUND TRUE)
-                    message(STATUS "Using OpenCL from oneAPI (${_root})")
-                endif()
-            endif()
-        endforeach()
+    # Prefer vendored Khronos headers + Windows x64 import lib (no vendor SDK).
+    set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
+    set(_OCL_LIB_WIN "${CMAKE_SOURCE_DIR}/third_party/opencl/lib/x64/OpenCL.lib")
+    if(WIN32 AND EXISTS "${_OCL_LIB_WIN}" AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+        set_target_properties(OpenCL::OpenCL PROPERTIES
+            IMPORTED_LOCATION "${_OCL_LIB_WIN}"
+            INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+        set(OpenCL_FOUND TRUE)
+        message(STATUS "Using vendored OpenCL: ${_OCL_LIB_WIN}")
     endif()
     if(NOT OpenCL_FOUND)
-        set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
-        if(EXISTS "${_OCL_HDR}/CL/cl.h")
-            set(_OCL_LIB_HINTS
-                "C:/Program Files (x86)/Intel/oneAPI/compiler/2023.2.0/windows/lib"
-                "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/windows/lib"
-                "C:/Program Files (x86)/Intel/oneAPI/compiler/2026.1/windows/lib")
-            if(DEFINED ENV{CUDA_PATH})
-                list(APPEND _OCL_LIB_HINTS "$ENV{CUDA_PATH}/lib/x64")
-            endif()
-            file(GLOB _cuda_roots "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*")
-            foreach(_root IN LISTS _cuda_roots)
-                list(APPEND _OCL_LIB_HINTS "${_root}/lib/x64")
-            endforeach()
-            find_library(OpenCL_LIBRARY NAMES OpenCL HINTS ${_OCL_LIB_HINTS})
-            if(OpenCL_LIBRARY)
-                add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
-                set_target_properties(OpenCL::OpenCL PROPERTIES
-                    IMPORTED_LOCATION "${OpenCL_LIBRARY}"
-                    INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
-                set(OpenCL_FOUND TRUE)
-                message(STATUS "Using vendored OpenCL headers + ${OpenCL_LIBRARY}")
-            endif()
+        find_package(OpenCL QUIET)
+    endif()
+    if(NOT OpenCL_FOUND AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.so)
+        if(OpenCL_LIBRARY)
+            add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+            set_target_properties(OpenCL::OpenCL PROPERTIES
+                IMPORTED_LOCATION "${OpenCL_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+            set(OpenCL_FOUND TRUE)
+            message(STATUS "Using system OpenCL + vendored headers: ${OpenCL_LIBRARY}")
         endif()
     endif()
     if(NOT OpenCL_FOUND)

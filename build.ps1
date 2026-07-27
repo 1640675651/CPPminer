@@ -202,32 +202,9 @@ function Ensure-OpenClHeaders {
 }
 
 function Find-OpenClLib {
-    $candidates = @()
-    # NVIDIA CUDA Toolkit ships OpenCL.lib (ICD import lib); runtime is System32\OpenCL.dll.
-    foreach ($cudaRoot in @($env:CUDA_PATH, $env:CUDA_PATH_V12_5, $env:CUDA_PATH_V12_6, $env:CUDA_PATH_V12_4, $env:CUDA_PATH_V12_3, $env:CUDA_PATH_V12_2, $env:CUDA_PATH_V12_1, $env:CUDA_PATH_V12_0)) {
-        if ($cudaRoot) {
-            $candidates += (Join-Path $cudaRoot "lib\x64\OpenCL.lib")
-        }
-    }
-    $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-    if (Test-Path $cudaBase) {
-        Get-ChildItem $cudaBase -Directory -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending |
-            ForEach-Object { $candidates += (Join-Path $_.FullName "lib\x64\OpenCL.lib") }
-    }
-    if ($env:ONEAPI_ROOT) {
-        $candidates += @(
-            (Join-Path $env:ONEAPI_ROOT "compiler\latest\windows\lib\OpenCL.lib"),
-            (Join-Path $env:ONEAPI_ROOT "windows\lib\OpenCL.lib")
-        )
-    }
-    foreach ($ver in @("2026.1", "2025.3", "2023.2.0")) {
-        $candidates += "C:\Program Files (x86)\Intel\oneAPI\compiler\$ver\windows\lib\OpenCL.lib"
-    }
-    foreach ($p in $candidates) {
-        if ($p -and (Test-Path $p)) { return $p }
-    }
-    throw "OpenCL.lib not found (CUDA Toolkit lib\x64, Intel oneAPI, or AMD OpenCL SDK)"
+    $vendored = Join-Path $Root "third_party\opencl\lib\x64\OpenCL.lib"
+    if (Test-Path $vendored) { return $vendored }
+    throw "Vendored OpenCL.lib missing at $vendored (see third_party/opencl/README.md)"
 }
 
 function Copy-OpenClKernels {

@@ -4,7 +4,6 @@
 internal/
 *.exe
 *.obj
-*.lib
 *.exp
 pp_dev_*
 pp_prod_*
