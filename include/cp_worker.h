@@ -47,6 +47,16 @@ void cp_worker_set_prepack_mode(CpPrepackMode mode);
 /* Legacy alias for CP_PREPACK_REUSE. */
 void cp_worker_set_inplace_prepack(int on);
 
+/* CPU SIMD ISA preference (ignored on CUDA/OpenCL). */
+typedef enum {
+    CP_SIMD_AUTO   = 0, /* AVX2 → SSSE3 → scalar */
+    CP_SIMD_AVX2   = 1,
+    CP_SIMD_SSE    = 2, /* force SSSE3 path */
+    CP_SIMD_SCALAR = 3,
+} CpSimdIsa;
+
+void cp_worker_set_simd_isa(CpSimdIsa isa);
+
 /* Prefer host matrix path when non-zero (CPU backend always uses host matrices). */
 int cp_worker_prefers_host_matrices(void);
 

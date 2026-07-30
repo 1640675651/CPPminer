@@ -14,8 +14,8 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 
 - MSVC (Windows) or GCC/Clang (Linux)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
-- **CPU build:** AVX2-capable x86_64, OpenMP
-- **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`). Production CUTLASS path links only `cudart` (no cuBLAS). Optional `-EnableCublas` / `-DCP_ENABLE_CUBLAS=ON` for `--cublas-period`.
+- **CPU build:** x86_64 with OpenMP; AVX2 preferred, SSSE3/scalar fallback at runtime (`--simd`)
+- **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 
 ## Build options (CMake)
@@ -62,19 +62,19 @@ Produces `cppminer.exe` in the repo root.
 
 ```powershell
 # CPU
-.\cppminer.exe --backend cpu --wallet prl1... --worker test --dry-run --max-nonce 1
+.\cppminer.exe --backend cpu --wallet prl1... --worker worker_name
 
 # CUDA (CUTLASS fused GEMM+jackpot)
 .\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker test --devices 0
+  --wallet prl1... --worker worker_name --devices 0
 
 # CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (requires -EnableCublas build)
 .\cppminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker test --devices 0
+  --wallet prl1... --worker worker_name --devices 0
 
 # OpenCL (LuckyPool production layout)
 .\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker test
+  --wallet prl1... --worker worker_name
 
 # Offline mock: first share + zk-pow verify (no pool)
 .\cppminer.exe --backend cuda --mock
@@ -104,6 +104,8 @@ Produces `cppminer.exe` in the repo root.
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job id, mine until first share, verify, exit (implies dry-run+verify) |
 | `--mock-diff D` | Mock pool difficulty (default 58; higher = longer before first share) |
+| `--prepack MODE` | CPU: `separate` (default), `reuse`, or `fused` matrix prepack |
+| `--simd ISA` | CPU: `auto` (default), `avx2`, `sse`, `scalar` |
 
 ### Scan batching (`--period-batch`)
 
@@ -128,7 +130,7 @@ Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLAS
 | `--row-period-batch` | Row CTAs (or row periods) per launch | 1 | 1024 |
 | `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
 
-CUTLASS fused needs no `C_hist`; `--cublas-period` sizes a period GEMM / `C_hist` window.
+CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C window.
 
 ## Performance
 

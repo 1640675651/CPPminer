@@ -92,6 +92,8 @@ static void print_usage(void)
            g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), avx2, sse, scalar\n");
+    printf("                       (also CP_SIMD / CASE33_ISA env)\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -188,6 +190,18 @@ int main(int argc, char** argv)
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
+    CpSimdIsa simd_isa = CP_SIMD_AUTO;
+    {
+        const char* env = getenv("CP_SIMD");
+        if(!env) env = getenv("CASE33_ISA");
+        if(env){
+            if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
+            else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
+                simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
+            else if(!strcmp(env, "auto")) simd_isa = CP_SIMD_AUTO;
+        }
+    }
     int profile_scan = 0;
     int profile_runs = 10;
     int profile_prep = 0;
@@ -273,6 +287,22 @@ int main(int argc, char** argv)
                 prepack_mode = CP_PREPACK_FUSED;
             else {
                 fprintf(stderr, "unknown --prepack mode %s (separate|reuse|fused)\n", mode);
+                return 1;
+            }
+        } else if(!strcmp(argv[i], "--simd") && i + 1 < argc){
+            const char* isa = argv[++i];
+            if(!strcmp(isa, "auto"))
+                simd_isa = CP_SIMD_AUTO;
+            else if(!strcmp(isa, "avx2"))
+                simd_isa = CP_SIMD_AVX2;
+            else if(!strcmp(isa, "sse") || !strcmp(isa, "ssse3"))
+                simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(isa, "scalar"))
+                simd_isa = CP_SIMD_SCALAR;
+            else {
+                fprintf(stderr,
+                        "unknown --simd %s (auto|avx2|sse|scalar)\n",
+                        isa);
                 return 1;
             }
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
@@ -493,6 +523,7 @@ int main(int argc, char** argv)
     pearl_set_cutlass_fused(cutlass_fused);
     g_cutlass_fused = cutlass_fused;
     cp_worker_set_prepack_mode(prepack_mode);
+    cp_worker_set_simd_isa(simd_isa);
 
     if(cutlass_fused){
         if(no_period_gemm){

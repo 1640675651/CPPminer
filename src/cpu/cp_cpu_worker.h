@@ -15,6 +15,7 @@ int cp_cpu_worker_handles_matrix_prep(void);
 void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n);
 void cp_cpu_worker_set_prepack_mode(CpPrepackMode mode);
 void cp_cpu_worker_set_inplace_prepack(int on);
+void cp_cpu_worker_set_simd_isa(CpSimdIsa isa);
 
 int cp_cpu_worker_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,

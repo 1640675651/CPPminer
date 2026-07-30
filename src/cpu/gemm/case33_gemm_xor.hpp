@@ -12,7 +12,22 @@ enum class Case33PrepackMode {
     Fused,        /* noise injection directly into scan/prepack layout */
 };
 
-// Case 3.3: Case 3.2 8x16 AVX2 ukernel + milestoned 8x16 tile XOR.
+/* ISA preference for micro-kernel dispatch. */
+enum class Case33Isa {
+    Auto,   /* AVX2 if available, else SSSE3, else scalar */
+    Avx2,   /* prefer AVX2; fall back if unavailable */
+    Sse,    /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    Scalar, /* force scalar reference ukernel */
+};
+
+/* SSSE3 register-tile shape inside the fixed 8x16 semantic/pack tile. */
+enum class Case33SseTile {
+    R4C8,  /* 4x8 (default): two row-halves x two col-groups */
+    R8C8,  /* 8x8: both row-halves live across K for one col-group */
+    R4C16, /* 4x16: one row-half x all 16 cols (better A reuse) */
+};
+
+// Case 3.3: Case 3.2 8x16 ukernel + milestoned 8x16 tile XOR.
 // tile_xor[milestone * tile_count + spatial_tile_id]
 struct Case33GemmXor {
     static constexpr int kNumMilestones = 16;
@@ -33,6 +48,14 @@ struct Case33GemmXor {
     bool inplace_prepack() const {
         return prepack_mode_ != Case33PrepackMode::Separate;
     }
+
+    void set_isa(Case33Isa isa) { isa_pref_ = isa; }
+    void set_sse_tile(Case33SseTile tile) { sse_tile_ = tile; }
+    Case33Isa isa() const { return isa_pref_; }
+    Case33Isa isa_used() const { return isa_used_; }
+    Case33SseTile sse_tile() const { return sse_tile_; }
+    /* Resolve preferred ISA against CPUID (updates isa_used_). */
+    void resolve_runtime_isa();
 
     bool init(int M, int N, int K, const int8_t *a, const int8_t *b);
     /* Zero-B CPU: B once per job, A each attempt. */
@@ -71,6 +94,9 @@ private:
     const char *backend_ = "unavailable";
     int num_threads_ = 1;
     Case32Int8Mode int8_mode_ = Case32Int8Mode::FastU8S8;
+    Case33Isa isa_pref_ = Case33Isa::Auto;
+    Case33Isa isa_used_ = Case33Isa::Scalar;
+    Case33SseTile sse_tile_ = Case33SseTile::R4C8;
 
     int M_ = 0;
     int N_ = 0;

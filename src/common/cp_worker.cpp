@@ -242,6 +242,16 @@ extern "C" void cp_worker_set_inplace_prepack(int on)
     cp_worker_set_prepack_mode(on ? CP_PREPACK_REUSE : CP_PREPACK_SEPARATE);
 }
 
+extern "C" void cp_worker_set_simd_isa(CpSimdIsa isa)
+{
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+        cp_cpu_worker_set_simd_isa(isa);
+#else
+    (void)isa;
+#endif
+}
+
 extern "C" int cp_worker_prefers_host_matrices(void)
 {
     return cp_worker_backend_id() == CP_BACKEND_CPU;

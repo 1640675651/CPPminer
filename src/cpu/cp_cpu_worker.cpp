@@ -31,6 +31,8 @@ struct ZeroBCache {
 /* Single copies: A scan buf; a_pre_/b_pre_ only in separate prepack mode. */
 static std::vector<int8_t> g_A_noisy;
 static Case33GemmXor g_gemm;
+static Case33Isa g_isa_pref = Case33Isa::Auto;
+static Case33SseTile g_sse_tile = Case33SseTile::R4C8;
 static CpPrepackMode g_prepack_mode = CP_PREPACK_SEPARATE;
 
 static void apply_prepack_mode_to_gemm(void)
@@ -45,6 +47,24 @@ static void apply_prepack_mode_to_gemm(void)
     default:
         g_gemm.set_prepack_mode(Case33PrepackMode::Separate);
         break;
+    }
+}
+
+static void apply_simd_to_gemm(void)
+{
+    g_gemm.set_isa(g_isa_pref);
+    g_gemm.set_sse_tile(g_sse_tile);
+}
+
+static const char* simd_isa_label(Case33Isa isa, Case33SseTile tile)
+{
+    (void)tile;
+    switch(isa){
+    case Case33Isa::Avx2: return "AVX2";
+    case Case33Isa::Sse: return "SSSE3";
+    case Case33Isa::Scalar: return "scalar";
+    case Case33Isa::Auto:
+    default: return "auto";
     }
 }
 
@@ -78,6 +98,7 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
     g_gemm.reset();
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     apply_prepack_mode_to_gemm();
+    apply_simd_to_gemm();
 
     if(log_step) t_step = cp_now_sec();
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
@@ -199,11 +220,35 @@ extern "C" void cp_cpu_worker_set_inplace_prepack(int on)
     cp_cpu_worker_set_prepack_mode(on ? CP_PREPACK_REUSE : CP_PREPACK_SEPARATE);
 }
 
+extern "C" void cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
+{
+    switch(isa){
+    case CP_SIMD_AVX2:
+        g_isa_pref = Case33Isa::Avx2;
+        break;
+    case CP_SIMD_SSE:
+        g_isa_pref = Case33Isa::Sse;
+        break;
+    case CP_SIMD_SCALAR:
+        g_isa_pref = Case33Isa::Scalar;
+        break;
+    case CP_SIMD_AUTO:
+    default:
+        g_isa_pref = Case33Isa::Auto;
+        break;
+    }
+    g_sse_tile = Case33SseTile::R4C8;
+    apply_simd_to_gemm();
+}
+
 extern "C" void cp_cpu_worker_init(void)
 {
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     apply_prepack_mode_to_gemm();
+    apply_simd_to_gemm();
+    g_gemm.resolve_runtime_isa();
     printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
+    printf("[cpu] SIMD ISA: %s\n", simd_isa_label(g_gemm.isa_used(), g_gemm.sse_tile()));
     if(g_prepack_mode != CP_PREPACK_SEPARATE)
         printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
     fflush(stdout);
