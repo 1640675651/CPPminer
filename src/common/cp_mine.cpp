@@ -100,55 +100,64 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     double last_report = 0.0;
     double t_prev_share = 0.0;
 
-    FILE *hf = fopen(hdr_path, "wb");
-    if (!hf) {
-        perror("header tmp");
-        rc = CP_JOB_NONE;
-        goto job_done;
-    }
-    fwrite(header, 1, (size_t)hlen, hf);
-    fclose(hf);
+    /* These are assigned inside the scope below so that early goto job_done
+     * does not cross initializations (GCC 15 C++17 strictness). */
+    int host_matrices = 0;
+    int zero_b_gpu = 0;
+    int handoff_bt = 0;
+    int defer_host_reclaim = 0;
 
-    const int host_matrices = (g_cpu_matrix_gen || cp_worker_prefers_host_matrices()) &&
-                              !cp_worker_worker_handles_matrix_prep();
-    if (host_matrices) {
-        h_A_scan = (int8_t *)malloc(szAp);
-        h_B_scan = (int8_t *)malloc(szBpT);
-        if (!h_A_scan || !h_B_scan) {
-            fprintf(stderr, "OOM scan buffers\n");
-            rc = CP_JOB_CANCELLED;
+    {
+        FILE *hf = fopen(hdr_path, "wb");
+        if (!hf) {
+            perror("header tmp");
+            rc = CP_JOB_NONE;
             goto job_done;
         }
-    }
+        fwrite(header, 1, (size_t)hlen, hf);
+        fclose(hf);
 
-    pearl_job_key(header, hlen, job_key_bytes);
-    if (cp_worker_worker_handles_matrix_prep()) {
-        memset(h_BpT_global, 0, szBpT);
-    }
-    cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active);
-    tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
-                        cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
-    cp_fee_set_tiles_per_matrix((uint64_t)tiles_per_attempt);
-    last_report = cp_now_sec();
-    t_prev_share = t0;
-    tiles_at_prev_share = 0;
+        host_matrices = (g_cpu_matrix_gen || cp_worker_prefers_host_matrices()) &&
+                        !cp_worker_worker_handles_matrix_prep();
+        if (host_matrices) {
+            h_A_scan = (int8_t *)malloc(szAp);
+            h_B_scan = (int8_t *)malloc(szBpT);
+            if (!h_A_scan || !h_B_scan) {
+                fprintf(stderr, "OOM scan buffers\n");
+                rc = CP_JOB_CANCELLED;
+                goto job_done;
+            }
+        }
 
-    if (g_share_queue) {
-        const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, hdr_path,
-                                         proof_path};
-        cp_share_queue_begin_job(g_share_queue, &share_ctx, job_key);
-    }
+        pearl_job_key(header, hlen, job_key_bytes);
+        if (cp_worker_worker_handles_matrix_prep()) {
+            memset(h_BpT_global, 0, szBpT);
+        }
+        cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active);
+        tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
+                            cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
+        cp_fee_set_tiles_per_matrix((uint64_t)tiles_per_attempt);
+        last_report = cp_now_sec();
+        t_prev_share = t0;
+        tiles_at_prev_share = 0;
 
-    const int zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
-    /* CUDA GPU prep uses random A/B (not zero-B); hand off both signal mats.
-     * CPU/OpenCL zero-B keeps shared zero B^T and only hands off A. */
-    const int handoff_bt = host_matrices || !zero_b_gpu;
-    /* Defer reclaim + D2H on share when signal mats live on device between attempts
-     * (CUDA / OpenCL GPU-prep). CPU always has correct A on host and must reclaim
-     * before the next attempt (proof handoff otherwise leaves h_Ap NULL -> rc=-2).
-     * OpenCL/CUDA gate fetch_share_signals on this flag — do not clear it for them. */
-    const int defer_host_reclaim =
-            !cp_worker_prefers_host_matrices() && !host_matrices && !g_cpu_matrix_gen;
+        if (g_share_queue) {
+            const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, hdr_path,
+                                             proof_path};
+            cp_share_queue_begin_job(g_share_queue, &share_ctx, job_key);
+        }
+
+        zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
+        /* CUDA GPU prep uses random A/B (not zero-B); hand off both signal mats.
+         * CPU/OpenCL zero-B keeps shared zero B^T and only hands off A. */
+        handoff_bt = host_matrices || !zero_b_gpu;
+        /* Defer reclaim + D2H on share when signal mats live on device between attempts
+         * (CUDA / OpenCL GPU-prep). CPU always has correct A on host and must reclaim
+         * before the next attempt (proof handoff otherwise leaves h_Ap NULL -> rc=-2).
+         * OpenCL/CUDA gate fetch_share_signals on this flag — do not clear it for them. */
+        defer_host_reclaim =
+                !cp_worker_prefers_host_matrices() && !host_matrices && !g_cpu_matrix_gen;
+    }
 
     for (;;) {
         if (cp_job_should_cancel()) {

@@ -214,7 +214,17 @@ else()
         target_link_options(cpminer PRIVATE -fopenmp)
     endif()
     if(CP_ENABLE_CPU)
-        target_compile_options(cpminer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
+        # Do NOT use -mavx2 here: BLAKE3 dispatch.c and case33_gemm_xor.cpp
+        # have runtime ISA detection that dispatches to SSE2/SSSE3 paths.
+        # -mavx2 forces the compiler to emit AVX2 (vp-prefix) instructions
+        # even in SSE paths, causing SIGILL on CPUs without AVX2.
+        # -mssse3 needed for _mm_maddubs_epi16 / _mm_sign_epi8 / rot16 etc.
+        # -msse4.1 needed for BLAKE3 SSE41 path (pmulld).
+        target_compile_options(cpminer PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-mssse3>
+            $<$<COMPILE_LANGUAGE:CXX>:-msse4.1>
+            $<$<COMPILE_LANGUAGE:C>:-mssse3>
+            $<$<COMPILE_LANGUAGE:C>:-msse4.1>)
     endif()
 endif()
 

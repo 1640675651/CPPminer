@@ -1,6 +1,11 @@
 #ifndef CP_NOISE_H
 #define CP_NOISE_H
 
+#ifdef __cplusplus
+#include <cstddef>
+#else
+#include <stddef.h>
+#endif
 #include <stdint.h>
 
 #ifdef __cplusplus

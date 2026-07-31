@@ -322,6 +322,10 @@ void pearl_commitment_seeds(const uint8_t job_key[32],
     }
 }
 
+static int pearl_keyed_matrix_digest_chunks(const uint8_t* data, size_t raw_len,
+                                            size_t pad_len,
+                                            const uint8_t job_key[32], uint8_t out[32]);
+
 void pearl_keyed_matrix_digest(const uint8_t* data, size_t len,
                                const uint8_t job_key[32], uint8_t out[32])
 {
