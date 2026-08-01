@@ -12,7 +12,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 
 ## Requirements
 
-- MSVC (Windows) or GCC/Clang (Linux)
+- MSVC + **CMake** (Windows) or GCC/Clang + CMake (Linux/macOS)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
 - **CPU build:** x86_64 with OpenMP; AVX2 preferred, SSSE3/scalar fallback at runtime (`--simd`)
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
@@ -40,7 +40,7 @@ Enable multiple backends in one binary; select at runtime with `--backend cpu|cu
 
 ## Build (Windows)
 
-CPU-only (default — no CUDA Toolkit required):
+Requires MSVC Build Tools and CMake (same CMake pipeline as `build.sh` on *nix). CPU-only default:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
@@ -168,7 +168,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_
 | zk-pow | `third_party/zk-pow` | Jackpot verify (`--verify`) |
 | plonky2 | `third_party/plonky2` | zk-pow compile dependency |
 
-`build.ps1` (CMake path) / `build.sh` let CMake run `cargo build --release` in `rust/cp-proof-ffi/`. Direct MSVC (`build.ps1` without cmake) still invokes cargo itself. Artifacts:
+`build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available. Artifacts:
 - Windows: `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`)
 - Linux/macOS: `libcp_proof_ffi.a` (linked into the miner) and `libcp_proof_ffi.dylib` / `.so` (for the host bridge)
 

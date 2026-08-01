@@ -1,4 +1,4 @@
-# Build cppminer on Windows.
+# Build cppminer on Windows via CMake (same pipeline as build.sh on *nix).
 # Default: CPU backend only (no CUDA Toolkit required).
 #
 # Usage:
@@ -9,7 +9,8 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
 #
-# The script snapshots and restores your shell environment on exit.
+# Requires: MSVC, CMake, and (for proofs) cargo. OpenCL headers/CUTLASS are
+# fetched as needed. The script snapshots and restores your shell environment.
 
 param(
     [ValidateSet("Cpu", "Cuda", "OpenCl")]
@@ -60,13 +61,6 @@ function Restore-ShellEnvironment {
         Set-Item -Path "env:$($kv.Key)" -Value $kv.Value
     }
     $script:OrigEnv = $null
-}
-
-function Get-SanitizedPathForNvcc {
-    param([string]$PathValue)
-    ($PathValue -split ';' | Where-Object {
-        $_ -and $_ -notmatch '\\miniconda3\\|\\anaconda3\\|\\envs\\|mingw-w64|\\.cargo\\bin'
-    }) -join ';'
 }
 
 function Clear-CondaToolchainOverrides {
@@ -207,6 +201,36 @@ function Find-OpenClLib {
     throw "Vendored OpenCL.lib missing at $vendored (see third_party/opencl/README.md)"
 }
 
+function Ensure-CargoOnPath {
+    $cmd = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        Write-Host "=== cargo: $($cmd.Source) ==="
+        return $true
+    }
+    $dirs = @(
+        $(if ($env:CARGO_HOME) { Join-Path $env:CARGO_HOME "bin" } else { $null }),
+        (Join-Path $env:USERPROFILE ".cargo\bin")
+    )
+    if ($env:CONDA_PREFIX) {
+        $dirs += @(
+            (Join-Path $env:CONDA_PREFIX "Library\bin"),
+            (Join-Path $env:CONDA_PREFIX "bin"),
+            (Join-Path $env:CONDA_PREFIX "Scripts")
+        )
+    }
+    foreach ($dir in $dirs) {
+        if (-not $dir) { continue }
+        $exe = Join-Path $dir "cargo.exe"
+        if (Test-Path $exe) {
+            $env:PATH = "$dir;$env:PATH"
+            Write-Host "=== cargo: $exe (prepended to PATH for CMake) ==="
+            return $true
+        }
+    }
+    Write-Host "=== WARNING: cargo not found; CMake will link the proof stub ==="
+    return $false
+}
+
 function Copy-OpenClKernels {
     $kernelSrcDir = Join-Path $Root "src\opencl\kernels"
     $kernelDstDir = Join-Path $Root "kernels"
@@ -261,280 +285,67 @@ function Invoke-External {
     if ($exitCode -ne 0) { throw $FailureMessage }
 }
 
-function Invoke-Cl {
-    param([Parameter(Mandatory = $true)][string[]]$ClArgs)
-    $quoted = ($ClArgs | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '""') + '"' } else { $_ }
-    }) -join ' '
-    $cmdLine = "`"$script:VcvarsBat`" >nul 2>&1 && cl.exe $quoted"
-    Invoke-External -Command { cmd /c $cmdLine } -FailureMessage "cl failed: $($ClArgs -join ' ')"
-}
-
-function Invoke-Nvcc {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$NvccArgs)
-    if (-not $script:ClExe) { throw "MSVC cl.exe not configured" }
-    $ccbin = @("-ccbin", $script:ClExe)
-    $allArgs = $ccbin + $NvccArgs
-    $quoted = ($allArgs | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '""') + '"' } else { $_ }
-    }) -join ' '
-    $savedPath = $env:PATH
-    $env:PATH = Get-SanitizedPathForNvcc -PathValue $env:PATH
-    try {
-        $envPreamble = "set INCLUDE=&& set LIB=&& set LIBPATH=&& set CC=&& set CXX=&& set CUDAHOSTC=&& set CUDAHOSTCXX=&& "
-        $cmdLine = "${envPreamble}`"$script:VcvarsBat`" >nul 2>&1 && `"$Nvcc`" $quoted"
-        Invoke-External -Command { cmd /c $cmdLine } -FailureMessage "nvcc failed: $($NvccArgs -join ' ')"
-    } finally {
-        $env:PATH = $savedPath
-    }
-}
-
 Save-ShellEnvironment
 $buildExitCode = 0
 try {
     Clear-CondaToolchainOverrides
     Initialize-MSVC
     $script:CmakeExe = Find-CMake
-    if ($script:CmakeExe) {
-        $cmakeBin = Split-Path -Parent $script:CmakeExe
-        if ($env:PATH -notlike "*$cmakeBin*") {
-            $env:PATH = "$cmakeBin;$env:PATH"
-        }
-        Write-Host "=== cmake: $($script:CmakeExe) ==="
+    if (-not $script:CmakeExe) {
+        throw "cmake not found. Install VS 'CMake tools for Windows' or add cmake to PATH (same as build.sh)."
     }
+    $cmakeBin = Split-Path -Parent $script:CmakeExe
+    if ($env:PATH -notlike "*$cmakeBin*") {
+        $env:PATH = "$cmakeBin;$env:PATH"
+    }
+    Write-Host "=== cmake: $($script:CmakeExe) ==="
+    $null = Ensure-CargoOnPath
+
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
     Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl CUBLAS=$EnableCublas) ==="
 
-    function Ensure-CpProofFfi {
-        Write-Host "=== Building cp-proof-ffi (Rust) ==="
-        $RustDir = Join-Path $Root "rust\cp-proof-ffi"
-        $PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
-        $ZkPow = Join-Path $Root "third_party\zk-pow\Cargo.toml"
-        $Plonky2 = Join-Path $Root "third_party\plonky2\plonky2\Cargo.toml"
-        $script:RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
-        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            Write-Host "=== WARNING: cargo not found; linking proof stub (no share submit proofs) ==="
-            return $false
-        }
-        if (-not (Test-Path $PearlBlake3)) {
-            Write-Host "=== WARNING: third_party/pearl-blake3 missing; linking proof stub ==="
-            return $false
-        }
-        if (-not (Test-Path $ZkPow)) {
-            Write-Host "=== WARNING: third_party/zk-pow missing; linking proof stub ==="
-            return $false
-        }
-        if (-not (Test-Path $Plonky2)) {
-            Write-Host "=== WARNING: third_party/plonky2 missing (zk-pow dep); linking proof stub ==="
-            return $false
-        }
-        Push-Location $RustDir
-        try {
-            Invoke-External -Command { cargo build --release } -FailureMessage "cargo build failed"
-        } finally {
-            Pop-Location
-        }
-        if (-not (Test-Path $script:RustLib)) { throw "Missing $($script:RustLib)" }
-        return $true
+    if ($EnableOpenCl) {
+        $null = Ensure-OpenClHeaders
+        $null = Find-OpenClLib
+    }
+    if ($EnableCuda) {
+        $null = Ensure-Cutlass
+        $CudaRoot = Find-CudaRoot
+        Write-Host "=== CUDA: $CudaRoot ==="
+        if (-not $CudaArch) { $CudaArch = Get-GpuArch }
+        Write-Host "=== CUDA arch: $CudaArch ==="
     }
 
-    function Build-CpuWithCl {
-        Write-Host "=== Direct MSVC build (CPU, no cmake) ==="
-        $null = Ensure-CpProofFfi
-        $Inc = @(
-            "/I$(Join-Path $Root 'include')",
-            "/I$(Join-Path $Root 'src\common')",
-            "/I$(Join-Path $Root 'src\cpu')",
-            "/I$B3Dir"
-        )
-        $Defs = @("/DCP_ENABLE_CPU=1", "/DCP_ENABLE_CUDA=0", "/DCP_ENABLE_OPENCL=0",
-                  "/DBLAKE3_NO_AVX512", "/DBLAKE3_NO_AVX2", "/DBLAKE3_NO_SSE41", "/DBLAKE3_NO_SSE2")
-        # Baseline without /arch:AVX2 so SSE/scalar paths stay safe on non-AVX2 CPUs.
-        $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp") + $Inc + $Defs
-        $objs = @()
-
-        $cUnits = @(
-            @{ src = (Join-Path $B3Dir "blake3.c"); obj = "blake3.obj" },
-            @{ src = (Join-Path $B3Dir "blake3_dispatch.c"); obj = "blake3_dispatch.obj" },
-            @{ src = (Join-Path $B3Dir "blake3_portable.c"); obj = "blake3_portable.obj" },
-            @{ src = (Join-Path $Root "src\common\cp_noise.c"); obj = "cp_noise.obj" }
-        )
-        foreach ($u in $cUnits) {
-            $objPath = Join-Path $BuildDir $u.obj
-            $objs += $objPath
-            Invoke-Cl -ClArgs ($Flags + @("/TC", "/c", $u.src, "/Fo$objPath"))
-        }
-
-        $cppUnits = @(
-            "src\common\main.cpp",
-            "src\common\cp_util.cpp",
-            "src\common\cp_pool.cpp",
-            "src\common\cp_job_ctrl.cpp",
-            "src\common\cp_mine.cpp",
-            "src\common\cp_fee.cpp",
-            "src\common\cp_share_queue.cpp",
-            "src\common\cp_state.cpp",
-            "src\common\cp_worker.cpp",
-            "src\cpu\cp_cpu_worker.cpp",
-            "src\cpu\gemm\case33_gemm_xor.cpp",
-            "src\cpu\gemm\case33_gemm_xor_avx2.cpp"
-        )
-        if (-not (Test-Path $script:RustLib)) {
-            $cppUnits += "src\common\cp_proof_stub.cpp"
-        }
-        foreach ($rel in $cppUnits) {
-            $srcPath = Join-Path $Root $rel
-            $objName = [IO.Path]::GetFileNameWithoutExtension($rel) + ".obj"
-            $objPath = Join-Path $BuildDir $objName
-            $objs += $objPath
-            $unitFlags = $Flags
-            if ($rel -like "*case33_gemm_xor_avx2.cpp") {
-                $unitFlags = $Flags + @("/arch:AVX2")
-            }
-            Invoke-Cl -ClArgs ($unitFlags + @("/c", $srcPath, "/Fo$objPath"))
-        }
-
-        $linkLibs = @("ws2_32.lib")
-        if ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib)) {
-            $linkLibs += @($script:RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
-        }
-        $linkArgs = @("/nologo", "/Fe$OutExe") + $objs + $linkLibs
-        Invoke-Cl -ClArgs $linkArgs
+    $CmakeBuild = Join-Path $BuildDir "cmake"
+    New-Item -ItemType Directory -Force -Path $CmakeBuild | Out-Null
+    $cmakeArgs = @(
+        "-S", $Root,
+        "-B", $CmakeBuild,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
+    )
+    if ($EnableCuda -and $CudaArch) {
+        $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
     }
 
-    function Build-OpenClWithCl {
-        $oclHdr = Ensure-OpenClHeaders
-        $oclLib = Find-OpenClLib
-        Write-Host "=== Direct MSVC build (OpenCL, no cmake) ==="
-        Write-Host "=== OpenCL.lib: $oclLib ==="
-        if ($EnableCpu) { $null = Ensure-CpProofFfi }
+    Write-Host "=== CMake configure ==="
+    Invoke-External -Command { & $script:CmakeExe @cmakeArgs } -FailureMessage "cmake configure failed"
+    Write-Host "=== CMake build ==="
+    Invoke-External -Command { & $script:CmakeExe --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
 
-        $Inc = @(
-            "/I$(Join-Path $Root 'include')",
-            "/I$(Join-Path $Root 'src\common')",
-            "/I$(Join-Path $Root 'src\cpu')",
-            "/I$(Join-Path $Root 'src\opencl')",
-            "/I$oclHdr",
-            "/I$B3Dir"
-        )
-        $Defs = @(
-            "/DCP_ENABLE_CPU=$(if ($EnableCpu) { '1' } else { '0' })",
-            "/DCP_ENABLE_CUDA=0",
-            "/DCP_ENABLE_OPENCL=1",
-            "/DBLAKE3_NO_AVX512", "/DBLAKE3_NO_AVX2", "/DBLAKE3_NO_SSE41", "/DBLAKE3_NO_SSE2"
-        )
-        $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp") + $Inc + $Defs
-        $objs = @()
-
-        $cUnits = @(
-            @{ src = (Join-Path $B3Dir "blake3.c"); obj = "blake3.obj" },
-            @{ src = (Join-Path $B3Dir "blake3_dispatch.c"); obj = "blake3_dispatch.obj" },
-            @{ src = (Join-Path $B3Dir "blake3_portable.c"); obj = "blake3_portable.obj" },
-            @{ src = (Join-Path $Root "src\common\cp_noise.c"); obj = "cp_noise.obj" }
-        )
-        foreach ($u in $cUnits) {
-            $objPath = Join-Path $BuildDir $u.obj
-            $objs += $objPath
-            Invoke-Cl -ClArgs ($Flags + @("/TC", "/c", $u.src, "/Fo$objPath"))
-        }
-
-        $cppUnits = @(
-            "src\common\main.cpp",
-            "src\common\cp_util.cpp",
-            "src\common\cp_pool.cpp",
-            "src\common\cp_job_ctrl.cpp",
-            "src\common\cp_mine.cpp",
-            "src\common\cp_fee.cpp",
-            "src\common\cp_share_queue.cpp",
-            "src\common\cp_state.cpp",
-            "src\common\cp_worker.cpp",
-            "src\opencl\cp_opencl_worker.cpp",
-            "src\opencl\case33_gemm_ocl.cpp",
-            "src\opencl\case33_ocl_prep.cpp",
-            "src\opencl\cp_ocl_align_test.cpp",
-            "src\opencl\cp_ocl_prep_profile.cpp",
-            "src\opencl\case32_prepack.cpp",
-            "src\opencl\opencl_context.cpp"
-        )
-        if ($EnableCpu) {
-            $cppUnits += @(
-                "src\cpu\cp_cpu_worker.cpp",
-                "src\cpu\gemm\case33_gemm_xor.cpp",
-                "src\cpu\gemm\case33_gemm_xor_avx2.cpp"
-            )
-        }
-        if (-not ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib))) {
-            $cppUnits += "src\common\cp_proof_stub.cpp"
-        }
-        foreach ($rel in $cppUnits) {
-            $srcPath = Join-Path $Root $rel
-            $objName = [IO.Path]::GetFileNameWithoutExtension($rel) + ".obj"
-            $objPath = Join-Path $BuildDir $objName
-            $objs += $objPath
-            $unitFlags = $Flags
-            if ($rel -like "*case33_gemm_xor_avx2.cpp") {
-                $unitFlags = $Flags + @("/arch:AVX2")
-            }
-            Invoke-Cl -ClArgs ($unitFlags + @("/c", $srcPath, "/Fo$objPath"))
-        }
-
-        $linkLibs = @("ws2_32.lib", $oclLib)
-        if ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib)) {
-            $linkLibs += @($script:RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
-        }
-        $linkArgs = @("/nologo", "/Fe$OutExe") + $objs + $linkLibs
-        Invoke-Cl -ClArgs $linkArgs
+    $built = @(
+        (Join-Path $CmakeBuild "Release\cppminer.exe"),
+        (Join-Path $CmakeBuild "cppminer.exe")
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
+    Copy-Item $built $OutExe -Force
+    if ($EnableOpenCl) {
         Copy-OpenClKernels
-    }
-
-    $hasCmake = [bool]$script:CmakeExe
-    if ($EnableCuda -and -not $hasCmake) {
-        throw "CUDA build requires cmake (install VS 'CMake tools for Windows' component, or add cmake to PATH)."
-    }
-
-    if ($hasCmake -and ($EnableCuda -or $EnableOpenCl -or -not $EnableCpu)) {
-        $CmakeBuild = Join-Path $BuildDir "cmake"
-        New-Item -ItemType Directory -Force -Path $CmakeBuild | Out-Null
-        $cmakeArgs = @(
-            "-S", $Root,
-            "-B", $CmakeBuild,
-            "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
-            "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
-            "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
-            "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
-        )
-        if ($EnableCuda -and $CudaArch) {
-            $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
-        }
-        if ($EnableCuda) {
-            $null = Ensure-Cutlass
-            $CudaRoot = Find-CudaRoot
-            Write-Host "=== CUDA: $CudaRoot ==="
-        }
-
-        Write-Host "=== CMake configure ==="
-        Invoke-External -Command { & $script:CmakeExe @cmakeArgs } -FailureMessage "cmake configure failed"
-        Write-Host "=== CMake build ==="
-        Invoke-External -Command { & $script:CmakeExe --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
-
-        $built = @(
-            (Join-Path $CmakeBuild "Release\cppminer.exe"),
-            (Join-Path $CmakeBuild "cppminer.exe")
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
-        Copy-Item $built $OutExe -Force
-        if ($EnableOpenCl) {
-            Copy-OpenClKernels
-        }
-    } elseif ($EnableOpenCl -and -not $EnableCuda) {
-        Build-OpenClWithCl
-    } else {
-        if (-not $EnableCpu -or $EnableCuda) {
-            throw "Without cmake, use -Backend Cpu and/or OpenCl (Cuda requires cmake)."
-        }
-        Build-CpuWithCl
     }
 
     # Keep legacy cpminer.exe name in sync (docs / habit).

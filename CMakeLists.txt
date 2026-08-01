@@ -184,6 +184,9 @@ find_program(CARGO_EXECUTABLE cargo
         "$ENV{HOME}/.cargo/bin"
         "$ENV{USERPROFILE}/.cargo/bin"
         "$ENV{CARGO_HOME}/bin"
+        "$ENV{CONDA_PREFIX}/bin"
+        "$ENV{CONDA_PREFIX}/Library/bin"
+        "$ENV{CONDA_PREFIX}/Scripts"
 )
 
 set(_cp_proof_deps_ok TRUE)
@@ -210,6 +213,7 @@ else()
     set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/libcp_proof_ffi.a)
 endif()
 
+set(_cp_link_proof_ffi FALSE)
 if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
         ${CP_PROOF_FFI_DIR}/src/*.rs)
@@ -231,7 +235,24 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     )
     add_custom_target(cp_proof_ffi_build DEPENDS ${_cp_proof_lib})
     add_dependencies(cpminer cp_proof_ffi_build)
+    set(_cp_link_proof_ffi TRUE)
+    message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
+elseif(EXISTS ${_cp_proof_lib})
+    # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
+    set(_cp_link_proof_ffi TRUE)
+    message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
+else()
+    if(NOT CARGO_EXECUTABLE)
+        message(WARNING "cargo not found; using proof stub (no share submit proofs)")
+    elseif(NOT _cp_proof_deps_ok)
+        message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
+    else()
+        message(WARNING "cp-proof-ffi manifest missing; using proof stub")
+    endif()
+    target_sources(cpminer PRIVATE src/common/cp_proof_stub.cpp)
+endif()
 
+if(_cp_link_proof_ffi)
     # Rust staticlibs need whole-archive / force_load so C-only refs pull the crate.
     if(MSVC)
         target_link_libraries(cpminer PRIVATE ${_cp_proof_lib})
@@ -253,16 +274,6 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     else()
         target_link_libraries(cpminer PRIVATE pthread dl m)
     endif()
-    message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
-else()
-    if(NOT CARGO_EXECUTABLE)
-        message(WARNING "cargo not found; using proof stub (no share submit proofs)")
-    elseif(NOT _cp_proof_deps_ok)
-        message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
-    else()
-        message(WARNING "cp-proof-ffi manifest missing; using proof stub")
-    endif()
-    target_sources(cpminer PRIVATE src/common/cp_proof_stub.cpp)
 endif()
 
 if(MSVC)
