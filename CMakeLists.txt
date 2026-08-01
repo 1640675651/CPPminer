@@ -68,6 +68,7 @@ if(CP_ENABLE_CPU)
     list(APPEND CP_SOURCES
         src/cpu/cp_cpu_worker.cpp
         src/cpu/gemm/case33_gemm_xor.cpp
+        src/cpu/gemm/case33_gemm_xor_avx2.cpp
     )
     add_compile_definitions(CP_ENABLE_CPU=1)
 else()
@@ -175,23 +176,92 @@ if(CP_ENABLE_OPENCL)
         COMMENT "Copy OpenCL kernels next to cppminer")
 endif()
 
-# Optional in-process proof FFI (built by build.ps1 / cargo).
-set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi/target/release)
-if(WIN32)
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/cp_proof_ffi.lib)
+# Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
+set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi)
+set(CP_PROOF_FFI_MANIFEST ${CP_PROOF_FFI_DIR}/Cargo.toml)
+find_program(CARGO_EXECUTABLE cargo
+    HINTS
+        "$ENV{HOME}/.cargo/bin"
+        "$ENV{USERPROFILE}/.cargo/bin"
+        "$ENV{CARGO_HOME}/bin"
+)
+
+set(_cp_proof_deps_ok TRUE)
+foreach(_dep
+        ${CMAKE_SOURCE_DIR}/third_party/pearl-blake3/Cargo.toml
+        ${CMAKE_SOURCE_DIR}/third_party/zk-pow/Cargo.toml
+        ${CMAKE_SOURCE_DIR}/third_party/plonky2/plonky2/Cargo.toml)
+    if(NOT EXISTS ${_dep})
+        set(_cp_proof_deps_ok FALSE)
+    endif()
+endforeach()
+
+# Match CMAKE_BUILD_TYPE when set; default Release (multi-config / empty type).
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_cp_cargo_args build)
+    set(_cp_cargo_profile debug)
 else()
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/libcp_proof_ffi.a)
+    set(_cp_cargo_args build --release)
+    set(_cp_cargo_profile release)
 endif()
-if(EXISTS ${_cp_proof_lib})
-    target_link_libraries(cpminer PRIVATE ${_cp_proof_lib})
+if(WIN32)
+    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/cp_proof_ffi.lib)
+else()
+    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/libcp_proof_ffi.a)
+endif()
+
+if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
+    file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
+        ${CP_PROOF_FFI_DIR}/src/*.rs)
+    add_custom_command(
+        OUTPUT ${_cp_proof_lib}
+        COMMAND ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+            --manifest-path ${CP_PROOF_FFI_MANIFEST}
+        WORKING_DIRECTORY ${CP_PROOF_FFI_DIR}
+        DEPENDS
+            ${CP_PROOF_FFI_MANIFEST}
+            ${CP_PROOF_FFI_DIR}/Cargo.lock
+            ${_cp_proof_rs}
+            ${CMAKE_SOURCE_DIR}/third_party/pearl-blake3/Cargo.toml
+            ${CMAKE_SOURCE_DIR}/third_party/zk-pow/Cargo.toml
+            ${CMAKE_SOURCE_DIR}/third_party/plonky2/plonky2/Cargo.toml
+        COMMENT "Building cp-proof-ffi (cargo ${_cp_cargo_profile})"
+        VERBATIM
+        USES_TERMINAL
+    )
+    add_custom_target(cp_proof_ffi_build DEPENDS ${_cp_proof_lib})
+    add_dependencies(cpminer cp_proof_ffi_build)
+
+    # Rust staticlibs need whole-archive / force_load so C-only refs pull the crate.
+    if(MSVC)
+        target_link_libraries(cpminer PRIVATE ${_cp_proof_lib})
+    elseif(APPLE)
+        target_link_libraries(cpminer PRIVATE
+            "-Wl,-force_load,${_cp_proof_lib}")
+    else()
+        target_link_libraries(cpminer PRIVATE
+            "-Wl,--whole-archive" ${_cp_proof_lib} "-Wl,--no-whole-archive")
+    endif()
     if(WIN32)
         target_link_libraries(cpminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+    elseif(APPLE)
+        target_link_libraries(cpminer PRIVATE
+            pthread dl m
+            "-framework Security"
+            "-framework CoreFoundation"
+            "-framework SystemConfiguration")
     else()
         target_link_libraries(cpminer PRIVATE pthread dl m)
     endif()
-    message(STATUS "Linking cp_proof_ffi from ${_cp_proof_lib}")
+    message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
 else()
-    message(WARNING "cp_proof_ffi not found; using stub (proof build/verify unavailable)")
+    if(NOT CARGO_EXECUTABLE)
+        message(WARNING "cargo not found; using proof stub (no share submit proofs)")
+    elseif(NOT _cp_proof_deps_ok)
+        message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
+    else()
+        message(WARNING "cp-proof-ffi manifest missing; using proof stub")
+    endif()
     target_sources(cpminer PRIVATE src/common/cp_proof_stub.cpp)
 endif()
 
@@ -200,31 +270,54 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
+    # AVX2 only in the dedicated ukernel TU; baseline stays SSE-safe for
+    # runtime ISA dispatch on CPUs without AVX2.
     if(CP_ENABLE_CPU)
-        target_compile_options(cpminer PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
-        )
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     endif()
 else()
+    # Apple Clang has no built-in OpenMP; use Homebrew libomp when present.
+    if(APPLE AND NOT OpenMP_ROOT AND NOT DEFINED ENV{OpenMP_ROOT})
+        foreach(_omp_prefix /usr/local/opt/libomp /opt/homebrew/opt/libomp)
+            if(EXISTS "${_omp_prefix}/lib/libomp.dylib")
+                set(OpenMP_ROOT "${_omp_prefix}")
+                break()
+            endif()
+        endforeach()
+        unset(_omp_prefix)
+    endif()
+    if(APPLE AND OpenMP_ROOT AND NOT OpenMP_CXX_FOUND)
+        # AppleClang needs -Xpreprocessor; plain -fopenmp is rejected.
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${OpenMP_ROOT}/include" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${OpenMP_ROOT}/include" CACHE STRING "" FORCE)
+        set(OpenMP_C_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_omp_LIBRARY "${OpenMP_ROOT}/lib/libomp.dylib" CACHE FILEPATH "" FORCE)
+    endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(cpminer PRIVATE OpenMP::OpenMP_CXX)
-    else()
+    elseif(NOT APPLE)
+        # GNU/Clang on Linux/etc.: -fopenmp is usually enough.
         target_compile_options(cpminer PRIVATE -fopenmp)
         target_link_options(cpminer PRIVATE -fopenmp)
+    else()
+        message(FATAL_ERROR
+            "OpenMP not found (required for CPU build on macOS).\n"
+            "  brew install libomp\n"
+            "  Then reconfigure, or pass -DOpenMP_ROOT=$(brew --prefix libomp)")
     endif()
     if(CP_ENABLE_CPU)
-        # Do NOT use -mavx2 here: BLAKE3 dispatch.c and case33_gemm_xor.cpp
-        # have runtime ISA detection that dispatches to SSE2/SSSE3 paths.
-        # -mavx2 forces the compiler to emit AVX2 (vp-prefix) instructions
-        # even in SSE paths, causing SIGILL on CPUs without AVX2.
-        # -mssse3 needed for _mm_maddubs_epi16 / _mm_sign_epi8 / rot16 etc.
-        # -msse4.1 needed for BLAKE3 SSE41 path (pmulld).
+        # Baseline SSSE3/SSE4.1 for portable + SSE paths. AVX2 ukernel is a
+        # separate TU built with -mavx2; runtime CPUID selects the path.
         target_compile_options(cpminer PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-mssse3>
             $<$<COMPILE_LANGUAGE:CXX>:-msse4.1>
             $<$<COMPILE_LANGUAGE:C>:-mssse3>
             $<$<COMPILE_LANGUAGE:C>:-msse4.1>)
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
     endif()
 endif()
 

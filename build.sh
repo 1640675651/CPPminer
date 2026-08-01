@@ -14,11 +14,13 @@
 #   BLAKE3 1.5.4          (always, for CPU hashing)
 #   OpenCL-Headers          (only if OpenCL backend is enabled)
 #   CUTLASS 2.11.0          (only if CUDA backend is enabled)
+#   cp-proof-ffi (Rust)     (built by CMake via cargo, for proof build/verify)
 #
 # Install cmake + a C++ compiler first:
 #   Debian/Ubuntu:  sudo apt install cmake g++ gcc
 #   RHEL/Fedora:    sudo dnf install cmake gcc-c++ gcc
-#   macOS:          brew install cmake
+#   macOS:          brew install cmake libomp
+# Proof FFI also needs Rust (rustup / cargo) and vendored crates under third_party/.
 
 set -euo pipefail
 
@@ -272,6 +274,7 @@ if [[ -n "$CMAKE_EXE" ]]; then
     cmake_args=(
         -S "${PROJECT_ROOT}"
         -B "${CMAKE_BUILD_DIR}"
+        -DCMAKE_BUILD_TYPE=Release
         -DCP_ENABLE_CPU=$(( ENABLE_CPU ? 1 : 0 ))
         -DCP_ENABLE_CUDA=$(( ENABLE_CUDA ? 1 : 0 ))
         -DCP_ENABLE_OPENCL=$(( ENABLE_OPENCL ? 1 : 0 ))
@@ -291,7 +294,6 @@ if [[ -n "$CMAKE_EXE" ]]; then
         || fail "CMake build failed"
 
     # Locate the built binary
-    local exe
     exe=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name cppminer -o -name cppminer.exe 2>/dev/null | head -n1)
     if [[ -z "$exe" ]]; then
         fail "cppminer not found after build"
@@ -307,6 +309,7 @@ log "Dependencies installed:"
 log "  BLAKE3:      ${B3_DIR}"
 (( ENABLE_OPENCL )) && log "  OpenCL-Headers: ${PROJECT_ROOT}/third_party/opencl-headers"
 (( ENABLE_CUDA )) && log "  CUTLASS:     ${PROJECT_ROOT}/third_party/cutlass"
+log "  cp-proof-ffi: built by CMake (cargo) when available"
 
 if [[ -f "${PROJECT_ROOT}/cppminer" ]]; then
     "${PROJECT_ROOT}/cppminer" --help 2>&1 | head -n 15 || true

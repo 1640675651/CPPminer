@@ -307,32 +307,42 @@ try {
 
     Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl CUBLAS=$EnableCublas) ==="
 
-    Write-Host "=== Building cp-proof-ffi (Rust) ==="
-    $RustDir = Join-Path $Root "rust\cp-proof-ffi"
-    $PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
-    $ZkPow = Join-Path $Root "third_party\zk-pow\Cargo.toml"
-    $Plonky2 = Join-Path $Root "third_party\plonky2\plonky2\Cargo.toml"
-    $RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        Write-Host "=== WARNING: cargo not found; linking proof stub (no share submit proofs) ==="
-    } elseif (-not (Test-Path $PearlBlake3)) {
-        Write-Host "=== WARNING: third_party/pearl-blake3 missing; linking proof stub ==="
-    } elseif (-not (Test-Path $ZkPow)) {
-        Write-Host "=== WARNING: third_party/zk-pow missing; linking proof stub ==="
-    } elseif (-not (Test-Path $Plonky2)) {
-        Write-Host "=== WARNING: third_party/plonky2 missing (zk-pow dep); linking proof stub ==="
-    } else {
+    function Ensure-CpProofFfi {
+        Write-Host "=== Building cp-proof-ffi (Rust) ==="
+        $RustDir = Join-Path $Root "rust\cp-proof-ffi"
+        $PearlBlake3 = Join-Path $Root "third_party\pearl-blake3\Cargo.toml"
+        $ZkPow = Join-Path $Root "third_party\zk-pow\Cargo.toml"
+        $Plonky2 = Join-Path $Root "third_party\plonky2\plonky2\Cargo.toml"
+        $script:RustLib = Join-Path $RustDir "target\release\cp_proof_ffi.lib"
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Write-Host "=== WARNING: cargo not found; linking proof stub (no share submit proofs) ==="
+            return $false
+        }
+        if (-not (Test-Path $PearlBlake3)) {
+            Write-Host "=== WARNING: third_party/pearl-blake3 missing; linking proof stub ==="
+            return $false
+        }
+        if (-not (Test-Path $ZkPow)) {
+            Write-Host "=== WARNING: third_party/zk-pow missing; linking proof stub ==="
+            return $false
+        }
+        if (-not (Test-Path $Plonky2)) {
+            Write-Host "=== WARNING: third_party/plonky2 missing (zk-pow dep); linking proof stub ==="
+            return $false
+        }
         Push-Location $RustDir
         try {
             Invoke-External -Command { cargo build --release } -FailureMessage "cargo build failed"
         } finally {
             Pop-Location
         }
-        if (-not (Test-Path $RustLib)) { throw "Missing $RustLib" }
+        if (-not (Test-Path $script:RustLib)) { throw "Missing $($script:RustLib)" }
+        return $true
     }
 
     function Build-CpuWithCl {
         Write-Host "=== Direct MSVC build (CPU, no cmake) ==="
+        $null = Ensure-CpProofFfi
         $Inc = @(
             "/I$(Join-Path $Root 'include')",
             "/I$(Join-Path $Root 'src\common')",
@@ -341,7 +351,8 @@ try {
         )
         $Defs = @("/DCP_ENABLE_CPU=1", "/DCP_ENABLE_CUDA=0", "/DCP_ENABLE_OPENCL=0",
                   "/DBLAKE3_NO_AVX512", "/DBLAKE3_NO_AVX2", "/DBLAKE3_NO_SSE41", "/DBLAKE3_NO_SSE2")
-        $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp", "/arch:AVX2") + $Inc + $Defs
+        # Baseline without /arch:AVX2 so SSE/scalar paths stay safe on non-AVX2 CPUs.
+        $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp") + $Inc + $Defs
         $objs = @()
 
         $cUnits = @(
@@ -367,9 +378,10 @@ try {
             "src\common\cp_state.cpp",
             "src\common\cp_worker.cpp",
             "src\cpu\cp_cpu_worker.cpp",
-            "src\cpu\gemm\case33_gemm_xor.cpp"
+            "src\cpu\gemm\case33_gemm_xor.cpp",
+            "src\cpu\gemm\case33_gemm_xor_avx2.cpp"
         )
-        if (-not (Test-Path $RustLib)) {
+        if (-not (Test-Path $script:RustLib)) {
             $cppUnits += "src\common\cp_proof_stub.cpp"
         }
         foreach ($rel in $cppUnits) {
@@ -377,12 +389,16 @@ try {
             $objName = [IO.Path]::GetFileNameWithoutExtension($rel) + ".obj"
             $objPath = Join-Path $BuildDir $objName
             $objs += $objPath
-            Invoke-Cl -ClArgs ($Flags + @("/c", $srcPath, "/Fo$objPath"))
+            $unitFlags = $Flags
+            if ($rel -like "*case33_gemm_xor_avx2.cpp") {
+                $unitFlags = $Flags + @("/arch:AVX2")
+            }
+            Invoke-Cl -ClArgs ($unitFlags + @("/c", $srcPath, "/Fo$objPath"))
         }
 
         $linkLibs = @("ws2_32.lib")
-        if (Test-Path $RustLib) {
-            $linkLibs += @($RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
+        if ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib)) {
+            $linkLibs += @($script:RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
         }
         $linkArgs = @("/nologo", "/Fe$OutExe") + $objs + $linkLibs
         Invoke-Cl -ClArgs $linkArgs
@@ -393,6 +409,7 @@ try {
         $oclLib = Find-OpenClLib
         Write-Host "=== Direct MSVC build (OpenCL, no cmake) ==="
         Write-Host "=== OpenCL.lib: $oclLib ==="
+        if ($EnableCpu) { $null = Ensure-CpProofFfi }
 
         $Inc = @(
             "/I$(Join-Path $Root 'include')",
@@ -409,7 +426,6 @@ try {
             "/DBLAKE3_NO_AVX512", "/DBLAKE3_NO_AVX2", "/DBLAKE3_NO_SSE41", "/DBLAKE3_NO_SSE2"
         )
         $Flags = @("/nologo", "/O2", "/EHsc", "/std:c++17", "/openmp") + $Inc + $Defs
-        if ($EnableCpu) { $Flags += "/arch:AVX2" }
         $objs = @()
 
         $cUnits = @(
@@ -445,10 +461,11 @@ try {
         if ($EnableCpu) {
             $cppUnits += @(
                 "src\cpu\cp_cpu_worker.cpp",
-                "src\cpu\gemm\case33_gemm_xor.cpp"
+                "src\cpu\gemm\case33_gemm_xor.cpp",
+                "src\cpu\gemm\case33_gemm_xor_avx2.cpp"
             )
         }
-        if (-not (Test-Path $RustLib)) {
+        if (-not ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib))) {
             $cppUnits += "src\common\cp_proof_stub.cpp"
         }
         foreach ($rel in $cppUnits) {
@@ -456,12 +473,16 @@ try {
             $objName = [IO.Path]::GetFileNameWithoutExtension($rel) + ".obj"
             $objPath = Join-Path $BuildDir $objName
             $objs += $objPath
-            Invoke-Cl -ClArgs ($Flags + @("/c", $srcPath, "/Fo$objPath"))
+            $unitFlags = $Flags
+            if ($rel -like "*case33_gemm_xor_avx2.cpp") {
+                $unitFlags = $Flags + @("/arch:AVX2")
+            }
+            Invoke-Cl -ClArgs ($unitFlags + @("/c", $srcPath, "/Fo$objPath"))
         }
 
         $linkLibs = @("ws2_32.lib", $oclLib)
-        if (Test-Path $RustLib) {
-            $linkLibs += @($RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
+        if ((Test-Path variable:script:RustLib) -and (Test-Path $script:RustLib)) {
+            $linkLibs += @($script:RustLib, "userenv.lib", "bcrypt.lib", "ntdll.lib", "advapi32.lib")
         }
         $linkArgs = @("/nologo", "/Fe$OutExe") + $objs + $linkLibs
         Invoke-Cl -ClArgs $linkArgs

@@ -166,7 +166,9 @@ Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_
 | zk-pow | `third_party/zk-pow` | Jackpot verify (`--verify`) |
 | plonky2 | `third_party/plonky2` | zk-pow compile dependency |
 
-`build.ps1` runs `cargo build --release` in `rust/cp-proof-ffi/`, producing `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`).
+`build.ps1` (CMake path) / `build.sh` let CMake run `cargo build --release` in `rust/cp-proof-ffi/`. Direct MSVC (`build.ps1` without cmake) still invokes cargo itself. Artifacts:
+- Windows: `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`)
+- Linux/macOS: `libcp_proof_ffi.a` (linked into the miner) and `libcp_proof_ffi.dylib` / `.so` (for the host bridge)
 
 If any are missing, copy from the Pearl repo:
 
