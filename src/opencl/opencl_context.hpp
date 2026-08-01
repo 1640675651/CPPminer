@@ -11,6 +11,20 @@
 #include <string>
 #include <vector>
 
+/* Flat enumeration entry (GPU discrete → GPU integrated → CPU). */
+struct OclDeviceInfo {
+    int flat_index = 0;
+    int platform_index = 0;
+    int device_index = 0; /* index within platform+type query order */
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    cl_device_type type = CL_DEVICE_TYPE_GPU;
+    std::string platform_name;
+    std::string device_name;
+    bool discrete = false; /* GPU with CL_DEVICE_HOST_UNIFIED_MEMORY == false */
+    bool integer_dot_product = false;
+};
+
 struct OpenClContext {
     cl_platform_id platform = nullptr;
     cl_device_id device = nullptr;
@@ -20,11 +34,20 @@ struct OpenClContext {
 
     std::string device_name;
     std::string platform_name;
+    int device_flat_index = -1;
+    bool discrete_gpu = false;
     bool has_integer_dot_product = false;
 
     ~OpenClContext();
 
-    bool init(int device_index = -1);
+    /* Enumerate devices. platform_filter < 0 → all platforms. */
+    static std::vector<OclDeviceInfo> enumerate_devices(int platform_filter = -1);
+
+    /* Print enumerated devices to stdout; returns count. */
+    static int list_devices(int platform_filter = -1);
+
+    /* Select by flat index from enumerate_devices(). Fails if out of range. */
+    bool init(int device_index = 0, int platform_filter = -1);
     bool build_program_from_file(const char *cl_path, const char *build_options = "");
     bool build_program_from_source(const char *source, const char *build_options = "");
     cl_kernel create_kernel(const char *name) const;

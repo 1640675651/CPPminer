@@ -10,6 +10,10 @@ extern "C" {
 void cp_opencl_worker_init(int *devices, int ndev);
 void cp_opencl_worker_shutdown(void);
 void cp_opencl_worker_set_macro_batch(int batch);
+/* Restrict OpenCL enumeration to platform index (default -1 = all). */
+void cp_opencl_worker_set_platform(int platform_index);
+/* Print OpenCL devices; returns count. */
+int cp_opencl_worker_list_devices(void);
 int cp_opencl_worker_handles_matrix_prep(void);
 void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n);
 

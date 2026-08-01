@@ -1,5 +1,6 @@
 #include "opencl_context.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -34,6 +35,56 @@ bool extension_enabled(cl_device_id device, const char *ext_name) {
         return false;
     }
     return std::strstr(buf.data(), ext_name) != nullptr;
+}
+
+bool device_is_discrete_gpu(cl_device_id device, cl_device_type type) {
+    if (type != CL_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    cl_bool unified = CL_TRUE;
+    if (clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified,
+                        nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    return unified == CL_FALSE;
+}
+
+void append_devices_of_type(cl_platform_id plat, int platform_index, const char *pname,
+                            cl_device_type type, std::vector<OclDeviceInfo> *out) {
+    cl_uint n_devices = 0;
+    if (clGetDeviceIDs(plat, type, 0, nullptr, &n_devices) != CL_SUCCESS || n_devices == 0) {
+        return;
+    }
+    std::vector<cl_device_id> devices(n_devices);
+    if (clGetDeviceIDs(plat, type, n_devices, devices.data(), nullptr) != CL_SUCCESS) {
+        return;
+    }
+    for (cl_uint di = 0; di < n_devices; ++di) {
+        cl_device_id dev = devices[di];
+        char dname[256] = {};
+        clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(dname), dname, nullptr);
+        OclDeviceInfo info;
+        info.platform_index = platform_index;
+        info.device_index = static_cast<int>(di);
+        info.platform = plat;
+        info.device = dev;
+        info.type = type;
+        info.platform_name = pname;
+        info.device_name = dname;
+        info.discrete = device_is_discrete_gpu(dev, type);
+        info.integer_dot_product = extension_enabled(dev, "cl_khr_integer_dot_product");
+        out->push_back(info);
+    }
+}
+
+int candidate_rank(const OclDeviceInfo &d) {
+    if (d.type == CL_DEVICE_TYPE_GPU && d.discrete) {
+        return 0;
+    }
+    if (d.type == CL_DEVICE_TYPE_GPU) {
+        return 1;
+    }
+    return 2; /* CPU / other */
 }
 
 } // namespace
@@ -84,91 +135,93 @@ std::string OpenClContext::error_string(cl_int err) {
     }
 }
 
-bool OpenClContext::init(int device_index) {
+std::vector<OclDeviceInfo> OpenClContext::enumerate_devices(int platform_filter) {
+    std::vector<OclDeviceInfo> out;
+
     cl_uint n_platforms = 0;
     if (clGetPlatformIDs(0, nullptr, &n_platforms) != CL_SUCCESS || n_platforms == 0) {
-        std::fprintf(stderr, "No OpenCL platforms found\n");
-        return false;
+        return out;
     }
-
     std::vector<cl_platform_id> platforms(n_platforms);
     if (clGetPlatformIDs(n_platforms, platforms.data(), nullptr) != CL_SUCCESS) {
-        return false;
+        return out;
     }
 
-    struct Candidate {
-        cl_platform_id platform;
-        cl_device_id device;
-        cl_device_type type;
-        std::string platform_name;
-        std::string device_name;
-        bool dot;
-    };
-    std::vector<Candidate> candidates;
-
-    for (cl_platform_id plat : platforms) {
+    std::vector<OclDeviceInfo> gpus;
+    std::vector<OclDeviceInfo> cpus;
+    for (cl_uint pi = 0; pi < n_platforms; ++pi) {
+        if (platform_filter >= 0 && static_cast<int>(pi) != platform_filter) {
+            continue;
+        }
         char pname[256] = {};
-        clGetPlatformInfo(plat, CL_PLATFORM_NAME, sizeof(pname), pname, nullptr);
-
-        cl_uint n_devices = 0;
-        if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &n_devices) != CL_SUCCESS ||
-            n_devices == 0) {
-            continue;
-        }
-        std::vector<cl_device_id> devices(n_devices);
-        if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, n_devices, devices.data(), nullptr) !=
-            CL_SUCCESS) {
-            continue;
-        }
-        for (cl_device_id dev : devices) {
-            char dname[256] = {};
-            clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(dname), dname, nullptr);
-            candidates.push_back(
-                    {plat, dev, CL_DEVICE_TYPE_GPU, pname, dname,
-                     extension_enabled(dev, "cl_khr_integer_dot_product")});
-        }
+        clGetPlatformInfo(platforms[pi], CL_PLATFORM_NAME, sizeof(pname), pname, nullptr);
+        append_devices_of_type(platforms[pi], static_cast<int>(pi), pname, CL_DEVICE_TYPE_GPU,
+                               &gpus);
+        append_devices_of_type(platforms[pi], static_cast<int>(pi), pname, CL_DEVICE_TYPE_CPU,
+                               &cpus);
     }
 
-    if (candidates.empty()) {
-        for (cl_platform_id plat : platforms) {
-            char pname[256] = {};
-            clGetPlatformInfo(plat, CL_PLATFORM_NAME, sizeof(pname), pname, nullptr);
-            cl_uint n_devices = 0;
-            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_CPU, 0, nullptr, &n_devices) !=
-                        CL_SUCCESS ||
-                n_devices == 0) {
-                continue;
-            }
-            std::vector<cl_device_id> devices(n_devices);
-            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_CPU, n_devices, devices.data(), nullptr) !=
-                CL_SUCCESS) {
-                continue;
-            }
-            for (cl_device_id dev : devices) {
-                char dname[256] = {};
-                clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(dname), dname, nullptr);
-                candidates.push_back(
-                        {plat, dev, CL_DEVICE_TYPE_CPU, pname, dname,
-                         extension_enabled(dev, "cl_khr_integer_dot_product")});
-            }
-        }
+    /* Prefer discrete GPUs, then iGPUs; CPU only if no GPUs exist. */
+    std::stable_sort(gpus.begin(), gpus.end(),
+                     [](const OclDeviceInfo &a, const OclDeviceInfo &b) {
+                         return candidate_rank(a) < candidate_rank(b);
+                     });
+
+    if (!gpus.empty()) {
+        out = std::move(gpus);
+    } else {
+        out = std::move(cpus);
     }
 
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i].flat_index = static_cast<int>(i);
+    }
+    return out;
+}
+
+int OpenClContext::list_devices(int platform_filter) {
+    const std::vector<OclDeviceInfo> devices = enumerate_devices(platform_filter);
+    if (devices.empty()) {
+        std::printf("[ocl] no OpenCL devices found\n");
+        return 0;
+    }
+
+    std::printf("[ocl] OpenCL devices (use --devices N; default prefers discrete GPU):\n");
+    for (const OclDeviceInfo &d : devices) {
+        const char *kind = (d.type == CL_DEVICE_TYPE_CPU) ? "CPU"
+                           : d.discrete                   ? "discrete GPU"
+                                                          : "integrated GPU";
+        std::printf("  [%d] %s\n", d.flat_index, d.device_name.c_str());
+        std::printf("      platform[%d]=%s  %s%s\n", d.platform_index,
+                    d.platform_name.c_str(), kind,
+                    d.integer_dot_product ? "  int-dot" : "");
+    }
+    return static_cast<int>(devices.size());
+}
+
+bool OpenClContext::init(int device_index, int platform_filter) {
+    const std::vector<OclDeviceInfo> candidates = enumerate_devices(platform_filter);
     if (candidates.empty()) {
         std::fprintf(stderr, "No OpenCL GPU or CPU devices found\n");
         return false;
     }
 
-    int pick = 0;
-    if (device_index >= 0 && device_index < static_cast<int>(candidates.size())) {
-        pick = device_index;
+    if (device_index < 0 || device_index >= static_cast<int>(candidates.size())) {
+        std::fprintf(stderr,
+                     "[ocl] invalid --devices %d (valid: 0..%d). Available:\n",
+                     device_index, static_cast<int>(candidates.size()) - 1);
+        list_devices(platform_filter);
+        return false;
     }
 
-    platform = candidates[static_cast<size_t>(pick)].platform;
-    device = candidates[static_cast<size_t>(pick)].device;
-    platform_name = candidates[static_cast<size_t>(pick)].platform_name;
-    device_name = candidates[static_cast<size_t>(pick)].device_name;
-    has_integer_dot_product = candidates[static_cast<size_t>(pick)].dot;
+    const OclDeviceInfo &pick = candidates[static_cast<size_t>(device_index)];
+    platform = pick.platform;
+    device = pick.device;
+    platform_name = pick.platform_name;
+    device_name = pick.device_name;
+    device_flat_index = pick.flat_index;
+    discrete_gpu = pick.discrete;
+    has_integer_dot_product = pick.integer_dot_product;
 
     cl_int err = CL_SUCCESS;
     context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);

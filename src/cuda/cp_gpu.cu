@@ -324,6 +324,28 @@ void cp_gpu_init(int* devs, int ndev)
     sync_ap_layout();
 }
 
+int cp_gpu_list_devices(void)
+{
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    if(err != cudaSuccess || count <= 0){
+        printf("[cuda] no CUDA devices found (%s)\n",
+               err == cudaSuccess ? "count=0" : cudaGetErrorString(err));
+        return 0;
+    }
+    printf("[cuda] CUDA devices (use --devices N[,M]):\n");
+    for(int i = 0; i < count; i++){
+        cudaDeviceProp prop{};
+        if(cudaGetDeviceProperties(&prop, i) != cudaSuccess){
+            printf("  [%d] <unavailable>\n", i);
+            continue;
+        }
+        printf("  [%d] %s  (sm_%d%d, %.1f GiB)\n", i, prop.name, prop.major,
+               prop.minor, prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    }
+    return count;
+}
+
 void cp_gpu_shutdown(void)
 {
     for(int i = 0; i < g_ngpu; i++){

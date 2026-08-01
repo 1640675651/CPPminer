@@ -9,6 +9,8 @@ extern "C" {
 
 void cp_gpu_init(int* devs, int ndev);
 void cp_gpu_shutdown(void);
+/* Print CUDA devices; returns count. */
+int cp_gpu_list_devices(void);
 void cp_gpu_set_contiguous_tiles(int on);
 void cp_gpu_set_period_gemm(int on);
 void cp_gpu_set_period_batch(int batch);

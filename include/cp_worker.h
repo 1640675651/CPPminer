@@ -28,6 +28,11 @@ int cp_worker_select(CpBackendId id);
 void cp_worker_init(int* devices, int ndev);
 void cp_worker_shutdown(void);
 
+/* Print devices for the selected backend (OpenCL/CUDA). Returns count, or 0. */
+int cp_worker_list_devices(void);
+/* OpenCL-only: restrict device enumeration to platform index (-1 = all). */
+void cp_worker_set_ocl_platform(int platform_index);
+
 void cp_worker_apply_backend_defaults(void);
 int cp_worker_uses_contiguous_tiles(void);
 void cp_worker_set_period_gemm(int on);

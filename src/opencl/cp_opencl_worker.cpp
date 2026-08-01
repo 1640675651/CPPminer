@@ -31,6 +31,7 @@ struct ZeroBCache {
 
 static Case33GemmOcl g_gemm;
 static int g_device_index = 0;
+static int g_platform_filter = -1;
 static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
 
@@ -173,23 +174,38 @@ extern "C" void cp_opencl_worker_set_macro_batch(int batch) {
     g_gemm.set_macro_batch(batch);
 }
 
+extern "C" void cp_opencl_worker_set_platform(int platform_index) {
+    g_platform_filter = platform_index;
+}
+
+extern "C" int cp_opencl_worker_list_devices(void) {
+    return OpenClContext::list_devices(g_platform_filter);
+}
+
 extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     if (devices && ndev > 0) {
         g_device_index = devices[0];
+        if (ndev > 1) {
+            fprintf(stderr,
+                    "[ocl] warning: OpenCL uses a single device; ignoring --devices after %d\n",
+                    g_device_index);
+        }
     } else {
         g_device_index = 0;
     }
 
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
-    if (!g_gemm.init_context(kernel_path.c_str(), g_device_index)) {
+    if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter)) {
         fprintf(stderr, "[ocl] OpenCL init failed (kernel=%s)\n", kernel_path.c_str());
         g_context_ready = 0;
         return;
     }
 
     g_context_ready = 1;
-    printf("[ocl] device: %s\n", g_gemm.device_name());
+    printf("[ocl] device[%d]: %s (%s)\n", g_gemm.device_index(), g_gemm.device_name(),
+           g_gemm.discrete_gpu() ? "discrete GPU" : "integrated GPU/CPU");
+    printf("[ocl] platform: %s\n", g_gemm.platform_name());
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
     printf("[ocl] macro batch: %d blocks (%d tiles/launch)\n", g_gemm.macro_batch(),

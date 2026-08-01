@@ -37,7 +37,8 @@ struct Case33GemmOcl {
 
 
 
-    bool init_context(const char *kernel_cl_path, int device_index = -1);
+    bool init_context(const char *kernel_cl_path, int device_index = 0,
+                      int platform_filter = -1);
 
     bool prepare_job(int M, int N, int K, const int8_t *b_colmajor);
 
@@ -68,6 +69,12 @@ struct Case33GemmOcl {
     const char *backend() const { return backend_; }
 
     const char *device_name() const { return device_name_.c_str(); }
+
+    const char *platform_name() const { return platform_name_.c_str(); }
+
+    int device_index() const { return device_flat_index_; }
+
+    bool discrete_gpu() const { return discrete_gpu_; }
 
     const char *dpi_status() const { return dpi_status_; }
 
@@ -158,6 +165,12 @@ private:
     Case33OclPrep prep_;
 
     std::string device_name_;
+
+    std::string platform_name_;
+
+    int device_flat_index_ = -1;
+
+    bool discrete_gpu_ = false;
 
     char backend_[192] = {};
 

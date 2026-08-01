@@ -49,7 +49,12 @@ static void print_usage(void)
         if(first) printf("none");
     }
     printf(")\n");
-    printf("  --devices N[,M]    CUDA devices (default: 0)\n");
+    printf("  --devices N[,M]    device index(es): CUDA ids, or OpenCL flat index\n");
+    printf("                     (default: 0; OpenCL prefers discrete GPU first)\n");
+    printf("  --list-devices     list devices for the selected backend and exit\n");
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
+#endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (CUDA debug)\n");
@@ -206,6 +211,8 @@ int main(int argc, char** argv)
     int profile_runs = 10;
     int profile_prep = 0;
     int profile_prep_runs = 3;
+    int list_devices = 0;
+    int ocl_platform = -1;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     for(int i = 1; i < argc; i++){
@@ -240,6 +247,12 @@ int main(int argc, char** argv)
             strncpy(tmp, s, 255); tmp[255] = 0;
             char* tok = strtok(tmp, ",");
             while(tok && ndev < MAX_GPUS){ devs[ndev++] = atoi(tok); tok = strtok(NULL, ","); }
+        } else if(!strcmp(argv[i], "--list-devices")){
+            list_devices = 1;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        } else if(!strcmp(argv[i], "--ocl-platform") && i + 1 < argc){
+            ocl_platform = atoi(argv[++i]);
+#endif
         } else if(!strcmp(argv[i], "--dev")){
             g_dev_dims = 1;
         } else if(!strcmp(argv[i], "--no-period-gemm")){
@@ -355,7 +368,44 @@ int main(int argc, char** argv)
         }
     }
 
+    if(list_devices){
+        int n = 0;
+        if(backend_sel == CP_BACKEND_NONE){
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+            if(cp_worker_has_cuda()){
+                if(cp_worker_select(CP_BACKEND_CUDA) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+            if(cp_worker_has_opencl()){
+                if(ocl_platform >= 0)
+                    cp_worker_set_ocl_platform(ocl_platform);
+                if(cp_worker_select(CP_BACKEND_OPENCL) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
+            if(n <= 0){
+                printf("[list-devices] no CUDA/OpenCL backends in this build\n");
+                return 1;
+            }
+            return 0;
+        }
+        if(cp_worker_select(backend_sel) != 0) return 1;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        if(ocl_platform >= 0)
+            cp_worker_set_ocl_platform(ocl_platform);
+#endif
+        n = cp_worker_list_devices();
+        return n > 0 ? 0 : 1;
+    }
+
     if(cp_worker_select(backend_sel) != 0) return 1;
+
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(ocl_platform >= 0)
+        cp_worker_set_ocl_platform(ocl_platform);
+#endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){
         if(cutlass_fused < 0) cutlass_fused = 1;

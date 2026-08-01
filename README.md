@@ -90,7 +90,9 @@ Produces `cppminer.exe` in the repo root.
 | `--pool` | `stratum+tcp://host:port` |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
-| `--devices` | CUDA device list |
+| `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |
+| `--list-devices` | List devices for the selected backend and exit |
+| `--ocl-platform` | OpenCL: restrict enumeration to platform index |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |

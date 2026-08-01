@@ -206,10 +206,11 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     return built;
 }
 
-bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index) {
+bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,
+                                 int platform_filter) {
     context_ready_ = false;
     available_ = false;
-    if (!ocl_.init(device_index)) {
+    if (!ocl_.init(device_index, platform_filter)) {
         return false;
     }
     if (!build_kernel_(kernel_cl_path)) {
@@ -223,6 +224,9 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index) {
         return false;
     }
     device_name_ = ocl_.device_name;
+    platform_name_ = ocl_.platform_name;
+    device_flat_index_ = ocl_.device_flat_index;
+    discrete_gpu_ = ocl_.discrete_gpu;
     std::snprintf(backend_, sizeof(backend_), "OpenCL context ready");
     context_ready_ = true;
     return true;

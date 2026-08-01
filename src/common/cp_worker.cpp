@@ -10,6 +10,7 @@
 #endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_cuda_worker.h"
+#include "cp_gpu.h"
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_opencl_worker.h"
@@ -123,6 +124,37 @@ extern "C" void cp_worker_init(int* devices, int ndev)
     default:
         fprintf(stderr, "[worker] no backend available\n");
         break;
+    }
+}
+
+extern "C" void cp_worker_set_ocl_platform(int platform_index)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_platform(platform_index);
+#else
+    (void)platform_index;
+#endif
+}
+
+extern "C" int cp_worker_list_devices(void)
+{
+    if(g_backend == CP_BACKEND_NONE)
+        g_backend = default_backend();
+    switch(g_backend){
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL:
+        return cp_opencl_worker_list_devices();
+#endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    case CP_BACKEND_CUDA:
+        return cp_gpu_list_devices();
+#endif
+    case CP_BACKEND_CPU:
+        printf("[cpu] host CPU backend (no device list)\n");
+        return 0;
+    default:
+        fprintf(stderr, "[worker] no backend available for --list-devices\n");
+        return 0;
     }
 }
 
