@@ -1,6 +1,7 @@
 #pragma once
 
 #include "case32_gemm.hpp"
+#include "cp_config.h"
 
 #include <cstdint>
 #include <functional>
@@ -29,8 +30,9 @@ enum class Case33SseTile {
 
 // Case 3.3: Case 3.2 8x16 ukernel + milestoned 8x16 tile XOR.
 // tile_xor[milestone * tile_count + spatial_tile_id]
+// Pearl jackpot milestones are every R_RANK along K (GEMM KR may be larger).
 struct Case33GemmXor {
-    static constexpr int kNumMilestones = 16;
+    static constexpr int kNumMilestones = K_DIM / R_RANK;
     static constexpr int kMR = Case32Gemm::kMR;
     static constexpr int kNR = Case32Gemm::kNR;
     static constexpr int kKR = Case32Gemm::kKR;
@@ -38,6 +40,12 @@ struct Case33GemmXor {
     static constexpr int kTileCols = kNR;
     static constexpr int kMacroM = Case32Gemm::kMacroM;
     static constexpr int kMacroN = Case32Gemm::kMacroN;
+    static constexpr int kPackRank = 4;
+
+    static_assert(K_DIM % R_RANK == 0, "K must be a multiple of noise rank");
+    static_assert(R_RANK % kPackRank == 0, "noise rank must be a multiple of pack rank");
+    static_assert(kKR == R_RANK, "GEMM KR must equal pearl noise rank");
+    static_assert(kNumMilestones == K_DIM / kKR, "one milestone per KR panel");
 
     void set_int8_mode(Case32Int8Mode mode) { int8_mode_ = mode; }
     void set_prepack_mode(Case33PrepackMode mode) { prepack_mode_ = mode; }

@@ -443,10 +443,6 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                     }
                 }
 
-                if ((kb + 1) % blocks_per_milestone != 0) {
-                    continue;
-                }
-
                 if (use_fast_u8s8 && b_comp_ms) {
                     for (int j = 0; j < kNR; ++j) {
                         const int32_t comp =
@@ -468,6 +464,7 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                 std::memset(panel_acc, 0, sizeof(panel_acc));
                 ++ms;
             }
+            (void)blocks_per_milestone;
             (void)num_milestones;
         }
     }

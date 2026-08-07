@@ -4,7 +4,7 @@
 #define M_DIM  131072
 #define N_DIM  131072
 #define K_DIM  4096
-#define R_RANK 256
+#define R_RANK 128
 
 #define PP_HASH_H 8
 #define PP_HASH_W 16

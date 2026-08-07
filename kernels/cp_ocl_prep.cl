@@ -7,10 +7,10 @@
 #define NR 16
 #endif
 #ifndef KR
-#define KR 256
+#define KR 128
 #endif
 #ifndef R_RANK
-#define R_RANK 256
+#define R_RANK 128
 #endif
 
 #define CP_RANGE_MASK 63

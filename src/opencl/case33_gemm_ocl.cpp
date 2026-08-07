@@ -118,6 +118,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
         build_opts += " -DNR=" + std::to_string(case32::kNR);
+        build_opts += " -DKR=" + std::to_string(case32::kKR);
+        build_opts += " -DR_RANK=" + std::to_string(R_RANK);
+        build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
         build_opts += " -DCASE32_WI_ROWMAJOR=1";
         if (use_asm) {
@@ -236,10 +239,10 @@ bool Case33GemmOcl::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
-    num_milestones_ = case32::kNumMilestones;
-    milestone_k_ = K / num_milestones_;
+    num_milestones_ = K / R_RANK;
+    milestone_k_ = R_RANK;
     blocks_k_ = K / case32::kKR;
-    blocks_per_milestone_ = milestone_k_ / case32::kKR;
+    blocks_per_milestone_ = 1;
     macro_rows_ = M / case32::kMacroM;
     macro_cols_ = N / case32::kMacroN;
     tile_cols_ = N / case32::kNR;
@@ -252,7 +255,8 @@ bool Case33GemmOcl::setup_dims_(int M, int N, int K) {
     if (M % case32::kMacroM != 0 || N % case32::kMacroN != 0) {
         return false;
     }
-    if (K % num_milestones_ != 0 || milestone_k_ % case32::kKR != 0) {
+    if (case32::kKR != R_RANK || K % R_RANK != 0 ||
+        num_milestones_ != case32::kNumMilestones) {
         return false;
     }
     return true;

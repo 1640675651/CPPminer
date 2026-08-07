@@ -39,6 +39,7 @@ constexpr int kPanelA = kKR * kMR;
 constexpr int kPanelB = kKR * kNR;
 constexpr int kColsPerGroup = 8;
 constexpr int kRank = 4;
+constexpr int kKGroups = kKR / kRank;
 
 void cpuid_ex(int leaf, int subleaf, int out[4]) {
 #if defined(_MSC_VER)
@@ -237,23 +238,22 @@ uint32_t xor_tile(const int32_t *tile_c) {
 }
 
 void scalar_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
     for (int j = 0; j < kNR; ++j) {
         for (int i = 0; i < kMR; ++i) {
-            for (int kk = 0; kk < kKR; ++kk) {
-                const int kg = kk / kRank;
-                const int ko = kk % kRank;
-                const size_t a_idx =
-                        static_cast<size_t>(kg) * 32 + static_cast<size_t>(i * kRank + ko);
-                vals[j * kMR + i] +=
-                        static_cast<int32_t>(a_tile[a_idx]) *
-                        static_cast<int32_t>(
-                                b_tile[(static_cast<size_t>(j / kColsPerGroup) *
-                                                static_cast<size_t>(kKGroups) +
-                                        static_cast<size_t>(kg)) *
-                                               32 +
-                                       static_cast<size_t>(j % kColsPerGroup) * 4 +
-                                       static_cast<size_t>(ko)]);
+            for (int kg = 0; kg < kKGroups; ++kg) {
+                for (int ko = 0; ko < kRank; ++ko) {
+                    const size_t a_idx =
+                            static_cast<size_t>(kg) * 32 + static_cast<size_t>(i * kRank + ko);
+                    vals[j * kMR + i] +=
+                            static_cast<int32_t>(a_tile[a_idx]) *
+                            static_cast<int32_t>(
+                                    b_tile[(static_cast<size_t>(j / kColsPerGroup) *
+                                                    static_cast<size_t>(kKGroups) +
+                                            static_cast<size_t>(kg)) *
+                                                   32 +
+                                           static_cast<size_t>(j % kColsPerGroup) * 4 +
+                                           static_cast<size_t>(ko)]);
+                }
             }
         }
     }
@@ -264,33 +264,29 @@ void scalar_micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, i
                                    int global_col0, size_t spatial_tile_id, size_t tile_count,
                                    const int32_t *b_comp_ms, bool use_fast_u8s8,
                                    bool xor_after_milestone, uint32_t *tile_xor_out) {
-    int32_t tile_c[kTileRows * kTileCols] = {};
+    /* Cumulative C tile (never cleared). One KR panel == one milestone. */
     int32_t vals[kNR * kMR] = {};
     int ms = 0;
+    (void)blocks_per_milestone;
 
     for (int kb = 0; kb < blocks_k; ++kb) {
         scalar_panel_accum(a_base + static_cast<size_t>(kb) * kPanelA,
                            b_base + static_cast<size_t>(kb) * kPanelB, vals);
 
-        if ((kb + 1) % blocks_per_milestone != 0) {
-            continue;
-        }
-
-        const int32_t *b_comp_slice =
-                use_fast_u8s8 ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
-                              : nullptr;
-        for (int j = 0; j < kNR; ++j) {
-            const int32_t comp = b_comp_slice ? b_comp_slice[global_col0 + j] : 0;
-            for (int i = 0; i < kMR; ++i) {
-                tile_c[static_cast<size_t>(j) * kTileRows + i] +=
-                        vals[j * kMR + i] + comp;
+        if (use_fast_u8s8 && b_comp_ms) {
+            const int32_t *b_comp_slice =
+                    b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N);
+            for (int j = 0; j < kNR; ++j) {
+                const int32_t comp = b_comp_slice[global_col0 + j];
+                for (int i = 0; i < kMR; ++i) {
+                    vals[j * kMR + i] += comp;
+                }
             }
         }
         if (xor_after_milestone) {
             tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
-                    xor_tile(tile_c);
+                    xor_tile(vals);
         }
-        std::memset(vals, 0, sizeof(vals));
         ++ms;
     }
     (void)num_milestones;
@@ -333,8 +329,7 @@ CASE33_FORCEINLINE void sse_add_acc_to_vals(__m128i *acc, int n_cols, int32_t *v
 }
 
 // 4x8: two row-halves x two col-groups (baseline).
-void sse_panel_accum_fast_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_fast_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     for (int row0 = 0; row0 < kMR; row0 += 4) {
         for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
@@ -342,7 +337,7 @@ void sse_panel_accum_fast_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_
             sse_zero_acc_n(acc, kColsPerGroup);
             const int8_t *b_jg =
                     b_tile + static_cast<size_t>(jg) * static_cast<size_t>(kKGroups) * 32;
-            for (int kg = 0; kg < kKGroups; ++kg) {
+            for (int kg = kg_begin; kg < kg_end; ++kg) {
                 const __m128i ua = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                         a_tile + static_cast<size_t>(kg) * 32 +
                         static_cast<size_t>(row0) * kRank));
@@ -358,8 +353,7 @@ void sse_panel_accum_fast_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_
     }
 }
 
-void sse_panel_accum_exact_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_exact_4x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     for (int row0 = 0; row0 < kMR; row0 += 4) {
         for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
@@ -367,7 +361,7 @@ void sse_panel_accum_exact_4x8(const int8_t *a_tile, const int8_t *b_tile, int32
             sse_zero_acc_n(acc, kColsPerGroup);
             const int8_t *b_jg =
                     b_tile + static_cast<size_t>(jg) * static_cast<size_t>(kKGroups) * 32;
-            for (int kg = 0; kg < kKGroups; ++kg) {
+            for (int kg = kg_begin; kg < kg_end; ++kg) {
                 const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                         a_tile + static_cast<size_t>(kg) * 32 +
                         static_cast<size_t>(row0) * kRank));
@@ -386,8 +380,7 @@ void sse_panel_accum_exact_4x8(const int8_t *a_tile, const int8_t *b_tile, int32
 }
 
 // 8x8: keep both 4-row halves live across K for one col-group (fewer vals stores).
-void sse_panel_accum_fast_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_fast_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
         __m128i acc0[kColsPerGroup];
@@ -396,7 +389,7 @@ void sse_panel_accum_fast_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_
         sse_zero_acc_n(acc1, kColsPerGroup);
         const int8_t *b_jg =
                 b_tile + static_cast<size_t>(jg) * static_cast<size_t>(kKGroups) * 32;
-        for (int kg = 0; kg < kKGroups; ++kg) {
+        for (int kg = kg_begin; kg < kg_end; ++kg) {
             const __m128i ua0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                     a_tile + static_cast<size_t>(kg) * 32));
             const __m128i ua1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
@@ -414,8 +407,7 @@ void sse_panel_accum_fast_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_
     }
 }
 
-void sse_panel_accum_exact_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_exact_8x8(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
         __m128i acc0[kColsPerGroup];
@@ -424,7 +416,7 @@ void sse_panel_accum_exact_8x8(const int8_t *a_tile, const int8_t *b_tile, int32
         sse_zero_acc_n(acc1, kColsPerGroup);
         const int8_t *b_jg =
                 b_tile + static_cast<size_t>(jg) * static_cast<size_t>(kKGroups) * 32;
-        for (int kg = 0; kg < kKGroups; ++kg) {
+        for (int kg = kg_begin; kg < kg_end; ++kg) {
             const __m128i va0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                     a_tile + static_cast<size_t>(kg) * 32));
             const __m128i va1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
@@ -447,14 +439,13 @@ void sse_panel_accum_exact_8x8(const int8_t *a_tile, const int8_t *b_tile, int32
 }
 
 // 4x16: one A load reused across all 16 B columns per row-half.
-void sse_panel_accum_fast_4x16(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_fast_4x16(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     const int8_t *b_jg1 = b_tile + static_cast<size_t>(kKGroups) * 32;
     for (int row0 = 0; row0 < kMR; row0 += 4) {
         __m128i acc[kNR];
         sse_zero_acc_n(acc, kNR);
-        for (int kg = 0; kg < kKGroups; ++kg) {
+        for (int kg = kg_begin; kg < kg_end; ++kg) {
             const __m128i ua = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                     a_tile + static_cast<size_t>(kg) * 32 +
                     static_cast<size_t>(row0) * kRank));
@@ -473,14 +464,13 @@ void sse_panel_accum_fast_4x16(const int8_t *a_tile, const int8_t *b_tile, int32
     }
 }
 
-void sse_panel_accum_exact_4x16(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    constexpr int kKGroups = kKR / kRank;
+void sse_panel_accum_exact_4x16(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals, int kg_begin, int kg_end) {
     const __m128i ones16 = _mm_set1_epi16(1);
     const int8_t *b_jg1 = b_tile + static_cast<size_t>(kKGroups) * 32;
     for (int row0 = 0; row0 < kMR; row0 += 4) {
         __m128i acc[kNR];
         sse_zero_acc_n(acc, kNR);
-        for (int kg = 0; kg < kKGroups; ++kg) {
+        for (int kg = kg_begin; kg < kg_end; ++kg) {
             const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                     a_tile + static_cast<size_t>(kg) * 32 +
                     static_cast<size_t>(row0) * kRank));
@@ -502,7 +492,7 @@ void sse_panel_accum_exact_4x16(const int8_t *a_tile, const int8_t *b_tile, int3
     }
 }
 
-using SsePanelAccumFn = void (*)(const int8_t *, const int8_t *, int32_t *);
+using SsePanelAccumFn = void (*)(const int8_t *, const int8_t *, int32_t *, int, int);
 
 SsePanelAccumFn sse_panel_fn(Case33SseTile tile, bool use_fast_u8s8) {
     switch (tile) {
@@ -534,37 +524,30 @@ void sse_micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int 
                                 const int32_t *b_comp_ms, bool use_fast_u8s8,
                                 Case33SseTile sse_tile, bool xor_after_milestone,
                                 uint32_t *tile_xor_out) {
-    int32_t tile_c[kTileRows * kTileCols] = {};
+    /* Cumulative C tile. One KR panel == one milestone. */
     int32_t vals[kNR * kMR] = {};
     int ms = 0;
     const SsePanelAccumFn panel = sse_panel_fn(sse_tile, use_fast_u8s8);
+    (void)blocks_per_milestone;
 
     for (int kb = 0; kb < blocks_k; ++kb) {
-        const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
-        const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
-        panel(a_tile, b_tile, vals);
+        panel(a_base + static_cast<size_t>(kb) * kPanelA,
+              b_base + static_cast<size_t>(kb) * kPanelB, vals, 0, kKGroups);
 
-        if ((kb + 1) % blocks_per_milestone != 0) {
-            continue;
-        }
-
-        const int32_t *b_comp_slice =
-                use_fast_u8s8 ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
-                              : nullptr;
-        uint32_t x = 0u;
-        for (int j = 0; j < kNR; ++j) {
-            const int32_t comp = b_comp_slice ? b_comp_slice[global_col0 + j] : 0;
-            for (int i = 0; i < kMR; ++i) {
-                const int32_t v = tile_c[static_cast<size_t>(j) * kTileRows + i] +
-                                  vals[j * kMR + i] + comp;
-                tile_c[static_cast<size_t>(j) * kTileRows + i] = v;
-                x ^= static_cast<uint32_t>(v);
+        if (use_fast_u8s8 && b_comp_ms) {
+            const int32_t *b_comp_slice =
+                    b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N);
+            for (int j = 0; j < kNR; ++j) {
+                const int32_t comp = b_comp_slice[global_col0 + j];
+                for (int i = 0; i < kMR; ++i) {
+                    vals[j * kMR + i] += comp;
+                }
             }
         }
         if (xor_after_milestone) {
-            tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] = x;
+            tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
+                    xor_tile(vals);
         }
-        std::memset(vals, 0, sizeof(vals));
         ++ms;
     }
     (void)num_milestones;
@@ -840,9 +823,9 @@ bool Case33GemmXor::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
-    milestone_k_ = K / kNumMilestones;
+    milestone_k_ = R_RANK;
     blocks_k_ = K / kKR;
-    blocks_per_milestone_ = milestone_k_ / kKR;
+    blocks_per_milestone_ = 1;
     tile_cols_ = N / kTileCols;
     tile_count_ = static_cast<size_t>(M / kTileRows) * static_cast<size_t>(tile_cols_);
     macro_rows_ = M / kMacroM;
@@ -851,10 +834,10 @@ bool Case33GemmXor::setup_dims_(int M, int N, int K) {
     if (M % kMacroM != 0 || N % kMacroN != 0) {
         return false;
     }
-    if (M % kTileRows != 0 || N % kTileCols != 0 || K % kNumMilestones != 0) {
+    if (M % kTileRows != 0 || N % kTileCols != 0 || K % kKR != 0) {
         return false;
     }
-    if (milestone_k_ % kKR != 0) {
+    if (K % R_RANK != 0 || (K / R_RANK) != kNumMilestones || kKR != R_RANK) {
         return false;
     }
     return true;

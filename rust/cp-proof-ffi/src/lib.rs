@@ -66,7 +66,7 @@ fn mining_config_for_layout(layout: TileLayout) -> Result<MiningConfiguration, S
     let (rows_pat, cols_pat) = row_patterns(layout);
     let row_offsets: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
     let col_offsets: Vec<u32> = cols_pat.iter().map(|&o| o as u32).collect();
-    let bytes = mining_config_bytes(4096, 256, &row_offsets, &col_offsets)?;
+    let bytes = mining_config_bytes(4096, 128, &row_offsets, &col_offsets)?;
     MiningConfiguration::from_bytes(&bytes).map_err(|e| e.to_string())
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cp_config.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -16,9 +18,10 @@ enum class Case32Int8Mode {
 
 struct Case32Gemm {
     // Micro-kernel (MR x NR x KR): 8x16 register tile (one A stream covers all NR).
+    // KR matches pearl noise rank so one GEMM panel == one jackpot milestone.
     static constexpr int kMR = 8;
     static constexpr int kNR = 16;
-    static constexpr int kKR = 256;
+    static constexpr int kKR = R_RANK;
     // Macro blocking: 128x128 is the best balanced fixed shape so far.
     static constexpr int kMacroM = 128;
     static constexpr int kMacroN = 128;

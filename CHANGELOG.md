@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2(tentative)
+
+- SSE fallback for non-AVX CPU (DONE)
+- CPU thread affinity to physical cores (TODO)
+- Use rank=128 to avoid pearl rank penalty (OpenCL + CPU done, KR=R; CUDA TODO)
+
 ## v0.1
 
 First public release of **CPPminer** — a cross-platform Pearl (LuckyPool plain_proof) miner in C++.

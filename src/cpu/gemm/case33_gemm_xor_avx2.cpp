@@ -14,12 +14,11 @@ namespace {
 constexpr int kMR = Case33GemmXor::kMR;
 constexpr int kNR = Case33GemmXor::kNR;
 constexpr int kKR = Case33GemmXor::kKR;
-constexpr int kTileRows = Case33GemmXor::kTileRows;
-constexpr int kTileCols = Case33GemmXor::kTileCols;
 constexpr int kPanelA = kKR * kMR;
 constexpr int kPanelB = kKR * kNR;
 constexpr int kColsPerGroup = 8;
 constexpr int kRank = 4;
+constexpr int kKGroups = kKR / kRank;
 
 CASE33_FORCEINLINE __m256i rank4_maddubs(__m256i acc, __m256i ua, __m256i sb,
                                          __m256i ones16) {
@@ -74,28 +73,6 @@ CASE33_FORCEINLINE void rank4_kgroup_update8_exact(__m256i acc[kColsPerGroup], c
     acc[7] = rank4_maddubs(acc[7], abs_a, _mm256_sign_epi8(b7, va), ones16);
 }
 
-CASE33_FORCEINLINE __m256i accum_col_group_to_tile(const __m256i acc[kColsPerGroup],
-                                                   int32_t *tile_c, int local_row0,
-                                                   int global_col0, int local_col0,
-                                                   const int32_t *b_comp_ms,
-                                                   bool xor_epilogue) {
-    __m256i xor_vec = _mm256_setzero_si256();
-    for (int c = 0; c < kColsPerGroup; ++c) {
-        __m256i v = acc[c];
-        if (b_comp_ms) {
-            v = _mm256_add_epi32(v, _mm256_set1_epi32(b_comp_ms[global_col0 + c]));
-        }
-        int32_t *dst = tile_c + static_cast<size_t>(local_col0 + c) * kTileRows + local_row0;
-        v = _mm256_add_epi32(
-                v, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst)));
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), v);
-        if (xor_epilogue) {
-            xor_vec = _mm256_xor_si256(xor_vec, v);
-        }
-    }
-    return xor_vec;
-}
-
 CASE33_FORCEINLINE uint32_t reduce_xor_epi32(__m256i v) {
     v = _mm256_xor_si256(v, _mm256_permute2x128_si256(v, v, 0x01));
     __m128i x = _mm256_castsi256_si128(v);
@@ -104,12 +81,35 @@ CASE33_FORCEINLINE uint32_t reduce_xor_epi32(__m256i v) {
     return static_cast<uint32_t>(_mm_cvtsi128_si32(x));
 }
 
+/* XOR-fold all 8x16 cumulative C cells held in register accs. */
+CASE33_FORCEINLINE uint32_t xor_micro_acc(const __m256i acc0[kColsPerGroup],
+                                          const __m256i acc1[kColsPerGroup]) {
+    __m256i x = _mm256_setzero_si256();
+    for (int c = 0; c < kColsPerGroup; ++c) {
+        x = _mm256_xor_si256(x, acc0[c]);
+        x = _mm256_xor_si256(x, acc1[c]);
+    }
+    return reduce_xor_epi32(x);
+}
+
+/* Fold this milestone's FastU8S8 column compensation into the live register accs. */
+CASE33_FORCEINLINE void apply_b_comp_to_acc(__m256i acc0[kColsPerGroup],
+                                            __m256i acc1[kColsPerGroup],
+                                            const int32_t *b_comp_slice, int global_col0) {
+    for (int c = 0; c < kColsPerGroup; ++c) {
+        acc0[c] = _mm256_add_epi32(
+                acc0[c], _mm256_set1_epi32(b_comp_slice[global_col0 + c]));
+        acc1[c] = _mm256_add_epi32(
+                acc1[c],
+                _mm256_set1_epi32(b_comp_slice[global_col0 + kColsPerGroup + c]));
+    }
+}
+
 template <typename UpdateFn>
 CASE33_FORCEINLINE void avx2_micro_gemm_kgroups(__m256i acc0[kColsPerGroup],
                                                 __m256i acc1[kColsPerGroup],
                                                 const int8_t *a_tile, const int8_t *b_jg0,
                                                 const int8_t *b_jg1, UpdateFn update) {
-    constexpr int kKGroups = kKR / kRank;
     const __m256i ones16 = _mm256_set1_epi16(1);
     int kg = 0;
     for (; kg + 1 < kKGroups; kg += 2) {
@@ -157,25 +157,20 @@ void avx2_micro_gemm_xor_fused_k_impl(const int8_t *a_base, const int8_t *b_base
                                       int global_col0, size_t spatial_tile_id, size_t tile_count,
                                       const int32_t *b_comp_ms, bool use_fast_u8s8,
                                       bool xor_after_milestone, uint32_t *tile_xor_out) {
-    constexpr int kKGroups = kKR / kRank;
-
-    int32_t tile_c[kTileRows * kTileCols] = {};
     __m256i acc0[kColsPerGroup];
     __m256i acc1[kColsPerGroup];
     zero_micro_acc(acc0, acc1);
+    (void)blocks_per_milestone;
 
     int ms = 0;
     const auto milestone_epilogue = [&](const int32_t *b_comp_slice) {
-        const __m256i xor0 = accum_col_group_to_tile(
-                acc0, tile_c, 0, global_col0, 0, b_comp_slice, xor_after_milestone);
-        const __m256i xor1 = accum_col_group_to_tile(
-                acc1, tile_c, 0, global_col0 + kColsPerGroup, kColsPerGroup,
-                b_comp_slice, xor_after_milestone);
+        if (b_comp_slice) {
+            apply_b_comp_to_acc(acc0, acc1, b_comp_slice, global_col0);
+        }
         if (xor_after_milestone) {
             tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
-                    reduce_xor_epi32(_mm256_xor_si256(xor0, xor1));
+                    xor_micro_acc(acc0, acc1);
         }
-        zero_micro_acc(acc0, acc1);
         ++ms;
     };
 
@@ -188,14 +183,11 @@ void avx2_micro_gemm_xor_fused_k_impl(const int8_t *a_base, const int8_t *b_base
             const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
             const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
             avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
-                                    b_tile + static_cast<size_t>(kKGroups) * 32,
-                                    update_fast);
-            if ((kb + 1) % blocks_per_milestone == 0) {
-                const int32_t *b_comp_slice =
-                        b_comp_ms ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
-                                  : nullptr;
-                milestone_epilogue(b_comp_slice);
-            }
+                                    b_tile + static_cast<size_t>(kKGroups) * 32, update_fast);
+            const int32_t *b_comp_slice =
+                    b_comp_ms ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
+                              : nullptr;
+            milestone_epilogue(b_comp_slice);
         }
     } else {
         const auto update_exact = [](__m256i acc[kColsPerGroup], const __m256i va,
@@ -207,11 +199,8 @@ void avx2_micro_gemm_xor_fused_k_impl(const int8_t *a_base, const int8_t *b_base
             const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
             const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
             avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
-                                    b_tile + static_cast<size_t>(kKGroups) * 32,
-                                    update_exact);
-            if ((kb + 1) % blocks_per_milestone == 0) {
-                milestone_epilogue(nullptr);
-            }
+                                    b_tile + static_cast<size_t>(kKGroups) * 32, update_exact);
+            milestone_epilogue(nullptr);
         }
     }
     (void)num_milestones;

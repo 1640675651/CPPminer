@@ -11,7 +11,7 @@
 #define NR 16
 #endif
 #ifndef KR
-#define KR 256
+#define KR 128
 #endif
 #ifndef MACRO_M
 #define MACRO_M 128
@@ -61,7 +61,13 @@
 
 #define PP_JACKPOT_WORDS 16
 #define PP_LROT 13
-#define PP_MAX_MILESTONES 16
+#ifndef R_RANK
+#define R_RANK 128
+#endif
+#ifndef PP_MAX_MILESTONES
+#define PP_MAX_MILESTONES 32
+#endif
+/* KR == R_RANK: one packed K-panel is one jackpot milestone. */
 
 #ifdef cl_khr_integer_dot_product
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
@@ -257,8 +263,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             }
         }
 #endif
-
-        if ((kb + 1) % blocks_per_milestone == 0) {
+        /* One milestone per KR panel (KR == R_RANK). */
+        {
             uint x = 0u;
             for (int i = 0; i < NR * MR; ++i) {
                 x ^= as_uint(acc[i]);
@@ -281,6 +287,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             ++ms;
         }
     }
+    (void)blocks_per_milestone;
 
     if (!fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
         return;

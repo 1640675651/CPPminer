@@ -3,6 +3,8 @@
 // Case 3.2 blocking constants (shared by host prepack and OpenCL kernels).
 // Override at CMake configure time: -DOPENCL_CASE32_MR=4 -DOPENCL_CASE32_NR=8
 
+#include "cp_config.h"
+
 #ifndef CASE32_MR
 #define CASE32_MR 8
 #endif
@@ -23,7 +25,8 @@ namespace case32 {
 
 constexpr int kMR = CASE32_MR;
 constexpr int kNR = CASE32_NR;
-constexpr int kKR = 256;
+/* KR == R_RANK: one packed K-panel is one jackpot milestone (no mid-panel split). */
+constexpr int kKR = R_RANK;
 constexpr int kMacroM = 128;
 constexpr int kMacroN = 128;
 constexpr int kMicroPerMacroM = kMacroM / kMR;
@@ -34,7 +37,7 @@ constexpr int kColsPerGroup = 8;
 constexpr int kRank = 4;
 constexpr int kKGroups = kKR / kRank;
 constexpr int kMacroWorkItems = kMicroPerMacroM * kMicroPerMacroN;
-constexpr int kNumMilestones = 16;
+constexpr int kNumMilestones = K_DIM / R_RANK;
 constexpr int kKgBytesA = kMR * kRank;
 constexpr int kKgSliceB = (kNR / kColsPerGroup) * 32;
 constexpr int kMacroKgStripA = kMicroPerMacroM * kKgBytesA;
@@ -45,7 +48,10 @@ constexpr int kMacroKbBlockB = kKGroups * kMacroKgStripB;
 static_assert(kMR > 0 && kNR > 0, "MR and NR must be positive");
 static_assert(kMacroM % kMR == 0 && kMacroN % kNR == 0, "macro must divide micro tile");
 static_assert(kNR % kColsPerGroup == 0, "NR must be a multiple of COLS_PER_GROUP (8)");
-static_assert(kKR % kRank == 0, "KR must divide rank");
+static_assert(kKR % kRank == 0, "KR must divide pack rank");
+static_assert(kKR == R_RANK, "GEMM KR must equal pearl noise rank");
+static_assert(K_DIM % R_RANK == 0, "K must be a multiple of noise rank");
+static_assert(kNumMilestones == K_DIM / kKR, "milestones are one per KR panel");
 static_assert(kKgBytesA % kMicroPerMacroN == 0,
               "A panel bytes must divide evenly across column micro-tiles for LDS");
 static_assert(kPanelB % kMicroPerMacroM == 0,
