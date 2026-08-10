@@ -58,6 +58,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -
 
 Produces `cppminer.exe` in the repo root.
 
+## Build (*nix)
+```bash
+./build.sh --backend cpu,opencl,cuda
+```
+This scipt pulls third-party dependencies and execute cmake.
 ## Run
 
 ```powershell
@@ -139,26 +144,32 @@ CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C windo
 
 ## Performance
 
-Hashrate on matrix size `m=n=131072`, `k=4096`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
-
-### AMD GPU (OpenCL)
-
-| Device | Hashrate |
-|--------|----------|
-| Radeon pro 5500m  (gfx1012) | ~5.0 TH/s |
+Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
 
 ### NVIDIA GPU (CUDA)
 
 | Device | Hashrate |
 |--------|----------|
-| GTX 1070 | ~8.5 TH/s |
+| GTX 1070 | ~8.0 TH/s |
+
+### AMD GPU (OpenCL)
+
+| Device | Hashrate |
+|--------|----------|
+| Radeon Pro 5500M  (gfx1012) | ~5.0 TH/s |
+
+### Other GPU (OpenCL)
+| Device | Hashrate |
+|--------|----------|
+| UHD 630 | ~100GH/s |
 
 ### CPU
 
 | Device | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|----------| ---------------------------|
-| Core i9 9980hk @ 2.4GHz AVX2 | ~440 GH/s | ~300GH/s |
-| Core i5 12490F @ 4.0GHz AVX2 | ~640 GH/s | ~400GH/s |
+| Celeron G1840 @ 2.8GHz SSSE3 | ~35 GH/s |  |
+| Core i9 9980HK @ 2.4GHz AVX2 | ~430 GH/s | ~300 GH/s |
+| Core i5 12490F @ 4.0GHz AVX2 | ~630 GH/s | ~400 GH/s |
 
 
 ## Vendored proof stack (`third_party/`)

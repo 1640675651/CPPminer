@@ -2,10 +2,10 @@
 
 ## v0.2
 
-- Use rank=128 to avoid pearl rank penalty
-- SSE fallback for non-AVX CPU
-- CPU thread affinity to physical cores
-- Use 8x8 tile as default for the opencl worker, lowering register pressure for iGPUs. Use 8x16 tile if detects AMD GPU.
+- Use rank=128 to avoid pearl rank penalty. This adds a bit more overhead compared to rank=256, may hurt hashrate slightly.
+- SSE fallback for non-AVX CPU.
+- Add CPU thread affinity and prioritizing physical cores than SMT threads.
+- Use 8x8 tile as default for the opencl worker, lowering register pressure for integrated GPUs. Use 8x16 tile if detects AMD GPU.
 
 ## v0.1
 
