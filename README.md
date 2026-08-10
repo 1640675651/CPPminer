@@ -106,7 +106,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
 | `--period-batch N` | Batch size for scan launches (default 1024; see below) |
 | `--col-period-batch N` | Alias for `--period-batch` |
-| `--row-period-batch N` | CUDA only: row-period batch (default 1, max 1024) |
+| `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
@@ -137,7 +137,7 @@ Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLAS
 
 | Flag | Role | Default | Max |
 |------|------|---------|-----|
-| `--row-period-batch` | Row CTAs (or row periods) per launch | 1 | 1024 |
+| `--row-period-batch` | Row CTAs (or row periods) per launch | 32 | 1024 |
 | `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
 
 CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C window.
@@ -150,7 +150,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Hashrate |
 |--------|----------|
-| GTX 1070 | ~8.0 TH/s |
+| GTX 1070 | ~9.1 TH/s |
 
 ### AMD GPU (OpenCL)
 

@@ -32,7 +32,7 @@
 /* Job return codes (mine loop). */
 #define CP_PERIOD_BATCH_DEFAULT 1024
 #define CP_PERIOD_BATCH_MAX     1024 /* launch window; scan clips to n/PP_COL_PERIOD */
-#define CP_ROW_PERIOD_BATCH_DEFAULT 1
+#define CP_ROW_PERIOD_BATCH_DEFAULT 32
 #define CP_ROW_PERIOD_BATCH_MAX   1024 /* 131072 rows / 128 rows per period */
 
 /* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
