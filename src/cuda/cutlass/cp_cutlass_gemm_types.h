@@ -2,6 +2,7 @@
  * CTA 128x128, Warp 32x64; MMA lane 8x8 tiles; reuse Mma + wind_down. */
 #pragma once
 
+#include "cp_config.h"
 #include "cp_cutlass.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -16,7 +17,6 @@
 
 namespace cp_cutlass {
 
-constexpr int kMilestoneK = 256;
 constexpr int kCtaM = 128;
 constexpr int kCtaN = 128;
 
@@ -88,18 +88,18 @@ struct FusedMilestoneGemmOp {
                                                     ElementCompute(0)};
     auto layout_c = LayoutC::packed({M, N});
     auto layout_a = GemmTypesT::GemmKernel::kMilestoneMajorStorage
-                        ? LayoutA::packed({M, kMilestoneK})
+                        ? LayoutA::packed({M, R_RANK})
                         : LayoutA::packed({M, K});
     auto layout_b = GemmTypesT::GemmKernel::kMilestoneMajorStorage
-                        ? LayoutB::packed({kMilestoneK, N})
+                        ? LayoutB::packed({R_RANK, N})
                         : LayoutB::packed({K, N});
     int64_t batch_stride_a = 0;
     int64_t batch_stride_b = 0;
     if (GemmTypesT::GemmKernel::kMilestoneMajorStorage) {
       batch_stride_a =
-          static_cast<int64_t>(full_M) * static_cast<int64_t>(kMilestoneK);
+          static_cast<int64_t>(full_M) * static_cast<int64_t>(R_RANK);
       batch_stride_b =
-          static_cast<int64_t>(full_N) * static_cast<int64_t>(kMilestoneK);
+          static_cast<int64_t>(full_N) * static_cast<int64_t>(R_RANK);
     }
     const bool fuse_jackpot = jackpot != nullptr;
     typename GemmTypesT::GemmKernel::JackpotParams jp;
@@ -121,7 +121,7 @@ struct FusedMilestoneGemmOp {
         cutlass::TensorRef<ElementInput, LayoutB>(d_B, layout_b),
         cutlass::TensorRef<ElementOutput, LayoutC>(nullptr, layout_c),
         cutlass::TensorRef<ElementOutput, LayoutC>(nullptr, layout_c),
-        nullptr, d_tile_xor, batch_stride_a, batch_stride_b, kMilestoneK,
+        nullptr, d_tile_xor, batch_stride_a, batch_stride_b, R_RANK,
         typename GemmTypesT::EpilogueVisitor::Arguments(
             linear, tile_cols, static_cast<int>(tile_count), false, false),
         jp);
