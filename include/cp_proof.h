@@ -12,10 +12,12 @@ extern "C" {
  *   0 = BzMiner scattered (8 A rows + 16 B^T rows)
  *   1 = contiguous debug (8 + 16)
  *   2 = CUTLASS Case 9 MMA lane 8x8 interleaved (128x128 CTA, 64 cells/thread)
+ *   3 = contiguous 8x8 (8 A rows + 8 B^T rows)
  */
 #define CP_TILE_LAYOUT_SCATTERED  0
 #define CP_TILE_LAYOUT_CONTIGUOUS 1
 #define CP_TILE_LAYOUT_CUTLASS    2
+#define CP_TILE_LAYOUT_CONTIGUOUS_8x8 3
 
 /* Build plain_proof base64 in-process (Rust/pearl-blake3). Returns 0 on ok, -1 on error.
  * mining_config is retained for ABI compatibility but job_key is derived from tile_layout. */

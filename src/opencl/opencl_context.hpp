@@ -21,6 +21,7 @@ struct OclDeviceInfo {
     cl_device_type type = CL_DEVICE_TYPE_GPU;
     std::string platform_name;
     std::string device_name;
+    std::string vendor_name;
     bool discrete = false; /* GPU with CL_DEVICE_HOST_UNIFIED_MEMORY == false */
     bool integer_dot_product = false;
 };
@@ -34,6 +35,7 @@ struct OpenClContext {
 
     std::string device_name;
     std::string platform_name;
+    std::string vendor_name;
     int device_flat_index = -1;
     bool discrete_gpu = false;
     bool has_integer_dot_product = false;

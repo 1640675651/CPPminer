@@ -1,10 +1,11 @@
 # Changelog
 
-## v0.2(tentative)
+## v0.2
 
-- SSE fallback for non-AVX CPU (DONE)
-- CPU thread affinity to physical cores (TODO)
-- Use rank=128 to avoid pearl rank penalty (OpenCL + CPU done, KR=R; CUDA TODO)
+- Use rank=128 to avoid pearl rank penalty
+- SSE fallback for non-AVX CPU
+- CPU thread affinity to physical cores
+- Use 8x8 tile as default for the opencl worker, lowering register pressure for iGPUs. Use 8x16 tile if detects AMD GPU.
 
 ## v0.1
 

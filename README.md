@@ -93,6 +93,7 @@ Produces `cppminer.exe` in the repo root.
 | `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--ocl-platform` | OpenCL: restrict enumeration to platform index |
+| `--ocl-tile MxN` | OpenCL hash tile: `8x8` (default) or `8x16` (auto on AMD discrete GPUs) |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
@@ -114,6 +115,8 @@ Produces `cppminer.exe` in the repo root.
 Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
 
 **OpenCL — 1D macro slicing**
+
+Each macro block is 128×128. `--ocl-tile` sets the **hash tile** size (`8×8` default for iGPUs; `8×16` auto on AMD discrete GPUs). GEMM, jackpot XOR, hashrate counting, and proof building all use the same tile shape.
 
 Macros are a 2D grid (`macro_rows × macro_cols`, each 128×128), walked as a flat index `mb`. `--period-batch N` is how many **macro blocks** each kernel launch covers (`CP_MACRO_BATCH_*` in `include/cp_config.h`).
 
@@ -186,7 +189,7 @@ Set `CP_PROOF_FFI` to override the shared library path for Python verify.
 
 A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
 
-- `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL 8×16, CUDA periodic/CUTLASS may differ).
+- `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL use 8×16 or 8×8 per `--ocl-tile`; CUDA periodic/CUTLASS may differ).
 - User scans: `debt += tiles` (including cancelled partial scans).
 - When `debt >= 100*T`, reconnect and mine under the developer wallet.
 - Fee scans: `debt -= 100 * tiles`; leave fee mode when `debt < 100*T`.

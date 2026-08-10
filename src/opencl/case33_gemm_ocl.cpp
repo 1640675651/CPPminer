@@ -308,7 +308,7 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
                   case32::kKR, dot_kind);
     available_ = true;
@@ -363,7 +363,7 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, %dx%d KR=%d %s s8s8 GPU-prep",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
                   case32::kKR, dot_kind);
     available_ = true;
@@ -517,7 +517,7 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
         if (!ocl_.read_buffer(found_buf_, &found, sizeof(int))) {
             return false;
         }
-        tiles_scanned += static_cast<uint64_t>(batch_count) * case32::kMacroWorkItems;
+        tiles_scanned += static_cast<uint64_t>(batch_count) * case32::hash_tiles_per_macro();
         if (out_tiles_scanned) {
             *out_tiles_scanned = tiles_scanned;
         }

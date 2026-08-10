@@ -1,6 +1,7 @@
 #include "cp_cpu_worker.h"
 
 #include "cp_config.h"
+#include "cp_cpu_affinity.h"
 #include "cp_jackpot.hpp"
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
@@ -247,6 +248,9 @@ extern "C" void cp_cpu_worker_init(void)
     apply_prepack_mode_to_gemm();
     apply_simd_to_gemm();
     g_gemm.resolve_runtime_isa();
+    if(cp_cpu_affinity_init() == 0)
+        cp_cpu_affinity_bind_openmp_pool();
+    printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
     printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
     printf("[cpu] SIMD ISA: %s\n", simd_isa_label(g_gemm.isa_used(), g_gemm.sse_tile()));
     if(g_prepack_mode != CP_PREPACK_SEPARATE)

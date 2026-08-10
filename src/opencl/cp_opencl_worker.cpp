@@ -7,6 +7,7 @@
 #include "cp_util.h"
 #include "case33_gemm_ocl.hpp"
 #include "case32_layout.hpp"
+#include "opencl_context.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -34,6 +35,46 @@ static int g_device_index = 0;
 static int g_platform_filter = -1;
 static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
+static int g_tile_mr = 0;
+static int g_tile_nr = 0;
+static int g_hash_tile_w = 8;
+
+namespace {
+
+bool string_contains_ci(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !needle[0]) {
+        return false;
+    }
+    for (const char *p = haystack; *p; ++p) {
+        const char *h = p;
+        const char *n = needle;
+        while (*h && *n &&
+               (static_cast<unsigned char>(*h) == static_cast<unsigned char>(*n) ||
+                static_cast<unsigned char>(*h) + 32u == static_cast<unsigned char>(*n) ||
+                static_cast<unsigned char>(*h) == static_cast<unsigned char>(*n) + 32u)) {
+            ++h;
+            ++n;
+        }
+        if (!*n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ocl_device_is_amd(const OclDeviceInfo &dev) {
+    if (string_contains_ci(dev.vendor_name.c_str(), "advanced micro devices") ||
+        string_contains_ci(dev.vendor_name.c_str(), "amd")) {
+        return true;
+    }
+    if (string_contains_ci(dev.platform_name.c_str(), "amd")) {
+        return true;
+    }
+    return string_contains_ci(dev.device_name.c_str(), "radeon") ||
+           string_contains_ci(dev.device_name.c_str(), "gfx");
+}
+
+} /* namespace */
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n, int cpu_prep) {
     return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
@@ -178,6 +219,64 @@ extern "C" void cp_opencl_worker_set_platform(int platform_index) {
     g_platform_filter = platform_index;
 }
 
+extern "C" void cp_opencl_worker_set_tile(int mr, int nr) {
+    if (mr <= 0 || nr <= 0) {
+        g_tile_mr = 0;
+        g_tile_nr = 0;
+        return;
+    }
+    g_tile_mr = mr;
+    g_tile_nr = nr;
+}
+
+extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
+    int tile_mr = PP_HASH_H;
+    int tile_nr = 8;
+    const char *source = "default 8x8";
+
+    if (g_tile_mr > 0 && g_tile_nr > 0) {
+        if (g_tile_mr != PP_HASH_H || (g_tile_nr != 8 && g_tile_nr != 16)) {
+            fprintf(stderr, "[ocl] --ocl-tile must be 8x8 or 8x16 (got %dx%d)\n", g_tile_mr,
+                    g_tile_nr);
+            tile_mr = PP_HASH_H;
+            tile_nr = 8;
+            source = "invalid CLI, using 8x8";
+        } else {
+            tile_mr = g_tile_mr;
+            tile_nr = g_tile_nr;
+            source = "CLI override";
+        }
+    } else {
+        const std::vector<OclDeviceInfo> devices =
+                OpenClContext::enumerate_devices(platform_filter);
+        if (device_index >= 0 && device_index < static_cast<int>(devices.size())) {
+            const OclDeviceInfo &dev = devices[static_cast<size_t>(device_index)];
+            if (ocl_device_is_amd(dev)) {
+                tile_nr = 16;
+                source = "AMD GPU auto 8x16";
+            }
+        }
+    }
+
+    if (!case32::configure(tile_mr, tile_nr)) {
+        fprintf(stderr, "[ocl] hash tile configure failed\n");
+        return;
+    }
+
+    g_hash_tile_w = tile_nr;
+    cp_pp_set_hash_tile(tile_mr, tile_nr);
+    pearl_set_contiguous_tile_width(tile_nr);
+
+    printf("[ocl] OpenCL hash tile: %dx%d (%s)\n", case32::kMR, case32::kNR, source);
+    fflush(stdout);
+}
+
+extern "C" int cp_opencl_hash_tile_w(void) { return g_hash_tile_w; }
+
+extern "C" void cp_opencl_configure_tile_for_worker(int device_index) {
+    cp_opencl_configure_tile(device_index, g_platform_filter);
+}
+
 extern "C" int cp_opencl_worker_list_devices(void) {
     return OpenClContext::list_devices(g_platform_filter);
 }
@@ -196,6 +295,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
 
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
+    cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter)) {
         fprintf(stderr, "[ocl] OpenCL init failed (kernel=%s)\n", kernel_path.c_str());
         g_context_ready = 0;
@@ -208,8 +308,8 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] platform: %s\n", g_gemm.platform_name());
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
-    printf("[ocl] macro batch: %d blocks (%d tiles/launch)\n", g_gemm.macro_batch(),
-           g_gemm.macro_batch() * case32::kMacroWorkItems);
+    printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
+           g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     printf("[ocl] zero-B GPU prep (default); --cpu-gen for host prep (~1 GiB VRAM)\n");
     fflush(stdout);
 }
@@ -302,8 +402,8 @@ extern "C" int cp_opencl_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
-    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n", row_parts,
-           col_parts, PP_HASH_H * PP_HASH_W * K_DIM);
+    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %.0f\n", row_parts,
+           col_parts, cp_pp_macs_per_hash_tile());
     printf("[ocl] GEMM %s\n", g_gemm.backend());
     fflush(stdout);
 

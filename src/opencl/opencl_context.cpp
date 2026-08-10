@@ -62,7 +62,9 @@ void append_devices_of_type(cl_platform_id plat, int platform_index, const char 
     for (cl_uint di = 0; di < n_devices; ++di) {
         cl_device_id dev = devices[di];
         char dname[256] = {};
+        char vname[256] = {};
         clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(dname), dname, nullptr);
+        clGetDeviceInfo(dev, CL_DEVICE_VENDOR, sizeof(vname), vname, nullptr);
         OclDeviceInfo info;
         info.platform_index = platform_index;
         info.device_index = static_cast<int>(di);
@@ -71,6 +73,7 @@ void append_devices_of_type(cl_platform_id plat, int platform_index, const char 
         info.type = type;
         info.platform_name = pname;
         info.device_name = dname;
+        info.vendor_name = vname;
         info.discrete = device_is_discrete_gpu(dev, type);
         info.integer_dot_product = extension_enabled(dev, "cl_khr_integer_dot_product");
         out->push_back(info);
@@ -219,6 +222,7 @@ bool OpenClContext::init(int device_index, int platform_filter) {
     device = pick.device;
     platform_name = pick.platform_name;
     device_name = pick.device_name;
+    vendor_name = pick.vendor_name;
     device_flat_index = pick.flat_index;
     discrete_gpu = pick.discrete;
     has_integer_dot_product = pick.integer_dot_product;

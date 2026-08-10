@@ -136,6 +136,25 @@ extern "C" void cp_worker_set_ocl_platform(int platform_index)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_tile(int mr, int nr)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_tile(mr, nr);
+#else
+    (void)mr;
+    (void)nr;
+#endif
+}
+
+extern "C" void cp_worker_configure_ocl_tile(int device_index)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_configure_tile_for_worker(device_index);
+#else
+    (void)device_index;
+#endif
+}
+
 extern "C" int cp_worker_list_devices(void)
 {
     if(g_backend == CP_BACKEND_NONE)
@@ -176,8 +195,9 @@ extern "C" void cp_worker_shutdown(void)
 
 extern "C" void cp_worker_apply_backend_defaults(void)
 {
+    const int layout = cp_worker_default_tile_layout();
     const int contiguous =
-        (cp_worker_default_tile_layout() == CP_TILE_LAYOUT_CONTIGUOUS);
+        (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8);
     pearl_set_contiguous_tiles(contiguous);
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
@@ -190,7 +210,8 @@ extern "C" void cp_worker_apply_backend_defaults(void)
 
 extern "C" int cp_worker_uses_contiguous_tiles(void)
 {
-    return cp_worker_default_tile_layout() == CP_TILE_LAYOUT_CONTIGUOUS;
+    const int layout = cp_worker_default_tile_layout();
+    return layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8;
 }
 
 extern "C" void cp_worker_set_period_gemm(int on)
@@ -316,9 +337,15 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n)
 
 extern "C" int cp_worker_default_tile_layout(void)
 {
-    if(cp_worker_backend_id() == CP_BACKEND_CPU ||
-       cp_worker_backend_id() == CP_BACKEND_OPENCL)
+    if(cp_worker_backend_id() == CP_BACKEND_CPU)
         return CP_TILE_LAYOUT_CONTIGUOUS;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL) {
+        if(cp_opencl_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+        return CP_TILE_LAYOUT_CONTIGUOUS;
+    }
+#endif
     return CP_TILE_LAYOUT_SCATTERED;
 }
 

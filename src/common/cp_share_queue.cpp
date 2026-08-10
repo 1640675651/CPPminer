@@ -223,6 +223,8 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     const uint8_t *mining_cfg = PEARL_SCATTERED_CONFIG;
     if (tile_layout == CP_TILE_LAYOUT_CUTLASS) {
         mining_cfg = PEARL_CUTLASS_CONFIG;
+    } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) {
+        mining_cfg = PEARL_CONTIGUOUS_8x8_CONFIG;
     } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) {
         mining_cfg = PEARL_CONTIGUOUS_CONFIG;
     }

@@ -279,6 +279,14 @@ double cp_json_num(const char* json, const char* key)
     return atof(p);
 }
 
+static int g_pp_hash_w_override = 0;
+
+void cp_pp_set_hash_tile(int h, int w)
+{
+    (void)h;
+    g_pp_hash_w_override = (w == 8 || w == 16) ? w : 0;
+}
+
 static int cp_active_hash_h(void)
 {
     return g_cutlass_fused ? CP_CUTLASS_HASH_H : PP_HASH_H;
@@ -286,7 +294,9 @@ static int cp_active_hash_h(void)
 
 static int cp_active_hash_w(void)
 {
-    return g_cutlass_fused ? CP_CUTLASS_HASH_W : PP_HASH_W;
+    if(g_cutlass_fused) return CP_CUTLASS_HASH_W;
+    if(g_pp_hash_w_override > 0) return g_pp_hash_w_override;
+    return PP_HASH_W;
 }
 
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
@@ -400,7 +410,7 @@ int cp_pp_num_row_parts(int m, int contiguous)
 int cp_pp_num_col_parts(int n, int contiguous)
 {
     if(g_cutlass_fused) return n / CP_CUTLASS_HASH_W;
-    if(contiguous) return n / PP_HASH_W;
+    if(contiguous) return n / cp_active_hash_w();
     return (n / 256) * 16;
 }
 
@@ -414,7 +424,7 @@ int cp_pp_num_row_periods(int m, int contiguous)
 int cp_pp_num_col_periods(int n, int contiguous)
 {
     if(g_cutlass_fused) return n / CP_CUTLASS_CTA_N;
-    if(contiguous) return n / PP_HASH_W;
+    if(contiguous) return n / cp_active_hash_w();
     return n / 256;
 }
 

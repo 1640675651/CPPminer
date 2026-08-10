@@ -4,6 +4,7 @@
 #include "case33_ocl_prep.hpp"
 #include "cp_config.h"
 #include "cp_noise.h"
+#include "cp_opencl_worker.h"
 #include "cp_util.h"
 #include "opencl_context.hpp"
 #include "blake3.h"
@@ -197,6 +198,8 @@ extern "C" int cp_opencl_run_prep_profile(int device_index, int m, int n, int wa
     if (warmup < 0) {
         warmup = 0;
     }
+
+    cp_opencl_configure_tile_for_worker(device_index);
 
     const int blocks_k = K_DIM / case32::kKR;
     const int macro_rows = m / case32::kMacroM;

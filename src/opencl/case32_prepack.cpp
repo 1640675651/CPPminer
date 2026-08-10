@@ -1,6 +1,7 @@
 #include "case32_prepack.hpp"
 
 #include <cstring>
+#include <vector>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -128,12 +129,13 @@ void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *ti
         }
         for (int tr = 0; tr < tile_rows; ++tr) {
             for (int tc = 0; tc < tile_cols; ++tc) {
-                int32_t tile_c[kMR * kNR] = {};
+                std::vector<int32_t> tile_c(static_cast<size_t>(kMR * kNR), 0);
                 const int row0 = tr * kMR;
                 const int col0 = tc * kNR;
                 for (int j = 0; j < kNR; ++j) {
                     for (int i = 0; i < kMR; ++i) {
-                        tile_c[j * kMR + i] =
+                        tile_c[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                               static_cast<size_t>(i)] =
                                 partial[static_cast<size_t>(row0 + i) * N + (col0 + j)];
                     }
                 }
@@ -141,7 +143,7 @@ void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *ti
                         static_cast<size_t>(tr) * static_cast<size_t>(tile_cols) +
                         static_cast<size_t>(tc);
                 tile_xor[static_cast<size_t>(ms) * tile_count + spatial_id] =
-                        xor_tile_host(tile_c, tile_elems);
+                        xor_tile_host(tile_c.data(), tile_elems);
             }
         }
     }
@@ -187,9 +189,9 @@ void prepack_a_coalesced(const int8_t *a, int M, int K, int blocks_k, int macro_
                                     static_cast<size_t>(kMacroKbBlockA) +
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripA) +
                             static_cast<size_t>(tr) * static_cast<size_t>(kKgBytesA);
-                    int8_t tmp[kPanelA];
-                    pack_a_panel(a, tr_global * kMR, kb * kKR, K, tmp, offset_a128);
-                    std::memcpy(out->data() + dst, tmp + kg * kKgBytesA, kKgBytesA);
+                    std::vector<int8_t> tmp(static_cast<size_t>(kPanelA));
+                    pack_a_panel(a, tr_global * kMR, kb * kKR, K, tmp.data(), offset_a128);
+                    std::memcpy(out->data() + dst, tmp.data() + kg * kKgBytesA, kKgBytesA);
                 }
             }
         }
@@ -217,11 +219,11 @@ void prepack_b_coalesced(const int8_t *b, int N, int K, int blocks_k, int macro_
                                     static_cast<size_t>(kMacroKbBlockB) +
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripB) +
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
-                    int8_t tmp[kPanelB];
-                    pack_b_panel(b, tc_global * kNR, kb * kKR, K, tmp);
+                    std::vector<int8_t> tmp(static_cast<size_t>(kPanelB));
+                    pack_b_panel(b, tc_global * kNR, kb * kKR, K, tmp.data());
                     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
                         std::memcpy(out->data() + dst + static_cast<size_t>(jg) * 32,
-                                    tmp + (jg * kKGroups + kg) * 32, 32);
+                                    tmp.data() + (jg * kKGroups + kg) * 32, 32);
                     }
                 }
             }
@@ -259,7 +261,7 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
             const int8_t *b_base =
                     b_pre + static_cast<size_t>(tc_global) * b_tile_stride;
 
-            int32_t acc[kNR * kMR] = {};
+            std::vector<int32_t> acc(static_cast<size_t>(kNR * kMR), 0);
             for (int kb = 0; kb < blocks_k; ++kb) {
                 const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
                 const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
@@ -275,7 +277,8 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
                             for (int i = 0; i < kMR; ++i) {
                                 for (int ko = 0; ko < kRank; ++ko) {
-                                    acc[j * kMR + i] +=
+                                    acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                        static_cast<size_t>(i)] +=
                                             static_cast<int32_t>(a_kg[i * kRank + ko]) *
                                             static_cast<int32_t>(bp[ko]);
                                 }
@@ -288,13 +291,16 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
                 for (int j = 0; j < kNR; ++j) {
                     const int32_t comp = b_comp[micro_col0 + j];
                     for (int i = 0; i < kMR; ++i) {
-                        acc[j * kMR + i] += comp;
+                        acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                            static_cast<size_t>(i)] += comp;
                     }
                 }
             }
             for (int j = 0; j < kNR; ++j) {
                 for (int i = 0; i < kMR; ++i) {
-                    c[(micro_row0 + i) * N + (micro_col0 + j)] = acc[j * kMR + i];
+                    c[(micro_row0 + i) * N + (micro_col0 + j)] =
+                            acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                static_cast<size_t>(i)];
                 }
             }
         }
@@ -323,7 +329,7 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
             const int micro_row0 = row0 + tr * kMR;
             const int micro_col0 = col0 + tc * kNR;
 
-            int32_t acc[kNR * kMR] = {};
+            std::vector<int32_t> acc(static_cast<size_t>(kNR * kMR), 0);
             for (int kb = 0; kb < blocks_k; ++kb) {
                 const size_t a_kb_base =
                         (static_cast<size_t>(im) * static_cast<size_t>(blocks_k) +
@@ -349,7 +355,8 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
                             for (int i = 0; i < kMR; ++i) {
                                 for (int ko = 0; ko < kRank; ++ko) {
-                                    acc[j * kMR + i] +=
+                                    acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                        static_cast<size_t>(i)] +=
                                             static_cast<int32_t>(a_kg[i * kRank + ko]) *
                                             static_cast<int32_t>(bp[ko]);
                                 }
@@ -362,13 +369,16 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
                 for (int j = 0; j < kNR; ++j) {
                     const int32_t comp = b_comp[micro_col0 + j];
                     for (int i = 0; i < kMR; ++i) {
-                        acc[j * kMR + i] += comp;
+                        acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                            static_cast<size_t>(i)] += comp;
                     }
                 }
             }
             for (int j = 0; j < kNR; ++j) {
                 for (int i = 0; i < kMR; ++i) {
-                    c[(micro_row0 + i) * N + (micro_col0 + j)] = acc[j * kMR + i];
+                    c[(micro_row0 + i) * N + (micro_col0 + j)] =
+                            acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                static_cast<size_t>(i)];
                 }
             }
         }
@@ -405,8 +415,8 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                     static_cast<size_t>(tr_global) * static_cast<size_t>(tile_cols) +
                     static_cast<size_t>(tc_global);
 
-            int32_t tile_c[kNR * kMR] = {};
-            int32_t panel_acc[kNR * kMR] = {};
+            std::vector<int32_t> tile_c(static_cast<size_t>(kNR * kMR), 0);
+            std::vector<int32_t> panel_acc(static_cast<size_t>(kNR * kMR), 0);
             int ms = 0;
 
             for (int kb = 0; kb < blocks_k; ++kb) {
@@ -434,7 +444,8 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
                             for (int i = 0; i < kMR; ++i) {
                                 for (int ko = 0; ko < kRank; ++ko) {
-                                    panel_acc[j * kMR + i] +=
+                                    panel_acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                              static_cast<size_t>(i)] +=
                                             static_cast<int32_t>(a_kg[i * kRank + ko]) *
                                             static_cast<int32_t>(bp[ko]);
                                 }
@@ -449,19 +460,25 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                                 b_comp_ms[static_cast<size_t>(ms) * static_cast<size_t>(N) +
                                           static_cast<size_t>(micro_col0 + j)];
                         for (int i = 0; i < kMR; ++i) {
-                            tile_c[j * kMR + i] += panel_acc[j * kMR + i] + comp;
+                            tile_c[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                   static_cast<size_t>(i)] +=
+                                    panel_acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                              static_cast<size_t>(i)] + comp;
                         }
                     }
                 } else {
                     for (int j = 0; j < kNR; ++j) {
                         for (int i = 0; i < kMR; ++i) {
-                            tile_c[j * kMR + i] += panel_acc[j * kMR + i];
+                            tile_c[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                   static_cast<size_t>(i)] +=
+                                    panel_acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                              static_cast<size_t>(i)];
                         }
                     }
                 }
                 tile_xor[static_cast<size_t>(ms) * tile_count + spatial_id] =
-                        xor_tile_host(tile_c, kNR * kMR);
-                std::memset(panel_acc, 0, sizeof(panel_acc));
+                        xor_tile_host(tile_c.data(), kNR * kMR);
+                std::fill(panel_acc.begin(), panel_acc.end(), 0);
                 ++ms;
             }
             (void)blocks_per_milestone;

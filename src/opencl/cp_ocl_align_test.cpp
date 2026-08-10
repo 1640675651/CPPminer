@@ -5,6 +5,7 @@
 #include "case33_ocl_prep.hpp"
 #include "cp_config.h"
 #include "cp_noise.h"
+#include "cp_opencl_worker.h"
 #include "cp_util.h"
 #include "opencl_context.hpp"
 
@@ -74,6 +75,8 @@ int compare_prepack_samples(const char *label, const int8_t *gpu, const int8_t *
 } /* namespace */
 
 extern "C" int cp_opencl_run_alignment_tests(int device_index, int m, int n) {
+    cp_opencl_configure_tile_for_worker(device_index);
+
     const size_t szAp = static_cast<size_t>(m) * static_cast<size_t>(K_DIM);
     const size_t szBpT = static_cast<size_t>(n) * static_cast<size_t>(K_DIM);
     const size_t pad_a = (szAp + 1023) / 1024 * 1024;

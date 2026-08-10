@@ -26,6 +26,7 @@ enum TileLayout {
     Scattered = 0,
     Contiguous = 1,
     Cutlass = 2,
+    Contiguous8x8 = 3,
 }
 
 impl TileLayout {
@@ -34,7 +35,8 @@ impl TileLayout {
             0 => Ok(Self::Scattered),
             1 => Ok(Self::Contiguous),
             2 => Ok(Self::Cutlass),
-            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, or 2)")),
+            3 => Ok(Self::Contiguous8x8),
+            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, or 3)")),
         }
     }
 }
@@ -76,6 +78,10 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
         TileLayout::Contiguous => (
             &[0, 1, 2, 3, 4, 5, 6, 7],
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        ),
+        TileLayout::Contiguous8x8 => (
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
         ),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
     }
@@ -176,7 +182,8 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 
 /// Build plain_proof base64. Returns 0 on success, -1 on error.
 ///
-/// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8.
+/// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8,
+/// 3 = contiguous 8x8.
 /// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_build(

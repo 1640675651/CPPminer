@@ -1,4 +1,4 @@
-// Case 3.3: Case 3.2 int8 GEMM + milestoned 8x16 tile XOR + optional fused device jackpot.
+// Case 3.3: Case 3.2 int8 GEMM + milestoned MR×NR tile XOR + optional fused device jackpot.
 //
 // fuse_jackpot=1 (mining): milestone XORs stay in private memory; BLAKE3 + target compare
 // on-device. Host readback is only found_flag (+ t_rows/t_cols on hit).
@@ -263,7 +263,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             }
         }
 #endif
-        /* One milestone per KR panel (KR == R_RANK). */
+        /* One milestone per KR panel (KR == R_RANK). Cumulative acc across kb. */
         {
             uint x = 0u;
             for (int i = 0; i < NR * MR; ++i) {

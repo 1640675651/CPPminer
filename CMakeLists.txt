@@ -67,6 +67,7 @@ set(CP_SOURCES ${CP_COMMON_SOURCES}
 if(CP_ENABLE_CPU)
     list(APPEND CP_SOURCES
         src/cpu/cp_cpu_worker.cpp
+        src/cpu/cp_cpu_affinity.cpp
         src/cpu/gemm/case33_gemm_xor.cpp
         src/cpu/gemm/case33_gemm_xor_avx2.cpp
     )
@@ -139,6 +140,7 @@ if(CP_ENABLE_OPENCL)
         src/opencl/cp_ocl_align_test.cpp
         src/opencl/cp_ocl_prep_profile.cpp
         src/opencl/case32_prepack.cpp
+        src/opencl/case32_layout.cpp
         src/opencl/opencl_context.cpp
     )
     add_compile_definitions(CP_ENABLE_OPENCL=1)
