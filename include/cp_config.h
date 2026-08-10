@@ -12,7 +12,7 @@
 #define PP_ROW_PERIOD 128
 #define PP_COL_PERIOD 256
 
-/* CUTLASS Case 9 CTA / hash tile (MMA lane 8x8 within 128x128). */
+/* CUTLASS Case 10 CTA / hash tile (MMA lane 8x8 within 128x128). */
 #define CP_CUTLASS_CTA_M 128
 #define CP_CUTLASS_CTA_N 128
 #define CP_CUTLASS_HASH_H 8

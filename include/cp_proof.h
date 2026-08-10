@@ -11,7 +11,7 @@ extern "C" {
 /* tile_layout for cp_proof_build:
  *   0 = BzMiner scattered (8 A rows + 16 B^T rows)
  *   1 = contiguous debug (8 + 16)
- *   2 = CUTLASS Case 9 MMA lane 8x8 interleaved (128x128 CTA, 64 cells/thread)
+ *   2 = CUTLASS Case 10 MMA lane 8x8 interleaved (128x128 CTA, 64 cells/thread)
  *   3 = contiguous 8x8 (8 A rows + 8 B^T rows)
  */
 #define CP_TILE_LAYOUT_SCATTERED  0

@@ -430,8 +430,8 @@ int main(int argc, char** argv)
     } else {
         cutlass_fused = 0;
     }
-    /* Case 9 assumes contiguous K (row-major Ap/BpT). Step-major is the old
-     * cuBLAS period / Case 7.2 packing. */
+    /* Case 10 (CUTLASS default) needs contiguous K (row-major Ap/BpT).
+     * Step-major falls back to Case 9 wind_down; cuBLAS period / Case 7.2 packing. */
     if(step_major_ap < 0)
         step_major_ap = cutlass_fused ? 0 : 1;
 
@@ -645,7 +645,7 @@ int main(int argc, char** argv)
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
-            printf("[mode] scan: CUTLASS fused GEMM + in-register XOR jackpot\n");
+            printf("[mode] scan: CUTLASS Case 10 fused GEMM + inline XOR jackpot\n");
         } else {
             printf("[mode] scan: %s\n",
                    (contiguous || no_period_gemm) ? "per-tile kernel"

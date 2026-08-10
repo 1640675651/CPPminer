@@ -81,7 +81,7 @@ static int g_contiguous = 0;
 static int g_period_gemm = 1;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
-static int g_step_major_ap = 0; /* Case 9 default; main sets 1 for cuBLAS period */
+static int g_step_major_ap = 0; /* Case 10 default; main sets 1 for cuBLAS period */
 static int g_cutlass_fused = 0;
 
 static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)

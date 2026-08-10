@@ -1,5 +1,7 @@
-/* CUTLASS fused int8 GEMM + in-register milestone XOR (Case 9 style).
- * CTA 128x128, Warp 32x64; MMA lane 8x8 tiles; reuse Mma + wind_down. */
+/* CUTLASS fused int8 GEMM + in-register milestone XOR.
+ * Case 10 (default / row-major): continuous in-order K pipeline, XOR every
+ *   R_RANK/32 K-tiles (skip residue-first). No per-milestone wind_down.
+ * Case 9 (step-major panels): reuse Mma + wind_down per milestone. */
 #pragma once
 
 #include "cp_config.h"
@@ -13,12 +15,18 @@
 
 #include "epilogue_visitor_store_c.h"
 #include "epilogue_with_visitor_visit_batch.h"
+#include "gemm_inline_xor_kernel.h"
 #include "gemm_with_milestone_mainloop.h"
+#include "mma_milestone.h"
 
 namespace cp_cutlass {
 
 constexpr int kCtaM = 128;
 constexpr int kCtaN = 128;
+constexpr int kCtaK = 32;
+
+static_assert(R_RANK % kCtaK == 0, "R_RANK must be a multiple of CTA K-tile");
+constexpr int kItersPerMs = R_RANK / kCtaK; /* 128/32 = 4 */
 
 using ElementInput = int8_t;
 using ElementOutput = int32_t;
@@ -29,9 +37,8 @@ using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
 
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
-          typename WarpShape, typename InstructionShape, int Stages,
-          bool PersistentAccumAcrossMilestones, bool UseMilestoneMajorStorage>
-struct GemmTypesCase9 {
+          typename WarpShape, typename InstructionShape, int Stages>
+struct GemmTypesCommon {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, 1, ElementAccumulator, ElementCompute>;
   using ThreadblockSwizzle =
@@ -54,13 +61,43 @@ struct GemmTypesCase9 {
   using Epilogue = typename cutlass::epilogue::threadblock::
       EpilogueWithVisitorFromExistingEpilogueSelect<
           EpilogueVisitor, typename DefaultGemmKernel::Epilogue, 1>::Epilogue;
+};
 
-  /* Case 9: persistent accum, milestone-major optional, inline XOR, reuse Mma. */
+/* Case 10: continuous pipeline, contiguous K (row-major Ap/BpT). */
+template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
+          typename WarpShape, typename InstructionShape, int Stages>
+struct GemmTypesCase10
+    : GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
+                      InstructionShape, Stages> {
+  using Base = GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
+                               InstructionShape, Stages>;
+  using MmaPipelined = typename Base::DefaultGemmKernel::Mma;
+  using Mma =
+      cutlass::gemm::threadblock::MmaMilestone<MmaPipelined, kItersPerMs>;
+  using GemmKernel = cutlass::gemm::kernel::InlineXorKernel<
+      Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle>;
+};
+
+/* Case 9: wind_down per milestone — required for step-major (non-contiguous K). */
+template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
+          typename WarpShape, typename InstructionShape, int Stages,
+          bool PersistentAccumAcrossMilestones, bool UseMilestoneMajorStorage>
+struct GemmTypesCase9
+    : GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
+                      InstructionShape, Stages> {
+  using Base = GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
+                               InstructionShape, Stages>;
   using GemmKernel = cutlass::gemm::kernel::GemmWithMilestoneMainloop<
-      typename DefaultGemmKernel::Mma, Epilogue, ThreadblockSwizzle,
-      PersistentAccumAcrossMilestones, UseMilestoneMajorStorage,
+      typename Base::DefaultGemmKernel::Mma, typename Base::Epilogue,
+      typename Base::ThreadblockSwizzle, PersistentAccumAcrossMilestones,
+      UseMilestoneMajorStorage,
       /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
+
+using Gemm128x128RowMajor = GemmTypesCase10<
+    cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2>;
 
 using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
@@ -68,42 +105,35 @@ using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
     true, true>;
 
-using Gemm128x128RowMajor = GemmTypesCase9<
-    cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
-    cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
-    true, false>;
-
 template <typename GemmTypesT>
 struct FusedMilestoneGemmOp {
   typename GemmTypesT::GemmKernel::Params params;
 
   cutlass::Status initialize(int M, int N, int K, int full_M, int full_N,
-                               ElementInput *d_A, ElementInput *d_B,
-                               uint32_t *d_tile_xor, int tile_cols,
-                               size_t tile_count,
-                               const CpCutlassJackpotLaunch *jackpot) {
+                             ElementInput *d_A, ElementInput *d_B,
+                             uint32_t *d_tile_xor, int tile_cols,
+                             size_t tile_count,
+                             const CpCutlassJackpotLaunch *jackpot) {
     cutlass::gemm::GemmCoord problem_size(M, N, K);
     typename GemmTypesT::EpilogueOpT::Params linear{ElementCompute(1),
                                                     ElementCompute(0)};
     auto layout_c = LayoutC::packed({M, N});
-    auto layout_a = GemmTypesT::GemmKernel::kMilestoneMajorStorage
-                        ? LayoutA::packed({M, R_RANK})
-                        : LayoutA::packed({M, K});
-    auto layout_b = GemmTypesT::GemmKernel::kMilestoneMajorStorage
-                        ? LayoutB::packed({R_RANK, N})
-                        : LayoutB::packed({K, N});
+    constexpr bool kMsMajor =
+        GemmTypesT::GemmKernel::kMilestoneMajorStorage;
+    auto layout_a = kMsMajor ? LayoutA::packed({M, R_RANK})
+                             : LayoutA::packed({M, K});
+    auto layout_b = kMsMajor ? LayoutB::packed({R_RANK, N})
+                             : LayoutB::packed({K, N});
     int64_t batch_stride_a = 0;
     int64_t batch_stride_b = 0;
-    if (GemmTypesT::GemmKernel::kMilestoneMajorStorage) {
+    if (kMsMajor) {
       batch_stride_a =
           static_cast<int64_t>(full_M) * static_cast<int64_t>(R_RANK);
       batch_stride_b =
           static_cast<int64_t>(full_N) * static_cast<int64_t>(R_RANK);
     }
-    const bool fuse_jackpot = jackpot != nullptr;
     typename GemmTypesT::GemmKernel::JackpotParams jp;
-    if (fuse_jackpot) {
+    if (jackpot != nullptr) {
       jp.enabled = true;
       jp.ptr_a_key8 = jackpot->d_a_key8;
       jp.ptr_found = jackpot->d_found;
@@ -114,7 +144,6 @@ struct FusedMilestoneGemmOp {
       for (int i = 0; i < 8; ++i)
         jp.bound[i] = jackpot->bound[i];
     }
-    (void)fuse_jackpot;
     typename GemmTypesT::GemmKernel::Arguments args(
         cutlass::gemm::GemmUniversalMode::kGemm, problem_size, 1,
         cutlass::TensorRef<ElementInput, LayoutA>(d_A, layout_a),
@@ -146,4 +175,4 @@ struct FusedMilestoneGemmOp {
   }
 };
 
-}  // namespace cp_cutlass
+} // namespace cp_cutlass
