@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.1 (tentative)
+## v0.2.1
 - Refactor CUTLASS GEMM main loop to reduce XOR overhead. This buys back the lost performance in the last version due to more frequent XOR boundary. 8.0TH -> 9.1TH on a GTX 1070.
 
 ## v0.2

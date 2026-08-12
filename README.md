@@ -150,24 +150,24 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Hashrate |
 |--------|----------|
-| GTX 1070 | ~9.1 TH/s |
+| GTX 1070 DP4A | ~9.1 TH/s |
 
 ### AMD GPU (OpenCL)
 
 | Device | Hashrate |
 |--------|----------|
-| Radeon Pro 5500M  (gfx1012) | ~5.0 TH/s |
+| Radeon Pro 5500M DP4A | ~5.0 TH/s |
 
 ### Other GPU (OpenCL)
 | Device | Hashrate |
 |--------|----------|
-| UHD 630 | ~100GH/s |
+| Intel UHD 630 scalar | ~100GH/s |
 
 ### CPU
 
 | Device | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|----------| ---------------------------|
-| Celeron G1840 @ 2.8GHz SSSE3 | ~35 GH/s |  |
+| Celeron G1840 @ 2.8GHz SSSE3 | ~35 GH/s | ~4 GH/s |
 | Core i9 9980HK @ 2.4GHz AVX2 | ~430 GH/s | ~300 GH/s |
 | Core i5 12490F @ 4.0GHz AVX2 | ~630 GH/s | ~400 GH/s |
 
