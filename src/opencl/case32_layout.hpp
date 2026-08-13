@@ -2,6 +2,7 @@
 
 // Case 3.2 blocking constants (shared by host prepack and OpenCL kernels).
 // Hash/register tile is 8x8 or 8x16 (selected via --ocl-tile / AMD auto-detect).
+// Fused GEMM private memory: see docs/memory.md (Beignet 8×8 ≈384 B/WI, 8×16 ≈1152 B/WI).
 
 #include "cp_config.h"
 

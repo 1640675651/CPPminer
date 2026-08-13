@@ -1,8 +1,18 @@
 // Case 3.3: Case 3.2 int8 GEMM + milestoned MR×NR tile XOR + optional fused device jackpot.
 //
-// fuse_jackpot=1 (mining): milestone XORs stay in private memory; BLAKE3 + target compare
-// on-device. Host readback is only found_flag (+ t_rows/t_cols on hit).
+// fuse_jackpot=1 (mining): milestone XORs fold online into private msg[16]; BLAKE3 + target
+// compare on-device. Host readback is only found_flag (+ t_rows/t_cols on hit).
 // fuse_jackpot=0: legacy tile_xor writeback for correctness benchmarks.
+//
+// Private memory (fuse_jackpot mining path; source arrays + compiler stack):
+//   acc[NR×MR]  8×8: 256 B   8×16: 512 B
+//   msg[16]           64 B         64 B   (online milestone fold; replaces old ms_xor[32])
+//   a_pack[MR]        32 B         32 B
+//   digest[8]         32 B         32 B
+//   b3_compress64     ~192 B       ~192 B  (inlined v/m/t; Beignet may reserve for whole kernel)
+// Measured CL_KERNEL_PRIVATE_MEM_SIZE on Beignet (Haswell GT1, scalar):
+//   8×8: 384 B/WI (was 1152 with ms_xor[32] + post-GEMM msg fold)
+//   8×16: 1152 B/WI (acc spill dominates; unchanged after ms_xor removal)
 
 #ifndef MR
 #define MR 8
@@ -198,7 +208,10 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         acc[i] = 0;
     }
 
-    uint ms_xor[PP_MAX_MILESTONES];
+    uint msg[PP_JACKPOT_WORDS];
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg[i] = 0u;
+    }
     int ms = 0;
     for (int kb = 0; kb < blocks_k; ++kb) {
 #if defined(CASE32_COALESCE)
@@ -272,7 +285,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             if (xor_after_milestone) {
                 if (fuse_jackpot) {
                     if (ms < PP_MAX_MILESTONES) {
-                        ms_xor[ms] = x;
+                        const int tid = ms % PP_JACKPOT_WORDS;
+                        msg[tid] = pp_rotl32(msg[tid], PP_LROT) ^ x;
                     }
                 } else if (compact_xor) {
                     const ulong batch_stride =
@@ -291,15 +305,6 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
     if (!fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
         return;
-    }
-
-    uint msg[PP_JACKPOT_WORDS];
-    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
-        msg[i] = 0u;
-    }
-    for (int step = 0; step < num_milestones; ++step) {
-        const int tid = step % PP_JACKPOT_WORDS;
-        msg[tid] = pp_rotl32(msg[tid], PP_LROT) ^ ms_xor[step];
     }
 
     uint digest[8];
