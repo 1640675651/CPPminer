@@ -52,6 +52,17 @@ struct OpenClContext {
     bool init(int device_index = 0, int platform_filter = -1);
     bool build_program_from_file(const char *cl_path, const char *build_options = "");
     bool build_program_from_source(const char *source, const char *build_options = "");
+
+    /* Probe clBuildProgram in a child process first. Drivers that abort() inside
+       the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill only the child;
+       the parent returns false and can fall back to another build. Does not
+       modify this->program. */
+    bool probe_build(const char *source, const char *build_options = "");
+
+    /* probe_build() then build_program_from_source/file if the probe survives. */
+    bool safe_build_program_from_source(const char *source, const char *build_options = "");
+    bool safe_build_program_from_file(const char *cl_path, const char *build_options = "");
+
     cl_kernel create_kernel(const char *name) const;
 
     bool write_buffer(cl_mem buf, const void *host, size_t bytes) const;

@@ -13,6 +13,8 @@
 #include <windows.h>
 #else
 #include <limits.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -289,6 +291,82 @@ bool OpenClContext::build_program_from_file(const char *cl_path,
         return false;
     }
     return build_program_from_source(source.c_str(), build_options);
+}
+
+#ifndef _WIN32
+bool OpenClContext::probe_build(const char *source, const char *build_options) {
+    if (!context || !device || source == nullptr) {
+        return false;
+    }
+
+    cl_int probe_err = CL_SUCCESS;
+    const char *srcs[] = {source};
+    const size_t lens[] = {std::strlen(source)};
+    cl_program probe_prog =
+            clCreateProgramWithSource(context, 1, srcs, lens, &probe_err);
+    if (!probe_prog || probe_err != CL_SUCCESS) {
+        log_cl_error("clCreateProgramWithSource (probe)", probe_err);
+        return false;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        clReleaseProgram(probe_prog);
+        std::fprintf(stderr, "OpenCL build probe: fork failed\n");
+        return false;
+    }
+    if (pid == 0) {
+        /* Let abort()/assert kill only this child with a normal signal exit. */
+        struct sigaction sa = {};
+        sa.sa_handler = SIG_DFL;
+        sigaction(SIGABRT, &sa, nullptr);
+        sigaction(SIGTRAP, &sa, nullptr);
+        const cl_int err =
+                clBuildProgram(probe_prog, 1, &device, build_options, nullptr, nullptr);
+        _exit(err == CL_SUCCESS ? 0 : 1);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    clReleaseProgram(probe_prog);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+    if (WIFSIGNALED(status)) {
+        std::fprintf(stderr,
+                     "OpenCL build probe crashed (signal %d); skipping this build\n",
+                     WTERMSIG(status));
+    } else {
+        std::fprintf(stderr,
+                     "OpenCL build probe failed (exit %d); skipping this build\n",
+                     WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+    return false;
+}
+#else
+bool OpenClContext::probe_build(const char * /*source*/, const char * /*build_options*/) {
+    /* No fork on Windows; rely on normal clBuildProgram error returns. */
+    return true;
+}
+#endif
+
+bool OpenClContext::safe_build_program_from_source(const char *source,
+                                                   const char *build_options) {
+    if (!probe_build(source, build_options)) {
+        return false;
+    }
+    return build_program_from_source(source, build_options);
+}
+
+bool OpenClContext::safe_build_program_from_file(const char *cl_path,
+                                                 const char *build_options) {
+    const std::string source = read_text_file(cl_path);
+    if (source.empty()) {
+        std::fprintf(stderr, "Failed to read OpenCL source: %s\n", cl_path);
+        return false;
+    }
+    return safe_build_program_from_source(source.c_str(), build_options);
 }
 
 cl_kernel OpenClContext::create_kernel(const char *name) const {

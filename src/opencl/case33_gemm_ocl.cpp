@@ -134,7 +134,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 build_opts += " -Dcl_khr_integer_dot_product";
             }
         }
-        if (!ocl_.build_program_from_file(kernel_cl_path, build_opts.c_str())) {
+        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
             if (use_dot && force_ext && !use_asm && !use_builtin) {
                 const std::string build_opts2 =
                         "-cl-std=CL1.2 -cl-ext=+cl_khr_integer_dot_product "
@@ -142,7 +142,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1";
-                if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
+                if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
                     if (kernel_) {
                         clReleaseKernel(kernel_);
                         kernel_ = nullptr;
@@ -210,7 +210,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
 }
 
 bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,
-                                 int platform_filter) {
+                                 int platform_filter, bool gpu_prep) {
     context_ready_ = false;
     available_ = false;
     if (!ocl_.init(device_index, platform_filter)) {
@@ -222,9 +222,13 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,
     if (!ensure_jackpot_bufs_()) {
         return false;
     }
-    if (!prep_.init(&ocl_, cp_ocl_kernel_dir())) {
-        std::fprintf(stderr, "[ocl] prep kernel init failed\n");
-        return false;
+    if (gpu_prep) {
+        if (!prep_.init(&ocl_, cp_ocl_kernel_dir())) {
+            std::fprintf(stderr, "[ocl] prep kernel init failed\n");
+            return false;
+        }
+    } else {
+        std::printf("[ocl] skipping GPU prep kernels (--cpu-gen)\n");
     }
     device_name_ = ocl_.device_name;
     platform_name_ = ocl_.platform_name;

@@ -38,7 +38,7 @@ struct Case33GemmOcl {
 
 
     bool init_context(const char *kernel_cl_path, int device_index = 0,
-                      int platform_filter = -1);
+                      int platform_filter = -1, bool gpu_prep = true);
 
     bool prepare_job(int M, int N, int K, const int8_t *b_colmajor);
 

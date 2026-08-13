@@ -296,7 +296,8 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
-    if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter)) {
+    if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
+                             !g_cpu_matrix_gen)) {
         fprintf(stderr, "[ocl] OpenCL init failed (kernel=%s)\n", kernel_path.c_str());
         g_context_ready = 0;
         return;
@@ -310,7 +311,11 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] %s\n", g_gemm.dpi_status());
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
-    printf("[ocl] zero-B GPU prep (default); --cpu-gen for host prep (~1 GiB VRAM)\n");
+    if (g_cpu_matrix_gen) {
+        printf("[ocl] host matrix prep (--cpu-gen)\n");
+    } else {
+        printf("[ocl] zero-B GPU prep (default); --cpu-gen for host prep (~1 GiB VRAM)\n");
+    }
     fflush(stdout);
 }
 
