@@ -275,3 +275,44 @@ cpminer.exe --backend opencl --dev ...
 | Prep `d_A_sig_` / merkle / pairs | `src/opencl/case33_ocl_prep.cpp` |
 | Layout / block sizes | `src/opencl/case32_layout.hpp` |
 | Share ownership | `src/common/cp_share_queue.cpp` |
+
+## Fused GEMM kernel private memory
+
+Per-work-item private use in `case33_macro_gemm_xor` (`case33_gemm_xor.cl`, mining /
+`fuse_jackpot=1`). Reported via `CL_KERNEL_PRIVATE_MEM_SIZE` after build.
+
+### Source arrays (tile-dependent)
+
+| Array | 8×8 (`--ocl-tile 8x8`) | 8×16 (`--ocl-tile 8x16`) |
+|-------|------------------------:|-------------------------:|
+| `acc[NR×MR]` (int32, flushed each KR) | 256 B | 512 B |
+| `cpm[NR × MR/VWM]` (`float4`, scalar path) | 256 B | 512 B |
+| `msg[16]` (online milestone fold) | 64 B | 64 B |
+| `a_pack[MR]` / `b_pack[NR]` | 32+32 B | 32+64 B |
+| `digest[8]` | 32 B | 32 B |
+
+Milestone XORs fold into `msg[16]` during the GEMM loop (no separate `ms_xor[32]` buffer).
+
+Inlined `b3_compress64` adds ~192 B of stack (`v[16]`, `m[16]`, `t[16]`). Beignet often
+reserves that frame for the whole kernel even though BLAKE3 runs only after GEMM.
+
+Issue shape: [`opencl_issue_shape.md`](opencl_issue_shape.md). Rates and tile notes: [`opencl_gemm.md`](opencl_gemm.md).
+
+### Measured on Beignet (Intel Haswell GT1, scalar build)
+
+| Tile | Work-items / 128×128 macro | Private / WI | Notes |
+|------|---------------------------:|-------------:|-------|
+| **4×8** | 512 | **128 B** | `--ocl-tile 4x8`; one `float4` along M; ~28 GMAC/s production on GT1 |
+| 8×8 | 256 | **128 B** (was 384 with per-element `dot4`; 1152 with `ms_xor[32]`) | CLBlast `cpm` issue |
+| 8×16 | 128 | **1152 B** | `acc[128]` spill dominates |
+
+`--ocl-lds` adds work-group local A/B panels (`LDS_KWG` default 16):
+
+```text
+lds_a  = MICRO_M × (LDS_KWG/4) × KG_BYTES_A
+lds_b  = MICRO_N × (LDS_KWG/4) × KG_SLICE_B
+```
+
+For 8×8 / KWG=16 this is 2 KiB + 2 KiB per work-group (not per WI). Measured on
+Beignet (Haswell GT1, `--ocl-lds`): `CL_KERNEL_LOCAL_MEM_SIZE` = **4100 B/WG**,
+private stays **128 B/WI** with the `cpm` inner loop.

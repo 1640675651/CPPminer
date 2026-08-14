@@ -251,7 +251,7 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | `bt` | Full **signal** B^T, row-major `int8[n×k]` |
 | `m`, `n`, `k`, `rank` | Dimensions (`PlainProof` metadata) |
 | `t_rows`, `t_cols` | Tile anchor from jackpot hit |
-| `tile_layout` | `0` scattered, `1` contiguous, `2` CUTLASS |
+| `tile_layout` | `0` scattered, `1` contiguous 8×16, `2` CUTLASS, `3` contiguous 8×8, `4` contiguous 4×8 |
 
 **Not required:** noisy A/B, `a_noise_seed`, pool target, stratum nonce (nonce only affects CPU `pearl_generate_ab` seeding; CUDA proof uses GPU-generated signal matrices from the hit attempt).
 
@@ -272,10 +272,12 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | `tile_layout` | A strip rows | B^T strip rows | Config constant |
 |---------------|--------------|----------------|-----------------|
 | 0 scattered | 8 | 16 | `PEARL_SCATTERED_CONFIG` |
-| 1 contiguous | 8 | 16 | `PEARL_CONTIGUOUS_CONFIG` |
-| 2 CUTLASS | 16 | 8 | `PEARL_CUTLASS_CONFIG` |
+| 1 contiguous 8×16 | 8 | 16 | `PEARL_CONTIGUOUS_CONFIG` |
+| 2 CUTLASS | 8 | 8 | `PEARL_CUTLASS_CONFIG` |
+| 3 contiguous 8×8 | 8 | 8 | `PEARL_CONTIGUOUS_8x8_CONFIG` |
+| 4 contiguous 4×8 | 4 | 8 | `PEARL_CONTIGUOUS_4x8_CONFIG` |
 
-Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs` (`SCATTERED_ROWS` / `COLS`, contiguous `0..7` / `0..15`, `CUTLASS_ROWS` / `COLS`).
+Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x8` uses layout 4.
 
 ### `PlainProof` payload
 

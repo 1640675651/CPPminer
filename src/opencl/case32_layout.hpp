@@ -1,7 +1,7 @@
 #pragma once
 
 // Case 3.2 blocking constants (shared by host prepack and OpenCL kernels).
-// Hash/register tile is 8x8 or 8x16 (selected via --ocl-tile / AMD auto-detect).
+// Hash/register tile is 4x8, 8x8, or 8x16 (selected via --ocl-tile / AMD auto-detect).
 // Fused GEMM private memory: see docs/memory.md (Beignet 8×8 ≈384 B/WI, 8×16 ≈1152 B/WI).
 
 #include "cp_config.h"
@@ -22,6 +22,8 @@ constexpr int kMacroM = 128;
 constexpr int kMacroN = 128;
 constexpr int kColsPerGroup = 8;
 constexpr int kRank = 4;
+/* Max work-items mapping one 128x128 macro (4x8 needs 512). */
+constexpr int kMacroWorkItemsMax = 512;
 
 /* Runtime tile shape and derived layout (set via configure() before OpenCL init). */
 extern int kMR;
@@ -41,7 +43,7 @@ extern int kMacroKgStripB;
 extern int kMacroKbBlockA;
 extern int kMacroKbBlockB;
 
-/* Configure hash-tile MR x NR (8x8 or 8x16). */
+/* Configure hash-tile MR x NR (4x8, 8x8, or 8x16). */
 bool configure(int mr, int nr);
 
 /* Hash tiles covered by one 128x128 macro block. */

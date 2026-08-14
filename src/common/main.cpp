@@ -54,7 +54,9 @@ static void print_usage(void)
     printf("  --list-devices     list devices for the selected backend and exit\n");
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
-    printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default) or 8x16 (auto on AMD)\n");
+    printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
+    printf("  --ocl-lds [KWG]    OpenCL: stage A/B in local memory (off by default; KWG=16)\n");
+    printf("  --ocl-cpm-int      OpenCL: int8 cpm tile (int32 acc; default is float mad)\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -216,6 +218,9 @@ int main(int argc, char** argv)
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
     int ocl_tile_nr = 0;
+    int ocl_lds = 0;
+    int ocl_lds_kwg = 16;
+    int ocl_cpm_int = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     for(int i = 1; i < argc; i++){
@@ -260,14 +265,32 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-tile requires MxN (e.g. 8x8 or 8x16)\n");
+                fprintf(stderr, "--ocl-tile requires MxN (e.g. 4x8, 8x8, or 8x16)\n");
                 return 1;
             }
             if(sscanf(v, "%dx%d", &ocl_tile_mr, &ocl_tile_nr) != 2 ||
-               ocl_tile_mr != 8 || (ocl_tile_nr != 8 && ocl_tile_nr != 16)){
-                fprintf(stderr, "invalid --ocl-tile %s (expected 8x8 or 8x16)\n", v);
+               !((ocl_tile_mr == 4 && ocl_tile_nr == 8) ||
+                 (ocl_tile_mr == 8 && (ocl_tile_nr == 8 || ocl_tile_nr == 16)))){
+                fprintf(stderr, "invalid --ocl-tile %s (expected 4x8, 8x8, or 8x16)\n", v);
                 return 1;
             }
+        } else if(!strncmp(argv[i], "--ocl-lds", 9)){
+            ocl_lds = 1;
+            const char* v = argv[i] + 9;
+            if(*v == '='){
+                ocl_lds_kwg = atoi(v + 1);
+            } else if(*v == '\0' && i + 1 < argc && argv[i + 1][0] >= '0' &&
+                      argv[i + 1][0] <= '9'){
+                ocl_lds_kwg = atoi(argv[++i]);
+            }
+            if(ocl_lds_kwg != 4 && ocl_lds_kwg != 8 && ocl_lds_kwg != 16 &&
+               ocl_lds_kwg != 32 && ocl_lds_kwg != 64 && ocl_lds_kwg != 128){
+                fprintf(stderr, "invalid --ocl-lds KWG %d (expected 4,8,16,32,64,128)\n",
+                        ocl_lds_kwg);
+                return 1;
+            }
+        } else if(!strcmp(argv[i], "--ocl-cpm-int")){
+            ocl_cpm_int = 1;
 #endif
         } else if(!strcmp(argv[i], "--dev")){
             g_dev_dims = 1;
@@ -423,6 +446,10 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_platform(ocl_platform);
     if(ocl_tile_mr > 0)
         cp_worker_set_ocl_tile(ocl_tile_mr, ocl_tile_nr);
+    if(ocl_lds)
+        cp_worker_set_ocl_lds(1, ocl_lds_kwg);
+    if(ocl_cpm_int)
+        cp_worker_set_ocl_cpm_int(1);
 #endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){

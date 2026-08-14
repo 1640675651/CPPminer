@@ -3,6 +3,11 @@
 ## v0.3 (tentative)
 - Put OpenCL kernel compilation into a subprocess with error handling. Improve compatibility for ill-behaving drivers.
 - Skip matrix prep kernel if --cpu-gen is on (fixes unsupported intrinsics on beignet driver)
+- Fold milestone XORs into `msg[16]` during GEMM; drop redundant `ms_xor[32]`. On Beignet (Haswell GT1) reported kernel private memory drops from 1152 B/WI to **384 B/WI** on the default 8×8 tile (8×16 stays 1152 B/WI).
+- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`): half-height register tile for tiny iGPUs; proof FFI `tile_layout=4`. On Beignet Haswell GT1, production scan **~28 GMAC/s** (mock share verified) vs ~9.9 GMAC/s at 8×8.
+- OpenCL `--ocl-lds [KWG]`: CLBlast-style `__local` A/B staging (default KWG=16) so work-items reuse packed panels instead of each reloading from global.
+- OpenCL scalar GEMM inner loop matches CLBlast GEMMK=0 (`cpm += aval * bscalar`). ~1.1 → ~9.9 GMAC/s on Beignet Haswell GT1 (`--dev` 8×8, no LDS). See `docs/opencl_issue_shape.md`.
+- OpenCL `--ocl-cpm-int`: same issue with int8 lanes and int32 acc (default remains float `mad`).
 - Lightweight random matrix generation (TODO)
 
 ## v0.2.1

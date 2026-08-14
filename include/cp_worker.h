@@ -32,8 +32,12 @@ void cp_worker_shutdown(void);
 int cp_worker_list_devices(void);
 /* OpenCL-only: restrict device enumeration to platform index (-1 = all). */
 void cp_worker_set_ocl_platform(int platform_index);
-/* OpenCL-only: hash tile MR x NR (8x8 or 8x16). mr<=0 restores auto detection. */
+/* OpenCL-only: hash tile MR x NR (4x8, 8x8, or 8x16). mr<=0 restores auto detection. */
 void cp_worker_set_ocl_tile(int mr, int nr);
+/* OpenCL-only: CLBlast-style local-memory A/B staging. kwg<=0 uses 16. */
+void cp_worker_set_ocl_lds(int on, int kwg);
+/* OpenCL-only: integer cpm tile (int8 inputs, int32 acc). Default is float mad. */
+void cp_worker_set_ocl_cpm_int(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 

@@ -15,6 +15,7 @@ extern "C" {
 extern const uint8_t PEARL_SCATTERED_CONFIG[52];
 extern const uint8_t PEARL_CONTIGUOUS_CONFIG[52];
 extern const uint8_t PEARL_CONTIGUOUS_8x8_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_4x8_CONFIG[52];
 /* Case 7.1 epilogue scatter: 16 A rows x 8 B cols per hash tile. */
 extern const uint8_t PEARL_CUTLASS_CONFIG[52];
 
@@ -25,6 +26,7 @@ extern const uint8_t PEARL_SEED_LABEL_B[32];
 
 void pearl_set_contiguous_tiles(int on);
 void pearl_set_contiguous_tile_width(int w);
+void pearl_set_contiguous_tile_shape(int mr, int w);
 
 int pearl_generate_ab(const uint8_t* seed, int seed_len, int m, int n, int k,
                       int8_t* A_out, int8_t* Bt_out);

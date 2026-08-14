@@ -27,6 +27,7 @@ enum TileLayout {
     Contiguous = 1,
     Cutlass = 2,
     Contiguous8x8 = 3,
+    Contiguous4x8 = 4,
 }
 
 impl TileLayout {
@@ -36,7 +37,8 @@ impl TileLayout {
             1 => Ok(Self::Contiguous),
             2 => Ok(Self::Cutlass),
             3 => Ok(Self::Contiguous8x8),
-            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, or 3)")),
+            4 => Ok(Self::Contiguous4x8),
+            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, 3, or 4)")),
         }
     }
 }
@@ -81,6 +83,10 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
         ),
         TileLayout::Contiguous8x8 => (
             &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+        ),
+        TileLayout::Contiguous4x8 => (
+            &[0, 1, 2, 3],
             &[0, 1, 2, 3, 4, 5, 6, 7],
         ),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
@@ -183,7 +189,7 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 /// Build plain_proof base64. Returns 0 on success, -1 on error.
 ///
 /// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8,
-/// 3 = contiguous 8x8.
+/// 3 = contiguous 8x8, 4 = contiguous 4x8.
 /// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_build(
@@ -382,6 +388,39 @@ mod tests {
         assert_eq!(pp.k, k);
         assert_eq!(pp.a.row_indices.len(), 8);
         assert_eq!(pp.bt.row_indices.len(), 16);
+    }
+
+    #[test]
+    fn contiguous_4x8_proof_row_counts() {
+        let m = 128;
+        let n = 128;
+        let k = 256;
+        let a: Vec<i8> = vec![0; m * k];
+        let bt: Vec<i8> = vec![0; n * k];
+        let header = [0u8; 76];
+        let row_offsets: Vec<u32> = (0..4).map(|i| i as u32).collect();
+        let col_offsets: Vec<u32> = (0..8).map(|i| i as u32).collect();
+        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            &bt,
+            m,
+            n,
+            k,
+            256,
+            0,
+            0,
+            TileLayout::Contiguous4x8,
+        )
+        .expect("4x8 build");
+        let raw = STANDARD.decode(&b64).unwrap();
+        let pp: PlainProof = bincode::deserialize(&raw).unwrap();
+        assert_eq!(pp.a.row_indices.len(), 4);
+        assert_eq!(pp.bt.row_indices.len(), 8);
+        assert_eq!(pp.a.row_indices, vec![0, 1, 2, 3]);
+        assert_eq!(pp.bt.row_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]

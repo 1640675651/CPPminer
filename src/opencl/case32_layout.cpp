@@ -42,11 +42,21 @@ void update_derived() {
     kMacroKbBlockB = kKGroups * kMacroKgStripB;
 }
 
+bool is_supported_tile(int mr, int nr) {
+    if (mr == 4 && nr == 8) {
+        return true;
+    }
+    if (mr == PP_HASH_H && (nr == 8 || nr == 16)) {
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 bool configure(int mr, int nr) {
-    if (mr != PP_HASH_H || (nr != 8 && nr != 16)) {
-        std::fprintf(stderr, "[ocl] hash tile must be 8x8 or 8x16 (got %dx%d)\n", mr, nr);
+    if (!is_supported_tile(mr, nr)) {
+        std::fprintf(stderr, "[ocl] hash tile must be 4x8, 8x8, or 8x16 (got %dx%d)\n", mr, nr);
         return false;
     }
     if (kMacroM % mr != 0 || kMacroN % nr != 0) {
@@ -64,10 +74,10 @@ bool configure(int mr, int nr) {
         return false;
     }
     const int work_items = (kMacroM / mr) * (kMacroN / nr);
-    if (work_items > 256) {
+    if (work_items > kMacroWorkItemsMax) {
         std::fprintf(stderr,
-                     "[ocl] tile %dx%d needs %d work-items per macro block (max 256)\n", mr, nr,
-                     work_items);
+                     "[ocl] tile %dx%d needs %d work-items per macro block (max %d)\n", mr, nr,
+                     work_items, kMacroWorkItemsMax);
         return false;
     }
     kMR = mr;

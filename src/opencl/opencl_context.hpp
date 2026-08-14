@@ -39,6 +39,7 @@ struct OpenClContext {
     int device_flat_index = -1;
     bool discrete_gpu = false;
     bool has_integer_dot_product = false;
+    size_t max_work_group_size = 256;
 
     ~OpenClContext();
 

@@ -73,6 +73,28 @@ void Case33GemmOcl::set_macro_batch(int batch) {
     macro_batch_ = clamp_macro_batch(batch);
 }
 
+void Case33GemmOcl::set_use_lds(int on, int kwg) {
+    use_lds_ = on != 0;
+    if (kwg > 0) {
+        lds_kwg_ = kwg;
+    }
+    if (lds_kwg_ < 4) {
+        lds_kwg_ = 4;
+    }
+    if (R_RANK % lds_kwg_ != 0) {
+        /* Snap down to a divisor of KR (rank panel). */
+        int k = lds_kwg_;
+        while (k > 4 && (R_RANK % k) != 0) {
+            --k;
+        }
+        lds_kwg_ = k;
+    }
+}
+
+void Case33GemmOcl::set_cpm_int(int on) {
+    use_cpm_int_ = on != 0;
+}
+
 Case33GemmOcl::~Case33GemmOcl() {
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -123,6 +145,13 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
         build_opts += " -DCASE32_WI_ROWMAJOR=1";
+        if (use_lds_) {
+            build_opts += " -DCASE32_USE_LDS=1";
+            build_opts += " -DLDS_KWG=" + std::to_string(lds_kwg_);
+        }
+        if (use_cpm_int_) {
+            build_opts += " -DCASE32_CPM_INT=1";
+        }
         if (use_asm) {
             build_opts += " -DCASE32_USE_ASM_DOT=1";
         } else if (use_builtin) {
@@ -141,7 +170,11 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         "-DCASE32_FORCE_DPI=1 -DMR=" +
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) +
-                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1";
+                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
+                        (use_lds_ ? (" -DCASE32_USE_LDS=1 -DLDS_KWG=" +
+                                    std::to_string(lds_kwg_))
+                                 : std::string()) +
+                        (use_cpm_int_ ? " -DCASE32_CPM_INT=1" : "");
                 if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
                     if (kernel_) {
                         clReleaseKernel(kernel_);
@@ -205,6 +238,18 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         }
     } else {
         built = try_build(false, false, false, false, "scalar (no DPI ext)");
+    }
+    if (built && kernel_) {
+        cl_ulong local_b = 0;
+        cl_ulong priv_b = 0;
+        (void)clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_LOCAL_MEM_SIZE,
+                                       sizeof(local_b), &local_b, nullptr);
+        (void)clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                       sizeof(priv_b), &priv_b, nullptr);
+        std::printf("[ocl] kernel mem: local=%llu B/WG private=%llu B/WI%s\n",
+                    (unsigned long long)local_b, (unsigned long long)priv_b,
+                    use_lds_ ? " (LDS)" : "");
+        std::fflush(stdout);
     }
     return built;
 }
@@ -303,7 +348,7 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
 
-    const char *dot_kind = "scalar";
+    const char *dot_kind = use_cpm_int_ ? "clblast cpm int" : "clblast cpm";
     if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
@@ -312,9 +357,9 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8%s",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
-                  case32::kKR, dot_kind);
+                  case32::kKR, dot_kind, use_lds_ ? " LDS" : "");
     available_ = true;
     return true;
 }
@@ -358,7 +403,7 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         return false;
     }
 
-    const char *dot_kind = "scalar";
+    const char *dot_kind = use_cpm_int_ ? "clblast cpm int" : "clblast cpm";
     if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
@@ -367,9 +412,9 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         dot_kind = "dot_acc_sat";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8 GPU-prep%s",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
-                  case32::kKR, dot_kind);
+                  case32::kKR, dot_kind, use_lds_ ? " LDS" : "");
     available_ = true;
     return true;
 }
@@ -427,8 +472,21 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     const int compact_xor = 0;
     const int fuse_jackpot = 1;
     const int tile_count_i = static_cast<int>(tile_count_);
-    const size_t global = static_cast<size_t>(batch_count) * case32::kMacroWorkItems;
-    const size_t local = case32::kMacroWorkItems;
+
+    const int micro_m = case32::kMicroPerMacroM;
+    const int micro_n = case32::kMicroPerMacroN;
+    const size_t max_wg = ocl_.max_work_group_size;
+
+    int slice_m = micro_m;
+    if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
+        slice_m = static_cast<int>(max_wg / static_cast<size_t>(micro_n));
+        if (slice_m < 1) {
+            slice_m = 1;
+        }
+        while (slice_m > 1 && (micro_m % slice_m) != 0) {
+            --slice_m;
+        }
+    }
 
     cl_mem tile_xor_dummy = dummy_buf_;
 
@@ -457,12 +515,28 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
         return false;
     }
 
-    err = clEnqueueNDRangeKernel(ocl_.queue, kernel_, 1, nullptr, &global, &local, 0, nullptr,
-                                 nullptr);
-    if (err != CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl] clEnqueueNDRangeKernel failed: %s\n",
-                     OpenClContext::error_string(err).c_str());
-        return false;
+    for (int m0 = 0; m0 < micro_m; m0 += slice_m) {
+        const int micro_m_begin = m0;
+        const int micro_m_count = (m0 + slice_m <= micro_m) ? slice_m : (micro_m - m0);
+        const size_t local =
+                static_cast<size_t>(micro_m_count) * static_cast<size_t>(micro_n);
+        const size_t global = static_cast<size_t>(batch_count) * local;
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(kernel_, 19, sizeof(int), &micro_m_begin);
+        err |= clSetKernelArg(kernel_, 20, sizeof(int), &micro_m_count);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clSetKernelArg micro_m slice failed\n");
+            return false;
+        }
+
+        err = clEnqueueNDRangeKernel(ocl_.queue, kernel_, 1, nullptr, &global, &local, 0,
+                                     nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clEnqueueNDRangeKernel failed: %s\n",
+                         OpenClContext::error_string(err).c_str());
+            return false;
+        }
     }
     return true;
 }

@@ -35,6 +35,11 @@ struct Case33GemmOcl {
 
     int macro_batch() const { return macro_batch_; }
 
+    /* CLBlast-style __local A/B staging (KWG bytes of K per fill). kwg<=0 keeps current. */
+    void set_use_lds(int on, int kwg = 16);
+    /* Scalar cpm tile: 0 = float4 mad (default), 1 = int8 lanes / int4 acc. */
+    void set_cpm_int(int on);
+
 
 
     bool init_context(const char *kernel_cl_path, int device_index = 0,
@@ -77,6 +82,8 @@ struct Case33GemmOcl {
     bool discrete_gpu() const { return discrete_gpu_; }
 
     const char *dpi_status() const { return dpi_status_; }
+
+    size_t max_work_group_size() const { return ocl_.max_work_group_size; }
 
 
 
@@ -127,6 +134,12 @@ private:
     int macro_batch_ = CP_MACRO_BATCH_DEFAULT;
 
     Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
+
+    bool use_lds_ = false;
+
+    int lds_kwg_ = 16;
+
+    bool use_cpm_int_ = false;
 
 
 

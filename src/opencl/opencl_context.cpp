@@ -229,6 +229,13 @@ bool OpenClContext::init(int device_index, int platform_filter) {
     discrete_gpu = pick.discrete;
     has_integer_dot_product = pick.integer_dot_product;
 
+    size_t max_wg = 0;
+    if (clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg,
+                        nullptr) == CL_SUCCESS &&
+        max_wg > 0) {
+        max_work_group_size = max_wg;
+    }
+
     cl_int err = CL_SUCCESS;
     context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
     if (!context || err != CL_SUCCESS) {

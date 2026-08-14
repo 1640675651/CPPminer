@@ -12,10 +12,15 @@ void cp_opencl_worker_shutdown(void);
 void cp_opencl_worker_set_macro_batch(int batch);
 /* Restrict OpenCL enumeration to platform index (default -1 = all). */
 void cp_opencl_worker_set_platform(int platform_index);
-/* OpenCL hash tile width (8 or 16) after configure. */
+/* OpenCL hash tile MR (4 or 8) and width (8 or 16) after configure. */
+int cp_opencl_hash_tile_mr(void);
 int cp_opencl_hash_tile_w(void);
 /* OpenCL hash tile size (MR x NR). Pass mr<=0 to restore auto (8x8 default, 8x16 on AMD). */
 void cp_opencl_worker_set_tile(int mr, int nr);
+/* OpenCL: CLBlast-style __local A/B staging. kwg<=0 uses default 16. */
+void cp_opencl_worker_set_lds(int on, int kwg);
+/* OpenCL: scalar cpm tile in int32 (int8 inputs). Default is float mad. */
+void cp_opencl_worker_set_cpm_int(int on);
 /* Apply tile override or auto-detect for device before kernel build. */
 void cp_opencl_configure_tile(int device_index, int platform_filter);
 /* Same as above using worker platform filter (-1 = all platforms). */

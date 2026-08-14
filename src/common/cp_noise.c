@@ -57,6 +57,17 @@ const uint8_t PEARL_CONTIGUOUS_8x8_CONFIG[52] = {
     0x00, 0x00, 0x00, 0x00
 };
 
+/* pearl_mining.MiningConfiguration rows=[0..3] cols=[0..7] k=4096 r=128 */
+const uint8_t PEARL_CONTIGUOUS_4x8_CONFIG[52] = {
+    0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
+};
+
 /* CUTLASS Case 9: interleaved 4x4 blocks — rows [0,1,2,3,16..19], cols [0,1,2,3,32..35]. */
 const uint8_t PEARL_CUTLASS_CONFIG[52] = {
     0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
@@ -69,6 +80,7 @@ const uint8_t PEARL_CUTLASS_CONFIG[52] = {
 };
 
 static int g_pearl_contiguous_tiles = 0;
+static int g_pearl_contiguous_tile_mr = 8;
 static int g_pearl_contiguous_tile_w = 16;
 static int g_pearl_cutlass_fused = 0;
 
@@ -80,6 +92,11 @@ void pearl_set_contiguous_tile_width(int w){
     g_pearl_contiguous_tile_w = (w == 8) ? 8 : 16;
 }
 
+void pearl_set_contiguous_tile_shape(int mr, int w){
+    g_pearl_contiguous_tile_mr = (mr == 4) ? 4 : 8;
+    g_pearl_contiguous_tile_w = (w == 8) ? 8 : 16;
+}
+
 void pearl_set_cutlass_fused(int on){
     g_pearl_cutlass_fused = on ? 1 : 0;
 }
@@ -88,6 +105,8 @@ static const uint8_t* pearl_active_mining_config(void){
     if(g_pearl_cutlass_fused)
         return PEARL_CUTLASS_CONFIG;
     if(g_pearl_contiguous_tiles) {
+        if(g_pearl_contiguous_tile_mr == 4 && g_pearl_contiguous_tile_w == 8)
+            return PEARL_CONTIGUOUS_4x8_CONFIG;
         return g_pearl_contiguous_tile_w == 8 ? PEARL_CONTIGUOUS_8x8_CONFIG
                                               : PEARL_CONTIGUOUS_CONFIG;
     }
