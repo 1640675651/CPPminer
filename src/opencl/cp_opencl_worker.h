@@ -12,7 +12,8 @@ void cp_opencl_worker_shutdown(void);
 void cp_opencl_worker_set_macro_batch(int batch);
 /* Restrict OpenCL enumeration to platform index (default -1 = all). */
 void cp_opencl_worker_set_platform(int platform_index);
-/* OpenCL hash tile width (8 or 16) after configure. */
+/* OpenCL hash tile MR (4 or 8) and width (8 or 16) after configure. */
+int cp_opencl_hash_tile_mr(void);
 int cp_opencl_hash_tile_w(void);
 /* OpenCL hash tile size (MR x NR). Pass mr<=0 to restore auto (8x8 default, 8x16 on AMD). */
 void cp_opencl_worker_set_tile(int mr, int nr);

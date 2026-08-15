@@ -221,7 +221,9 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
         ${CP_PROOF_FFI_DIR}/src/*.rs)
     add_custom_command(
         OUTPUT ${_cp_proof_lib}
-        COMMAND ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+        COMMAND ${CMAKE_COMMAND} -E env
+            CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target
+            ${CARGO_EXECUTABLE} ${_cp_cargo_args}
             --manifest-path ${CP_PROOF_FFI_MANIFEST}
         WORKING_DIRECTORY ${CP_PROOF_FFI_DIR}
         DEPENDS

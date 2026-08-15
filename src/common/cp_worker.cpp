@@ -341,6 +341,8 @@ extern "C" int cp_worker_default_tile_layout(void)
         return CP_TILE_LAYOUT_CONTIGUOUS;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL) {
+        if(cp_opencl_hash_tile_mr() == 4 && cp_opencl_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_4x8;
         if(cp_opencl_hash_tile_w() == 8)
             return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
         return CP_TILE_LAYOUT_CONTIGUOUS;

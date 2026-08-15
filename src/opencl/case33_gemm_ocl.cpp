@@ -427,8 +427,21 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     const int compact_xor = 0;
     const int fuse_jackpot = 1;
     const int tile_count_i = static_cast<int>(tile_count_);
-    const size_t global = static_cast<size_t>(batch_count) * case32::kMacroWorkItems;
-    const size_t local = case32::kMacroWorkItems;
+
+    const int micro_m = case32::kMicroPerMacroM;
+    const int micro_n = case32::kMicroPerMacroN;
+    const size_t max_wg = ocl_.max_work_group_size;
+
+    int slice_m = micro_m;
+    if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
+        slice_m = static_cast<int>(max_wg / static_cast<size_t>(micro_n));
+        if (slice_m < 1) {
+            slice_m = 1;
+        }
+        while (slice_m > 1 && (micro_m % slice_m) != 0) {
+            --slice_m;
+        }
+    }
 
     cl_mem tile_xor_dummy = dummy_buf_;
 
@@ -457,12 +470,28 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
         return false;
     }
 
-    err = clEnqueueNDRangeKernel(ocl_.queue, kernel_, 1, nullptr, &global, &local, 0, nullptr,
-                                 nullptr);
-    if (err != CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl] clEnqueueNDRangeKernel failed: %s\n",
-                     OpenClContext::error_string(err).c_str());
-        return false;
+    for (int m0 = 0; m0 < micro_m; m0 += slice_m) {
+        const int micro_m_begin = m0;
+        const int micro_m_count = (m0 + slice_m <= micro_m) ? slice_m : (micro_m - m0);
+        const size_t local =
+                static_cast<size_t>(micro_m_count) * static_cast<size_t>(micro_n);
+        const size_t global = static_cast<size_t>(batch_count) * local;
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(kernel_, 19, sizeof(int), &micro_m_begin);
+        err |= clSetKernelArg(kernel_, 20, sizeof(int), &micro_m_count);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clSetKernelArg micro_m slice failed\n");
+            return false;
+        }
+
+        err = clEnqueueNDRangeKernel(ocl_.queue, kernel_, 1, nullptr, &global, &local, 0,
+                                     nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clEnqueueNDRangeKernel failed: %s\n",
+                         OpenClContext::error_string(err).c_str());
+            return false;
+        }
     }
     return true;
 }

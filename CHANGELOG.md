@@ -1,9 +1,13 @@
 # Changelog
 
 ## v0.3 (tentative)
-- Put OpenCL kernel compilation into a subprocess with error handling. Improve compatibility for ill-behaving drivers.
-- Skip matrix prep kernel if --cpu-gen is on (fixes unsupported intrinsics on beignet driver)
+- Put OpenCL kernel compilation into a subprocess with error handling. Improve compatibility for driver that crashes at compilation failure.
+- Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on beignet driver.
+- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`): half-height register tile
+- CLBlast-style issue shape (TODO)
+- native int8/int16 upcast/fp32 upcast modes (TODO)
 - Lightweight random matrix generation (TODO)
+- Smaller matrix low-memory mode (TODO)
 
 ## v0.2.1
 - Refactor CUTLASS GEMM main loop to reduce XOR overhead. This buys back the lost performance in the last version due to more frequent XOR boundary. 8.0TH -> 9.1TH on a GTX 1070.

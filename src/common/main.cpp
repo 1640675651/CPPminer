@@ -54,7 +54,7 @@ static void print_usage(void)
     printf("  --list-devices     list devices for the selected backend and exit\n");
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
-    printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default) or 8x16 (auto on AMD)\n");
+    printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -260,12 +260,13 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-tile requires MxN (e.g. 8x8 or 8x16)\n");
+                fprintf(stderr, "--ocl-tile requires MxN (e.g. 4x8, 8x8, or 8x16)\n");
                 return 1;
             }
             if(sscanf(v, "%dx%d", &ocl_tile_mr, &ocl_tile_nr) != 2 ||
-               ocl_tile_mr != 8 || (ocl_tile_nr != 8 && ocl_tile_nr != 16)){
-                fprintf(stderr, "invalid --ocl-tile %s (expected 8x8 or 8x16)\n", v);
+               !((ocl_tile_mr == 4 && ocl_tile_nr == 8) ||
+                 (ocl_tile_mr == 8 && (ocl_tile_nr == 8 || ocl_tile_nr == 16)))){
+                fprintf(stderr, "invalid --ocl-tile %s (expected 4x8, 8x8, or 8x16)\n", v);
                 return 1;
             }
 #endif

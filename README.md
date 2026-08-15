@@ -98,7 +98,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--ocl-platform` | OpenCL: restrict enumeration to platform index |
-| `--ocl-tile MxN` | OpenCL hash tile: `8x8` (default) or `8x16` (auto on AMD discrete GPUs) |
+| `--ocl-tile MxN` | OpenCL hash tile: `8x8` (default), `4x8`, or `8x16` (auto on AMD discrete GPUs) |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
@@ -121,7 +121,7 @@ Host syncs after each batch (cancel / progress / share check). Meaning differs b
 
 **OpenCL — 1D macro slicing**
 
-Each macro block is 128×128. `--ocl-tile` sets the **hash tile** size (`8×8` default for iGPUs; `8×16` auto on AMD discrete GPUs). GEMM, jackpot XOR, hashrate counting, and proof building all use the same tile shape.
+Each macro block is 128×128. `--ocl-tile` sets the **hash tile** size (`8×8` default for iGPUs; `4×8` for smaller register tiles; `8×16` auto on AMD discrete GPUs). GEMM, jackpot XOR, hashrate counting, and proof building all use the same tile shape.
 
 Macros are a 2D grid (`macro_rows × macro_cols`, each 128×128), walked as a flat index `mb`. `--period-batch N` is how many **macro blocks** each kernel launch covers (`CP_MACRO_BATCH_*` in `include/cp_config.h`).
 

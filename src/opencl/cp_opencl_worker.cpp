@@ -37,6 +37,7 @@ static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
 static int g_tile_mr = 0;
 static int g_tile_nr = 0;
+static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 
 namespace {
@@ -235,12 +236,13 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     const char *source = "default 8x8";
 
     if (g_tile_mr > 0 && g_tile_nr > 0) {
-        if (g_tile_mr != PP_HASH_H || (g_tile_nr != 8 && g_tile_nr != 16)) {
-            fprintf(stderr, "[ocl] --ocl-tile must be 8x8 or 8x16 (got %dx%d)\n", g_tile_mr,
+        if (!case32::configure(g_tile_mr, g_tile_nr)) {
+            fprintf(stderr, "[ocl] --ocl-tile %dx%d invalid; using 8x8\n", g_tile_mr,
                     g_tile_nr);
             tile_mr = PP_HASH_H;
             tile_nr = 8;
             source = "invalid CLI, using 8x8";
+            case32::configure(tile_mr, tile_nr);
         } else {
             tile_mr = g_tile_mr;
             tile_nr = g_tile_nr;
@@ -253,24 +255,27 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
             const OclDeviceInfo &dev = devices[static_cast<size_t>(device_index)];
             if (ocl_device_is_amd(dev)) {
                 tile_nr = 16;
+                tile_mr = PP_HASH_H;
                 source = "AMD GPU auto 8x16";
             }
         }
+        if (!case32::configure(tile_mr, tile_nr)) {
+            fprintf(stderr, "[ocl] hash tile configure failed\n");
+            return;
+        }
     }
 
-    if (!case32::configure(tile_mr, tile_nr)) {
-        fprintf(stderr, "[ocl] hash tile configure failed\n");
-        return;
-    }
+    g_hash_tile_mr = case32::kMR;
+    g_hash_tile_w = case32::kNR;
+    cp_pp_set_hash_tile(case32::kMR, case32::kNR);
+    pearl_set_contiguous_tile_shape(case32::kMR, case32::kNR);
 
-    g_hash_tile_w = tile_nr;
-    cp_pp_set_hash_tile(tile_mr, tile_nr);
-    pearl_set_contiguous_tile_width(tile_nr);
-
-    printf("[ocl] OpenCL hash tile: %dx%d (%s)\n", case32::kMR, case32::kNR, source);
+    printf("[ocl] OpenCL hash tile: %dx%d (%s, %d WI/macro)\n", case32::kMR, case32::kNR,
+           source, case32::kMacroWorkItems);
     fflush(stdout);
 }
 
+extern "C" int cp_opencl_hash_tile_mr(void) { return g_hash_tile_mr; }
 extern "C" int cp_opencl_hash_tile_w(void) { return g_hash_tile_w; }
 
 extern "C" void cp_opencl_configure_tile_for_worker(int device_index) {
@@ -307,6 +312,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] device[%d]: %s (%s)\n", g_gemm.device_index(), g_gemm.device_name(),
            g_gemm.discrete_gpu() ? "discrete GPU" : "integrated GPU/CPU");
     printf("[ocl] platform: %s\n", g_gemm.platform_name());
+    printf("[ocl] max work-group size: %zu\n", g_gemm.max_work_group_size());
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),

@@ -78,6 +78,8 @@ struct Case33GemmOcl {
 
     const char *dpi_status() const { return dpi_status_; }
 
+    size_t max_work_group_size() const { return ocl_.max_work_group_size; }
+
 
 
 private:

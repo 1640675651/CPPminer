@@ -175,7 +175,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                                     int mb_begin, int compact_xor, __global const uint *a_key8,
                                     __global const uint *bound, __global int *found_flag,
                                     __global int *out_t_rows, __global int *out_t_cols,
-                                    int fuse_jackpot) {
+                                    int fuse_jackpot, int micro_m_begin, int micro_m_count) {
     if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
         return;
     }
@@ -190,12 +190,16 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
     const int lid = (int)get_local_id(0);
 #if CASE32_WI_ROWMAJOR
-    const int tr = lid / MICRO_N;
+    const int tr_in_slice = lid / MICRO_N;
     const int tc = lid % MICRO_N;
 #else
-    const int tr = lid % MICRO_M;
-    const int tc = lid / MICRO_M;
+    const int tr_in_slice = lid % micro_m_count;
+    const int tc = lid / micro_m_count;
 #endif
+    if (tr_in_slice >= micro_m_count) {
+        return;
+    }
+    const int tr = micro_m_begin + tr_in_slice;
 
     const int micro_col0 = col0 + tc * NR;
     const int tr_global = tr0 + tr;
