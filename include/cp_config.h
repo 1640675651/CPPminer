@@ -5,6 +5,14 @@
 #define N_DIM  131072
 #define K_DIM  4096
 #define R_RANK 128
+/* Pearl rank-penalty floor / normalization (zk-pow PENALTY_BASE_RANK). */
+#define PENALTY_BASE_RANK 128
+#if R_RANK < PENALTY_BASE_RANK
+#error "R_RANK must be >= PENALTY_BASE_RANK"
+#endif
+#if (K_DIM % R_RANK) != 0
+#error "K_DIM must be a multiple of R_RANK"
+#endif
 
 #define PP_HASH_H 8
 #define PP_HASH_W 16

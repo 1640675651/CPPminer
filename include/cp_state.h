@@ -26,8 +26,15 @@ extern int g_dry_run;
 extern int g_plain_verify;
 extern int g_mock;
 extern double g_mock_diff;
+/* Certificate version for noise-seed derivation (1/2=legacy, 3=salted). Default 3. */
+extern uint32_t g_cert_version;
+/* Nonzero if --cert-version was set (forces g_cert_version over notify). */
+extern int g_cert_version_forced;
 extern int g_cpu_matrix_gen;
 extern int g_max_nonce;
+
+/* Resolve cert version: forced CLI, else notify (1..3), else g_cert_version. */
+uint32_t cp_resolve_cert_version(uint32_t notify_cert_version);
 
 #ifdef __cplusplus
 }

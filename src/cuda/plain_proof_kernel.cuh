@@ -93,7 +93,8 @@ __device__ __forceinline__ int32_t pp_dot_i8_rows(
 /*
  * One block = one hash tile at (row_part, col_part).
  * A, B: int8 step-major noisy matrices Ap[step][row][r], Bp[step][col][r].
- * bound: jackpot hash target (LE uint256), already scaled by h*w*k_eff.
+ * bound: jackpot hash target (LE uint256), already rank-penalized
+ * (pool_target × h×w×(k/r)×PENALTY_BASE_RANK).
  */
 __global__ void plain_proof_jackpot_kernel(
     const int8_t* __restrict__ A,

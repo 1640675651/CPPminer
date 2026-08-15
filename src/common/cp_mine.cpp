@@ -56,7 +56,7 @@ int cp_mine_last_share_outcome(void)
 }
 
 int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char *target_hex,
-                const uint32_t pool_tgt[8], int sock, int *msg_id) {
+                const uint32_t pool_tgt[8], uint32_t cert_version, int sock, int *msg_id) {
     int rc = CP_JOB_NONE;
     char job_key[320];
     char hdr_prefix[20];
@@ -142,8 +142,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         tiles_at_prev_share = 0;
 
         if (g_share_queue) {
-            const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, hdr_path,
-                                             proof_path};
+            const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, cert_version,
+                                             hdr_path, proof_path};
             cp_share_queue_begin_job(g_share_queue, &share_ctx, job_key);
         }
 

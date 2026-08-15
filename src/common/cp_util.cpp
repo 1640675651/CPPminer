@@ -367,12 +367,19 @@ void cp_scale_target_le(uint32_t tgt[8], uint64_t factor)
     }
 }
 
+uint64_t cp_jackpot_scale_factor(void)
+{
+    return (uint64_t)cp_active_hash_h() * (uint64_t)cp_active_hash_w()
+         * (uint64_t)(K_DIM / R_RANK) * (uint64_t)PENALTY_BASE_RANK;
+}
+
 void cp_scale_jackpot_target(const uint32_t pool_tgt[8], uint32_t bound[8])
 {
-    uint64_t factor = (uint64_t)cp_active_hash_h() * (uint64_t)cp_active_hash_w()
-                    * (uint64_t)K_DIM;
+    /* Rank-penalized bound: target * h * w * (k/r) * PENALTY_BASE_RANK
+     * (pearl penalized_target_bound / check_rank_penalty). At r == 128 this
+     * equals the legacy unpenalized h*w*k scale. */
     memcpy(bound, pool_tgt, 8 * sizeof(uint32_t));
-    cp_scale_target_le(bound, factor);
+    cp_scale_target_le(bound, cp_jackpot_scale_factor());
 }
 
 int cp_send_all(int sock, const void* data, size_t len)

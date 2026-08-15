@@ -1452,11 +1452,10 @@ static int gpu_scan_device_period(
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
     printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
-           "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %d\n",
+           "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %llu\n",
            row_periods, col_periods, g_row_period_batch, g_col_period_batch,
            total_tiles,
-           (g_cutlass_fused ? CP_CUTLASS_HASH_H * CP_CUTLASS_HASH_W
-                            : PP_HASH_H * PP_HASH_W) * K_DIM);
+           (unsigned long long)cp_jackpot_scale_factor());
     fflush(stdout);
 
     for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch){
@@ -1543,8 +1542,8 @@ static int gpu_scan_device(
 
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
-    printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n",
-           row_parts, col_parts, PP_HASH_H * PP_HASH_W * K_DIM);
+    printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
+           row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
     //printf("[gpu] jackpot target LE: %08X %08X ...\n", bound[0], bound[1]);
     fflush(stdout);
 

@@ -15,6 +15,7 @@ typedef struct CpShareJobCtx {
     int *msg_id;
     int m;
     int n;
+    uint32_t cert_version;
     const char *hdr_path;
     const char *proof_path;
 } CpShareJobCtx;

@@ -448,8 +448,8 @@ extern "C" int cp_opencl_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
-    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %.0f\n", row_parts,
-           col_parts, cp_pp_macs_per_hash_tile());
+    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n", row_parts,
+           col_parts, (unsigned long long)cp_jackpot_scale_factor());
     printf("[ocl] GEMM %s\n", g_gemm.backend());
     fflush(stdout);
 

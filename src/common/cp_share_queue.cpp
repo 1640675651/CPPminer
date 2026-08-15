@@ -39,7 +39,8 @@ struct ShareSnapshot {
     int bt_owned = 0;
 };
 
-static int verify_proof_file(const char *hdr_path, const char *target_hex, const char *proof_path) {
+static int verify_proof_file(const char *hdr_path, const char *target_hex, const char *proof_path,
+                             uint32_t cert_version) {
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     uint8_t target_be[32];
     char errbuf[4096];
@@ -99,8 +100,8 @@ static int verify_proof_file(const char *hdr_path, const char *target_hex, const
     }
 
     errbuf[0] = 0;
-    if (cp_proof_verify(header, sizeof(header), (const uint8_t *)b64, n, target_be, errbuf,
-                        sizeof(errbuf)) != 0) {
+    if (cp_proof_verify(header, sizeof(header), (const uint8_t *)b64, n, target_be, cert_version,
+                        errbuf, sizeof(errbuf)) != 0) {
         fprintf(stderr, "verify FAIL: %s\n", errbuf[0] ? errbuf : "unknown");
         free(b64);
         return -1;
@@ -279,8 +280,10 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     if (g_plain_verify && snap->target_hex[0]) {
-        if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path) != 0) {
-            printf("[plain] verify failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
+        if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path,
+                              job_ctx.cert_version) != 0) {
+            printf("[plain] verify failed (nonce=%llu cert_version=%u)\n",
+                   (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
             fflush(stdout);
             set_outcome(CP_SHARE_OUTCOME_VERIFY_FAIL);
             free(b64);
@@ -288,7 +291,8 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
             share_snapshot_delete(snap);
             return;
         }
-        printf("[plain] verify OK (nonce=%llu)\n", (unsigned long long)snap->nonce);
+        printf("[plain] verify OK (nonce=%llu cert_version=%u)\n",
+               (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
         fflush(stdout);
     }
 

@@ -2,6 +2,7 @@
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
 #include "cp_platform.h"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <atomic>
@@ -55,7 +56,8 @@ static int tcp_connect(const char* host, int port)
 
 static void queue_pending_job(
     const char* job_id, const char* job_key,
-    const uint8_t* header, const char* target_hex, const uint32_t tgt[8])
+    const uint8_t* header, const char* target_hex, const uint32_t tgt[8],
+    uint32_t cert_version)
 {
     std::lock_guard<std::mutex> lk(g_pending_mx);
     strncpy(g_pending_job.job_id, job_id, sizeof(g_pending_job.job_id) - 1);
@@ -66,6 +68,7 @@ static void queue_pending_job(
     g_pending_job.target_hex[sizeof(g_pending_job.target_hex) - 1] = 0;
     memcpy(g_pending_job.header, header, INCOMPLETE_HEADER_BYTES);
     memcpy(g_pending_job.tgt, tgt, 8 * sizeof(uint32_t));
+    g_pending_job.cert_version = cp_resolve_cert_version(cert_version);
     g_pending_valid = 1;
 }
 
@@ -178,11 +181,14 @@ static void pool_dispatch_line(const char* line)
         char job_id[128] = {0};
         char header_hex[320] = {0};
         char target_hex[80] = {0};
+        uint32_t cert_version = 0;
         if(!cp_pool_parse_notify(line, job_id, sizeof(job_id),
                                 header_hex, sizeof(header_hex),
-                                target_hex, sizeof(target_hex))){
+                                target_hex, sizeof(target_hex),
+                                &cert_version)){
             return;
         }
+        cert_version = cp_resolve_cert_version(cert_version);
 
         char job_key[320];
         snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
@@ -199,7 +205,7 @@ static void pool_dispatch_line(const char* line)
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
             cp_job_request_cancel();
-            queue_pending_job(job_id, job_key, header, target_hex, tgt);
+            queue_pending_job(job_id, job_key, header, target_hex, tgt, cert_version);
             printf("[net] new job %s while mining %s - cancelling stale work\n",
                    job_id, cp_job_mining_key());
             fflush(stdout);
@@ -366,9 +372,16 @@ void cp_pool_log_share_submit_outcome(void)
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,
                          char* header_hex, int header_len,
-                         char* target_hex, int target_len)
+                         char* target_hex, int target_len,
+                         uint32_t* cert_version_out)
 {
     job_id[0] = header_hex[0] = target_hex[0] = 0;
+    uint32_t cert_version = 0;
+    double cv = cp_json_num(json, "cert_version");
+    if(cv >= 1.0 && cv <= 3.0)
+        cert_version = (uint32_t)cv;
+    if(cert_version_out)
+        *cert_version_out = cert_version;
 
     if(strstr(json, "\"header\"")){
         cp_json_str(json, "job_id", job_id, job_len);

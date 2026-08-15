@@ -6,7 +6,7 @@ mod test {
     use std::io::Write;
     use std::path::Path;
 
-    use crate::api::proof::{PublicProofParams, ZKProof};
+    use crate::api::proof::{PublicProofParams, SeedDerivation, ZKProof};
     use crate::api::{prove, verify};
     use crate::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
     use crate::circuit::pearl_stark::PearlStark;
@@ -147,7 +147,9 @@ mod test {
     fn starky_hash(block_header: IncompleteBlockHeader, plain_proof: &PlainProof) -> String {
         use starky::stark::Stark;
 
-        let (private_params, public_params) = plain_proof.parse_proof(block_header).expect("Failed to parse plain proof");
+        let (private_params, public_params) = plain_proof
+            .parse_proof(block_header, SeedDerivation::Legacy)
+            .expect("Failed to parse plain proof");
 
         let mut hasher = blake3::Hasher::new();
 
@@ -283,7 +285,8 @@ mod test {
         let public_data = &buffer[..PublicProofParams::WIRE_SIZE];
         let proof_data = &buffer[PublicProofParams::WIRE_SIZE..];
 
-        let (public_params, proof) = ZKProof::deserialize(params.block_header, public_data, proof_data).unwrap();
+        let (public_params, proof) =
+            ZKProof::deserialize(params.block_header, SeedDerivation::Legacy, public_data, proof_data).unwrap();
 
         let mut cache = <PearlRecursion as RecursionCircuit>::CircuitCache::default();
         verify::verify_block(&public_params, &proof, &mut cache).expect("Proof must verify");
@@ -364,7 +367,8 @@ mod test {
         let public_data = &buffer[4..4 + public_data_len];
         let proof_data = &buffer[4 + public_data_len..];
 
-        let (public_params, proof) = ZKProof::deserialize(header, public_data, proof_data).unwrap();
+        let (public_params, proof) =
+            ZKProof::deserialize(header, SeedDerivation::Legacy, public_data, proof_data).unwrap();
         assert!(public_params.moe.is_some(), "MoE fixture must have moe params");
 
         let mut cache = <PearlRecursion as RecursionCircuit>::CircuitCache::default();

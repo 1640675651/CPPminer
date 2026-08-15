@@ -554,6 +554,7 @@ mod tests {
         let hash_routing = build_routing_proof(&routing, &job_key, 1, &[0]).proof.root;
         let params = PublicProofParams {
             block_header: IncompleteBlockHeader::new_for_test(0x207FFFFF),
+            seed_derivation: crate::api::proof::SeedDerivation::Legacy,
             mining_config: MiningConfiguration {
                 common_dim: 1024,
                 rank: 32,
@@ -603,6 +604,6 @@ mod tests {
             moe: Some(MoEConfig { e: e as u16, top_k: 1 }),
         };
         let proof = mine_moe(m, n, k as usize, header, config, None, false).unwrap();
-        verify_plain_proof(&header, &proof, None).unwrap();
+        verify_plain_proof(&header, &proof, None, crate::api::proof::SeedDerivation::Legacy).unwrap();
     }
 }

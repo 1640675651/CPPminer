@@ -83,6 +83,7 @@ fn setup(
 
     let mut public_params = PublicProofParams::new_dummy(
         block_header,
+        crate::api::proof::SeedDerivation::Legacy,
         mining_configuration,
         6144, // m: rows of A
         4096, // n: columns of B
@@ -246,7 +247,9 @@ fn test_ffi_mine_prove_verify_with_rank(rank: u16, is_moe: bool) {
 
     // Step 2: Parse plain proof to get private/public params
     let start = Instant::now();
-    let (private_params, mut public_params) = pow_proof.parse_proof(block_header).expect("Failed to parse plain proof");
+    let (private_params, mut public_params) = pow_proof
+        .parse_proof(block_header, crate::api::proof::SeedDerivation::Legacy)
+        .expect("Failed to parse plain proof");
     info!("Parsing took {:?}", start.elapsed());
 
     // Step 3: Prove

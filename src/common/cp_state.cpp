@@ -18,5 +18,16 @@ int g_mock = 0;
 /* Mock scan difficulty (cp_target_from_difficulty). Higher = rarer shares / longer run.
  * ~58 is typically a few–tens of seconds on --dev before the first share. */
 double g_mock_diff = 58.0;
+uint32_t g_cert_version = 3;
+int g_cert_version_forced = 0;
 int g_cpu_matrix_gen = 0;
 int g_max_nonce = 0;
+
+uint32_t cp_resolve_cert_version(uint32_t notify_cert_version)
+{
+    if(g_cert_version_forced)
+        return g_cert_version;
+    if(notify_cert_version >= 1 && notify_cert_version <= 3)
+        return notify_cert_version;
+    return g_cert_version;
+}

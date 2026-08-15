@@ -19,6 +19,7 @@ int cp_mine_job(const uint8_t* header, int hlen,
                 const char* job_id,
                 const char* target_hex,
                 const uint32_t pool_tgt[8],
+                uint32_t cert_version,
                 int sock, int* msg_id);
 
 #ifdef __cplusplus

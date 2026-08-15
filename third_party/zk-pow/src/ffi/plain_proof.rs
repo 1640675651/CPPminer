@@ -162,6 +162,19 @@ pub enum CertificateVersion {
     ZkDense = 1,
     /// V2: MoE and dense proofs.
     ZkMoe = 2,
+    /// V3: same wire layout as V2, salted noise-seed derivation.
+    ZkV3 = 3,
+}
+
+impl CertificateVersion {
+    /// Map certificate version to the noise-seed derivation the verifier must use.
+    pub fn seed_derivation(self) -> crate::api::proof::SeedDerivation {
+        use crate::api::proof::SeedDerivation;
+        match self {
+            Self::ZkDense | Self::ZkMoe => SeedDerivation::Legacy,
+            Self::ZkV3 => SeedDerivation::Salted,
+        }
+    }
 }
 
 impl TryFrom<u32> for CertificateVersion {
@@ -171,6 +184,7 @@ impl TryFrom<u32> for CertificateVersion {
         match version {
             v if v == Self::ZkDense as u32 => Ok(Self::ZkDense),
             v if v == Self::ZkMoe as u32 => Ok(Self::ZkMoe),
+            v if v == Self::ZkV3 as u32 => Ok(Self::ZkV3),
             v => bail!("unknown certificate version: {v}"),
         }
     }
@@ -453,7 +467,11 @@ impl PlainProof {
     }
 
     /// Converts plain proof to Rust proof types, checks a,bt merkle roots match provided hashes.
-    pub fn parse_proof(&self, header: IncompleteBlockHeader) -> Result<(PrivateProofParams, PublicProofParams)> {
+    pub fn parse_proof(
+        &self,
+        header: IncompleteBlockHeader,
+        seed_derivation: crate::api::proof::SeedDerivation,
+    ) -> Result<(PrivateProofParams, PublicProofParams)> {
         let (m, n, k) = (self.m, self.n, self.k);
 
         for &tok in &self.a.row_indices {
@@ -466,6 +484,7 @@ impl PlainProof {
 
         let public = PublicProofParams {
             block_header: header,
+            seed_derivation,
             mining_config: MiningConfiguration {
                 common_dim: k as u32,
                 rank: self.noise_rank as u16,

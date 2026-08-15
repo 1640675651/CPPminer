@@ -218,7 +218,7 @@ def proof_build(
     return out.value.decode("ascii")
 
 
-def proof_verify(header: bytes, proof_b64: str, pool_target_be: int) -> None:
+def proof_verify(header: bytes, proof_b64: str, pool_target_be: int, cert_version: int = 3) -> None:
     if len(header) != HEADER_SIZE:
         raise ValueError(f"header must be {HEADER_SIZE} bytes, got {len(header)}")
     target = pool_target_be.to_bytes(32, "big")
@@ -234,6 +234,7 @@ def proof_verify(header: bytes, proof_b64: str, pool_target_be: int) -> None:
         ctypes.cast(b64_c, ctypes.c_void_p),
         len(b64_buf),
         ctypes.cast(target_arr, ctypes.c_void_p),
+        ctypes.c_uint32(cert_version),
         err,
         ERR_BUF,
     )

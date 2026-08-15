@@ -168,7 +168,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 ### Other GPU (OpenCL)
 | Device | Hashrate |
 |--------|----------|
-| Intel UHD 630 scalar | ~100GH/s |
+| Intel HD graphics 10EU (Haswell) scalar | ~25 GH/s |
+| Intel UHD 630 scalar | ~110 GH/s |
 
 ### CPU
 

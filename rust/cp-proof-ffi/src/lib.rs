@@ -275,7 +275,7 @@ pub unsafe extern "C" fn cp_proof_build(
 }
 
 /// Verify plain_proof base64 against pool target (32-byte BE U256).
-/// Returns 0 on success, -1 on error (message written to `err`).
+/// `cert_version`: 1/2 = legacy seeds, 3 = salted (V3). Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_verify(
     header: *const u8,
@@ -283,6 +283,7 @@ pub unsafe extern "C" fn cp_proof_verify(
     proof_b64: *const u8,
     proof_b64_len: usize,
     pool_target_be: *const u8,
+    cert_version: u32,
     err: *mut u8,
     err_cap: usize,
 ) -> i32 {
@@ -336,13 +337,18 @@ pub unsafe extern "C" fn cp_proof_verify(
 
     let mut target_arr = [0u8; 32];
     std::ptr::copy_nonoverlapping(pool_target_be, target_arr.as_mut_ptr(), 32);
-    match verify_plain_proof_with_pool_target(&block_header, &plain_proof, &target_arr) {
+    match verify_plain_proof_with_pool_target(
+        &block_header,
+        &plain_proof,
+        &target_arr,
+        cert_version,
+    ) {
         Ok(()) => 0,
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("Jackpot condition not satisfied") {
                 if let Ok(detail) =
-                    jackpot_verify_detail(&block_header, &plain_proof, &target_arr)
+                    jackpot_verify_detail(&block_header, &plain_proof, &target_arr, cert_version)
                 {
                     return fail(detail);
                 }
@@ -488,7 +494,11 @@ mod tests {
         let block_header = IncompleteBlockHeader::from_bytes(&header).unwrap();
         let raw = STANDARD.decode(&b64).unwrap();
         let pp: ZkPlainProof = ZkPlainProof::deserialize_compat(&raw).unwrap();
-        let pool_target = [0xffu8; 32];
-        verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target).expect("verify");
+        // Near-max share target that still scales under the rank-penalized factor
+        // (8*16*(k/r)*128 with r=256, k=256 → 16384).
+        let factor = primitive_types::U256::from(8u64 * 16 * 128);
+        let mut pool_target = [0u8; 32];
+        (primitive_types::U256::MAX / factor).to_big_endian(&mut pool_target);
+        verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target, 2).expect("verify");
     }
 }

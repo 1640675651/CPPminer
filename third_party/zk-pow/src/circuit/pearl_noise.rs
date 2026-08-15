@@ -268,7 +268,15 @@ mod tests {
             moe: None,
         };
 
-        let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);
+        let params = PublicProofParams::new_dummy(
+            block_header,
+            crate::api::proof::SeedDerivation::Legacy,
+            mining_configuration,
+            1024,
+            768,
+            0,
+            0,
+        );
 
         compute_noise(&CompiledPublicParams::from(&params)); // Should panic in debug mode
     }
@@ -288,7 +296,15 @@ mod tests {
             moe: None,
         };
 
-        let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);
+        let params = PublicProofParams::new_dummy(
+            block_header,
+            crate::api::proof::SeedDerivation::Legacy,
+            mining_configuration,
+            1024,
+            768,
+            0,
+            0,
+        );
 
         compute_noise(&CompiledPublicParams::from(&params)); // Should panic in debug mode
     }

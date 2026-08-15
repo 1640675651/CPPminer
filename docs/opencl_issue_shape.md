@@ -19,10 +19,6 @@ Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `-
 
 Only applies on the cpm nest (auto scalar fallback or `--ocl-issue broadcast`).
 
-## Regression note (dev vs beignet-fix)
-
-On beignet-fix, **no-DPI always meant cpm** (`!CASE32_PACKED_DOT`). An intermediate `dev` change gated cpm behind `--ocl-issue broadcast` and made the no-DPI `#else` a slow per-C `case32_dot4` loop, also dropping `#pragma unroll` on loads. That is restored: scalar ≡ cpm again (case36 / beignet-fix).
-
 ## packed
 
 ```text
@@ -59,3 +55,5 @@ cvec += avec * bscalar    // mad(float4, float, float4)
 ```
 
 Wait for `[ocl] attempt timing: … GMAC/s`. Look for `clblast cpm float` in the backend line and `private=… B/WI` from the kernel mem print.
+
+Broadcast+float issue may improve performance since some GPUs are weak in int but strong in float. For example, on UHD 630, broadcast+float yields 115GH/s, packed+int yields 100GH/s, and broadcast+int yields 90GH/s.

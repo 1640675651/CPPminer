@@ -96,6 +96,8 @@ static void print_usage(void)
     printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
+    printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
+    printf("                       default 3; without this flag, pool notify cert_version wins)\n");
     printf("  --mock / -mock       offline: fixed job, mine until first share, verify, exit\n");
     printf("  --mock-diff D        mock difficulty (default %.0f; higher = longer before share)\n",
            g_mock_diff);
@@ -110,12 +112,15 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     char job_id[128] = {0};
     char header_hex[320] = {0};
     char target_hex[80] = {0};
+    uint32_t cert_version = 0;
     if(!cp_pool_parse_notify(line, job_id, sizeof(job_id),
                             header_hex, sizeof(header_hex),
-                            target_hex, sizeof(target_hex))){
+                            target_hex, sizeof(target_hex),
+                            &cert_version)){
         printf("[pool] mining.notify parse failed\n"); fflush(stdout);
         return CP_JOB_NONE;
     }
+    cert_version = cp_resolve_cert_version(cert_version);
 
     char job_key[320];
     snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
@@ -137,19 +142,19 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     uint32_t tgt[8];
     memset(tgt, 0, sizeof(tgt));
     if(target_hex[0] && cp_be_target_hex_to_le_words(target_hex, tgt)){
-        printf("[job] notify id=%s header=%.16s... pool_target (unscaled)\n",
-               job_id, header_hex);
+        printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
+               job_id, header_hex, (unsigned)cert_version);
     } else {
         cp_target_from_difficulty(cp_pool_difficulty(), tgt);
-        printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify)\n",
-               job_id, header_hex, cp_pool_difficulty());
+        printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
+               job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
     }
     fflush(stdout);
 
     printf("[plain] mining job=%s%s...\n", job_id,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
-    int rc = cp_mine_job(header, hlen, job_id, target_hex, tgt,
+    int rc = cp_mine_job(header, hlen, job_id, target_hex, tgt, cert_version,
                          cp_pool_socket(), msg_id);
     if(rc == CP_JOB_FEE_SWITCH){
         printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
@@ -169,7 +174,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
                cp_fee_next_is_dev() ? " [DEV FEE]" : "");
         fflush(stdout);
         rc = cp_mine_job(pj.header, INCOMPLETE_HEADER_BYTES, pj.job_id,
-                         pj.target_hex, pj.tgt, cp_pool_socket(), msg_id);
+                         pj.target_hex, pj.tgt, pj.cert_version, cp_pool_socket(), msg_id);
         if(rc == CP_JOB_FEE_SWITCH){
             printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
             return rc;
@@ -392,6 +397,14 @@ int main(int argc, char** argv)
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--verify")){
             g_plain_verify = 1;
+        } else if(!strcmp(argv[i], "--cert-version") && i + 1 < argc){
+            int v = atoi(argv[++i]);
+            if(v < 1 || v > 3){
+                fprintf(stderr, "--cert-version must be 1, 2, or 3 (got %d)\n", v);
+                return 1;
+            }
+            g_cert_version = (uint32_t)v;
+            g_cert_version_forced = 1;
         } else if(!strcmp(argv[i], "--mock") || !strcmp(argv[i], "-mock")){
             g_mock = 1;
         } else if(!strcmp(argv[i], "--mock-diff") && i + 1 < argc){
@@ -736,8 +749,10 @@ int main(int argc, char** argv)
                (g_cpu_matrix_gen || cp_worker_prefers_host_matrices())
                    ? "host BLAKE3 + noise"
                    : "device random + commitment/noise");
-        printf("[mode] verify=%d dry_run=%d max_nonce=%d mock=%d\n",
-               g_plain_verify, g_dry_run, g_max_nonce, g_mock);
+        printf("[mode] verify=%d dry_run=%d max_nonce=%d mock=%d cert_version=%u%s\n",
+               g_plain_verify, g_dry_run, g_max_nonce, g_mock,
+               (unsigned)g_cert_version,
+               g_cert_version_forced ? " (forced)" : "");
         if(cp_fee_enabled()){
             printf("[mode] dev fee: 1%%\n");
         }
@@ -774,12 +789,14 @@ int main(int argc, char** argv)
         cp_le_words_to_be_target_hex(tgt, target_hex);
 
         printf("[mock] job_id=%s (offline, no pool)\n", k_mock_job_id);
-        printf("[mock] difficulty=%.1f target=%.16s...\n", g_mock_diff, target_hex);
+        printf("[mock] difficulty=%.1f target=%.16s... cert_version=%u%s\n",
+               g_mock_diff, target_hex, (unsigned)g_cert_version,
+               g_cert_version_forced ? " (forced)" : "");
         printf("[mock] mining until first share + zk-pow verify...\n");
         fflush(stdout);
 
         const int rc = cp_mine_job(header, INCOMPLETE_HEADER_BYTES, k_mock_job_id, target_hex, tgt,
-                                   -1, NULL);
+                                   g_cert_version, -1, NULL);
         const int outcome = cp_mine_last_share_outcome();
         cp_mine_free_host_buffers();
         cp_worker_shutdown();

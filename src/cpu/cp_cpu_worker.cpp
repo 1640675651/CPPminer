@@ -332,8 +332,8 @@ extern "C" int cp_cpu_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
-    printf("[cpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %d\n",
-           row_parts, col_parts, PP_HASH_H * PP_HASH_W * K_DIM);
+    printf("[cpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
+           row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
     printf("[cpu] GEMM %s\n", g_gemm.backend());
     fflush(stdout);
 

@@ -33,7 +33,8 @@ void cp_pool_log_share_submit_outcome(void);
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,
                          char* header_hex, int header_len,
-                         char* target_hex, int target_len);
+                         char* target_hex, int target_len,
+                         uint32_t* cert_version_out);
 
 typedef struct {
     char job_id[128];
@@ -41,6 +42,7 @@ typedef struct {
     char target_hex[80];
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     uint32_t tgt[8];
+    uint32_t cert_version; /* 1/2=legacy seeds, 3=salted */
 } CpPendingJob;
 
 int cp_pool_take_pending_job(CpPendingJob* out);
