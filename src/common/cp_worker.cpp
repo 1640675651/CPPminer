@@ -155,6 +155,15 @@ extern "C" void cp_worker_set_ocl_issue_broadcast(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_cpm_int(int on)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_cpm_int(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_configure_ocl_tile(int device_index)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL

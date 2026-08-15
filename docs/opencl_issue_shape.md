@@ -5,9 +5,18 @@ Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `-
 | Mode | Flag | Inner loop |
 |------|------|------------|
 | **packed** (default) | `--ocl-issue packed` | Per-C `dot4` / DP4A into `acc[j,i]` |
-| **broadcast** | `--ocl-issue broadcast` | `cpm += aval * bscalar` (float4 `mad`, flush each KR) |
+| **broadcast** | `--ocl-issue broadcast` | `cpm += aval * bscalar`; type via `--ocl-cpm-type` |
 
 `broadcast` forces a scalar kernel build (DPI off) so the nest actually runs. AMD `sdot4` / `dot_acc_sat` stay on **packed**.
+
+### Broadcast cpm type (`--ocl-cpm-type`)
+
+| Type | Flag | Acc tile |
+|------|------|----------|
+| **float** (default) | `--ocl-cpm-type float` | `float4 mad`, flush to int32 each KR |
+| **int** | `--ocl-cpm-type int` | int8→int32 lanes, `int4` mul+add (products do not fit in `char`) |
+
+Only applies with `--ocl-issue broadcast`.
 
 ## packed (current)
 
@@ -49,9 +58,13 @@ for k in 0..3:
 # default packed
 ./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32
 
-# B-broadcast issue
+# B-broadcast issue (float default)
 ./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32 \
   --ocl-issue broadcast
+
+# same nest, native int32 cpm
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32 \
+  --ocl-issue broadcast --ocl-cpm-type int
 ```
 
-Wait for `[ocl] attempt timing: … GMAC/s`. Backend line prints `broadcast` when active.
+Wait for `[ocl] attempt timing: … GMAC/s`. Backend line prints `broadcast float` or `broadcast int`.

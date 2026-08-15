@@ -40,6 +40,7 @@ static int g_tile_nr = 0;
 static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_broadcast = 0;
+static int g_cpm_int = 0;
 
 namespace {
 
@@ -235,6 +236,10 @@ extern "C" void cp_opencl_worker_set_issue_broadcast(int on) {
     g_issue_broadcast = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_cpm_int(int on) {
+    g_cpm_int = on ? 1 : 0;
+}
+
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
     int tile_mr = PP_HASH_H;
     int tile_nr = 8;
@@ -306,6 +311,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
     g_gemm.set_issue_broadcast(g_issue_broadcast);
+    g_gemm.set_cpm_int(g_cpm_int);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -322,7 +328,12 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
     if (g_issue_broadcast) {
-        printf("[ocl] issue: broadcast (--ocl-issue broadcast)\n");
+        printf("[ocl] issue: broadcast %s (--ocl-issue broadcast%s)\n",
+               g_cpm_int ? "int" : "float",
+               g_cpm_int ? ", --ocl-cpm-type int" : "");
+    } else if (g_cpm_int) {
+        fprintf(stderr,
+                "[ocl] warning: --ocl-cpm-type int ignored without --ocl-issue broadcast\n");
     }
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());

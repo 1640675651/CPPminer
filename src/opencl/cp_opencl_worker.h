@@ -19,6 +19,8 @@ int cp_opencl_hash_tile_w(void);
 void cp_opencl_worker_set_tile(int mr, int nr);
 /* OpenCL GEMM issue: 0 = packed per-C dot4 (default), 1 = broadcast. */
 void cp_opencl_worker_set_issue_broadcast(int on);
+/* Broadcast cpm type: 0 = float (default), 1 = int32. Requires broadcast issue. */
+void cp_opencl_worker_set_cpm_int(int on);
 /* Apply tile override or auto-detect for device before kernel build. */
 void cp_opencl_configure_tile(int device_index, int platform_filter);
 /* Same as above using worker platform filter (-1 = all platforms). */

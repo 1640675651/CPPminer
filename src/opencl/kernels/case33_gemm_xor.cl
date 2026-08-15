@@ -13,8 +13,9 @@
 // Measured CL_KERNEL_PRIVATE_MEM_SIZE on Beignet (Haswell GT1, scalar):
 //   8×8: 384 B/WI (was 1152 with ms_xor[32] + post-GEMM msg fold)
 //   8×16: 1152 B/WI (acc spill dominates; unchanged after ms_xor removal)
-// --ocl-issue broadcast (CASE32_ISSUE_BROADCAST): CLBlast GEMMK=0 cpm += aval * bscalar
-//   (float4 mad; flush to int32 each KR). Default --ocl-issue packed keeps per-C dot4.
+// --ocl-issue broadcast (CASE32_ISSUE_BROADCAST): cpm += aval * bscalar; flush each KR.
+//   --ocl-cpm-type float (default): float4 mad. --ocl-cpm-type int: int8→int32, int4 acc.
+//   Default --ocl-issue packed keeps per-C dot4.
 
 #ifndef MR
 #define MR 8
@@ -52,11 +53,27 @@
 #ifndef CASE32_ISSUE_BROADCAST
 #define CASE32_ISSUE_BROADCAST 0
 #endif
+#ifndef CASE32_CPM_INT
+#define CASE32_CPM_INT 0
+#endif
 #if CASE32_ISSUE_BROADCAST
 #define CPM_COLVEC (MR / VWM)
 #define CPM_NVEC (NR * CPM_COLVEC)
 #if (MR % VWM) != 0 || (NR % VWN) != 0
-#error CLBlast-style cpm tile requires MR%VWM==0 and NR%VWN==0
+#error broadcast cpm tile requires MR%VWM==0 and NR%VWN==0
+#endif
+#if CASE32_CPM_INT
+typedef int cpm_lane;
+typedef int4 cpm_vec;
+#define CASE32_CPM_ZERO ((int4)(0))
+#define CASE32_CPM_SPLAT(b) ((int4)(b))
+#define CASE32_CPM_MAD(aval, bsc, c) ((aval) * CASE32_CPM_SPLAT(bsc) + (c))
+#else
+typedef float cpm_lane;
+typedef float4 cpm_vec;
+#define CASE32_CPM_ZERO ((float4)(0.0f))
+#define CASE32_CPM_SPLAT(b) ((float4)(b))
+#define CASE32_CPM_MAD(aval, bsc, c) mad((aval), CASE32_CPM_SPLAT(bsc), (c))
 #endif
 #endif
 #ifndef KGROUPS
@@ -187,35 +204,35 @@ inline int case32_dot4(int acc, int a_pack, int b_pack) {
 }
 
 #if CASE32_ISSUE_BROADCAST
-/* CLBlast GEMMK=0: cpm[n][m] += apm[m] * bpm[n] (B scalar broadcast). Float panel
-   flushed to int32 each KR (exact: |sum|<2^21). DP4A path is unchanged (--ocl-issue packed). */
+/* Broadcast issue: cpm[n][m] += apm[m] * bpm[n] (B scalar). Float or int32 panel
+   (--ocl-cpm-type); flushed to int32 acc each KR. Packed/DP4A path unchanged. */
 
-inline float case32_char_lane(char4 c, int k) {
+inline cpm_lane case32_char_lane(char4 c, int k) {
     if (k == 0) {
-        return (float)c.s0;
+        return (cpm_lane)c.s0;
     }
     if (k == 1) {
-        return (float)c.s1;
+        return (cpm_lane)c.s1;
     }
     if (k == 2) {
-        return (float)c.s2;
+        return (cpm_lane)c.s2;
     }
-    return (float)c.s3;
+    return (cpm_lane)c.s3;
 }
 
-inline float4 case32_apm(__private const char4 *ar, int row0, int k) {
-    return (float4)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k),
-                    case32_char_lane(ar[row0 + 2], k), case32_char_lane(ar[row0 + 3], k));
+inline cpm_vec case32_apm(__private const char4 *ar, int row0, int k) {
+    return (cpm_vec)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k),
+                     case32_char_lane(ar[row0 + 2], k), case32_char_lane(ar[row0 + 3], k));
 }
 
-inline void case32_cpm_zero(__private float4 *cpm) {
+inline void case32_cpm_zero(__private cpm_vec *cpm) {
     #pragma unroll
     for (int i = 0; i < CPM_NVEC; ++i) {
-        cpm[i] = (float4)(0.0f);
+        cpm[i] = CASE32_CPM_ZERO;
     }
 }
 
-inline void case32_cpm_kgroup(__private float4 *cpm, __private const int *a_pack,
+inline void case32_cpm_kgroup(__private cpm_vec *cpm, __private const int *a_pack,
                               __private const int *b_pack) {
     char4 ar[MR];
     char4 br[NR];
@@ -231,28 +248,28 @@ inline void case32_cpm_kgroup(__private float4 *cpm, __private const int *a_pack
     for (int k = 0; k < RANK; ++k) {
         #pragma unroll
         for (int mi = 0; mi < CPM_COLVEC; ++mi) {
-            const float4 aval = case32_apm(ar, mi * VWM, k);
+            const cpm_vec aval = case32_apm(ar, mi * VWM, k);
             #pragma unroll
             for (int ni = 0; ni < NR / VWN; ++ni) {
                 const int j0 = ni * VWN;
-                cpm[(j0 + 0) * CPM_COLVEC + mi] =
-                        mad(aval, (float4)case32_char_lane(br[j0 + 0], k),
-                            cpm[(j0 + 0) * CPM_COLVEC + mi]);
-                cpm[(j0 + 1) * CPM_COLVEC + mi] =
-                        mad(aval, (float4)case32_char_lane(br[j0 + 1], k),
-                            cpm[(j0 + 1) * CPM_COLVEC + mi]);
-                cpm[(j0 + 2) * CPM_COLVEC + mi] =
-                        mad(aval, (float4)case32_char_lane(br[j0 + 2], k),
-                            cpm[(j0 + 2) * CPM_COLVEC + mi]);
-                cpm[(j0 + 3) * CPM_COLVEC + mi] =
-                        mad(aval, (float4)case32_char_lane(br[j0 + 3], k),
-                            cpm[(j0 + 3) * CPM_COLVEC + mi]);
+                cpm[(j0 + 0) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 0], k),
+                        cpm[(j0 + 0) * CPM_COLVEC + mi]);
+                cpm[(j0 + 1) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 1], k),
+                        cpm[(j0 + 1) * CPM_COLVEC + mi]);
+                cpm[(j0 + 2) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 2], k),
+                        cpm[(j0 + 2) * CPM_COLVEC + mi]);
+                cpm[(j0 + 3) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 3], k),
+                        cpm[(j0 + 3) * CPM_COLVEC + mi]);
             }
         }
     }
 }
 
-inline void case32_cpm_flush(__private int *acc, __private const float4 *cpm) {
+inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
     #pragma unroll
     for (int j = 0; j < NR; ++j) {
         #pragma unroll
@@ -312,7 +329,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         acc[i] = 0;
     }
 #if CASE32_ISSUE_BROADCAST
-    float4 cpm[CPM_NVEC];
+    cpm_vec cpm[CPM_NVEC];
 #endif
 
     uint msg[PP_JACKPOT_WORDS];

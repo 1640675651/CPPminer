@@ -56,6 +56,7 @@ static void print_usage(void)
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
     printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: packed (default) or broadcast\n");
+    printf("  --ocl-cpm-type T   OpenCL broadcast cpm type: float (default) or int\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -218,6 +219,7 @@ int main(int argc, char** argv)
     int ocl_tile_mr = 0;
     int ocl_tile_nr = 0;
     int ocl_issue_broadcast = 0;
+    int ocl_cpm_int = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     for(int i = 1; i < argc; i++){
@@ -285,6 +287,22 @@ int main(int argc, char** argv)
                 ocl_issue_broadcast = 1;
             } else {
                 fprintf(stderr, "invalid --ocl-issue %s (expected packed or broadcast)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-cpm-type", 14)){
+            const char* v = argv[i] + 14;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-cpm-type requires float or int\n");
+                return 1;
+            }
+            if(!strcmp(v, "float") || !strcmp(v, "fp32")){
+                ocl_cpm_int = 0;
+            } else if(!strcmp(v, "int") || !strcmp(v, "int32")){
+                ocl_cpm_int = 1;
+            } else {
+                fprintf(stderr, "invalid --ocl-cpm-type %s (expected float or int)\n", v);
                 return 1;
             }
 #endif
@@ -444,6 +462,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_tile(ocl_tile_mr, ocl_tile_nr);
     if(ocl_issue_broadcast)
         cp_worker_set_ocl_issue_broadcast(1);
+    if(ocl_cpm_int)
+        cp_worker_set_ocl_cpm_int(1);
 #endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){

@@ -37,6 +37,8 @@ struct Case33GemmOcl {
 
     /* 0 = packed per-C dot4 (default); 1 = B-broadcast cpm += aval * bscalar. */
     void set_issue_broadcast(int on);
+    /* Broadcast cpm element type: 0 = float (default), 1 = int32. Ignored if packed. */
+    void set_cpm_int(int on);
 
 
 
@@ -134,6 +136,8 @@ private:
     Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
 
     bool use_issue_broadcast_ = false;
+
+    bool use_cpm_int_ = false;
 
 
 
