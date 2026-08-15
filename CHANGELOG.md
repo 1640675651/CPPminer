@@ -4,8 +4,10 @@
 - Put OpenCL kernel compilation into a subprocess with error handling. Improve compatibility for driver that crashes at compilation failure.
 - Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some driver like beignet.
 - Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`): half-height register tile.
-- OpenCL issue mode selection `--ocl-issue packed|broadcast`, may improve performance on scalar only GPUs.
-- OpenCL int8 promotion selection `--ocl-cpm-type float|int`: broadcast B scalar in float (default) or int32. This may improve performance since some GPUs are weak in int but strong in float.
+- OpenCL issue mode `--ocl-issue auto|broadcast|packed` (default **auto** = DP4A detection then broadcast fallback).
+- OpenCL int8 promotion selection `--ocl-cpm-type float|int`: broadcast B scalar in float (default) or int32. 
+
+Broadcast+float issue may improve performance since some GPUs are weak in int but strong in float. For example, on UHD 630, broadcast+float yields 115GH/s, packed+int yields 100GH/s, and broadcast+int yields 90GH/s.
 - Lightweight random matrix generation (TODO)
 - Smaller matrix low-memory mode (TODO)
 

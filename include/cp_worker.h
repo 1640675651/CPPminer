@@ -34,7 +34,9 @@ int cp_worker_list_devices(void);
 void cp_worker_set_ocl_platform(int platform_index);
 /* OpenCL-only: hash tile MR x NR (4x8, 8x8, or 8x16). mr<=0 restores auto detection. */
 void cp_worker_set_ocl_tile(int mr, int nr);
-/* OpenCL-only: GEMM issue shape. 0 = packed (default), 1 = broadcast. */
+/* OpenCL-only: GEMM issue. 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
+void cp_worker_set_ocl_issue_mode(int mode);
+/* Legacy: on → broadcast, off → auto. */
 void cp_worker_set_ocl_issue_broadcast(int on);
 /* OpenCL-only: broadcast cpm type. 0 = float (default), 1 = int32. */
 void cp_worker_set_ocl_cpm_int(int on);

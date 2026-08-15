@@ -17,7 +17,9 @@ int cp_opencl_hash_tile_mr(void);
 int cp_opencl_hash_tile_w(void);
 /* OpenCL hash tile size (MR x NR). Pass mr<=0 to restore auto (8x8 default, 8x16 on AMD). */
 void cp_opencl_worker_set_tile(int mr, int nr);
-/* OpenCL GEMM issue: 0 = packed per-C dot4 (default), 1 = broadcast. */
+/* OpenCL GEMM issue: 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
+void cp_opencl_worker_set_issue_mode(int mode);
+/* Legacy: on → broadcast (1), off → auto (0). */
 void cp_opencl_worker_set_issue_broadcast(int on);
 /* Broadcast cpm type: 0 = float (default), 1 = int32. Requires broadcast issue. */
 void cp_opencl_worker_set_cpm_int(int on);

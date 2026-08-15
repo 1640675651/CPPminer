@@ -73,8 +73,18 @@ void Case33GemmOcl::set_macro_batch(int batch) {
     macro_batch_ = clamp_macro_batch(batch);
 }
 
+void Case33GemmOcl::set_issue_mode(int mode) {
+    if (mode < 0) {
+        mode = 0;
+    }
+    if (mode > 2) {
+        mode = 2;
+    }
+    issue_mode_ = mode;
+}
+
 void Case33GemmOcl::set_issue_broadcast(int on) {
-    use_issue_broadcast_ = on != 0;
+    issue_mode_ = on ? 1 : 0;
 }
 
 void Case33GemmOcl::set_cpm_int(int on) {
@@ -123,6 +133,7 @@ Case33GemmOcl::~Case33GemmOcl() {
 bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     auto try_build = [&](bool use_dot, bool force_ext, bool use_asm, bool use_builtin,
                          const char *label) -> bool {
+        const bool scalar = !use_dot && !use_asm && !use_builtin;
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
         build_opts += " -DNR=" + std::to_string(case32::kNR);
@@ -131,11 +142,17 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
         build_opts += " -DCASE32_WI_ROWMAJOR=1";
-        if (use_issue_broadcast_) {
-            build_opts += " -DCASE32_ISSUE_BROADCAST=1";
+        /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
+        if (scalar) {
+            build_opts += " -DCASE32_NO_DPI=1";
             if (use_cpm_int_) {
                 build_opts += " -DCASE32_CPM_INT=1";
             }
+            if (issue_mode_ == 2) {
+                build_opts += " -DCASE32_FORCE_PACKED=1";
+            }
+        } else if (issue_mode_ == 2) {
+            build_opts += " -DCASE32_FORCE_PACKED=1";
         }
         if (use_asm) {
             build_opts += " -DCASE32_USE_ASM_DOT=1";
@@ -150,16 +167,16 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         }
         if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
             if (use_dot && force_ext && !use_asm && !use_builtin) {
-                const std::string build_opts2 =
+                std::string build_opts2 =
                         "-cl-std=CL1.2 -cl-ext=+cl_khr_integer_dot_product "
                         "-DCASE32_FORCE_DPI=1 -DMR=" +
                         std::to_string(case32::kMR) + " -DNR=" +
-                        std::to_string(case32::kNR) +
-                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
-                        (use_issue_broadcast_
-                                 ? (std::string(" -DCASE32_ISSUE_BROADCAST=1") +
-                                    (use_cpm_int_ ? " -DCASE32_CPM_INT=1" : ""))
-                                 : "");
+                        std::to_string(case32::kNR) + " -DKR=" +
+                        std::to_string(case32::kKR) +
+                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1";
+                if (issue_mode_ == 2) {
+                    build_opts2 += " -DCASE32_FORCE_PACKED=1";
+                }
                 if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
                     if (kernel_) {
                         clReleaseKernel(kernel_);
@@ -170,6 +187,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         using_integer_dot_ = true;
                         using_asm_dot_ = false;
                         using_builtin_dot_ = false;
+                        using_cpm_ = false;
                         std::snprintf(dpi_status_, sizeof(dpi_status_), "%s (-cl-ext): OK",
                                       label);
                         return true;
@@ -191,42 +209,91 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         using_integer_dot_ = use_dot && !use_asm && !use_builtin;
         using_asm_dot_ = use_asm;
         using_builtin_dot_ = use_builtin;
+        using_cpm_ = scalar && issue_mode_ != 2;
         std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", label);
         return true;
     };
 
     bool built = false;
-    /* Broadcast issue is a scalar float cpm nest; force DPI off so the flag applies. */
-    if (use_issue_broadcast_) {
+    /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
+    if (issue_mode_ == 1) {
         built = try_build(false, false, false, false,
-                          use_cpm_int_ ? "broadcast int (scalar)" : "broadcast float (scalar)");
+                          use_cpm_int_ ? "broadcast int (cpm)" : "broadcast float (cpm)");
+    } else if (issue_mode_ == 2) {
+        /* --ocl-issue packed: DPI if possible, else scalar per-C dot4. */
+        if (dpi_mode_ == Case32OclDpiMode::Off) {
+            built = try_build(false, false, false, false, "packed scalar dot4");
+        } else if (dpi_mode_ == Case32OclDpiMode::Asm) {
+            built = try_build(false, false, true, false, "packed asm v_dot4c");
+            if (!built) {
+                built = try_build(false, false, false, false, "packed scalar (asm failed)");
+            }
+        } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
+            built = try_build(false, false, false, true, "packed builtin sdot4");
+            if (!built) {
+                built = try_build(true, false, false, false, "packed KHR dot_acc_sat");
+            }
+            if (!built) {
+                built = try_build(false, false, false, false, "packed scalar (builtin failed)");
+            }
+        } else if (dpi_mode_ == Case32OclDpiMode::Force) {
+            built = try_build(true, true, false, false, "packed force DPI");
+            if (!built) {
+                built = try_build(false, false, false, false, "packed scalar (force failed)");
+            }
+        } else if (ocl_.has_integer_dot_product) {
+            built = try_build(true, false, false, false, "packed auto DPI");
+            if (!built) {
+                built = try_build(false, false, false, false, "packed scalar (auto DPI failed)");
+            }
+        } else {
+            built = try_build(false, false, false, true, "packed builtin sdot4");
+            if (!built) {
+                built = try_build(false, false, false, false, "packed scalar (no DPI)");
+            }
+        }
     } else if (dpi_mode_ == Case32OclDpiMode::Off) {
-        built = try_build(false, false, false, false, "scalar (forced off)");
+        built = try_build(false, false, false, false,
+                          use_cpm_int_ ? "cpm int (forced off)" : "cpm float (forced off)");
     } else if (dpi_mode_ == Case32OclDpiMode::Asm) {
         built = try_build(false, false, true, false, "asm v_dot4c_i32_i8");
         if (!built) {
-            built = try_build(false, false, false, false, "scalar (asm failed)");
+            built = try_build(false, false, false, false, "cpm (asm failed)");
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
+        /* beignet-fix default cascade: AMD builtin → KHR → scalar cpm. */
         built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
         if (!built) {
             built = try_build(true, false, false, false, "KHR dot_acc_sat (builtin failed)");
         }
         if (!built) {
-            built = try_build(false, false, false, false, "scalar (builtin failed)");
+            built = try_build(false, false, false, false,
+                              use_cpm_int_ ? "cpm int (builtin failed)" : "cpm float (builtin failed)");
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Force) {
         built = try_build(true, true, false, false, "force CASE32_FORCE_DPI");
         if (!built) {
-            built = try_build(false, false, false, false, "scalar (force failed)");
+            built = try_build(false, false, false, false, "cpm (force failed)");
         }
     } else if (ocl_.has_integer_dot_product) {
         built = try_build(true, false, false, false, "auto cl_khr_integer_dot_product");
         if (!built) {
-            built = try_build(false, false, false, false, "scalar (auto DPI failed)");
+            built = try_build(false, false, false, false, "cpm (auto DPI failed)");
         }
     } else {
-        built = try_build(false, false, false, false, "scalar (no DPI ext)");
+        built = try_build(false, false, false, false,
+                          use_cpm_int_ ? "cpm int (no DPI)" : "cpm float (no DPI)");
+    }
+    if (built && kernel_) {
+        cl_ulong local_b = 0;
+        cl_ulong priv_b = 0;
+        (void)clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_LOCAL_MEM_SIZE,
+                                       sizeof(local_b), &local_b, nullptr);
+        (void)clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                       sizeof(priv_b), &priv_b, nullptr);
+        std::printf("[ocl] kernel mem: local=%llu B/WG private=%llu B/WI\n",
+                    (unsigned long long)local_b, (unsigned long long)priv_b);
+        std::fflush(stdout);
     }
     return built;
 }
@@ -325,15 +392,19 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
 
-    const char *dot_kind = "scalar";
-    if (use_issue_broadcast_) {
-        dot_kind = use_cpm_int_ ? "broadcast int" : "broadcast float";
-    } else if (using_asm_dot_) {
+    const char *dot_kind = "clblast cpm";
+    if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
         dot_kind = "builtin sdot4";
     } else if (using_integer_dot_) {
         dot_kind = "dot_acc_sat";
+    } else if (issue_mode_ == 2) {
+        dot_kind = "packed scalar";
+    } else if (use_cpm_int_) {
+        dot_kind = "clblast cpm int";
+    } else if (using_cpm_) {
+        dot_kind = "clblast cpm float";
     }
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
@@ -382,15 +453,19 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         return false;
     }
 
-    const char *dot_kind = "scalar";
-    if (use_issue_broadcast_) {
-        dot_kind = use_cpm_int_ ? "broadcast int" : "broadcast float";
-    } else if (using_asm_dot_) {
+    const char *dot_kind = "clblast cpm";
+    if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
         dot_kind = "builtin sdot4";
     } else if (using_integer_dot_) {
         dot_kind = "dot_acc_sat";
+    } else if (issue_mode_ == 2) {
+        dot_kind = "packed scalar";
+    } else if (use_cpm_int_) {
+        dot_kind = "clblast cpm int";
+    } else if (using_cpm_) {
+        dot_kind = "clblast cpm float";
     }
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8 GPU-prep",

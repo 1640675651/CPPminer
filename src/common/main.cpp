@@ -7,6 +7,7 @@
 #include "cp_noise.h"
 #include "cp_pool.h"
 #include "cp_platform.h"
+#include "cp_proof.h"
 #include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
@@ -55,8 +56,8 @@ static void print_usage(void)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
     printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
-    printf("  --ocl-issue MODE   OpenCL GEMM issue: packed (default) or broadcast\n");
-    printf("  --ocl-cpm-type T   OpenCL broadcast cpm type: float (default) or int\n");
+    printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
+    printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -218,7 +219,7 @@ int main(int argc, char** argv)
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
     int ocl_tile_nr = 0;
-    int ocl_issue_broadcast = 0;
+    int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
     int ocl_cpm_int = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
@@ -278,15 +279,17 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-issue requires packed or broadcast\n");
+                fprintf(stderr, "--ocl-issue requires auto, broadcast, or packed\n");
                 return 1;
             }
-            if(!strcmp(v, "packed") || !strcmp(v, "dot4")){
-                ocl_issue_broadcast = 0;
+            if(!strcmp(v, "auto")){
+                ocl_issue_mode = 0;
             } else if(!strcmp(v, "broadcast")){
-                ocl_issue_broadcast = 1;
+                ocl_issue_mode = 1;
+            } else if(!strcmp(v, "packed") || !strcmp(v, "dot4")){
+                ocl_issue_mode = 2;
             } else {
-                fprintf(stderr, "invalid --ocl-issue %s (expected packed or broadcast)\n", v);
+                fprintf(stderr, "invalid --ocl-issue %s (expected auto, broadcast, or packed)\n", v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-cpm-type", 14)){
@@ -460,8 +463,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_platform(ocl_platform);
     if(ocl_tile_mr > 0)
         cp_worker_set_ocl_tile(ocl_tile_mr, ocl_tile_nr);
-    if(ocl_issue_broadcast)
-        cp_worker_set_ocl_issue_broadcast(1);
+    if(ocl_issue_mode != 0)
+        cp_worker_set_ocl_issue_mode(ocl_issue_mode);
     if(ocl_cpm_int)
         cp_worker_set_ocl_cpm_int(1);
 #endif
@@ -624,6 +627,11 @@ int main(int argc, char** argv)
        && period_batch == CP_PERIOD_BATCH_DEFAULT){
         period_batch = CP_MACRO_BATCH_DEFAULT;
     }
+    /* Resolve tile (incl. broadcast auto 4x8) before mode banner / fee tile counts. */
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+        cp_worker_configure_ocl_tile(devs[0]);
+        cp_worker_apply_backend_defaults();
+    }
 #endif
     cp_worker_set_period_batch(period_batch);
     cp_worker_set_row_period_batch(row_period_batch);
@@ -658,16 +666,20 @@ int main(int argc, char** argv)
         double host_mib = ((double)g_m_active * K_DIM + (double)g_n_active * K_DIM)
                         / (1024.0 * 1024.0);
         const int contiguous = cp_worker_uses_contiguous_tiles();
+        const int tile_layout = cp_worker_default_tile_layout();
         int row_parts = cp_pp_num_row_parts(g_m_active, contiguous);
         int col_parts = cp_pp_num_col_parts(g_n_active, contiguous);
+        const char *tile_layout_name =
+            cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
+            : "BzMiner periodic scattered 8x16";
         printf("[mode] backend=%s\n", cp_worker_backend_name());
         printf("[mode] plain_proof m=%d n=%d k=%d r=%d%s\n",
                g_m_active, g_n_active, K_DIM, R_RANK,
                g_dev_dims ? " (dev)" : " (production)");
-        printf("[mode] tile layout: %s\n",
-               cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
-               : (contiguous ? "contiguous 8x16 blocks"
-                             : "BzMiner periodic scattered 8x16"));
+        printf("[mode] tile layout: %s\n", tile_layout_name);
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
             printf("[mode] scan: fused GEMM + XOR + host jackpot\n");
             if(prepack_mode == CP_PREPACK_FUSED)
@@ -680,9 +692,13 @@ int main(int argc, char** argv)
                 printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
                        host_mib, host_mib * 2.0);
         } else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+            const int tiles_per_macro =
+                (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? (128 / 4) * (128 / 8)
+                : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? (128 / 8) * (128 / 8)
+                : (128 / 8) * (128 / 16);
             printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
-                   period_batch, period_batch * 128);
+                   period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");

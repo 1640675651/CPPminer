@@ -146,6 +146,15 @@ extern "C" void cp_worker_set_ocl_tile(int mr, int nr)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_issue_mode(int mode)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_issue_mode(mode);
+#else
+    (void)mode;
+#endif
+}
+
 extern "C" void cp_worker_set_ocl_issue_broadcast(int on)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -215,7 +224,8 @@ extern "C" void cp_worker_apply_backend_defaults(void)
 {
     const int layout = cp_worker_default_tile_layout();
     const int contiguous =
-        (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8);
+        (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
+         layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8);
     pearl_set_contiguous_tiles(contiguous);
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
@@ -229,7 +239,8 @@ extern "C" void cp_worker_apply_backend_defaults(void)
 extern "C" int cp_worker_uses_contiguous_tiles(void)
 {
     const int layout = cp_worker_default_tile_layout();
-    return layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+    return layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
+           layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8;
 }
 
 extern "C" void cp_worker_set_period_gemm(int on)

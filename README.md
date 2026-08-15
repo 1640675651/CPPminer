@@ -119,10 +119,10 @@ This scipt pulls third-party dependencies and execute cmake.
 |------|-------------|
 | `--ocl-platform P` | Restrict device enumeration to platform index `P` |
 | `--ocl-tile MxN` | Hash tile: `8x8` (default), `4x8`, or `8x16` (auto on AMD discrete GPUs) |
-| `--ocl-issue MODE` | GEMM issue: `packed` (default, per-C `dot4`) or `broadcast` (`cpm += aval * bscalar`) |
-| `--ocl-cpm-type T` | Broadcast cpm type: `float` (default) or `int` (requires `--ocl-issue broadcast`) |
+| `--ocl-issue MODE` | GEMM issue: `auto` (default: DPI, else broadcast), `broadcast` (B-scalar `mad`), or `packed` (per-C `dot4`) |
+| `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
 
-`--ocl-tile` sets the hash tile for GEMM, jackpot XOR, hashrate counting, and proof layout. `--ocl-issue` / `--ocl-cpm-type` select the scalar nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)).
+`--ocl-tile` sets the hash tile for GEMM, jackpot XOR, hashrate counting, and proof layout. `--ocl-issue` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** is float **B-scalar broadcast**.
 
 ### Scan batching (`--period-batch`)
 

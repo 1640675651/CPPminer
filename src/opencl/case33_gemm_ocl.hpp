@@ -35,9 +35,11 @@ struct Case33GemmOcl {
 
     int macro_batch() const { return macro_batch_; }
 
-    /* 0 = packed per-C dot4 (default); 1 = B-broadcast cpm += aval * bscalar. */
+    /* 0 = auto (DPI then cpm; beignet-fix), 1 = broadcast/cpm, 2 = packed per-C dot4. */
+    void set_issue_mode(int mode);
+    /* Legacy: on → broadcast (1), off → auto (0). */
     void set_issue_broadcast(int on);
-    /* Broadcast cpm element type: 0 = float (default), 1 = int32. Ignored if packed. */
+    /* Broadcast/cpm element type: 0 = float4 mad (default), 1 = int32. Ignored if packed. */
     void set_cpm_int(int on);
 
 
@@ -135,7 +137,7 @@ private:
 
     Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
 
-    bool use_issue_broadcast_ = false;
+    int issue_mode_ = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 
     bool use_cpm_int_ = false;
 
@@ -146,6 +148,8 @@ private:
     bool using_asm_dot_ = false;
 
     bool using_builtin_dot_ = false;
+
+    bool using_cpm_ = false;
 
 
 
