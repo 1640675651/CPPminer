@@ -46,6 +46,12 @@ extern "C" void cp_cuda_worker_set_cutlass_fused(int on)
     cp_gpu_set_cutlass_fused(on);
 }
 
+extern "C" void cp_cuda_worker_begin_job(const uint8_t job_key[32], int m, int n,
+                                         uint32_t cert_version)
+{
+    cp_gpu_begin_job(job_key, m, n, cert_version);
+}
+
 extern "C" int cp_cuda_worker_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,
     const uint8_t job_key[32],

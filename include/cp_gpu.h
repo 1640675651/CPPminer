@@ -18,6 +18,7 @@ void cp_gpu_set_row_period_batch(int batch);
 void cp_gpu_set_col_period_batch(int batch);
 void cp_gpu_set_step_major_ap(int on);
 void cp_gpu_set_cutlass_fused(int on);
+void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version);
 
 /* CPU matrix path: upload host noisy matrices and scan. */
 int cp_gpu_mine_plain_proof(const int8_t* h_A, const int8_t* h_B,

@@ -83,6 +83,8 @@ static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 0; /* Case 10 default; main sets 1 for cuBLAS period */
 static int g_cutlass_fused = 0;
+/* Cert V3: bind Merkle roots with m/n before noise-seed chain. Set by begin_job. */
+static int g_salted = 1;
 
 static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)
 {
@@ -282,6 +284,17 @@ void cp_gpu_set_cutlass_fused(int on)
     g_cutlass_fused = on ? 1 : 0;
     for(int i = 0; i < g_ngpu; i++)
         g_gpus[i].use_cutlass_fused = g_cutlass_fused;
+}
+
+void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
+{
+    (void)job_key;
+    (void)m;
+    (void)n;
+    g_salted = (cert_version >= 3) ? 1 : 0;
+    printf("[gpu] job noise seeds: salted=%d (cert_version=%u)\n",
+           g_salted, (unsigned)cert_version);
+    fflush(stdout);
 }
 
 void cp_gpu_init(int* devs, int ndev)
@@ -772,11 +785,12 @@ static int gpu_prepare_noisy_matrices(
     fflush(stdout);
 
     t_step = cp_now_sec();
-    pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, 0,
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, g_salted,
                              b_seed, a_key_out);
     CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice));
-    printf("[gpu-prep] noise seeds + H2D %.3fs\n", cp_now_sec() - t_step);
+    printf("[gpu-prep] noise seeds + H2D %.3fs (salted=%d)\n", cp_now_sec() - t_step,
+           g_salted);
     fflush(stdout);
 
     t_step = cp_now_sec();
@@ -888,13 +902,24 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     printf("[align-test-prod] GPU/CPU matrix hash OK\n");
     fflush(stdout);
 
-    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, (uint32_t)m, (uint32_t)n, 0,
-                             b_seed_gpu, a_key_gpu);
-    pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, 0, b_seed_cpu, a_key_cpu);
-    if(compare_digest("b_noise_seed", b_seed_gpu, b_seed_cpu) != 0) goto done;
-    if(compare_digest("a_noise_seed", a_key_gpu, a_key_cpu) != 0) goto done;
-    printf("[align-test-prod] noise seeds OK\n");
+    /* Match GPU derive vs host commitment for both legacy and cert-V3 salted. */
+    for(int salted = 0; salted <= 1; salted++){
+        pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, (uint32_t)m, (uint32_t)n,
+                                 salted, b_seed_gpu, a_key_gpu);
+        pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, salted, b_seed_cpu,
+                               a_key_cpu);
+        char tag_b[32], tag_a[32];
+        snprintf(tag_b, sizeof(tag_b), "b_noise_seed(salted=%d)", salted);
+        snprintf(tag_a, sizeof(tag_a), "a_noise_seed(salted=%d)", salted);
+        if(compare_digest(tag_b, b_seed_gpu, b_seed_cpu) != 0) goto done;
+        if(compare_digest(tag_a, a_key_gpu, a_key_cpu) != 0) goto done;
+    }
+    printf("[align-test-prod] noise seeds OK (legacy + salted)\n");
     fflush(stdout);
+
+    /* Continue noise-apply checks with salted seeds (cert V3 default). */
+    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, (uint32_t)m, (uint32_t)n, 1,
+                             b_seed_gpu, a_key_gpu);
 
     CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_gpu, 32, cudaMemcpyHostToDevice));
     {

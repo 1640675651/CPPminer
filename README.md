@@ -110,6 +110,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job id, mine until first share, verify, exit (implies dry-run+verify) |
 | `--mock-diff D` | Mock pool difficulty (default 58; higher = longer before first share) |
+| `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `separate` (default), `reuse`, or `fused` matrix prepack |
 | `--simd ISA` | CPU: `auto` (default), `avx2`, `sse`, `scalar` |
 
@@ -169,7 +170,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Device | Hashrate |
 |--------|----------|
 | Intel HD graphics 10EU (Haswell) scalar | ~25 GH/s |
-| Intel UHD 630 scalar | ~110 GH/s |
+| Intel UHD 630 scalar | ~115 GH/s |
 
 ### CPU
 

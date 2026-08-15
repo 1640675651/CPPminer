@@ -1,19 +1,22 @@
 # Changelog
 
+## v0.4 (tentative)
+- Lightweight random matrix generation, only sparsely fill matrix elements (TODO)
+- Zero-B on cuda worker (TODO)
+- Smaller matrix low-memory mode (TODO)
+- ARM CPU support (TODO)
+
 ## v0.3 (tentative)
-- Align with the cert V3 salted seed hardfork. Old cert v2 shares are not accepted anymore (CPU, OpenCL done, CUDA TODO).
-- Local `--verify` and jackpot target scaling use pearl **rank-penalized** bound (at `r=128` identical to the old `h×w×k` scale).
-- Separate OpenCL kernel compilation process with error handling. Improve compatibility for driver/compiler that crashes at compilation failure.
-- Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some driver like beignet.
+- Switch to cert V3 salted seed hardfork. Old cert V2 shares are no longer accepted by the network.
+- Separate OpenCL kernel compilation process with error handling. Improve compatibility for driver/compiler that crashes on specific compilation failure.
+- Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some drivers like beignet.
 - Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`) to further reduce register pressure on small GPUs.
 - OpenCL issue mode `--ocl-issue auto|broadcast|packed` (default **auto** = DP4A detection then broadcast fallback).
 - OpenCL int8 promotion selection `--ocl-cpm-type float|int`: broadcast B scalar in float (default) or int32. 
 
+OpenCL mode note:
 Broadcast+float issue may improve performance since some GPUs are weak in int but strong in float. For example, on UHD 630, broadcast+float yields 115GH/s, packed+int yields 100GH/s, and broadcast+int yields 90GH/s.
-- Lightweight random matrix generation, only fill some matrix elements (TODO)
-- Zero-B on cuda worker (TODO)
-- Smaller matrix low-memory mode (TODO)
-- ARM CPU support (TODO)
+
 
 ## v0.2.1
 - Refactor CUTLASS GEMM main loop to reduce XOR overhead. This buys back the lost performance in the last version due to more frequent XOR boundary. 8.0TH -> 9.1TH on a GTX 1070.

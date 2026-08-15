@@ -359,10 +359,17 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         cp_cpu_worker_begin_job(job_key, m, n, cert_version);
 #endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        cp_cuda_worker_begin_job(job_key, m, n, cert_version);
+#endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         cp_opencl_worker_begin_job(job_key, m, n, cert_version);
 #endif
+    (void)job_key;
+    (void)m;
+    (void)n;
     (void)cert_version;
 }
 
