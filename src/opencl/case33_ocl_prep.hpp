@@ -18,7 +18,8 @@ struct Case33OclPrep {
 
     bool prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
                            const uint8_t job_key[32], const uint8_t b_noise_seed[32], int m,
-                           int K, int blocks_k, int macro_rows, uint8_t a_key_out[32]);
+                           int K, int blocks_k, int macro_rows, int salted,
+                           uint8_t a_key_out[32]);
 
     /* Noise perm pairs + fused coalesced A prepack (d_noise_seed_ and d_A_sig_ must be set). */
     bool fused_prepack_a(cl_mem a_buf, int m, int K, int blocks_k, int macro_rows);

@@ -133,7 +133,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         if (cp_worker_worker_handles_matrix_prep()) {
             memset(h_BpT_global, 0, szBpT);
         }
-        cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active);
+        cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active, cert_version);
         tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
                             cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
         cp_fee_set_tiles_per_matrix((uint64_t)tiles_per_attempt);
@@ -225,7 +225,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             }
 
             pearl_commitment_seeds(job_key_bytes, h_Ap_global, h_BpT_global, g_m_active, g_n_active,
-                                   K_DIM, b_seed, a_key);
+                                   K_DIM, cert_version >= 3, b_seed, a_key);
 
             if (pearl_build_noisy_matrices(g_m_active, g_n_active, K_DIM, R_RANK, b_seed, a_key,
                                            h_Ap_global, h_BpT_global, h_A_scan, h_B_scan) != 0) {

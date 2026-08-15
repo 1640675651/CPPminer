@@ -26,6 +26,7 @@ struct ZeroBCache {
     int n = 0;
     int ready = 0;
     int use_cpu_prep = 0;
+    int salted = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<int8_t> B_noisy;
 } g_zero_b;
@@ -93,7 +94,8 @@ static int zero_b_prepare_job_host(const uint8_t job_key[32], int m, int n) {
     g_zero_b.n = n;
     g_zero_b.use_cpu_prep = 1;
 
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
+                               g_zero_b.b_noise_seed);
     if (pearl_build_noisy_b(n, K_DIM, R_RANK, g_zero_b.b_noise_seed, NULL,
                             g_zero_b.B_noisy.data()) != 0) {
         g_zero_b.ready = 0;
@@ -117,7 +119,8 @@ static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
     g_zero_b.use_cpu_prep = 0;
     g_zero_b.B_noisy.clear();
 
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
+                               g_zero_b.b_noise_seed);
     if (!g_gemm.prepare_job_gpu(m, n, K_DIM, g_zero_b.b_noise_seed)) {
         g_zero_b.ready = 0;
         fprintf(stderr, "[ocl] prepare_job_gpu failed\n");
@@ -161,7 +164,8 @@ static int zero_b_prepare_attempt_host(const uint8_t *ab_seed, int ab_seed_len,
         return -1;
     }
 
-    pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed, h_A_sig, m, K_DIM, a_key_out);
+    pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed, h_A_sig, m, K_DIM,
+                              g_zero_b.salted, a_key_out);
 
     const size_t szA = static_cast<size_t>(m) * static_cast<size_t>(K_DIM);
     std::vector<int8_t> a_noisy(szA);
@@ -195,7 +199,7 @@ static int zero_b_prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
     }
 
     if (!g_gemm.prepare_attempt_gpu(a_rng, (int)sizeof(a_rng), job_key, g_zero_b.b_noise_seed,
-                                      a_key_out)) {
+                                      g_zero_b.salted, a_key_out)) {
         fprintf(stderr, "[ocl] prepare_attempt_gpu failed\n");
         return -2;
     }
@@ -366,17 +370,21 @@ extern "C" void cp_opencl_worker_shutdown(void) {
     g_context_ready = 0;
 }
 
-extern "C" void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n) {
+extern "C" void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n,
+                                           uint32_t cert_version) {
     if (!g_context_ready) {
         return;
     }
     g_zero_b.ready = 0;
+    g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     const int cpu_prep = g_cpu_matrix_gen;
     if (zero_b_prepare_job(job_key, m, n, cpu_prep) == 0) {
         if (cpu_prep) {
-            printf("[ocl] zero-B: host noise + prepack, B cached on device\n");
+            printf("[ocl] zero-B: host noise + prepack, B cached on device (salted=%d)\n",
+                   g_zero_b.salted);
         } else {
-            printf("[ocl] zero-B: GPU noise + fused prepack, B on device\n");
+            printf("[ocl] zero-B: GPU noise + fused prepack, B on device (salted=%d)\n",
+                   g_zero_b.salted);
         }
         fflush(stdout);
     }

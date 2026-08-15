@@ -3,7 +3,6 @@
 #include "case32_layout.hpp"
 #include "cp_config.h"
 #include "cp_noise.h"
-#include "blake3.h"
 
 #include <cstdio>
 #include <cstring>
@@ -51,13 +50,6 @@ uint64_t pearl_seed_to_u64(const uint8_t *seed, int seed_len) {
         s ^= static_cast<uint64_t>(seed[i]) << ((i & 7) * 8);
     }
     return s;
-}
-
-void blake3_unkeyed(const uint8_t *data, size_t len, uint8_t out[32]) {
-    blake3_hasher h;
-    blake3_hasher_init(&h);
-    blake3_hasher_update(&h, data, len);
-    blake3_hasher_finalize(&h, out, 32);
 }
 
 } // namespace
@@ -422,7 +414,7 @@ bool Case33OclPrep::prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], 
 
 bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
                                       const uint8_t job_key[32], const uint8_t b_noise_seed[32],
-                                      int m, int K, int blocks_k, int macro_rows,
+                                      int m, int K, int blocks_k, int macro_rows, int salted,
                                       uint8_t a_key_out[32]) {
     if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed || !a_key_out) {
         return false;
@@ -461,10 +453,8 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
         return false;
     }
 
-    uint8_t a_in[64];
-    memcpy(a_in, b_noise_seed, 32);
-    memcpy(a_in + 32, hash_a, 32);
-    blake3_unkeyed(a_in, 64, a_key_out);
+    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), salted,
+                                 a_key_out);
 
     if (!ocl_->write_buffer(d_noise_seed_, a_key_out, 32)) {
         return false;

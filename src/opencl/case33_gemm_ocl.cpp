@@ -477,12 +477,13 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
 
 bool Case33GemmOcl::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                                         const uint8_t job_key[32],
-                                        const uint8_t b_noise_seed[32], uint8_t a_key_out[32]) {
+                                        const uint8_t b_noise_seed[32], int salted,
+                                        uint8_t a_key_out[32]) {
     if (!available_ || !a_buf_ || !prep_.ready()) {
         return false;
     }
     return prep_.prepare_attempt_a(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
-                                   blocks_k_, macro_rows_, a_key_out);
+                                   blocks_k_, macro_rows_, salted, a_key_out);
 }
 
 bool Case33GemmOcl::read_A_sig(int8_t *h_A_sig) {

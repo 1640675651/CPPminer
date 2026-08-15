@@ -53,7 +53,7 @@ struct Case33GemmOcl {
     bool prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]);
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                              const uint8_t job_key[32], const uint8_t b_noise_seed[32],
-                             uint8_t a_key_out[32]);
+                             int salted, uint8_t a_key_out[32]);
     bool read_A_sig(int8_t *h_A_sig);
 
     bool prepare_attempt_a(const int8_t *a_rowmajor);

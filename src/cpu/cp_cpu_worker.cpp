@@ -25,6 +25,7 @@ struct ZeroBCache {
     int m = 0;
     int n = 0;
     int ready = 0;
+    int salted = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<int8_t> B_noisy;
 } g_zero_b;
@@ -102,7 +103,7 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
     apply_simd_to_gemm();
 
     if(log_step) t_step = cp_now_sec();
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.b_noise_seed);
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, g_zero_b.b_noise_seed);
     if(log_step)
         printf("[gen]   zero-B b_noise_seed done in %.1fs\n", cp_now_sec() - t_step);
 
@@ -166,7 +167,7 @@ static int zero_b_prepare_attempt(
         return -1;
 
     pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,
-                              h_A_sig, m, K_DIM, a_key_out);
+                              h_A_sig, m, K_DIM, g_zero_b.salted, a_key_out);
 
     if(g_prepack_mode == CP_PREPACK_FUSED){
         if(!g_gemm.prepare_attempt_a(&g_A_noisy, h_A_sig, a_key_out, R_RANK)){
@@ -195,15 +196,17 @@ extern "C" int cp_cpu_worker_handles_matrix_prep(void)
     return 1;
 }
 
-extern "C" void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n)
+extern "C" void cp_cpu_worker_begin_job(const uint8_t job_key[32], int m, int n,
+                                        uint32_t cert_version)
 {
     g_zero_b.ready = 0;
+    g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     if(zero_b_prepare_job(job_key, m, n) == 0){
         const char* b_desc = "noisy B + b_pre";
         if(g_prepack_mode == CP_PREPACK_FUSED || g_prepack_mode == CP_PREPACK_REUSE)
             b_desc = "B scan buf";
-        printf("[cpu] zero-B: cached %s for job (signal B^T = 0, prepack=%s)\n",
-               b_desc, prepack_mode_name(g_prepack_mode));
+        printf("[cpu] zero-B: cached %s for job (signal B^T = 0, prepack=%s, salted=%d)\n",
+               b_desc, prepack_mode_name(g_prepack_mode), g_zero_b.salted);
         fflush(stdout);
     }
 }

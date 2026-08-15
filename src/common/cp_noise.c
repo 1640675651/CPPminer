@@ -324,9 +324,83 @@ void pearl_job_key(const uint8_t* header, int header_len, uint8_t out32[32]){
     blake3_digest(buf, (size_t)header_len + 52, NULL, out32);
 }
 
+/* Domain salts: blake3("pearl/cert-v3/noise-seed/{A,B}") — pinned in pearl seed.rs. */
+static const uint8_t PEARL_SEED_SALT_A[32] = {
+    0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
+    0x92, 0xdb, 0xdb, 0x2a, 0x70, 0x23, 0xb8, 0x52, 0xf0, 0xd4, 0x77, 0x19, 0xc3, 0x90, 0x01, 0x7b
+};
+static const uint8_t PEARL_SEED_SALT_B[32] = {
+    0x11, 0x30, 0x06, 0x32, 0xec, 0x63, 0x01, 0xca, 0x2b, 0xe2, 0xaf, 0x71, 0x8b, 0x3f, 0x4d, 0x4f,
+    0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9
+};
+
+static void pearl_bind_message(const uint8_t root[32], uint32_t dim, uint8_t msg[64])
+{
+    memset(msg, 0, 64);
+    memcpy(msg, root, 32);
+    msg[32] = (uint8_t)(dim);
+    msg[33] = (uint8_t)(dim >> 8);
+    msg[34] = (uint8_t)(dim >> 16);
+    msg[35] = (uint8_t)(dim >> 24);
+}
+
+void pearl_bind_root_a(const uint8_t hash_a[32], uint32_t m, uint8_t out[32])
+{
+    uint8_t msg[64];
+    pearl_bind_message(hash_a, m, msg);
+    blake3_digest(msg, 64, PEARL_SEED_SALT_A, out);
+}
+
+void pearl_bind_root_b(const uint8_t hash_b[32], uint32_t n, uint8_t out[32])
+{
+    uint8_t msg[64];
+    pearl_bind_message(hash_b, n, msg);
+    blake3_digest(msg, 64, PEARL_SEED_SALT_B, out);
+}
+
+void pearl_a_noise_seed_from_hash(const uint8_t b_noise_seed[32],
+                                  const uint8_t hash_a[32],
+                                  uint32_t m, int salted,
+                                  uint8_t a_noise_seed[32])
+{
+    uint8_t bound_a[32];
+    const uint8_t* root_a = hash_a;
+    if(salted){
+        pearl_bind_root_a(hash_a, m, bound_a);
+        root_a = bound_a;
+    }
+    uint8_t a_in[64];
+    memcpy(a_in, b_noise_seed, 32);
+    memcpy(a_in + 32, root_a, 32);
+    blake3_digest(a_in, 64, NULL, a_noise_seed);
+}
+
+void pearl_derive_noise_seeds(const uint8_t job_key[32],
+                              const uint8_t hash_a[32], const uint8_t hash_b[32],
+                              uint32_t m, uint32_t n, int salted,
+                              uint8_t b_noise_seed[32], uint8_t a_noise_seed[32])
+{
+    uint8_t bound_a[32], bound_b[32];
+    const uint8_t* root_a = hash_a;
+    const uint8_t* root_b = hash_b;
+    if(salted){
+        pearl_bind_root_a(hash_a, m, bound_a);
+        pearl_bind_root_b(hash_b, n, bound_b);
+        root_a = bound_a;
+        root_b = bound_b;
+    }
+
+    uint8_t b_in[64];
+    memcpy(b_in, job_key, 32);
+    memcpy(b_in + 32, root_b, 32);
+    blake3_digest(b_in, 64, NULL, b_noise_seed);
+
+    pearl_a_noise_seed_from_hash(b_noise_seed, root_a, m, 0, a_noise_seed);
+}
+
 void pearl_commitment_seeds(const uint8_t job_key[32],
                             const int8_t* A, const int8_t* Bt,
-                            int m, int n, int k,
+                            int m, int n, int k, int salted,
                             uint8_t b_noise_seed[32], uint8_t a_noise_seed[32])
 {
     const int log_step = (m >= 65536) ? 1 : 0;
@@ -342,15 +416,8 @@ void pearl_commitment_seeds(const uint8_t job_key[32],
     pearl_keyed_digest_int8(A, raw_a, job_key, hash_a);
     pearl_keyed_digest_int8(Bt, raw_b, job_key, hash_b);
 
-    uint8_t b_in[64];
-    memcpy(b_in, job_key, 32);
-    memcpy(b_in + 32, hash_b, 32);
-    blake3_digest(b_in, 64, NULL, b_noise_seed);
-
-    uint8_t a_in[64];
-    memcpy(a_in, b_noise_seed, 32);
-    memcpy(a_in + 32, hash_a, 32);
-    blake3_digest(a_in, 64, NULL, a_noise_seed);
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, salted,
+                             b_noise_seed, a_noise_seed);
 
     if(log_step){
 #ifdef _OPENMP
@@ -507,6 +574,46 @@ int pearl_test_get_random_hash(void)
     return 0;
 }
 
+static int pearl_test_salted_seeds(void)
+{
+    /* Pinned vectors from pearl zk-pow api/seed.rs commitment_hash_pinned_vectors. */
+    uint8_t job_key[32], hash_a[32], hash_b[32];
+    memset(job_key, 0x11, 32);
+    memset(hash_a, 0xAA, 32);
+    memset(hash_b, 0xBB, 32);
+    const uint32_t m = 192, n = 320;
+
+    static const uint8_t expect_legacy_b[32] = {
+        0xad, 0xd6, 0xf7, 0xea, 0x5f, 0xee, 0xbf, 0x89, 0xc8, 0xa7, 0x7e, 0x2e, 0xbf, 0xa0, 0xd8, 0x24,
+        0x42, 0xe7, 0xdb, 0xb0, 0x04, 0x6d, 0xbd, 0x48, 0x97, 0x18, 0x61, 0xd1, 0x2f, 0xcb, 0x01, 0x77
+    };
+    static const uint8_t expect_legacy_a[32] = {
+        0x48, 0x3b, 0x07, 0xb6, 0xf7, 0x31, 0x05, 0x03, 0x0b, 0x94, 0x82, 0x25, 0x5f, 0x37, 0x72, 0x3f,
+        0x3f, 0xed, 0x69, 0xae, 0x91, 0x67, 0x24, 0xee, 0x82, 0x91, 0x84, 0x8b, 0x8c, 0x28, 0x79, 0x4b
+    };
+    static const uint8_t expect_salted_b[32] = {
+        0x60, 0xed, 0x9b, 0x73, 0xc5, 0xa9, 0x59, 0x9b, 0x20, 0x0b, 0x6c, 0xd5, 0x63, 0xe7, 0xf0, 0xd5,
+        0xd9, 0xa6, 0x7d, 0x24, 0x02, 0xd8, 0x5f, 0xd4, 0xef, 0x96, 0x6c, 0x58, 0x00, 0x80, 0xd0, 0xe5
+    };
+    static const uint8_t expect_salted_a[32] = {
+        0x30, 0x17, 0x84, 0x16, 0x80, 0x05, 0xec, 0x83, 0x3a, 0xb0, 0xaa, 0x60, 0x00, 0x6f, 0x7f, 0xe7,
+        0xfa, 0xaa, 0x95, 0x30, 0x7d, 0x8c, 0x1f, 0xc6, 0x81, 0x9b, 0x2f, 0xfd, 0xd7, 0x17, 0xec, 0xcf
+    };
+
+    uint8_t b[32], a[32];
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, m, n, 0, b, a);
+    if(memcmp(b, expect_legacy_b, 32) != 0 || memcmp(a, expect_legacy_a, 32) != 0){
+        fprintf(stderr, "[align-test] legacy seed vector mismatch\n");
+        return -1;
+    }
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, m, n, 1, b, a);
+    if(memcmp(b, expect_salted_b, 32) != 0 || memcmp(a, expect_salted_a, 32) != 0){
+        fprintf(stderr, "[align-test] salted seed vector mismatch\n");
+        return -1;
+    }
+    return 0;
+}
+
 int pearl_run_alignment_tests(void)
 {
     static const int cases[][3] = {
@@ -516,11 +623,12 @@ int pearl_run_alignment_tests(void)
         {128, 128, 4096},
     };
     if(pearl_test_get_random_hash() != 0) return -1;
+    if(pearl_test_salted_seeds() != 0) return -1;
     for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++){
         if(pearl_test_keyed_matrix_root(cases[i][0], cases[i][1], cases[i][2]) != 0)
             return -1;
     }
-    printf("[align-test] CPU keyed hash + chunk root OK (small cases)\n");
+    printf("[align-test] CPU keyed hash + chunk root + salted seeds OK (small cases)\n");
     fflush(stdout);
     return 0;
 }
@@ -544,7 +652,7 @@ void pearl_keyed_digest_int8(const int8_t* mat, size_t raw_len,
 
 void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
                                const uint8_t b_noise_seed[32],
-                               const int8_t* A, int m, int k,
+                               const int8_t* A, int m, int k, int salted,
                                uint8_t a_noise_seed[32])
 {
     const int log_step = (m >= 65536) ? 1 : 0;
@@ -557,10 +665,7 @@ void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
     uint8_t hash_a[32];
     pearl_keyed_digest_int8(A, raw_a, job_key, hash_a);
 
-    uint8_t a_in[64];
-    memcpy(a_in, b_noise_seed, 32);
-    memcpy(a_in + 32, hash_a, 32);
-    blake3_digest(a_in, 64, NULL, a_noise_seed);
+    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, (uint32_t)m, salted, a_noise_seed);
 
     if(log_step){
 #ifdef _OPENMP
@@ -756,23 +861,8 @@ int pearl_root_from_chunk_cvs(const uint8_t* chunk_cvs, int num_chunks,
     return 0;
 }
 
-void pearl_derive_noise_seeds(const uint8_t job_key[32],
-                              const uint8_t hash_a[32], const uint8_t hash_b[32],
-                              uint8_t b_noise_seed[32], uint8_t a_noise_seed[32])
-{
-    uint8_t b_in[64];
-    memcpy(b_in, job_key, 32);
-    memcpy(b_in + 32, hash_b, 32);
-    blake3_digest(b_in, 64, NULL, b_noise_seed);
-
-    uint8_t a_in[64];
-    memcpy(a_in, b_noise_seed, 32);
-    memcpy(a_in + 32, hash_a, 32);
-    blake3_digest(a_in, 64, NULL, a_noise_seed);
-}
-
 void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
-                                const int8_t* Bt, int n, int k,
+                                const int8_t* Bt, int n, int k, int salted,
                                 uint8_t b_noise_seed[32])
 {
     size_t raw_b = (size_t)n * (size_t)k;
@@ -789,9 +879,16 @@ void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
         exit(1);
     }
 
+    uint8_t bound_b[32];
+    const uint8_t* root_b = hash_b;
+    if(salted){
+        pearl_bind_root_b(hash_b, (uint32_t)n, bound_b);
+        root_b = bound_b;
+    }
+
     uint8_t b_in[64];
     memcpy(b_in, job_key, 32);
-    memcpy(b_in + 32, hash_b, 32);
+    memcpy(b_in + 32, root_b, 32);
     blake3_digest(b_in, 64, NULL, b_noise_seed);
 }
 

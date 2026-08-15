@@ -352,16 +352,18 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     return 0;
 }
 
-extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n)
+extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
+                                    uint32_t cert_version)
 {
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
-        cp_cpu_worker_begin_job(job_key, m, n);
+        cp_cpu_worker_begin_job(job_key, m, n, cert_version);
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
-        cp_opencl_worker_begin_job(job_key, m, n);
+        cp_opencl_worker_begin_job(job_key, m, n, cert_version);
 #endif
+    (void)cert_version;
 }
 
 extern "C" int cp_worker_default_tile_layout(void)

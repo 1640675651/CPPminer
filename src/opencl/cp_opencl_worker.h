@@ -30,7 +30,8 @@ void cp_opencl_configure_tile_for_worker(int device_index);
 /* Print OpenCL devices; returns count. */
 int cp_opencl_worker_list_devices(void);
 int cp_opencl_worker_handles_matrix_prep(void);
-void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n);
+void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int n,
+                                uint32_t cert_version);
 
 int cp_opencl_worker_mine_attempt(
         const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],

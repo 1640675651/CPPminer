@@ -199,8 +199,9 @@ extern "C" int cp_opencl_run_alignment_tests(int device_index, int m, int n) {
     printf("[align-test-prod] GPU/CPU matrix hash OK\n");
     fflush(stdout);
 
-    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, b_seed_gpu, a_key_gpu);
-    pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, b_seed_cpu, a_key_cpu);
+    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, static_cast<uint32_t>(m),
+                             static_cast<uint32_t>(n), 0, b_seed_gpu, a_key_gpu);
+    pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, 0, b_seed_cpu, a_key_cpu);
     if (compare_digest("b_noise_seed", b_seed_gpu, b_seed_cpu) != 0) {
         goto done;
     }
@@ -321,7 +322,7 @@ extern "C" int cp_opencl_run_alignment_tests(int device_index, int m, int n) {
     fflush(stdout);
 
     if (!prep.prepare_attempt_a(d_a_pre, ab_seed, static_cast<int>(sizeof(ab_seed)), job_key,
-                                b_seed_gpu, m, K_DIM, blocks_k, macro_rows, a_key_gpu)) {
+                                b_seed_gpu, m, K_DIM, blocks_k, macro_rows, 0, a_key_gpu)) {
         fprintf(stderr, "[align-test-prod] GPU fused prepack A failed\n");
         goto done;
     }

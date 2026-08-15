@@ -772,7 +772,8 @@ static int gpu_prepare_noisy_matrices(
     fflush(stdout);
 
     t_step = cp_now_sec();
-    pearl_derive_noise_seeds(job_key, hash_a, hash_b, b_seed, a_key_out);
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, 0,
+                             b_seed, a_key_out);
     CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice));
     printf("[gpu-prep] noise seeds + H2D %.3fs\n", cp_now_sec() - t_step);
@@ -887,8 +888,9 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     printf("[align-test-prod] GPU/CPU matrix hash OK\n");
     fflush(stdout);
 
-    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, b_seed_gpu, a_key_gpu);
-    pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, b_seed_cpu, a_key_cpu);
+    pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, (uint32_t)m, (uint32_t)n, 0,
+                             b_seed_gpu, a_key_gpu);
+    pearl_commitment_seeds(job_key, h_A, h_Bt, m, n, K_DIM, 0, b_seed_cpu, a_key_cpu);
     if(compare_digest("b_noise_seed", b_seed_gpu, b_seed_cpu) != 0) goto done;
     if(compare_digest("a_noise_seed", a_key_gpu, a_key_cpu) != 0) goto done;
     printf("[align-test-prod] noise seeds OK\n");

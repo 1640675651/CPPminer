@@ -77,7 +77,7 @@ int cp_worker_prefers_host_matrices(void);
 
 /* Worker generates noisy matrices internally (CPU zero-B). */
 int cp_worker_worker_handles_matrix_prep(void);
-void cp_worker_begin_job(const uint8_t job_key[32], int m, int n);
+void cp_worker_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version);
 
 /* Default tile layout for proof build (matches CP_TILE_LAYOUT_* in cp_proof.h). */
 int cp_worker_default_tile_layout(void);

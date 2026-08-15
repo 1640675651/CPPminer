@@ -7,7 +7,6 @@
 #include "cp_opencl_worker.h"
 #include "cp_util.h"
 #include "opencl_context.hpp"
-#include "blake3.h"
 
 #include <cstdio>
 #include <cstring>
@@ -71,13 +70,6 @@ void scale_attempt(ZeroBAttemptTimes *t, double inv) {
     t->total *= inv;
 }
 
-void blake3_unkeyed_64(const uint8_t in[64], uint8_t out[32]) {
-    blake3_hasher h;
-    blake3_hasher_init(&h);
-    blake3_hasher_update(&h, in, 64);
-    blake3_hasher_finalize(&h, out, 32);
-}
-
 uint64_t pearl_seed_to_u64(const uint8_t *seed, int seed_len) {
     uint64_t s = 0;
     for (int i = 0; i < seed_len; i++) {
@@ -122,7 +114,8 @@ bool run_full_prep(Case33OclPrep *prep, cl_mem d_b_sig, cl_mem d_b_pre, cl_mem d
     t.hash_b = cp_now_sec() - t0;
 
     t0 = cp_now_sec();
-    pearl_derive_noise_seeds(job_key, hash_a, hash_b, b_seed, a_key);
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, static_cast<uint32_t>(m),
+                             static_cast<uint32_t>(n), 0, b_seed, a_key);
     t.noise_seeds = cp_now_sec() - t0;
 
     t0 = cp_now_sec();
@@ -169,10 +162,7 @@ bool run_zero_b_attempt(Case33OclPrep *prep, cl_mem d_a_pre, const uint8_t b_noi
     t.hash_a = cp_now_sec() - t0;
 
     t0 = cp_now_sec();
-    uint8_t a_in[64];
-    memcpy(a_in, b_noise_seed, 32);
-    memcpy(a_in + 32, hash_a, 32);
-    blake3_unkeyed_64(a_in, a_key);
+    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), 0, a_key);
     if (!prep->write_noise_seed(a_key)) {
         return false;
     }
@@ -288,7 +278,7 @@ extern "C" int cp_opencl_run_prep_profile(int device_index, int m, int n, int wa
 
     uint8_t b_seed[32];
     double t0 = cp_now_sec();
-    pearl_b_noise_seed_from_bt(job_key, nullptr, n, K_DIM, b_seed);
+    pearl_b_noise_seed_from_bt(job_key, nullptr, n, K_DIM, 0, b_seed);
     const double b_seed_cpu = cp_now_sec() - t0;
 
     t0 = cp_now_sec();

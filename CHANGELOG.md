@@ -1,16 +1,11 @@
 # Changelog
 
 ## v0.3 (tentative)
-- Local `--verify` and jackpot target scaling use pearl **rank-penalized** bound
-  (`target × h × w × (k/r) × 128`), matching `penalized_target_bound` /
-  `check_rank_penalty` (at `r=128` identical to the old `h×w×k` scale).
-- Cert V3 salted seed: `--verify` defaults to **cert_version=3** (salted). Pool
-  notify `cert_version` is used when present unless `--cert-version N` forces an
-  override. Mock uses the same default/override. Mining still legacy — V3 verify
-  of current shares should fail until the mine path salts.
-- Put OpenCL kernel compilation into a subprocess with error handling. Improve compatibility for driver that crashes at compilation failure.
+- Align with the cert V3 salted seed hardfork. Old cert v2 shares are not accepted anymore (CPU, OpenCL done, CUDA TODO).
+- Local `--verify` and jackpot target scaling use pearl **rank-penalized** bound (at `r=128` identical to the old `h×w×k` scale).
+- Separate OpenCL kernel compilation process with error handling. Improve compatibility for driver/compiler that crashes at compilation failure.
 - Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some driver like beignet.
-- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`): half-height register tile.
+- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`) to further reduce register pressure on small GPUs.
 - OpenCL issue mode `--ocl-issue auto|broadcast|packed` (default **auto** = DP4A detection then broadcast fallback).
 - OpenCL int8 promotion selection `--ocl-cpm-type float|int`: broadcast B scalar in float (default) or int32. 
 
