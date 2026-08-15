@@ -348,11 +348,6 @@ try {
         Copy-OpenClKernels
     }
 
-    # Keep legacy cpminer.exe name in sync (docs / habit).
-    if (Test-Path $OutExe) {
-        Copy-Item $OutExe (Join-Path $Root "cpminer.exe") -Force
-    }
-
     Write-Host "=== Done: $OutExe ==="
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'

@@ -19,7 +19,7 @@ set(_cp_langs CXX C)
 if(CP_ENABLE_CUDA)
     list(APPEND _cp_langs CUDA)
 endif()
-project(cpminer LANGUAGES ${_cp_langs})
+project(cppminer LANGUAGES ${_cp_langs})
 
 set(CMAKE_CXX_STANDARD 17)
 if(CP_ENABLE_CUDA)
@@ -148,33 +148,32 @@ else()
     add_compile_definitions(CP_ENABLE_OPENCL=0)
 endif()
 
-add_executable(cpminer ${CP_SOURCES})
-set_target_properties(cpminer PROPERTIES OUTPUT_NAME cppminer)
-target_include_directories(cpminer PRIVATE ${CP_INCLUDE_DIRS})
+add_executable(cppminer ${CP_SOURCES})
+target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)
-    target_link_libraries(cpminer PRIVATE CUDA::cudart)
+    target_link_libraries(cppminer PRIVATE CUDA::cudart)
     if(CP_ENABLE_CUBLAS)
-        target_link_libraries(cpminer PRIVATE CUDA::cublas)
+        target_link_libraries(cppminer PRIVATE CUDA::cublas)
     endif()
 endif()
 
 if(CP_ENABLE_OPENCL)
-    target_link_libraries(cpminer PRIVATE OpenCL::OpenCL)
-    add_custom_command(TARGET cpminer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cpminer>/kernels"
+    target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/case33_gemm_xor.cl"
-            "$<TARGET_FILE_DIR:cpminer>/kernels/case33_gemm_xor.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/case33_gemm_xor.cl"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
-            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_blake3.cl"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
-            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_merkle.cl"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
-            "$<TARGET_FILE_DIR:cpminer>/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
         COMMENT "Copy OpenCL kernels next to cppminer")
 endif()
 
@@ -238,7 +237,7 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
         USES_TERMINAL
     )
     add_custom_target(cp_proof_ffi_build DEPENDS ${_cp_proof_lib})
-    add_dependencies(cpminer cp_proof_ffi_build)
+    add_dependencies(cppminer cp_proof_ffi_build)
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
 elseif(EXISTS ${_cp_proof_lib})
@@ -253,35 +252,35 @@ else()
     else()
         message(WARNING "cp-proof-ffi manifest missing; using proof stub")
     endif()
-    target_sources(cpminer PRIVATE src/common/cp_proof_stub.cpp)
+    target_sources(cppminer PRIVATE src/common/cp_proof_stub.cpp)
 endif()
 
 if(_cp_link_proof_ffi)
     # Rust staticlibs need whole-archive / force_load so C-only refs pull the crate.
     if(MSVC)
-        target_link_libraries(cpminer PRIVATE ${_cp_proof_lib})
+        target_link_libraries(cppminer PRIVATE ${_cp_proof_lib})
     elseif(APPLE)
-        target_link_libraries(cpminer PRIVATE
+        target_link_libraries(cppminer PRIVATE
             "-Wl,-force_load,${_cp_proof_lib}")
     else()
-        target_link_libraries(cpminer PRIVATE
+        target_link_libraries(cppminer PRIVATE
             "-Wl,--whole-archive" ${_cp_proof_lib} "-Wl,--no-whole-archive")
     endif()
     if(WIN32)
-        target_link_libraries(cpminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+        target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
     elseif(APPLE)
-        target_link_libraries(cpminer PRIVATE
+        target_link_libraries(cppminer PRIVATE
             pthread dl m
             "-framework Security"
             "-framework CoreFoundation"
             "-framework SystemConfiguration")
     else()
-        target_link_libraries(cpminer PRIVATE pthread dl m)
+        target_link_libraries(cppminer PRIVATE pthread dl m)
     endif()
 endif()
 
 if(MSVC)
-    target_compile_options(cpminer PRIVATE
+    target_compile_options(cppminer PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
@@ -312,11 +311,11 @@ else()
     endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(cpminer PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(cppminer PRIVATE OpenMP::OpenMP_CXX)
     elseif(NOT APPLE)
         # GNU/Clang on Linux/etc.: -fopenmp is usually enough.
-        target_compile_options(cpminer PRIVATE -fopenmp)
-        target_link_options(cpminer PRIVATE -fopenmp)
+        target_compile_options(cppminer PRIVATE -fopenmp)
+        target_link_options(cppminer PRIVATE -fopenmp)
     else()
         message(FATAL_ERROR
             "OpenMP not found (required for CPU build on macOS).\n"
@@ -326,7 +325,7 @@ else()
     if(CP_ENABLE_CPU)
         # Baseline SSSE3/SSE4.1 for portable + SSE paths. AVX2 ukernel is a
         # separate TU built with -mavx2; runtime CPUID selects the path.
-        target_compile_options(cpminer PRIVATE
+        target_compile_options(cppminer PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-mssse3>
             $<$<COMPILE_LANGUAGE:CXX>:-msse4.1>
             $<$<COMPILE_LANGUAGE:C>:-mssse3>
@@ -337,7 +336,7 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(cpminer PRIVATE ws2_32)
+    target_link_libraries(cppminer PRIVATE ws2_32)
 endif()
 
 message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} CUBLAS=${CP_ENABLE_CUBLAS}")

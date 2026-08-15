@@ -6,8 +6,8 @@
 - Smaller matrix low-memory mode (TODO)
 - ARM CPU support (TODO)
 
-## v0.3 (tentative)
-- Switch to cert V3 salted seed hardfork. Old cert V2 shares are no longer accepted by the network.
+## v0.3
+- Switch to cert V3 to align with the salted seed hardfork. Old cert V2 shares are no longer accepted by the network.
 - Separate OpenCL kernel compilation process with error handling. Improve compatibility for driver/compiler that crashes on specific compilation failure.
 - Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some drivers like beignet.
 - Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`) to further reduce register pressure on small GPUs.
@@ -17,12 +17,10 @@
 OpenCL mode note:
 Broadcast+float issue may improve performance since some GPUs are weak in int but strong in float. For example, on UHD 630, broadcast+float yields 115GH/s, packed+int yields 100GH/s, and broadcast+int yields 90GH/s.
 
-
 ## v0.2.1
 - Refactor CUTLASS GEMM main loop to reduce XOR overhead. This buys back the lost performance in the last version due to more frequent XOR boundary. 8.0TH -> 9.1TH on a GTX 1070.
 
 ## v0.2
-
 - Use rank=128 to avoid pearl rank penalty. This adds a bit more overhead compared to rank=256, may hurt hashrate slightly.
 - SSE fallback for non-AVX CPU.
 - Add CPU thread affinity and prioritizing physical cores than SMT threads.
