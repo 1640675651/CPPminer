@@ -35,6 +35,9 @@ struct Case33GemmOcl {
 
     int macro_batch() const { return macro_batch_; }
 
+    /* 0 = packed per-C dot4 (default); 1 = B-broadcast cpm += aval * bscalar. */
+    void set_issue_broadcast(int on);
+
 
 
     bool init_context(const char *kernel_cl_path, int device_index = 0,
@@ -129,6 +132,8 @@ private:
     int macro_batch_ = CP_MACRO_BATCH_DEFAULT;
 
     Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
+
+    bool use_issue_broadcast_ = false;
 
 
 

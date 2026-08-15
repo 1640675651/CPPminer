@@ -13,6 +13,8 @@
 // Measured CL_KERNEL_PRIVATE_MEM_SIZE on Beignet (Haswell GT1, scalar):
 //   8×8: 384 B/WI (was 1152 with ms_xor[32] + post-GEMM msg fold)
 //   8×16: 1152 B/WI (acc spill dominates; unchanged after ms_xor removal)
+// --ocl-issue broadcast (CASE32_ISSUE_BROADCAST): CLBlast GEMMK=0 cpm += aval * bscalar
+//   (float4 mad; flush to int32 each KR). Default --ocl-issue packed keeps per-C dot4.
 
 #ifndef MR
 #define MR 8
@@ -40,6 +42,22 @@
 #endif
 #ifndef RANK
 #define RANK 4
+#endif
+#ifndef VWM
+#define VWM 4
+#endif
+#ifndef VWN
+#define VWN 4
+#endif
+#ifndef CASE32_ISSUE_BROADCAST
+#define CASE32_ISSUE_BROADCAST 0
+#endif
+#if CASE32_ISSUE_BROADCAST
+#define CPM_COLVEC (MR / VWM)
+#define CPM_NVEC (NR * CPM_COLVEC)
+#if (MR % VWM) != 0 || (NR % VWN) != 0
+#error CLBlast-style cpm tile requires MR%VWM==0 and NR%VWN==0
+#endif
 #endif
 #ifndef KGROUPS
 #define KGROUPS (KR / RANK)
@@ -168,6 +186,88 @@ inline int case32_dot4(int acc, int a_pack, int b_pack) {
 #endif
 }
 
+#if CASE32_ISSUE_BROADCAST
+/* CLBlast GEMMK=0: cpm[n][m] += apm[m] * bpm[n] (B scalar broadcast). Float panel
+   flushed to int32 each KR (exact: |sum|<2^21). DP4A path is unchanged (--ocl-issue packed). */
+
+inline float case32_char_lane(char4 c, int k) {
+    if (k == 0) {
+        return (float)c.s0;
+    }
+    if (k == 1) {
+        return (float)c.s1;
+    }
+    if (k == 2) {
+        return (float)c.s2;
+    }
+    return (float)c.s3;
+}
+
+inline float4 case32_apm(__private const char4 *ar, int row0, int k) {
+    return (float4)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k),
+                    case32_char_lane(ar[row0 + 2], k), case32_char_lane(ar[row0 + 3], k));
+}
+
+inline void case32_cpm_zero(__private float4 *cpm) {
+    #pragma unroll
+    for (int i = 0; i < CPM_NVEC; ++i) {
+        cpm[i] = (float4)(0.0f);
+    }
+}
+
+inline void case32_cpm_kgroup(__private float4 *cpm, __private const int *a_pack,
+                              __private const int *b_pack) {
+    char4 ar[MR];
+    char4 br[NR];
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        ar[i] = as_char4(a_pack[i]);
+    }
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        br[j] = as_char4(b_pack[j]);
+    }
+    #pragma unroll
+    for (int k = 0; k < RANK; ++k) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const float4 aval = case32_apm(ar, mi * VWM, k);
+            #pragma unroll
+            for (int ni = 0; ni < NR / VWN; ++ni) {
+                const int j0 = ni * VWN;
+                cpm[(j0 + 0) * CPM_COLVEC + mi] =
+                        mad(aval, (float4)case32_char_lane(br[j0 + 0], k),
+                            cpm[(j0 + 0) * CPM_COLVEC + mi]);
+                cpm[(j0 + 1) * CPM_COLVEC + mi] =
+                        mad(aval, (float4)case32_char_lane(br[j0 + 1], k),
+                            cpm[(j0 + 1) * CPM_COLVEC + mi]);
+                cpm[(j0 + 2) * CPM_COLVEC + mi] =
+                        mad(aval, (float4)case32_char_lane(br[j0 + 2], k),
+                            cpm[(j0 + 2) * CPM_COLVEC + mi]);
+                cpm[(j0 + 3) * CPM_COLVEC + mi] =
+                        mad(aval, (float4)case32_char_lane(br[j0 + 3], k),
+                            cpm[(j0 + 3) * CPM_COLVEC + mi]);
+            }
+        }
+    }
+}
+
+inline void case32_cpm_flush(__private int *acc, __private const float4 *cpm) {
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const int4 t = convert_int4(cpm[j * CPM_COLVEC + mi]);
+            const int base = j * MR + mi * VWM;
+            acc[base + 0] += t.s0;
+            acc[base + 1] += t.s1;
+            acc[base + 2] += t.s2;
+            acc[base + 3] += t.s3;
+        }
+    }
+}
+#endif
+
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -211,6 +311,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     for (int i = 0; i < NR * MR; ++i) {
         acc[i] = 0;
     }
+#if CASE32_ISSUE_BROADCAST
+    float4 cpm[CPM_NVEC];
+#endif
 
     uint msg[PP_JACKPOT_WORDS];
     for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
@@ -218,6 +321,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     }
     int ms = 0;
     for (int kb = 0; kb < blocks_k; ++kb) {
+#if CASE32_ISSUE_BROADCAST
+        case32_cpm_zero(cpm);
+#endif
 #if defined(CASE32_COALESCE)
         const size_t a_kb_base =
                 (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
@@ -239,6 +345,17 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
             }
 
+#if CASE32_ISSUE_BROADCAST
+            int b_pack[NR];
+            for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
+                __global const char *b_jg = b_kg + (size_t)jg * 32;
+                for (int col = 0; col < COLS_PER_GROUP; ++col) {
+                    b_pack[jg * COLS_PER_GROUP + col] =
+                            as_int(vload4(0, b_jg + (size_t)col * RANK));
+                }
+            }
+            case32_cpm_kgroup(cpm, a_pack, b_pack);
+#else
             for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
                 __global const char *b_jg = b_kg + (size_t)jg * 32;
                 for (int col = 0; col < COLS_PER_GROUP; ++col) {
@@ -250,6 +367,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                     }
                 }
             }
+#endif
         }
 #else
         __global const char *a_tile = a_pre + (size_t)tr_global * (size_t)blocks_k *
@@ -266,6 +384,18 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
             }
 
+#if CASE32_ISSUE_BROADCAST
+            int b_pack[NR];
+            for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
+                __global const char *b_jg =
+                        b_tile + ((size_t)jg * (size_t)KGROUPS + (size_t)kg) * 32;
+                for (int col = 0; col < COLS_PER_GROUP; ++col) {
+                    b_pack[jg * COLS_PER_GROUP + col] =
+                            as_int(vload4(0, b_jg + (size_t)col * RANK));
+                }
+            }
+            case32_cpm_kgroup(cpm, a_pack, b_pack);
+#else
             for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
                 __global const char *b_jg =
                         b_tile + ((size_t)jg * (size_t)KGROUPS + (size_t)kg) * 32;
@@ -278,7 +408,11 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                     }
                 }
             }
+#endif
         }
+#endif
+#if CASE32_ISSUE_BROADCAST
+        case32_cpm_flush(acc, cpm);
 #endif
         /* One milestone per KR panel (KR == R_RANK). Cumulative acc across kb. */
         {

@@ -73,6 +73,10 @@ void Case33GemmOcl::set_macro_batch(int batch) {
     macro_batch_ = clamp_macro_batch(batch);
 }
 
+void Case33GemmOcl::set_issue_broadcast(int on) {
+    use_issue_broadcast_ = on != 0;
+}
+
 Case33GemmOcl::~Case33GemmOcl() {
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -123,6 +127,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
         build_opts += " -DCASE32_WI_ROWMAJOR=1";
+        if (use_issue_broadcast_) {
+            build_opts += " -DCASE32_ISSUE_BROADCAST=1";
+        }
         if (use_asm) {
             build_opts += " -DCASE32_USE_ASM_DOT=1";
         } else if (use_builtin) {
@@ -141,7 +148,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         "-DCASE32_FORCE_DPI=1 -DMR=" +
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) +
-                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1";
+                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
+                        (use_issue_broadcast_ ? " -DCASE32_ISSUE_BROADCAST=1" : "");
                 if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
                     if (kernel_) {
                         clReleaseKernel(kernel_);
@@ -178,7 +186,10 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     };
 
     bool built = false;
-    if (dpi_mode_ == Case32OclDpiMode::Off) {
+    /* Broadcast issue is a scalar float cpm nest; force DPI off so the flag applies. */
+    if (use_issue_broadcast_) {
+        built = try_build(false, false, false, false, "broadcast (scalar)");
+    } else if (dpi_mode_ == Case32OclDpiMode::Off) {
         built = try_build(false, false, false, false, "scalar (forced off)");
     } else if (dpi_mode_ == Case32OclDpiMode::Asm) {
         built = try_build(false, false, true, false, "asm v_dot4c_i32_i8");
@@ -304,7 +315,9 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
     }
 
     const char *dot_kind = "scalar";
-    if (using_asm_dot_) {
+    if (use_issue_broadcast_) {
+        dot_kind = "broadcast";
+    } else if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
         dot_kind = "builtin sdot4";
@@ -359,7 +372,9 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
     }
 
     const char *dot_kind = "scalar";
-    if (using_asm_dot_) {
+    if (use_issue_broadcast_) {
+        dot_kind = "broadcast";
+    } else if (using_asm_dot_) {
         dot_kind = "asm v_dot4c";
     } else if (using_builtin_dot_) {
         dot_kind = "builtin sdot4";

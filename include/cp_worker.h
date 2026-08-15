@@ -34,6 +34,8 @@ int cp_worker_list_devices(void);
 void cp_worker_set_ocl_platform(int platform_index);
 /* OpenCL-only: hash tile MR x NR (4x8, 8x8, or 8x16). mr<=0 restores auto detection. */
 void cp_worker_set_ocl_tile(int mr, int nr);
+/* OpenCL-only: GEMM issue shape. 0 = packed (default), 1 = broadcast. */
+void cp_worker_set_ocl_issue_broadcast(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 
