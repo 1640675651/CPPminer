@@ -15,9 +15,10 @@ enum class Case33PrepackMode {
 
 /* ISA preference for micro-kernel dispatch. */
 enum class Case33Isa {
-    Auto,   /* AVX2 if available, else SSSE3, else scalar */
+    Auto,   /* architecture-specific best ISA, else scalar */
     Avx2,   /* prefer AVX2; fall back if unavailable */
     Sse,    /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    Neon,   /* force AArch64 Advanced SIMD path */
     Scalar, /* force scalar reference ukernel */
 };
 
@@ -62,8 +63,9 @@ struct Case33GemmXor {
     Case33Isa isa() const { return isa_pref_; }
     Case33Isa isa_used() const { return isa_used_; }
     Case33SseTile sse_tile() const { return sse_tile_; }
-    /* Resolve preferred ISA against CPUID (updates isa_used_). */
-    void resolve_runtime_isa();
+    /* Resolve the requested ISA against compiled and runtime capabilities. */
+    bool resolve_runtime_isa();
+    const char *simd_error() const { return simd_error_; }
 
     bool init(int M, int N, int K, const int8_t *a, const int8_t *b);
     /* Zero-B CPU: B once per job, A each attempt. */
@@ -90,6 +92,9 @@ struct Case33GemmXor {
 
 private:
     bool setup_dims_(int M, int N, int K);
+    bool use_fast_u8s8_() const {
+        return int8_mode_ == Case32Int8Mode::FastU8S8 && isa_used_ != Case33Isa::Scalar;
+    }
     void update_backend_label_();
     bool fused_noisy_prepack_a_(const int8_t *a_signal, const uint8_t *a_noise_seed,
                                 int rank, std::vector<int8_t> *scan);
@@ -124,7 +129,10 @@ private:
     std::vector<int32_t> b_comp_ms_;
     std::vector<uint32_t> tile_xor_;
     char backend_buf_[192] = {};
+    char simd_error_[160] = {};
 };
 
 int case33_test_inplace_prepack(int M, int N, int K);
 int case33_test_fused_prepack(int M, int N, int K, int rank);
+/* Compare every compiled/runtime-supported SIMD implementation with scalar. */
+int case33_test_simd_parity();

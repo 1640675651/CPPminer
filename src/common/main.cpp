@@ -13,6 +13,10 @@
 #include "cp_util.h"
 #include "cp_worker.h"
 
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+#include "gemm/case33_gemm_xor.hpp"
+#endif
+
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_gpu.h"
 #include "cp_cutlass.h"
@@ -103,8 +107,9 @@ static void print_usage(void)
            g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), avx2, sse, scalar\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), avx2, ssse3, neon, scalar\n");
     printf("                       (also CP_SIMD / CASE33_ISA env)\n");
+    printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -205,6 +210,7 @@ int main(int argc, char** argv)
     int cutlass_fused = -1;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
+    int simd_env_invalid = 0;
     {
         const char* env = getenv("CP_SIMD");
         if(!env) env = getenv("CASE33_ISA");
@@ -212,14 +218,20 @@ int main(int argc, char** argv)
             if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "neon")) simd_isa = CP_SIMD_NEON;
             else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
             else if(!strcmp(env, "auto")) simd_isa = CP_SIMD_AUTO;
+            else {
+                fprintf(stderr, "unknown CP_SIMD/CASE33_ISA value %s\n", env);
+                simd_env_invalid = 1;
+            }
         }
     }
     int profile_scan = 0;
     int profile_runs = 10;
     int profile_prep = 0;
     int profile_prep_runs = 3;
+    int simd_test = 0;
     int list_devices = 0;
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
@@ -227,6 +239,9 @@ int main(int argc, char** argv)
     int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
     int ocl_cpm_int = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
+
+    if(simd_env_invalid)
+        return 1;
 
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--pool") && i + 1 < argc){
@@ -371,14 +386,18 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(isa, "sse") || !strcmp(isa, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(isa, "neon"))
+                simd_isa = CP_SIMD_NEON;
             else if(!strcmp(isa, "scalar"))
                 simd_isa = CP_SIMD_SCALAR;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|avx2|sse|scalar)\n",
+                        "unknown --simd %s (auto|avx2|ssse3|neon|scalar)\n",
                         isa);
                 return 1;
             }
+        } else if(!strcmp(argv[i], "--simd-test")){
+            simd_test = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
@@ -653,7 +672,18 @@ int main(int argc, char** argv)
     pearl_set_cutlass_fused(cutlass_fused);
     g_cutlass_fused = cutlass_fused;
     cp_worker_set_prepack_mode(prepack_mode);
-    cp_worker_set_simd_isa(simd_isa);
+    if(cp_worker_set_simd_isa(simd_isa) != 0)
+        return 1;
+    if(simd_test){
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+        const int rc = case33_test_simd_parity();
+        printf("[cpu] SIMD parity test: %s\n", rc == 0 ? "passed" : "failed");
+        return rc == 0 ? 0 : 1;
+#else
+        fprintf(stderr, "--simd-test requires a CPU-enabled build\n");
+        return 1;
+#endif
+    }
 
     if(cutlass_fused){
         if(no_period_gemm){

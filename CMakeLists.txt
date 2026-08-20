@@ -69,8 +69,17 @@ if(CP_ENABLE_CPU)
         src/cpu/cp_cpu_worker.cpp
         src/cpu/cp_cpu_affinity.cpp
         src/cpu/gemm/case33_gemm_xor.cpp
-        src/cpu/gemm/case33_gemm_xor_avx2.cpp
+        src/cpu/gemm/case33_cpu_features.cpp
+        src/cpu/gemm/case33_gemm_xor_neon.cpp
     )
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        list(APPEND CP_SOURCES
+            src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
+        add_compile_definitions(CASE33_BUILD_X86=1)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        add_compile_definitions(CASE33_BUILD_AARCH64=1)
+    endif()
     add_compile_definitions(CP_ENABLE_CPU=1)
 else()
     add_compile_definitions(CP_ENABLE_CPU=0)
@@ -284,9 +293,10 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
-    # AVX2 only in the dedicated ukernel TU; baseline stays SSE-safe for
-    # runtime ISA dispatch on CPUs without AVX2.
-    if(CP_ENABLE_CPU)
+    # AVX2 is only available in the dedicated x86 ukernel translation unit.
+    if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "-mssse3")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     endif()
@@ -322,14 +332,7 @@ else()
             "  brew install libomp\n"
             "  Then reconfigure, or pass -DOpenMP_ROOT=$(brew --prefix libomp)")
     endif()
-    if(CP_ENABLE_CPU)
-        # Baseline SSSE3/SSE4.1 for portable + SSE paths. AVX2 ukernel is a
-        # separate TU built with -mavx2; runtime CPUID selects the path.
-        target_compile_options(cppminer PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:-mssse3>
-            $<$<COMPILE_LANGUAGE:CXX>:-msse4.1>
-            $<$<COMPILE_LANGUAGE:C>:-mssse3>
-            $<$<COMPILE_LANGUAGE:C>:-msse4.1>)
+    if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2")
     endif()

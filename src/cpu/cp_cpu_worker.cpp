@@ -64,6 +64,7 @@ static const char* simd_isa_label(Case33Isa isa, Case33SseTile tile)
     switch(isa){
     case Case33Isa::Avx2: return "AVX2";
     case Case33Isa::Sse: return "SSSE3";
+    case Case33Isa::Neon: return "NEON";
     case Case33Isa::Scalar: return "scalar";
     case Case33Isa::Auto:
     default: return "auto";
@@ -224,7 +225,7 @@ extern "C" void cp_cpu_worker_set_inplace_prepack(int on)
     cp_cpu_worker_set_prepack_mode(on ? CP_PREPACK_REUSE : CP_PREPACK_SEPARATE);
 }
 
-extern "C" void cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
+extern "C" int cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
 {
     switch(isa){
     case CP_SIMD_AVX2:
@@ -236,6 +237,9 @@ extern "C" void cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
     case CP_SIMD_SCALAR:
         g_isa_pref = Case33Isa::Scalar;
         break;
+    case CP_SIMD_NEON:
+        g_isa_pref = Case33Isa::Neon;
+        break;
     case CP_SIMD_AUTO:
     default:
         g_isa_pref = Case33Isa::Auto;
@@ -243,6 +247,11 @@ extern "C" void cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
     }
     g_sse_tile = Case33SseTile::R4C8;
     apply_simd_to_gemm();
+    if(!g_gemm.resolve_runtime_isa()) {
+        fprintf(stderr, "[cpu] %s\n", g_gemm.simd_error());
+        return -1;
+    }
+    return 0;
 }
 
 extern "C" void cp_cpu_worker_init(void)
@@ -250,7 +259,10 @@ extern "C" void cp_cpu_worker_init(void)
     g_gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     apply_prepack_mode_to_gemm();
     apply_simd_to_gemm();
-    g_gemm.resolve_runtime_isa();
+    if(!g_gemm.resolve_runtime_isa()) {
+        fprintf(stderr, "[cpu] %s\n", g_gemm.simd_error());
+        return;
+    }
     if(cp_cpu_affinity_init() == 0)
         cp_cpu_affinity_bind_openmp_pool();
     printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
