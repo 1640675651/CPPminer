@@ -293,7 +293,8 @@ static bool bind_current_thread(const CpuSlot &slot) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(slot.cpu, &set);
-    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
+    /* pid 0 targets the calling thread on Linux, including Android/Bionic. */
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
 
 #elif defined(__APPLE__)
