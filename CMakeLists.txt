@@ -58,11 +58,43 @@ add_compile_definitions(
     BLAKE3_NO_AVX512 BLAKE3_NO_AVX2 BLAKE3_NO_SSE41 BLAKE3_NO_SSE2
 )
 
-set(CP_SOURCES ${CP_COMMON_SOURCES}
+set(CP_BLAKE3_SOURCES
     ${B3_DIR}/blake3.c
     ${B3_DIR}/blake3_dispatch.c
     ${B3_DIR}/blake3_portable.c
 )
+
+# The Rust proof FFI and the miner both use BLAKE3. On AArch64, build each
+# NEON implementation and namespace the miner's C symbols to avoid collisions.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    list(APPEND CP_BLAKE3_SOURCES ${B3_DIR}/blake3_neon.c)
+    set(CP_BLAKE3_NAMESPACE_DEFINITIONS
+        blake3_version=cp_blake3_version
+        blake3_hasher_init=cp_blake3_hasher_init
+        blake3_hasher_init_keyed=cp_blake3_hasher_init_keyed
+        blake3_hasher_init_derive_key=cp_blake3_hasher_init_derive_key
+        blake3_hasher_init_derive_key_raw=cp_blake3_hasher_init_derive_key_raw
+        blake3_hasher_update=cp_blake3_hasher_update
+        blake3_hasher_finalize=cp_blake3_hasher_finalize
+        blake3_hasher_finalize_seek=cp_blake3_hasher_finalize_seek
+        blake3_hasher_reset=cp_blake3_hasher_reset
+        blake3_compress_in_place=cp_blake3_compress_in_place
+        blake3_compress_xof=cp_blake3_compress_xof
+        blake3_xof_many=cp_blake3_xof_many
+        blake3_hash_many=cp_blake3_hash_many
+        blake3_simd_degree=cp_blake3_simd_degree
+        blake3_compress_in_place_portable=cp_blake3_compress_in_place_portable
+        blake3_compress_xof_portable=cp_blake3_compress_xof_portable
+        blake3_hash_many_portable=cp_blake3_hash_many_portable
+        blake3_hash_many_neon=cp_blake3_hash_many_neon)
+    set_source_files_properties(
+        ${CP_BLAKE3_SOURCES}
+        src/common/cp_noise.c
+        PROPERTIES COMPILE_DEFINITIONS
+            "${CP_BLAKE3_NAMESPACE_DEFINITIONS}")
+endif()
+
+set(CP_SOURCES ${CP_COMMON_SOURCES} ${CP_BLAKE3_SOURCES})
 
 if(CP_ENABLE_CPU)
     list(APPEND CP_SOURCES
@@ -265,16 +297,10 @@ else()
 endif()
 
 if(_cp_link_proof_ffi)
-    # Rust staticlibs need whole-archive / force_load so C-only refs pull the crate.
-    if(MSVC)
-        target_link_libraries(cppminer PRIVATE ${_cp_proof_lib})
-    elseif(APPLE)
-        target_link_libraries(cppminer PRIVATE
-            "-Wl,-force_load,${_cp_proof_lib}")
-    else()
-        target_link_libraries(cppminer PRIVATE
-            "-Wl,--whole-archive" ${_cp_proof_lib} "-Wl,--no-whole-archive")
-    endif()
+    # C++ directly references cp_proof_build/cp_proof_verify. Normal archive linking pulls
+    # their FFI object without force-loading Rust's bundled BLAKE3 objects, which would clash
+    # with the C BLAKE3 implementation used by the miner on ELF linkers.
+    target_link_libraries(cppminer PRIVATE ${_cp_proof_lib})
     if(WIN32)
         target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
     elseif(APPLE)

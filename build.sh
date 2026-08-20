@@ -11,7 +11,7 @@
 #   ./build.sh --backend cuda --enable-cublas
 #
 # Dependencies downloaded:
-#   BLAKE3 1.5.4          (always, for CPU hashing)
+#   BLAKE3 1.8.5          (always, for CPU hashing)
 #   OpenCL-Headers          (only if OpenCL backend is enabled)
 #   CUTLASS 2.11.0          (only if CUDA backend is enabled)
 #   cp-proof-ffi (Rust)     (built by CMake via cargo, for proof build/verify)
@@ -97,33 +97,31 @@ fail()   { echo "ERROR: $*" >&2; exit 1; }
 # ── Ensure-Blake3 ─────────────────────────────────────────────────────────────
 ensure_blake3() {
     local src_dir="${PROJECT_ROOT}/third_party/blake3"
-    if [[ -f "${src_dir}/blake3.c" ]]; then
+    if [[ -f "${src_dir}/blake3.c" && -f "${src_dir}/blake3_neon.c" ]]; then
         log "BLAKE3 already present at ${src_dir}"
         return
     fi
 
-    log "Fetching BLAKE3 1.5.4"
+    log "Fetching/upgrading BLAKE3 1.8.5"
     mkdir -p "${src_dir}"
 
-    local base="https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.5.4/c"
+    local base="https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.8.5/c"
     local files=(
         blake3.c blake3.h blake3_dispatch.c blake3_portable.c blake3_impl.h
-        blake3_sse2.c blake3_sse41.c blake3_avx2.c blake3_avx512.c
+        blake3_sse2.c blake3_sse41.c blake3_avx2.c blake3_avx512.c blake3_neon.c
     )
 
     local url
     for f in "${files[@]}"; do
-        if [[ ! -f "${src_dir}/${f}" ]]; then
-            url="${base}/${f}"
-            if command -v curl &>/dev/null; then
-                curl -fSL --retry 3 --retry-delay 2 -o "${src_dir}/${f}" "$url" \
-                    || fail "Failed to download ${url}"
-            elif command -v wget &>/dev/null; then
-                wget -q --retry-connrefused --tries=3 -O "${src_dir}/${f}" "$url" \
-                    || fail "Failed to download ${url}"
-            else
-                fail "Neither curl nor wget found — cannot download BLAKE3"
-            fi
+        url="${base}/${f}"
+        if command -v curl &>/dev/null; then
+            curl -fSL --retry 3 --retry-delay 2 -o "${src_dir}/${f}" "$url" \
+                || fail "Failed to download ${url}"
+        elif command -v wget &>/dev/null; then
+            wget -q --retry-connrefused --tries=3 -O "${src_dir}/${f}" "$url" \
+                || fail "Failed to download ${url}"
+        else
+            fail "Neither curl nor wget found — cannot download BLAKE3"
         fi
     done
 

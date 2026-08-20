@@ -247,13 +247,14 @@ function Copy-OpenClKernels {
 
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
-    if (-not (Test-Path (Join-Path $b3Src "blake3.c"))) {
-        Write-Host "=== Fetching BLAKE3 1.5.4 ==="
+    if (-not (Test-Path (Join-Path $b3Src "blake3.c")) -or
+        -not (Test-Path (Join-Path $b3Src "blake3_neon.c"))) {
+        Write-Host "=== Fetching/upgrading BLAKE3 1.8.5 ==="
         New-Item -ItemType Directory -Force -Path $b3Src | Out-Null
-        $base = "https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.5.4/c"
+        $base = "https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.8.5/c"
         foreach ($f in @(
             "blake3.c", "blake3.h", "blake3_dispatch.c", "blake3_portable.c", "blake3_impl.h",
-            "blake3_sse2.c", "blake3_sse41.c", "blake3_avx2.c", "blake3_avx512.c"
+            "blake3_sse2.c", "blake3_sse41.c", "blake3_avx2.c", "blake3_avx512.c", "blake3_neon.c"
         )) {
             Invoke-WebRequest -Uri "$base/$f" -OutFile (Join-Path $b3Src $f) -UseBasicParsing
         }
