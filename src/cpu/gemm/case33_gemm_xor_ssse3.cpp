@@ -5,10 +5,11 @@
 
 #if defined(_MSC_VER)
 #define CASE33_FORCEINLINE __forceinline
-#else
-#define CASE33_FORCEINLINE inline __attribute__((always_inline))
-#endif
 #define CASE33_SSSE3
+#else
+#define CASE33_FORCEINLINE inline __attribute__((always_inline, target("ssse3")))
+#define CASE33_SSSE3 __attribute__((target("ssse3")))
+#endif
 
 namespace {
 

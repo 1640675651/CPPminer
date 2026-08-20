@@ -333,6 +333,8 @@ else()
             "  Then reconfigure, or pass -DOpenMP_ROOT=$(brew --prefix libomp)")
     endif()
     if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "-mssse3")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2")
     endif()
