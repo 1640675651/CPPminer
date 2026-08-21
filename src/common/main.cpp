@@ -107,8 +107,8 @@ static void print_usage(void)
            g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), avx2, ssse3, dotprod, neon, scalar\n");
-    printf("                       (also CP_SIMD / CASE33_ISA env)\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
+    printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
 }
 
@@ -215,7 +215,9 @@ int main(int argc, char** argv)
         const char* env = getenv("CP_SIMD");
         if(!env) env = getenv("CASE33_ISA");
         if(env){
-            if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
+            if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
+                simd_isa = CP_SIMD_AVXVNNI;
+            else if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
             else if(!strcmp(env, "dotprod")) simd_isa = CP_SIMD_DOTPROD;
@@ -383,6 +385,9 @@ int main(int argc, char** argv)
             const char* isa = argv[++i];
             if(!strcmp(isa, "auto"))
                 simd_isa = CP_SIMD_AUTO;
+            else if(!strcmp(isa, "avxvnni") || !strcmp(isa, "vnni") ||
+                    !strcmp(isa, "avx-vnni"))
+                simd_isa = CP_SIMD_AVXVNNI;
             else if(!strcmp(isa, "avx2"))
                 simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(isa, "sse") || !strcmp(isa, "ssse3"))
@@ -395,7 +400,7 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_SCALAR;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|avx2|ssse3|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }

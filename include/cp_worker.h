@@ -64,12 +64,13 @@ void cp_worker_set_inplace_prepack(int on);
 
 /* CPU SIMD ISA preference (ignored on CUDA/OpenCL). */
 typedef enum {
-    CP_SIMD_AUTO   = 0, /* architecture-specific best ISA → scalar */
-    CP_SIMD_AVX2   = 1,
-    CP_SIMD_SSE    = 2, /* force SSSE3 path */
-    CP_SIMD_SCALAR = 3,
-    CP_SIMD_NEON   = 4,
+    CP_SIMD_AUTO    = 0, /* architecture-specific best ISA → scalar */
+    CP_SIMD_AVX2    = 1,
+    CP_SIMD_SSE     = 2, /* force SSSE3 path */
+    CP_SIMD_SCALAR  = 3,
+    CP_SIMD_NEON    = 4,
     CP_SIMD_DOTPROD = 5,
+    CP_SIMD_AVXVNNI = 6, /* force AVX-VNNI vpdpbusd path */
 } CpSimdIsa;
 
 /* Returns 0, or -1 when an explicit ISA is unavailable. */

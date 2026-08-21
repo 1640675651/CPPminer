@@ -140,6 +140,7 @@ if(CP_ENABLE_CPU)
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         list(APPEND CP_SOURCES
+            src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
             src/cpu/gemm/case33_gemm_xor_avx2.cpp
             src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
         add_compile_definitions(CASE33_BUILD_X86=1)
@@ -360,12 +361,16 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
-    # AVX2 is only available in the dedicated x86 ukernel translation unit.
+    # AVX2 / AVX-VNNI only in dedicated x86 ukernel translation units.
     if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
             PROPERTIES COMPILE_OPTIONS "-mssse3")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
+            PROPERTIES
+                COMPILE_OPTIONS "/arch:AVX2"
+                COMPILE_DEFINITIONS "__AVXVNNI__")
 
     endif()
 else()
@@ -405,6 +410,8 @@ else()
             PROPERTIES COMPILE_OPTIONS "-mssse3")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni")
     endif()
 endif()
 

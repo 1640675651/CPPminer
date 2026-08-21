@@ -62,6 +62,7 @@ static const char* simd_isa_label(Case33Isa isa, Case33SseTile tile)
 {
     (void)tile;
     switch(isa){
+    case Case33Isa::AvxVnni: return "AVX-VNNI";
     case Case33Isa::Avx2: return "AVX2";
     case Case33Isa::Sse: return "SSSE3";
     case Case33Isa::DotProd: return "DotProd";
@@ -229,6 +230,9 @@ extern "C" void cp_cpu_worker_set_inplace_prepack(int on)
 extern "C" int cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
 {
     switch(isa){
+    case CP_SIMD_AVXVNNI:
+        g_isa_pref = Case33Isa::AvxVnni;
+        break;
     case CP_SIMD_AVX2:
         g_isa_pref = Case33Isa::Avx2;
         break;

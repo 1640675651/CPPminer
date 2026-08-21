@@ -73,6 +73,11 @@ Case33CpuFeatures case33_detect_cpu_features() {
             if ((xcr & 0x6) == 0x6) {
                 cpuid_ex(7, 0, r);
                 features.avx2 = (r[1] & (1 << 5)) != 0;
+                /* AVX-VNNI: CPUID.(EAX=7,ECX=1):EAX[4]; needs AVX2 OS support. */
+                if (features.avx2 && r[0] >= 1) {
+                    cpuid_ex(7, 1, r);
+                    features.avx_vnni = (r[0] & (1 << 4)) != 0;
+                }
             }
         }
     }

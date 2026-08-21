@@ -5,6 +5,7 @@
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
 #define CASE33_X86 1
+#include "case33_gemm_xor_avxvnni.hpp"
 #include "case33_gemm_xor_avx2.hpp"
 #include "case33_gemm_xor_ssse3.hpp"
 #else
@@ -45,11 +46,15 @@ constexpr int kKGroups = kKR / kRank;
 
 bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size) {
     const Case33CpuFeatures features = case33_detect_cpu_features();
+    const bool avx_vnni = CASE33_X86 && features.avx_vnni;
     const bool avx2 = CASE33_X86 && features.avx2;
     const bool ssse3 = CASE33_X86 && features.ssse3;
     const bool dotprod = case33_is_aarch64_build() && features.dotprod;
     const bool neon = case33_is_aarch64_build() && features.neon;
     switch (pref) {
+    case Case33Isa::AvxVnni:
+        if (avx_vnni) { *out = Case33Isa::AvxVnni; return true; }
+        break;
     case Case33Isa::Avx2:
         if (avx2) { *out = Case33Isa::Avx2; return true; }
         break;
@@ -67,7 +72,8 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
         return true;
     case Case33Isa::Auto:
     default:
-        if (avx2) *out = Case33Isa::Avx2;
+        if (avx_vnni) *out = Case33Isa::AvxVnni;
+        else if (avx2) *out = Case33Isa::Avx2;
         else if (ssse3) *out = Case33Isa::Sse;
         else if (dotprod) *out = Case33Isa::DotProd;
         else if (neon) *out = Case33Isa::Neon;
@@ -279,6 +285,13 @@ void micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int bloc
                             Case33SseTile sse_tile, bool xor_after_milestone,
                             uint32_t *tile_xor_out) {
 #if CASE33_X86
+    if (isa == Case33Isa::AvxVnni) {
+        case33_avxvnni_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
+                                              num_milestones, N, global_col0, spatial_tile_id,
+                                              tile_count, b_comp_ms, use_fast_u8s8,
+                                              xor_after_milestone, tile_xor_out);
+        return;
+    }
     if (isa == Case33Isa::Avx2) {
         case33_avx2_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
                                            num_milestones, N, global_col0, spatial_tile_id,
@@ -568,8 +581,8 @@ int case33_test_simd_parity() {
         scalar.run();
         const std::vector<uint32_t> expected = scalar.tile_xor();
 
-        for (Case33Isa isa : {Case33Isa::Sse, Case33Isa::Avx2, Case33Isa::DotProd,
-                               Case33Isa::Neon}) {
+        for (Case33Isa isa : {Case33Isa::Sse, Case33Isa::Avx2, Case33Isa::AvxVnni,
+                               Case33Isa::DotProd, Case33Isa::Neon}) {
             Case33GemmXor candidate;
             candidate.set_isa(isa);
             candidate.set_int8_mode(mode);
@@ -624,7 +637,11 @@ void Case33GemmXor::update_backend_label_() {
     const char *par = "serial";
 #endif
     const char *dot = use_fast ? "u8s8" : "exact s8s8";
-    if (isa_used_ == Case33Isa::Avx2) {
+    if (isa_used_ == Case33Isa::AvxVnni) {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "ukernel %s %dx%d 2D-par fused-K %s+XOR, AVX-VNNI 8x16 KR=%d%s",
+                      par, kMacroM, kMacroN, dot, kKR, prepack);
+    } else if (isa_used_ == Case33Isa::Avx2) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
                       "ukernel %s %dx%d 2D-par fused-K %s+XOR, AVX2 8x16 KR=%d%s",
                       par, kMacroM, kMacroN, dot, kKR, prepack);
@@ -813,7 +830,8 @@ bool Case33GemmXor::prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_bu
             return false;
         }
         const int8_t *b_row = b_buf->data();
-        if (!use_fast && (isa_used_ == Case33Isa::Avx2 || isa_used_ == Case33Isa::Sse)) {
+        if (!use_fast && (isa_used_ == Case33Isa::AvxVnni || isa_used_ == Case33Isa::Avx2 ||
+                          isa_used_ == Case33Isa::Sse)) {
             for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
                 if (b_row[i] == INT8_MIN) {
                     return false;

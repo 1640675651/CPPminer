@@ -1,10 +1,12 @@
 # Changelog
 
 ## v0.4 (tentative)
+- ARM CPU support (DONE)
+- AVX-VNNI support (DONE)
 - Lightweight random matrix generation, only sparsely fill matrix elements (TODO)
 - Zero-B on cuda worker (TODO)
 - Smaller matrix low-memory mode (TODO)
-- ARM CPU support (TODO)
+
 
 ## v0.3
 - Switch to cert V3 to align with the salted seed hardfork. Old cert V2 shares are no longer accepted by the network.

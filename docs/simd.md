@@ -15,13 +15,13 @@ runtime-supported path.
 
 | Target | `--simd auto` order | Runtime check |
 |---|---|---|
-| x86/x86-64 | AVX2, then SSSE3, then scalar | CPUID; AVX2 additionally requires OS AVX state enabled by XCR0 |
+| x86/x86-64 | AVX-VNNI, then AVX2, then SSSE3, then scalar | CPUID; AVX2/VNNI require OS AVX state via XCR0; AVX-VNNI is leaf 7.1 EAX[4] |
 | AArch64 | DotProd, then NEON, then scalar | DotProd is detected per OS; Advanced SIMD is required by the AArch64 architecture profile |
 | Other targets | scalar | None |
 
 Forcing an unavailable ISA, such as `--simd neon` on x86 or `--simd avx2` on
 a CPU without AVX2, fails instead of silently selecting another path. `sse` is
-an alias for `ssse3`.
+an alias for `ssse3`. `avxvnni`, `vnni`, and `avx-vnni` select AVX-VNNI.
 
 The current NEON noisyGEMM kernel is AArch64-only. The scalar path remains the
 baseline for 32-bit ARM and all other unsupported CPU targets.
@@ -48,7 +48,8 @@ rows and columns stay in vector registers at one time.
 |---|---|---|---|---|
 | Scalar | `case33_gemm_xor.cpp` | Exact signed `int8 * int8 -> int32` | Scalar loops over 8x16 | Portable reference; no intrinsics |
 | SSSE3 | `case33_gemm_xor_ssse3.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | Selectable 4x8, 8x8, or 4x16 | Uses `pmaddubsw` and `pmaddwd` |
-| AVX2 | `case33_gemm_xor_avx2.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | 8x16 | Uses 256-bit byte multiply-add operations |
+| AVX2 | `case33_gemm_xor_avx2.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | 8x16 | Uses `vpmaddubsw` + `vpmaddwd` |
+| AVX-VNNI | `case33_gemm_xor_avxvnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 | Uses one `vpdpbusd` per rank-4 update |
 | DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | Two 8x8 register tiles | Uses `vdotq_s32`; optional ARMv8.2 extension |
 | NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | Two 8x8 register tiles | Uses `vmlal_s16`; baseline AArch64 NEON only |
 
@@ -61,18 +62,19 @@ which is cheaper than repeated accumulator spills in the K loop.
 
 ### x86 byte-dot conversion
 
-The x86 kernels use `_mm_maddubs_epi16` or `_mm256_maddubs_epi16`. Those
-instructions require their first byte operand to be unsigned and their second
-to be signed. In the default fast mode, the A input is represented as
-`uint8(A + 128)`, and the result applies this correction for every output
-column and milestone:
+The x86 kernels use `_mm_maddubs_epi16` / `_mm256_maddubs_epi16`, or AVX-VNNI
+`_mm256_dpbusd_avx_epi32`. Those operations require their first byte operand to
+be unsigned and their second to be signed. In the default fast mode, the A
+input is represented as `uint8(A + 128)`, and the result applies this
+correction for every output column and milestone:
 
 ```text
 sum(A * B) = sum((A + 128) * B) - 128 * sum(B)
 ```
 
 The prepack stage adds 128 to A, and the B preparation computes the per-column
-compensation. This work is only enabled for the AVX2 and SSSE3 paths.
+compensation. This work is only enabled for the AVX-VNNI, AVX2, and SSSE3
+paths.
 
 ### DotProd byte arithmetic
 
@@ -138,6 +140,7 @@ baseline.
 |---|---|---|
 | SSSE3 kernel | `-mssse3` | Intrinsics are isolated in its source file |
 | AVX2 kernel | `-mavx2` | `/arch:AVX2` |
+| AVX-VNNI kernel | `-mavx2 -mavxvnni` | `/arch:AVX2` + `__AVXVNNI__` |
 | DotProd kernel | `-march=armv8.2-a+dotprod` | `/arch:armv8.2` |
 | BLAKE3 SSE2/SSE4.1/AVX2/AVX-512 kernels | Per-source ISA options | Per-source `/arch:` options |
 

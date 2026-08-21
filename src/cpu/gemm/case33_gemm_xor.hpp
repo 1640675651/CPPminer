@@ -15,12 +15,13 @@ enum class Case33PrepackMode {
 
 /* ISA preference for micro-kernel dispatch. */
 enum class Case33Isa {
-    Auto,   /* architecture-specific best ISA, else scalar */
-    Avx2,   /* prefer AVX2; fall back if unavailable */
-    Sse,    /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
-    DotProd,/* force AArch64 DotProd path */
-    Neon,   /* force AArch64 Advanced SIMD path */
-    Scalar, /* force scalar reference ukernel */
+    Auto,    /* architecture-specific best ISA, else scalar */
+    AvxVnni, /* prefer AVX-VNNI vpdpbusd; fall back if unavailable */
+    Avx2,    /* prefer AVX2 maddubs; fall back if unavailable */
+    Sse,     /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    DotProd, /* force AArch64 DotProd path */
+    Neon,    /* force AArch64 Advanced SIMD path */
+    Scalar,  /* force scalar reference ukernel */
 };
 
 /* SSSE3 register-tile shape inside the fixed 8x16 semantic/pack tile. */
@@ -95,7 +96,8 @@ private:
     bool setup_dims_(int M, int N, int K);
     bool use_fast_u8s8_() const {
         return int8_mode_ == Case32Int8Mode::FastU8S8 &&
-               (isa_used_ == Case33Isa::Avx2 || isa_used_ == Case33Isa::Sse);
+               (isa_used_ == Case33Isa::AvxVnni || isa_used_ == Case33Isa::Avx2 ||
+                isa_used_ == Case33Isa::Sse);
     }
     void update_backend_label_();
     bool fused_noisy_prepack_a_(const int8_t *a_signal, const uint8_t *a_noise_seed,
