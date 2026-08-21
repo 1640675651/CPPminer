@@ -6,6 +6,14 @@ option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
+# Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
+# Static libc++ lets LD_LIBRARY_PATH prefer /vendor without breaking the binary.
+option(CP_STATIC_LIBCXX "Statically link libc++ (Termux/vendor OpenCL)" OFF)
+if(NOT CP_STATIC_LIBCXX AND DEFINED ENV{PREFIX} AND
+   ("$ENV{PREFIX}" MATCHES "/com\\.termux/" OR DEFINED ENV{TERMUX_VERSION}))
+    set(CP_STATIC_LIBCXX ON)
+    message(STATUS "Termux detected: enabling CP_STATIC_LIBCXX for vendor OpenCL coexistence")
+endif()
 
 if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
@@ -402,6 +410,61 @@ endif()
 
 if(WIN32)
     target_link_libraries(cppminer PRIVATE ws2_32)
+endif()
+
+if(CP_STATIC_LIBCXX AND NOT MSVC)
+    # Embed libc++ so /vendor/lib64 on LD_LIBRARY_PATH (needed by Adreno/Mali
+    # OpenCL ICDs) cannot replace Termux's libc++_shared at process start.
+    #
+    # Termux: -static-libstdc++ still emits -lc++_shared and fails (no static
+    # lib in $PREFIX/lib). Use ndk-multilib's libc++_static.a + libc++abi.a.
+    set(_cp_libcxx_hints)
+    if(DEFINED ENV{PREFIX})
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/aarch64-linux-android/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|arm)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/arm-linux-androideabi/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/x86_64-linux-android/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86|x86)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/i686-linux-android/lib")
+        endif()
+        list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/lib")
+    endif()
+    find_library(CP_LIBCXX_STATIC NAMES c++_static libc++_static
+        HINTS ${_cp_libcxx_hints} NO_DEFAULT_PATH)
+    find_library(CP_LIBCXXABI_STATIC NAMES c++abi libc++abi
+        HINTS ${_cp_libcxx_hints} NO_DEFAULT_PATH)
+    if(NOT CP_LIBCXX_STATIC)
+        find_library(CP_LIBCXX_STATIC NAMES c++_static libc++_static
+            HINTS ${_cp_libcxx_hints})
+    endif()
+    if(NOT CP_LIBCXXABI_STATIC)
+        find_library(CP_LIBCXXABI_STATIC NAMES c++abi libc++abi
+            HINTS ${_cp_libcxx_hints})
+    endif()
+    if(CP_LIBCXX_STATIC AND CP_LIBCXXABI_STATIC)
+        target_link_options(cppminer PRIVATE -nostdlib++)
+        target_link_libraries(cppminer PRIVATE
+            ${CP_LIBCXX_STATIC} ${CP_LIBCXXABI_STATIC})
+        find_library(CP_LIBUNWIND_STATIC NAMES unwind
+            HINTS ${_cp_libcxx_hints})
+        if(CP_LIBUNWIND_STATIC)
+            target_link_libraries(cppminer PRIVATE ${CP_LIBUNWIND_STATIC})
+        endif()
+        message(STATUS "Linking libc++ statically: ${CP_LIBCXX_STATIC}")
+    elseif(DEFINED ENV{TERMUX_VERSION} OR
+           (DEFINED ENV{PREFIX} AND "$ENV{PREFIX}" MATCHES "/com\\.termux/"))
+        message(FATAL_ERROR
+            "CP_STATIC_LIBCXX requires static libc++ on Termux.\n"
+            "  pkg install ndk-multilib\n"
+            "  Then reconfigure, or pass -DCP_STATIC_LIBCXX=OFF")
+    else()
+        # Desktop clang/gcc often supports this; Termux does not without ndk-multilib.
+        target_link_options(cppminer PRIVATE -static-libstdc++)
+        message(STATUS "Linking libc++ via -static-libstdc++ (no libc++_static.a found)")
+    endif()
+    unset(_cp_libcxx_hints)
 endif()
 
 message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} CUBLAS=${CP_ENABLE_CUBLAS}")
