@@ -128,6 +128,7 @@ if(CP_ENABLE_CPU)
         src/cpu/gemm/case33_gemm_xor.cpp
         src/cpu/gemm/case33_cpu_features.cpp
         src/cpu/gemm/case33_gemm_xor_neon.cpp
+        src/cpu/gemm/case33_gemm_xor_dotprod.cpp
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         list(APPEND CP_SOURCES
@@ -136,6 +137,13 @@ if(CP_ENABLE_CPU)
         add_compile_definitions(CASE33_BUILD_X86=1)
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         add_compile_definitions(CASE33_BUILD_AARCH64=1)
+        if(MSVC)
+            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:armv8.2")
+        else()
+            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+                PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+        endif()
     endif()
     add_compile_definitions(CP_ENABLE_CPU=1)
 else()

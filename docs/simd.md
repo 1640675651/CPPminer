@@ -16,7 +16,7 @@ runtime-supported path.
 | Target | `--simd auto` order | Runtime check |
 |---|---|---|
 | x86/x86-64 | AVX2, then SSSE3, then scalar | CPUID; AVX2 additionally requires OS AVX state enabled by XCR0 |
-| AArch64 | NEON, then scalar | Advanced SIMD is required by the AArch64 architecture profile |
+| AArch64 | DotProd, then NEON, then scalar | DotProd is detected per OS; Advanced SIMD is required by the AArch64 architecture profile |
 | Other targets | scalar | None |
 
 Forcing an unavailable ISA, such as `--simd neon` on x86 or `--simd avx2` on
@@ -49,6 +49,7 @@ rows and columns stay in vector registers at one time.
 | Scalar | `case33_gemm_xor.cpp` | Exact signed `int8 * int8 -> int32` | Scalar loops over 8x16 | Portable reference; no intrinsics |
 | SSSE3 | `case33_gemm_xor_ssse3.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | Selectable 4x8, 8x8, or 4x16 | Uses `pmaddubsw` and `pmaddwd` |
 | AVX2 | `case33_gemm_xor_avx2.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | 8x16 | Uses 256-bit byte multiply-add operations |
+| DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | 8x16 | Uses `vdotq_s32`; optional ARMv8.2 extension |
 | NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | 8x16 | Uses `vmlal_s16`; baseline AArch64 NEON only |
 
 ### x86 byte-dot conversion
@@ -65,6 +66,22 @@ sum(A * B) = sum((A + 128) * B) - 128 * sum(B)
 
 The prepack stage adds 128 to A, and the B preparation computes the per-column
 compensation. This work is only enabled for the AVX2 and SSSE3 paths.
+
+### DotProd byte arithmetic
+
+The DotProd path uses `vdotq_s32`. Each instruction consumes 16 signed bytes
+from A and B, divides them into four groups of four products, and adds each
+group into one `int32` lane. The existing A panel pack already stores four K
+bytes contiguously per row, so one 16-byte load covers four rows. The kernel
+loads the first and second four-row halves, repeats a four-byte B coefficient
+group, and issues two dot-product instructions per output column and K group.
+
+DotProd is an optional ARMv8.2 extension. Linux and Android detect it through
+`getauxval(AT_HWCAP) & HWCAP_ASIMDDP`; Apple uses
+`hw.optional.arm.FEAT_DotProd`; Windows uses
+`PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE`. The DotProd source is compiled with
+`-march=armv8.2-a+dotprod` (or `/arch:armv8.2` on MSVC) and is never called
+unless the runtime check succeeds.
 
 ### NEON signed widening arithmetic
 
@@ -94,8 +111,8 @@ then uses `vget_low_s16` and `vget_high_s16` to issue two `vmlal_s16`
 instructions. Eight 32-bit results require 256 bits, represented by the two
 independent 128-bit accumulators, `lo` and `hi`.
 
-It is vectorized arithmetic, but not an ARM byte-dot-product instruction. A
-future DotProd implementation could add a separate runtime chain:
+It is vectorized arithmetic, but not an ARM byte-dot-product instruction. The
+optional DotProd kernel is compiled separately and sits ahead of NEON:
 
 ```text
 DotProd -> NEON widening -> scalar
@@ -114,6 +131,7 @@ baseline.
 |---|---|---|
 | SSSE3 kernel | `-mssse3` | Intrinsics are isolated in its source file |
 | AVX2 kernel | `-mavx2` | `/arch:AVX2` |
+| DotProd kernel | `-march=armv8.2-a+dotprod` | `/arch:armv8.2` |
 | BLAKE3 SSE2/SSE4.1/AVX2/AVX-512 kernels | Per-source ISA options | Per-source `/arch:` options |
 
 The SSSE3 source also uses a GCC/Clang `target("ssse3")` attribute on its

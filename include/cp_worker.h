@@ -69,6 +69,7 @@ typedef enum {
     CP_SIMD_SSE    = 2, /* force SSSE3 path */
     CP_SIMD_SCALAR = 3,
     CP_SIMD_NEON   = 4,
+    CP_SIMD_DOTPROD = 5,
 } CpSimdIsa;
 
 /* Returns 0, or -1 when an explicit ISA is unavailable. */

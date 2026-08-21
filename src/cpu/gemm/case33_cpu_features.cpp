@@ -11,6 +11,14 @@
 #include <asm/hwcap.h>
 #endif
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/sysctl.h>
+#endif
+
+#if defined(_WIN32) && defined(_M_ARM64)
+#include <windows.h>
+#endif
+
 namespace {
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -71,6 +79,16 @@ Case33CpuFeatures case33_detect_cpu_features() {
 #elif defined(_M_ARM64) || defined(__aarch64__)
     /* Advanced SIMD is mandatory in the AArch64 architecture profile. */
     features.neon = true;
+#if defined(__linux__) && defined(HWCAP_ASIMDDP)
+    features.dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#elif defined(__APPLE__)
+    int value = 0;
+    size_t size = sizeof(value);
+    features.dotprod = sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size,
+                                    nullptr, 0) == 0 && value != 0;
+#elif defined(_WIN32) && defined(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE)
+    features.dotprod = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+#endif
 #elif defined(__arm__)
 #if defined(__linux__) && defined(HWCAP_NEON)
     features.neon = (getauxval(AT_HWCAP) & HWCAP_NEON) != 0;

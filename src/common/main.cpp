@@ -107,7 +107,7 @@ static void print_usage(void)
            g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), avx2, ssse3, neon, scalar\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), avx2, ssse3, dotprod, neon, scalar\n");
     printf("                       (also CP_SIMD / CASE33_ISA env)\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
 }
@@ -218,6 +218,7 @@ int main(int argc, char** argv)
             if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "dotprod")) simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(env, "neon")) simd_isa = CP_SIMD_NEON;
             else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
             else if(!strcmp(env, "auto")) simd_isa = CP_SIMD_AUTO;
@@ -388,11 +389,13 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_SSE;
             else if(!strcmp(isa, "neon"))
                 simd_isa = CP_SIMD_NEON;
+            else if(!strcmp(isa, "dotprod"))
+                simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(isa, "scalar"))
                 simd_isa = CP_SIMD_SCALAR;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|avx2|ssse3|neon|scalar)\n",
+                        "unknown --simd %s (auto|avx2|ssse3|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }

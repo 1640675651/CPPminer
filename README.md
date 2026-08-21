@@ -14,7 +14,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 
 - MSVC + **CMake** (Windows) or GCC/Clang + CMake (Linux/macOS)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
-- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX2/SSSE3/scalar and AArch64 NEON/scalar (`--simd`)
+- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX2/SSSE3/scalar and AArch64 DotProd/NEON/scalar (`--simd`)
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 
@@ -112,7 +112,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--mock-diff D` | Mock pool difficulty (default 58; higher = longer before first share) |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `separate` (default), `reuse`, or `fused` matrix prepack |
-| `--simd ISA` | CPU: `auto` (default), `avx2`, `ssse3` (`sse` alias), `neon`, `scalar` |
+| `--simd ISA` | CPU: `auto` (default), `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar` |
 | `--simd-test` | Compare every available CPU SIMD kernel against scalar and exit |
 
 ### OpenCL options

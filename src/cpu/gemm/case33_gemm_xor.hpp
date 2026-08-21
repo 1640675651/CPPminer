@@ -18,6 +18,7 @@ enum class Case33Isa {
     Auto,   /* architecture-specific best ISA, else scalar */
     Avx2,   /* prefer AVX2; fall back if unavailable */
     Sse,    /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    DotProd,/* force AArch64 DotProd path */
     Neon,   /* force AArch64 Advanced SIMD path */
     Scalar, /* force scalar reference ukernel */
 };
