@@ -30,28 +30,32 @@ int8x16_t repeat_b4(const int8_t *b) {
 }
 
 void dotprod_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
-    int32x4_t lo[kNR];
-    int32x4_t hi[kNR];
-    for (int j = 0; j < kNR; ++j) lo[j] = hi[j] = vdupq_n_s32(0);
+    constexpr int kColsPerGroup = 8;
+    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
+        int32x4_t lo[kColsPerGroup];
+        int32x4_t hi[kColsPerGroup];
+        for (int c = 0; c < kColsPerGroup; ++c) lo[c] = hi[c] = vdupq_n_s32(0);
 
-    for (int kg = 0; kg < kKGroups; ++kg) {
-        const int8_t *a_group = a_tile + static_cast<size_t>(kg) * 32;
-        const int8x16_t a_lo = vld1q_s8(a_group);
-        const int8x16_t a_hi = vld1q_s8(a_group + 16);
-        for (int j = 0; j < kNR; ++j) {
-            const size_t b_index = static_cast<size_t>(j / 8 * kKGroups + kg) * 32 +
-                                   static_cast<size_t>(j % 8) * 4;
-            const int8x16_t b = repeat_b4(b_tile + b_index);
-            lo[j] = vdotq_s32(lo[j], a_lo, b);
-            hi[j] = vdotq_s32(hi[j], a_hi, b);
+        for (int kg = 0; kg < kKGroups; ++kg) {
+            const int8_t *a_group = a_tile + static_cast<size_t>(kg) * 32;
+            const int8x16_t a_lo = vld1q_s8(a_group);
+            const int8x16_t a_hi = vld1q_s8(a_group + 16);
+            const int8_t *b_group =
+                    b_tile + static_cast<size_t>(jg * kKGroups + kg) * 32;
+            for (int c = 0; c < kColsPerGroup; ++c) {
+                const int8x16_t b = repeat_b4(b_group + c * 4);
+                lo[c] = vdotq_s32(lo[c], a_lo, b);
+                hi[c] = vdotq_s32(hi[c], a_hi, b);
+            }
         }
-    }
 
-    for (int j = 0; j < kNR; ++j) {
-        int32_t lanes[8];
-        vst1q_s32(lanes, lo[j]);
-        vst1q_s32(lanes + 4, hi[j]);
-        for (int i = 0; i < kMR; ++i) vals[j * kMR + i] += lanes[i];
+        for (int c = 0; c < kColsPerGroup; ++c) {
+            int32_t lanes[8];
+            vst1q_s32(lanes, lo[c]);
+            vst1q_s32(lanes + 4, hi[c]);
+            const int j = jg * kColsPerGroup + c;
+            for (int i = 0; i < kMR; ++i) vals[j * kMR + i] += lanes[i];
+        }
     }
 }
 } // namespace

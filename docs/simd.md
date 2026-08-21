@@ -49,8 +49,15 @@ rows and columns stay in vector registers at one time.
 | Scalar | `case33_gemm_xor.cpp` | Exact signed `int8 * int8 -> int32` | Scalar loops over 8x16 | Portable reference; no intrinsics |
 | SSSE3 | `case33_gemm_xor_ssse3.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | Selectable 4x8, 8x8, or 4x16 | Uses `pmaddubsw` and `pmaddwd` |
 | AVX2 | `case33_gemm_xor_avx2.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | 8x16 | Uses 256-bit byte multiply-add operations |
-| DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | 8x16 | Uses `vdotq_s32`; optional ARMv8.2 extension |
-| NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | 8x16 | Uses `vmlal_s16`; baseline AArch64 NEON only |
+| DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | Two 8x8 register tiles | Uses `vdotq_s32`; optional ARMv8.2 extension |
+| NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | Two 8x8 register tiles | Uses `vmlal_s16`; baseline AArch64 NEON only |
+
+The ARM paths compute columns `0..7` and `8..15` as separate register tiles.
+Each half uses 16 vector accumulators: one four-lane `int32` accumulator for
+rows `0..3` and one for rows `4..7`, for each of eight columns. This leaves
+registers for A and B operands and avoids spilling the full 32-accumulator
+8x16 tile to the stack. It reloads the A panel for the second column half,
+which is cheaper than repeated accumulator spills in the K loop.
 
 ### x86 byte-dot conversion
 
