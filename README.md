@@ -123,6 +123,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--ocl-tile MxN` | Hash tile: `8x8` (default), `4x8`, or `8x16` (auto on AMD discrete GPUs) |
 | `--ocl-issue MODE` | GEMM issue: `auto` (default: DPI, else broadcast), `broadcast` (B-scalar `mad`), or `packed` (per-C `dot4`) |
 | `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
+| `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
 
 `--ocl-tile` sets the hash tile for GEMM, jackpot XOR, hashrate counting, and proof layout. `--ocl-issue` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** is float **B-scalar broadcast**.
 
@@ -168,10 +169,11 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Radeon Pro 5500M DP4A | ~5.0 TH/s |
 
 ### Other GPU (OpenCL)
-| Device | Hashrate |
-|--------|----------|
-| Intel HD graphics 10EU (Haswell) scalar | ~25 GH/s |
-| Intel UHD 630 scalar | ~115 GH/s |
+| Device | Tile size | Hashrate |
+|--------|-----------|----------|
+| Intel HD graphics 10EU (Haswell) scalar | 4x8 | ~25 GH/s |
+| Intel UHD 630 scalar | 8x8 | ~115 GH/s |
+| Mali-G57 MC2 DP4A | 4x8 | ~80GH/s |
 
 ### CPU
 

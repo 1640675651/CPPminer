@@ -91,6 +91,10 @@ void Case33GemmOcl::set_cpm_int(int on) {
     use_cpm_int_ = on != 0;
 }
 
+void Case33GemmOcl::set_use_lds(int on) {
+    use_lds_ = on != 0;
+}
+
 Case33GemmOcl::~Case33GemmOcl() {
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -142,6 +146,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
         build_opts += " -DCASE32_WI_ROWMAJOR=1";
+        build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (scalar) {
             build_opts += " -DCASE32_NO_DPI=1";
@@ -173,7 +178,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) + " -DKR=" +
                         std::to_string(case32::kKR) +
-                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1";
+                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
+                        (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0");
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
@@ -234,7 +240,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 built = try_build(true, false, false, false, "packed KHR dot_acc_sat");
             }
             if (!built) {
-                built = try_build(false, false, false, false, "packed scalar (builtin failed)");
+                built = try_build(false, false, false, false, "packed scalar");
             }
         } else if (dpi_mode_ == Case32OclDpiMode::Force) {
             built = try_build(true, true, false, false, "packed force DPI");
@@ -261,14 +267,14 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             built = try_build(false, false, false, false, "cpm (asm failed)");
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
-        /* beignet-fix default cascade: AMD builtin → KHR → scalar cpm. */
+        /* Default cascade: AMD builtin → KHR → scalar cpm. */
         built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
         if (!built) {
-            built = try_build(true, false, false, false, "KHR dot_acc_sat (builtin failed)");
+            built = try_build(true, false, false, false, "KHR dot_acc_sat");
         }
         if (!built) {
             built = try_build(false, false, false, false,
-                              use_cpm_int_ ? "cpm int (builtin failed)" : "cpm float (builtin failed)");
+                              use_cpm_int_ ? "cpm int" : "cpm float");
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Force) {
         built = try_build(true, true, false, false, "force CASE32_FORCE_DPI");

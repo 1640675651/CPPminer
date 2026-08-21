@@ -62,6 +62,7 @@ static void print_usage(void)
     printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
+    printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -241,6 +242,7 @@ int main(int argc, char** argv)
     int ocl_tile_nr = 0;
     int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
     int ocl_cpm_int = 0;
+    int ocl_lds = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     if(simd_env_invalid)
@@ -329,6 +331,22 @@ int main(int argc, char** argv)
                 ocl_cpm_int = 1;
             } else {
                 fprintf(stderr, "invalid --ocl-cpm-type %s (expected float or int)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-lds", 9)){
+            const char* v = argv[i] + 9;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-lds requires on or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
+                ocl_lds = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
+                ocl_lds = 0;
+            } else {
+                fprintf(stderr, "invalid --ocl-lds %s (expected on or off)\n", v);
                 return 1;
             }
 #endif
@@ -507,6 +525,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_issue_mode(ocl_issue_mode);
     if(ocl_cpm_int)
         cp_worker_set_ocl_cpm_int(1);
+    if(ocl_lds)
+        cp_worker_set_ocl_lds(1);
 #endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){

@@ -40,6 +40,8 @@ void cp_worker_set_ocl_issue_mode(int mode);
 void cp_worker_set_ocl_issue_broadcast(int on);
 /* OpenCL-only: broadcast cpm type. 0 = float (default), 1 = int32. */
 void cp_worker_set_ocl_cpm_int(int on);
+/* OpenCL-only: stage A/B panels in local memory (0 = off default, 1 = on). */
+void cp_worker_set_ocl_lds(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 

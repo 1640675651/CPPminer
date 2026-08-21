@@ -42,6 +42,7 @@ static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 static int g_cpm_int = 0;
+static int g_use_lds = 0;
 
 namespace {
 
@@ -254,6 +255,10 @@ extern "C" void cp_opencl_worker_set_cpm_int(int on) {
     g_cpm_int = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_use_lds(int on) {
+    g_use_lds = on ? 1 : 0;
+}
+
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
     int tile_mr = PP_HASH_H;
     int tile_nr = 8;
@@ -326,6 +331,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_macro_batch(g_macro_batch);
     g_gemm.set_issue_mode(g_issue_mode);
     g_gemm.set_cpm_int(g_cpm_int);
+    g_gemm.set_use_lds(g_use_lds);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -354,6 +360,8 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     } else if (g_cpm_int) {
         printf("[ocl] cpm tile: int8 lanes, int32 acc (--ocl-cpm-type int)\n");
     }
+    printf("[ocl] LDS staging: %s (--ocl-lds %s)\n", g_use_lds ? "on" : "off",
+           g_use_lds ? "on" : "off");
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {

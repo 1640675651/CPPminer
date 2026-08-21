@@ -41,6 +41,9 @@ struct Case33GemmOcl {
     void set_issue_broadcast(int on);
     /* Broadcast/cpm element type: 0 = float4 mad (default), 1 = int32. Ignored if packed. */
     void set_cpm_int(int on);
+    /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
+    void set_use_lds(int on);
+    bool use_lds() const { return use_lds_; }
 
 
 
@@ -140,6 +143,8 @@ private:
     int issue_mode_ = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 
     bool use_cpm_int_ = false;
+
+    bool use_lds_ = false;
 
 
 
