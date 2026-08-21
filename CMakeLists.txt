@@ -199,11 +199,41 @@ if(CP_ENABLE_OPENCL)
         set(OpenCL_FOUND TRUE)
         message(STATUS "Using vendored OpenCL: ${_OCL_LIB_WIN}")
     endif()
+    # Termux: prefer vendor GPU libOpenCL over ocl-icd. ocl-icd often reports 0
+    # platforms unless a vendors/*.icd entry + LD_LIBRARY_PATH are set just right.
+    set(_cp_termux_ocl FALSE)
+    if(DEFINED ENV{TERMUX_VERSION} OR
+       (DEFINED ENV{PREFIX} AND "$ENV{PREFIX}" MATCHES "/com\\.termux/"))
+        set(_cp_termux_ocl TRUE)
+    endif()
+    if(NOT OpenCL_FOUND AND _cp_termux_ocl AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        foreach(_ocl_cand
+                "/vendor/lib64/libOpenCL.so"
+                "/vendor/lib/libOpenCL.so"
+                "/system/vendor/lib64/libOpenCL.so"
+                "/system/vendor/lib/libOpenCL.so")
+            if(EXISTS "${_ocl_cand}")
+                add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+                set_target_properties(OpenCL::OpenCL PROPERTIES
+                    IMPORTED_LOCATION "${_ocl_cand}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+                set(OpenCL_FOUND TRUE)
+                set(OpenCL_LIBRARY "${_ocl_cand}")
+                message(STATUS "Using Android vendor OpenCL: ${_ocl_cand}")
+                message(STATUS "  Run with the same LD_LIBRARY_PATH that makes clinfo work")
+                message(STATUS "  (often /system/lib64:/system_ext/lib64:/vendor/lib64 + SoC/VNDK dirs;")
+                message(STATUS "   see docs/termux_note.txt). Requires CP_STATIC_LIBCXX.")
+                break()
+            endif()
+        endforeach()
+        unset(_ocl_cand)
+    endif()
     if(NOT OpenCL_FOUND)
         find_package(OpenCL QUIET)
     endif()
     if(NOT OpenCL_FOUND AND EXISTS "${_OCL_HDR}/CL/cl.h")
-        find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.so)
+        find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.so
+            HINTS "$ENV{PREFIX}/lib")
         if(OpenCL_LIBRARY)
             add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
             set_target_properties(OpenCL::OpenCL PROPERTIES
@@ -211,11 +241,15 @@ if(CP_ENABLE_OPENCL)
                 INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
             set(OpenCL_FOUND TRUE)
             message(STATUS "Using system OpenCL + vendored headers: ${OpenCL_LIBRARY}")
+            if(_cp_termux_ocl)
+                message(STATUS "  If clGetPlatformIDs returns 0, see docs/termux_note.txt (ICD + LD_LIBRARY_PATH)")
+            endif()
         endif()
     endif()
     if(NOT OpenCL_FOUND)
         find_package(OpenCL REQUIRED)
     endif()
+    unset(_cp_termux_ocl)
     list(APPEND CP_SOURCES
         src/opencl/cp_opencl_worker.cpp
         src/opencl/case33_gemm_ocl.cpp

@@ -188,6 +188,11 @@ int OpenClContext::list_devices(int platform_filter) {
     const std::vector<OclDeviceInfo> devices = enumerate_devices(platform_filter);
     if (devices.empty()) {
         std::printf("[ocl] no OpenCL devices found\n");
+#if defined(__ANDROID__)
+        std::printf("[ocl] Termux/Android hint: use the same LD_LIBRARY_PATH that makes clinfo work\n");
+        std::printf("[ocl] (system + system_ext + vendor + SoC EGL/VNDK dirs; see docs/termux_note.txt)\n");
+        std::printf("[ocl] Requires a CP_STATIC_LIBCXX build so system libc++ does not break the binary\n");
+#endif
         return 0;
     }
 
