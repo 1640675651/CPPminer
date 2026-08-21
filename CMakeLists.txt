@@ -54,10 +54,6 @@ if(NOT EXISTS ${B3_DIR}/blake3.c)
 endif()
 list(APPEND CP_INCLUDE_DIRS ${B3_DIR})
 
-add_compile_definitions(
-    BLAKE3_NO_AVX512 BLAKE3_NO_AVX2 BLAKE3_NO_SSE41 BLAKE3_NO_SSE2
-)
-
 set(CP_BLAKE3_SOURCES
     ${B3_DIR}/blake3.c
     ${B3_DIR}/blake3_dispatch.c
@@ -79,6 +75,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         blake3_hasher_finalize_seek=cp_blake3_hasher_finalize_seek
         blake3_hasher_reset=cp_blake3_hasher_reset
         blake3_compress_in_place=cp_blake3_compress_in_place
+        blake3_compress_subtree_wide=cp_blake3_compress_subtree_wide
         blake3_compress_xof=cp_blake3_compress_xof
         blake3_xof_many=cp_blake3_xof_many
         blake3_hash_many=cp_blake3_hash_many
@@ -92,6 +89,34 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         src/common/cp_noise.c
         PROPERTIES COMPILE_DEFINITIONS
             "${CP_BLAKE3_NAMESPACE_DEFINITIONS}")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    list(APPEND CP_BLAKE3_SOURCES
+        ${B3_DIR}/blake3_sse2.c
+        ${B3_DIR}/blake3_sse41.c
+        ${B3_DIR}/blake3_avx2.c
+        ${B3_DIR}/blake3_avx512.c)
+    if(MSVC)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+            set_source_files_properties(${B3_DIR}/blake3_sse2.c
+                PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+        endif()
+        # MSVC has no SSE4.1-specific switch; this is BLAKE3's upstream setting.
+        set_source_files_properties(${B3_DIR}/blake3_sse41.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+        set_source_files_properties(${B3_DIR}/blake3_avx2.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(${B3_DIR}/blake3_avx512.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    else()
+        set_source_files_properties(${B3_DIR}/blake3_sse2.c
+            PROPERTIES COMPILE_OPTIONS "-msse2")
+        set_source_files_properties(${B3_DIR}/blake3_sse41.c
+            PROPERTIES COMPILE_OPTIONS "-msse4.1")
+        set_source_files_properties(${B3_DIR}/blake3_avx2.c
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(${B3_DIR}/blake3_avx512.c
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl")
+    endif()
 endif()
 
 set(CP_SOURCES ${CP_COMMON_SOURCES} ${CP_BLAKE3_SOURCES})
@@ -325,6 +350,7 @@ if(MSVC)
             PROPERTIES COMPILE_OPTIONS "-mssse3")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+
     endif()
 else()
     # Apple Clang has no built-in OpenMP; use Homebrew libomp when present.

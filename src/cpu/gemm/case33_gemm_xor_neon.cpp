@@ -19,8 +19,7 @@ uint32_t xor_tile(const int32_t *tile) {
     return result;
 }
 
-void neon_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals,
-                      bool use_fast_u8s8) {
+void neon_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals) {
     int32x4_t lo[kNR];
     int32x4_t hi[kNR];
     for (int j = 0; j < kNR; ++j) lo[j] = hi[j] = vdupq_n_s32(0);
@@ -28,12 +27,7 @@ void neon_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals,
     for (int kg = 0; kg < kKGroups; ++kg) {
         const int8x8x4_t a = vld4_s8(a_tile + static_cast<size_t>(kg) * 32);
         for (int ko = 0; ko < 4; ++ko) {
-            int16x8_t aw;
-            if (use_fast_u8s8) {
-                aw = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_s8(a.val[ko])));
-            } else {
-                aw = vmovl_s8(a.val[ko]);
-            }
+            const int16x8_t aw = vmovl_s8(a.val[ko]);
             for (int j = 0; j < kNR; ++j) {
                 const size_t b_index = static_cast<size_t>(j / 8 * kKGroups + kg) * 32 +
                         static_cast<size_t>(j % 8) * 4 + static_cast<size_t>(ko);
@@ -54,26 +48,20 @@ void neon_panel_accum(const int8_t *a_tile, const int8_t *b_tile, int32_t *vals,
 
 void case33_neon_micro_gemm_xor_fused_k(
         const int8_t *a_base, const int8_t *b_base, int blocks_k, int blocks_per_milestone,
-        int num_milestones, int n, int global_col0, size_t spatial_tile_id, size_t tile_count,
-        const int32_t *b_comp_ms, bool use_fast_u8s8, bool xor_after_milestone,
+        int num_milestones, size_t spatial_tile_id, size_t tile_count, bool xor_after_milestone,
         uint32_t *tile_xor_out) {
     int32_t vals[kMR * kNR] = {};
     (void)blocks_per_milestone;
     (void)num_milestones;
     for (int ms = 0; ms < blocks_k; ++ms) {
         neon_panel_accum(a_base + static_cast<size_t>(ms) * kPanelA,
-                         b_base + static_cast<size_t>(ms) * kPanelB, vals, use_fast_u8s8);
-        if (use_fast_u8s8 && b_comp_ms) {
-            const int32_t *comp = b_comp_ms + static_cast<size_t>(ms) * n;
-            for (int j = 0; j < kNR; ++j)
-                for (int i = 0; i < kMR; ++i) vals[j * kMR + i] += comp[global_col0 + j];
-        }
+                         b_base + static_cast<size_t>(ms) * kPanelB, vals);
         if (xor_after_milestone)
             tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] = xor_tile(vals);
     }
 }
 #else
 void case33_neon_micro_gemm_xor_fused_k(
-        const std::int8_t *, const std::int8_t *, int, int, int, int, int, std::size_t,
-        std::size_t, const std::int32_t *, bool, bool, std::uint32_t *) {}
+        const std::int8_t *, const std::int8_t *, int, int, int, std::size_t, std::size_t, bool,
+        std::uint32_t *) {}
 #endif

@@ -97,7 +97,8 @@ fail()   { echo "ERROR: $*" >&2; exit 1; }
 # ── Ensure-Blake3 ─────────────────────────────────────────────────────────────
 ensure_blake3() {
     local src_dir="${PROJECT_ROOT}/third_party/blake3"
-    if [[ -f "${src_dir}/blake3.c" && -f "${src_dir}/blake3_neon.c" ]]; then
+    if [[ -f "${src_dir}/blake3.c" && -f "${src_dir}/blake3_neon.c" &&
+          $(sed -n 's/^#define BLAKE3_VERSION_STRING "\(.*\)"/\1/p' "${src_dir}/blake3.h") == "1.8.5" ]]; then
         log "BLAKE3 already present at ${src_dir}"
         return
     fi

@@ -290,8 +290,7 @@ void micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int bloc
 #endif
     if (isa == Case33Isa::Neon) {
         case33_neon_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
-                                            num_milestones, N, global_col0, spatial_tile_id,
-                                            tile_count, b_comp_ms, use_fast_u8s8,
+                                            num_milestones, spatial_tile_id, tile_count,
                                             xor_after_milestone, tile_xor_out);
         return;
     }

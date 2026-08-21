@@ -93,7 +93,8 @@ struct Case33GemmXor {
 private:
     bool setup_dims_(int M, int N, int K);
     bool use_fast_u8s8_() const {
-        return int8_mode_ == Case32Int8Mode::FastU8S8 && isa_used_ != Case33Isa::Scalar;
+        return int8_mode_ == Case32Int8Mode::FastU8S8 &&
+               (isa_used_ == Case33Isa::Avx2 || isa_used_ == Case33Isa::Sse);
     }
     void update_backend_label_();
     bool fused_noisy_prepack_a_(const int8_t *a_signal, const uint8_t *a_noise_seed,

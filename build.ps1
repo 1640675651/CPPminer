@@ -247,8 +247,12 @@ function Copy-OpenClKernels {
 
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
+    $b3Header = Join-Path $b3Src "blake3.h"
+    $b3VersionMatches = (Test-Path $b3Header) -and
+        ((Get-Content $b3Header -Raw) -match '#define BLAKE3_VERSION_STRING "1\.8\.5"')
     if (-not (Test-Path (Join-Path $b3Src "blake3.c")) -or
-        -not (Test-Path (Join-Path $b3Src "blake3_neon.c"))) {
+        -not (Test-Path (Join-Path $b3Src "blake3_neon.c")) -or
+        -not $b3VersionMatches) {
         Write-Host "=== Fetching/upgrading BLAKE3 1.8.5 ==="
         New-Item -ItemType Directory -Force -Path $b3Src | Out-Null
         $base = "https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.8.5/c"
