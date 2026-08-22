@@ -2,6 +2,13 @@
 
 Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `--ocl-issue`.
 
+The OpenCL register tile can be `4x4`, `4x8`, `8x8`, or `8x16`. Pearl requires
+at least 32 cells per hash tile, so the `4x4` path assigns one work-item to a
+semantic `4x8` hash tile. It processes the two four-column halves sequentially
+with a reused 4x4 accumulator and folds both halves directly into one private
+message before BLAKE3. No inter-work-item exchange is required. The `4x4`
+path uses four-column packed-B groups; wider paths retain eight-column groups.
+
 | Mode | Flag | Inner loop |
 |------|------|------------|
 | **auto** (default) | `--ocl-issue auto` | DPI if available, else CLBlast **cpm** (beignet-fix) |
@@ -18,6 +25,12 @@ Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `-
 | **int** | `--ocl-cpm-type int` | int8→int32 lanes, `int4` mul+add |
 
 Only applies on the cpm nest (auto scalar fallback or `--ocl-issue broadcast`).
+
+### LDS staging (`--ocl-lds`)
+
+Optional `__local` A/B panel staging with work-group barriers (`CASE32_USE_LDS`). Default **off**.
+
+On most GPUs this **regressed** scan throughput: barrier + global→local copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
 
 ## packed
 

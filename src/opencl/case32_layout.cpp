@@ -8,16 +8,20 @@ namespace case32 {
 
 int kMR = PP_HASH_H;
 int kNR = PP_HASH_W;
+int kColsPerGroup = 8;
+int kKgGroupBytes = kColsPerGroup * kRank;
 int kKR = R_RANK;
 int kMicroPerMacroM = kMacroM / PP_HASH_H;
 int kMicroPerMacroN = kMacroN / PP_HASH_W;
+int kHashPerMacroM = kMicroPerMacroM;
+int kHashPerMacroN = kMicroPerMacroN;
 int kPanelA = kKR * PP_HASH_H;
 int kPanelB = kKR * PP_HASH_W;
 int kKGroups = kKR / kRank;
 int kMacroWorkItems = kMicroPerMacroM * kMicroPerMacroN;
 int kNumMilestones = K_DIM / R_RANK;
 int kKgBytesA = PP_HASH_H * kRank;
-int kKgSliceB = (PP_HASH_W / kColsPerGroup) * 32;
+int kKgSliceB = (PP_HASH_W / kColsPerGroup) * kKgGroupBytes;
 int kMacroKgStripA = kMicroPerMacroM * kKgBytesA;
 int kMacroKgStripB = kMicroPerMacroN * kKgSliceB;
 int kMacroKbBlockA = kKGroups * kMacroKgStripA;
@@ -26,16 +30,20 @@ int kMacroKbBlockB = kKGroups * kMacroKgStripB;
 namespace {
 
 void update_derived() {
+    kColsPerGroup = kNR < 8 ? kNR : 8;
+    kKgGroupBytes = kColsPerGroup * kRank;
     kKR = R_RANK;
     kMicroPerMacroM = kMacroM / kMR;
     kMicroPerMacroN = kMacroN / kNR;
+    kHashPerMacroM = kMacroM / hash_tile_mr();
+    kHashPerMacroN = kMacroN / hash_tile_nr();
     kPanelA = kKR * kMR;
     kPanelB = kKR * kNR;
     kKGroups = kKR / kRank;
-    kMacroWorkItems = kMicroPerMacroM * kMicroPerMacroN;
+    kMacroWorkItems = kHashPerMacroM * kHashPerMacroN;
     kNumMilestones = K_DIM / kKR;
     kKgBytesA = kMR * kRank;
-    kKgSliceB = (kNR / kColsPerGroup) * 32;
+    kKgSliceB = (kNR / kColsPerGroup) * kKgGroupBytes;
     kMacroKgStripA = kMicroPerMacroM * kKgBytesA;
     kMacroKgStripB = kMicroPerMacroN * kKgSliceB;
     kMacroKbBlockA = kKGroups * kMacroKgStripA;
@@ -43,6 +51,9 @@ void update_derived() {
 }
 
 bool is_supported_tile(int mr, int nr) {
+    if (mr == 4 && nr == 4) {
+        return true;
+    }
     if (mr == 4 && nr == 8) {
         return true;
     }
@@ -56,7 +67,8 @@ bool is_supported_tile(int mr, int nr) {
 
 bool configure(int mr, int nr) {
     if (!is_supported_tile(mr, nr)) {
-        std::fprintf(stderr, "[ocl] hash tile must be 4x8, 8x8, or 8x16 (got %dx%d)\n", mr, nr);
+        std::fprintf(stderr, "[ocl] register tile must be 4x4, 4x8, 8x8, or 8x16 (got %dx%d)\n",
+                     mr, nr);
         return false;
     }
     if (kMacroM % mr != 0 || kMacroN % nr != 0) {
@@ -65,15 +77,12 @@ bool configure(int mr, int nr) {
                      kMacroN);
         return false;
     }
-    if (nr % kColsPerGroup != 0) {
-        std::fprintf(stderr, "[ocl] tile NR=%d must be a multiple of %d\n", nr, kColsPerGroup);
-        return false;
-    }
     if (kKR % kRank != 0 || K_DIM % R_RANK != 0) {
         std::fprintf(stderr, "[ocl] KR/rank layout mismatch\n");
         return false;
     }
-    const int work_items = (kMacroM / mr) * (kMacroN / nr);
+    const int hash_nr = (mr == 4 && nr == 4) ? 8 : nr;
+    const int work_items = (kMacroM / mr) * (kMacroN / hash_nr);
     if (work_items > kMacroWorkItemsMax) {
         std::fprintf(stderr,
                      "[ocl] tile %dx%d needs %d work-items per macro block (max %d)\n", mr, nr,
@@ -86,6 +95,12 @@ bool configure(int mr, int nr) {
     return true;
 }
 
-int hash_tiles_per_macro() { return (kMacroM / kMR) * (kMacroN / kNR); }
+int hash_tile_mr() { return kMR; }
+
+int hash_tile_nr() { return (kMR == 4 && kNR == 4) ? 8 : kNR; }
+
+int hash_tiles_per_macro() {
+    return (kMacroM / hash_tile_mr()) * (kMacroN / hash_tile_nr());
+}
 
 } // namespace case32

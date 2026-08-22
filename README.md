@@ -120,12 +120,12 @@ This scipt pulls third-party dependencies and execute cmake.
 | Flag | Description |
 |------|-------------|
 | `--ocl-platform P` | Restrict device enumeration to platform index `P` |
-| `--ocl-tile MxN` | Hash tile: `8x8` (default), `4x8`, or `8x16` (auto on AMD discrete GPUs) |
+| `--ocl-tile MxN` | Register tile: `8x8` (default), `4x4`, `4x8`, or `8x16` (auto on AMD discrete GPUs) |
 | `--ocl-issue MODE` | GEMM issue: `auto` (default: DPI, else broadcast), `broadcast` (B-scalar `mad`), or `packed` (per-C `dot4`) |
 | `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
 
-`--ocl-tile` sets the hash tile for GEMM, jackpot XOR, hashrate counting, and proof layout. `--ocl-issue` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** is float **B-scalar broadcast**.
+`--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-issue` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** is float **B-scalar broadcast**.
 
 ### Scan batching (`--period-batch`)
 
@@ -213,7 +213,7 @@ Set `CP_PROOF_FFI` to override the shared library path for Python verify.
 
 A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
 
-- `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL use 8×16 or 8×8 per `--ocl-tile`; CUDA periodic/CUTLASS may differ).
+- `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL use the selected contiguous tile shape; CUDA periodic/CUTLASS may differ).
 - User scans: `debt += tiles` (including cancelled partial scans).
 - When `debt >= 100*T`, reconnect and mine under the developer wallet.
 - Fee scans: `debt -= 100 * tiles`; leave fee mode when `debt < 100*T`.

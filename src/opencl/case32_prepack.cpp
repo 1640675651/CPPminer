@@ -29,7 +29,7 @@ void pack_a_panel(const int8_t *a, int row0, int k_base, int K, int8_t *a_tile,
 void pack_b_panel(const int8_t *b, int col0, int k_base, int K, int8_t *b_tile) {
     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
         for (int kg = 0; kg < kKGroups; ++kg) {
-            int8_t *dst = b_tile + (jg * kKGroups + kg) * 32;
+            int8_t *dst = b_tile + (jg * kKGroups + kg) * kKgGroupBytes;
             for (int c = 0; c < kColsPerGroup; ++c) {
                 for (int ko = 0; ko < kRank; ++ko) {
                     dst[c * kRank + ko] =
@@ -108,9 +108,11 @@ uint32_t xor_tile_host(const int32_t *tile_c, int tile_elems) {
 void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *tile_xor,
                                   int M, int N, int K, int num_milestones,
                                   int milestone_k, size_t tile_count) {
-    const int tile_rows = M / kMR;
-    const int tile_cols = N / kNR;
-    const int tile_elems = kMR * kNR;
+    const int hash_mr = hash_tile_mr();
+    const int hash_nr = hash_tile_nr();
+    const int tile_rows = M / hash_mr;
+    const int tile_cols = N / hash_nr;
+    const int tile_elems = hash_mr * hash_nr;
     std::vector<int32_t> partial(static_cast<size_t>(M) * static_cast<size_t>(N), 0);
 
     for (int ms = 0; ms < num_milestones; ++ms) {
@@ -129,12 +131,12 @@ void reference_milestone_tile_xor(const int8_t *a, const int8_t *b, uint32_t *ti
         }
         for (int tr = 0; tr < tile_rows; ++tr) {
             for (int tc = 0; tc < tile_cols; ++tc) {
-                std::vector<int32_t> tile_c(static_cast<size_t>(kMR * kNR), 0);
-                const int row0 = tr * kMR;
-                const int col0 = tc * kNR;
-                for (int j = 0; j < kNR; ++j) {
-                    for (int i = 0; i < kMR; ++i) {
-                        tile_c[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                std::vector<int32_t> tile_c(static_cast<size_t>(tile_elems), 0);
+                const int row0 = tr * hash_mr;
+                const int col0 = tc * hash_nr;
+                for (int j = 0; j < hash_nr; ++j) {
+                    for (int i = 0; i < hash_mr; ++i) {
+                        tile_c[static_cast<size_t>(j) * static_cast<size_t>(hash_mr) +
                                static_cast<size_t>(i)] =
                                 partial[static_cast<size_t>(row0 + i) * N + (col0 + j)];
                     }
@@ -222,8 +224,12 @@ void prepack_b_coalesced(const int8_t *b, int N, int K, int blocks_k, int macro_
                     std::vector<int8_t> tmp(static_cast<size_t>(kPanelB));
                     pack_b_panel(b, tc_global * kNR, kb * kKR, K, tmp.data());
                     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        std::memcpy(out->data() + dst + static_cast<size_t>(jg) * 32,
-                                    tmp.data() + (jg * kKGroups + kg) * 32, 32);
+                        std::memcpy(out->data() + dst +
+                                            static_cast<size_t>(jg) * kKgGroupBytes,
+                                    tmp.data() +
+                                            static_cast<size_t>(jg * kKGroups + kg) *
+                                                    kKgGroupBytes,
+                                    static_cast<size_t>(kKgGroupBytes));
                     }
                 }
             }
@@ -248,7 +254,7 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
         const int row0 = im * kMacroM;
         const int tr0 = im * kMicroPerMacroM;
 
-        for (int lid = 0; lid < kMacroWorkItems; ++lid) {
+        for (int lid = 0; lid < kMicroPerMacroM * kMicroPerMacroN; ++lid) {
             const int tr = lid % kMicroPerMacroM;
             const int tc = lid / kMicroPerMacroM;
             const int micro_row0 = row0 + tr * kMR;
@@ -271,7 +277,7 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
                         const int8_t *b_jg =
                                 b_tile + (static_cast<size_t>(jg) * kKGroups +
                                           static_cast<size_t>(kg)) *
-                                                 32;
+                                                 static_cast<size_t>(kKgGroupBytes);
                         for (int col = 0; col < kColsPerGroup; ++col) {
                             const int j = jg * kColsPerGroup + col;
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
@@ -318,7 +324,7 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
         const int col0 = jm * kMacroN;
         const int row0 = im * kMacroM;
 
-        for (int lid = 0; lid < kMacroWorkItems; ++lid) {
+        for (int lid = 0; lid < kMicroPerMacroM * kMicroPerMacroN; ++lid) {
 #if CASE32_WI_ROWMAJOR
             const int tr = lid / kMicroPerMacroN;
             const int tc = lid % kMicroPerMacroN;
@@ -349,7 +355,8 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripB) +
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
                     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        const int8_t *b_jg = b_kg + static_cast<size_t>(jg) * 32;
+                        const int8_t *b_jg =
+                                b_kg + static_cast<size_t>(jg) * kKgGroupBytes;
                         for (int col = 0; col < kColsPerGroup; ++col) {
                             const int j = jg * kColsPerGroup + col;
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
@@ -392,6 +399,7 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                                         size_t tile_count, const int32_t *b_comp_ms,
                                         bool use_fast_u8s8) {
     const int macro_blocks = macro_cols * macro_rows;
+    const int register_tiles_per_hash = hash_tile_nr() / kNR;
 
     for (int mb = 0; mb < macro_blocks; ++mb) {
         const int jm = mb / macro_rows;
@@ -400,7 +408,7 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
         const int tr0 = im * kMicroPerMacroM;
         const int tc0 = jm * kMicroPerMacroN;
 
-        for (int lid = 0; lid < kMacroWorkItems; ++lid) {
+        for (int lid = 0; lid < kMicroPerMacroM * kMicroPerMacroN; ++lid) {
 #if CASE32_WI_ROWMAJOR
             const int tr = lid / kMicroPerMacroN;
             const int tc = lid % kMicroPerMacroN;
@@ -411,9 +419,10 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
             const int micro_col0 = col0 + tc * kNR;
             const int tr_global = tr0 + tr;
             const int tc_global = tc0 + tc;
+            const int hash_tc_global = tc_global / register_tiles_per_hash;
             const size_t spatial_id =
                     static_cast<size_t>(tr_global) * static_cast<size_t>(tile_cols) +
-                    static_cast<size_t>(tc_global);
+                    static_cast<size_t>(hash_tc_global);
 
             std::vector<int32_t> tile_c(static_cast<size_t>(kNR * kMR), 0);
             std::vector<int32_t> panel_acc(static_cast<size_t>(kNR * kMR), 0);
@@ -438,7 +447,8 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripB) +
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
                     for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        const int8_t *b_jg = b_kg + static_cast<size_t>(jg) * 32;
+                        const int8_t *b_jg =
+                                b_kg + static_cast<size_t>(jg) * kKgGroupBytes;
                         for (int col = 0; col < kColsPerGroup; ++col) {
                             const int j = jg * kColsPerGroup + col;
                             const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
@@ -476,8 +486,14 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                         }
                     }
                 }
-                tile_xor[static_cast<size_t>(ms) * tile_count + spatial_id] =
-                        xor_tile_host(tile_c.data(), kNR * kMR);
+                uint32_t &hash_xor =
+                        tile_xor[static_cast<size_t>(ms) * tile_count + spatial_id];
+                const uint32_t register_xor = xor_tile_host(tile_c.data(), kNR * kMR);
+                if ((tc % register_tiles_per_hash) == 0) {
+                    hash_xor = register_xor;
+                } else {
+                    hash_xor ^= register_xor;
+                }
                 std::fill(panel_acc.begin(), panel_acc.end(), 0);
                 ++ms;
             }

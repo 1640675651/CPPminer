@@ -277,7 +277,7 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | 3 contiguous 8×8 | 8 | 8 | `PEARL_CONTIGUOUS_8x8_CONFIG` |
 | 4 contiguous 4×8 | 4 | 8 | `PEARL_CONTIGUOUS_4x8_CONFIG` |
 
-Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x8` uses layout 4.
+Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x4` and `--ocl-tile 4x8` both use the contiguous 4×8 layout 4.
 
 ### `PlainProof` payload
 

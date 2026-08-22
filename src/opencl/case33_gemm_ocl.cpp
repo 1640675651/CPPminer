@@ -141,7 +141,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
         build_opts += " -DNR=" + std::to_string(case32::kNR);
+        build_opts += " -DHASH_NR=" + std::to_string(case32::hash_tile_nr());
         build_opts += " -DKR=" + std::to_string(case32::kKR);
+        build_opts += " -DCOLS_PER_GROUP=" + std::to_string(case32::kColsPerGroup);
         build_opts += " -DR_RANK=" + std::to_string(R_RANK);
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
@@ -178,6 +180,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) + " -DKR=" +
                         std::to_string(case32::kKR) +
+                        " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
+                        " -DCOLS_PER_GROUP=" + std::to_string(case32::kColsPerGroup) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
                         (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0");
                 if (issue_mode_ == 2) {
@@ -344,8 +348,9 @@ bool Case33GemmOcl::setup_dims_(int M, int N, int K) {
     blocks_per_milestone_ = 1;
     macro_rows_ = M / case32::kMacroM;
     macro_cols_ = N / case32::kMacroN;
-    tile_cols_ = N / case32::kNR;
-    tile_count_ = static_cast<size_t>(M / case32::kMR) * static_cast<size_t>(tile_cols_);
+    tile_cols_ = N / case32::hash_tile_nr();
+    tile_count_ = static_cast<size_t>(M / case32::hash_tile_mr()) *
+                  static_cast<size_t>(tile_cols_);
     macro_blocks_ = macro_cols_ * macro_rows_;
 
     if (M % case32::kMR != 0 || N % case32::kNR != 0 || K % case32::kKR != 0) {
@@ -474,9 +479,9 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         dot_kind = "clblast cpm float";
     }
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
-                  case32::kKR, dot_kind);
+                  case32::hash_tile_mr(), case32::hash_tile_nr(), case32::kKR, dot_kind);
     available_ = true;
     return true;
 }
@@ -536,9 +541,15 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     const int fuse_jackpot = 1;
     const int tile_count_i = static_cast<int>(tile_count_);
 
-    const int micro_m = case32::kMicroPerMacroM;
-    const int micro_n = case32::kMicroPerMacroN;
-    const size_t max_wg = ocl_.max_work_group_size;
+    const int micro_m = case32::kHashPerMacroM;
+    const int micro_n = case32::kHashPerMacroN;
+    size_t max_wg = ocl_.max_work_group_size;
+    size_t kernel_max_wg = 0;
+    if (clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(kernel_max_wg), &kernel_max_wg, nullptr) == CL_SUCCESS &&
+        kernel_max_wg > 0 && kernel_max_wg < max_wg) {
+        max_wg = kernel_max_wg;
+    }
 
     int slice_m = micro_m;
     if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
