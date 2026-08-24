@@ -147,7 +147,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DR_RANK=" + std::to_string(R_RANK);
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
-        build_opts += " -DCASE32_WI_ROWMAJOR=1";
+        build_opts += " -DCASE32_WI_ROWMAJOR=" +
+                      std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (scalar) {
@@ -182,7 +183,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         std::to_string(case32::kKR) +
                         " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
                         " -DCOLS_PER_GROUP=" + std::to_string(case32::kColsPerGroup) +
-                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=1" +
+                        " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=" +
+                        std::to_string(case32::wi_row_major() ? 1 : 0) +
                         (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0");
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";

@@ -99,6 +99,10 @@ int hash_tile_mr() { return kMR; }
 
 int hash_tile_nr() { return (kMR == 4 && kNR == 4) ? 8 : kNR; }
 
+bool wi_row_major() {
+    return !((kMR == 4 && kNR == 8) || (kMR == 8 && kNR == 16));
+}
+
 int hash_tiles_per_macro() {
     return (kMacroM / hash_tile_mr()) * (kMacroN / hash_tile_nr());
 }

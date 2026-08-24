@@ -299,9 +299,9 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     cp_pp_set_hash_tile(g_hash_tile_mr, g_hash_tile_w);
     pearl_set_contiguous_tile_shape(g_hash_tile_mr, g_hash_tile_w);
 
-    printf("[ocl] OpenCL register tile: %dx%d, hash tile: %dx%d (%s, %d WI/macro)\n",
-           case32::kMR, case32::kNR, g_hash_tile_mr, g_hash_tile_w, source,
-           case32::kMacroWorkItems);
+    printf("[ocl] OpenCL register tile: %dx%d, hash tile: %dx%d, %s-major WI (%s, %d WI/macro)\n",
+           case32::kMR, case32::kNR, g_hash_tile_mr, g_hash_tile_w,
+           case32::wi_row_major() ? "row" : "column", source, case32::kMacroWorkItems);
     fflush(stdout);
 }
 

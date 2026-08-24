@@ -9,6 +9,12 @@ with a reused 4x4 accumulator and folds both halves directly into one private
 message before BLAKE3. No inter-work-item exchange is required. The `4x4`
 path uses four-column packed-B groups; wider paths retain eight-column groups.
 
+Work-item traversal is selected with the register tile. The `4x8` and `8x16`
+kernels use column-major work-item order, so adjacent work-items share a column
+tile and walk consecutive row tiles. The `4x4` and `8x8` kernels retain
+row-major order. Packing and the existing `vload4` loads are unchanged so the
+work-item-ordering change can be measured independently.
+
 | Mode | Flag | Inner loop |
 |------|------|------------|
 | **auto** (default) | `--ocl-issue auto` | DPI if available, else CLBlast **cpm** (beignet-fix) |

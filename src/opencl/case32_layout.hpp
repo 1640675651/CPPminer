@@ -53,6 +53,9 @@ bool configure(int mr, int nr);
 int hash_tile_mr();
 int hash_tile_nr();
 
+/* Work-item traversal chosen for the selected register tile. */
+bool wi_row_major();
+
 /* Hash tiles covered by one 128x128 macro block. */
 int hash_tiles_per_macro();
 
