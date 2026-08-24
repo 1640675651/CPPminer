@@ -14,7 +14,7 @@
 #define CASE32_COALESCE 1
 #endif
 #ifndef CASE32_WI_ROWMAJOR
-#define CASE32_WI_ROWMAJOR 1
+#define CASE32_WI_ROWMAJOR 0
 #endif
 
 namespace case32 {
@@ -53,7 +53,7 @@ bool configure(int mr, int nr);
 int hash_tile_mr();
 int hash_tile_nr();
 
-/* Work-item traversal chosen for the selected register tile. */
+/* All supported tiles use column-major work-item traversal. */
 bool wi_row_major();
 
 /* Hash tiles covered by one 128x128 macro block. */
