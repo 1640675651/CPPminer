@@ -45,6 +45,12 @@ for each of NR columns:
     acc[j,i] += dot4(A[i][k:k+4], B[j][k:k+4])
 ```
 
+On the direct global-memory path, packed kernels rotate B registers across
+K-groups. After `B[j]` has updated all MR rows, its dead register is refilled
+with column `j` from the next K-group. This overlaps B loads with the remaining
+dots without allocating a second `b_pack`; the last group in each KR panel
+uses the normal non-refill path.
+
 ## broadcast / cpm
 
 ```text
