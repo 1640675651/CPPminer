@@ -120,7 +120,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | Flag | Description |
 |------|-------------|
 | `--ocl-platform P` | Restrict device enumeration to platform index `P` |
-| `--ocl-tile MxN` | Register tile: `8x8` (default), `4x4`, `4x8`, or `8x16` (auto on AMD discrete GPUs) |
+| `--ocl-tile MxN` | Register tile: `4x8` (default), `4x4`, `8x8`, or `8x16` (auto on AMD discrete GPUs) |
 | `--ocl-issue MODE` | GEMM issue: `auto` (default: DPI, else broadcast), `broadcast` (B-scalar `mad`), or `packed` (per-C `dot4`) |
 | `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
@@ -172,8 +172,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Device | Tile size | Hashrate |
 |--------|-----------|----------|
 | Intel HD graphics 10EU (Haswell) scalar | 4x8 | ~25 GH/s |
-| Intel UHD 630 scalar | 8x8 | ~115 GH/s |
-| Mali-G57 MC2 DP4A | 4x8 | ~80GH/s |
+| Intel UHD 630 scalar | 4x8 | ~130 GH/s |
+| Mali-G57 MC2 DP4A | 4x8 | ~100GH/s |
 
 ### CPU
 

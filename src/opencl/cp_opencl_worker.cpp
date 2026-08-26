@@ -260,17 +260,17 @@ extern "C" void cp_opencl_worker_set_use_lds(int on) {
 }
 
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
-    int tile_mr = PP_HASH_H;
+    int tile_mr = 4;
     int tile_nr = 8;
-    const char *source = "default 8x8";
+    const char *source = "default 4x8";
 
     if (g_tile_mr > 0 && g_tile_nr > 0) {
         if (!case32::configure(g_tile_mr, g_tile_nr)) {
-            fprintf(stderr, "[ocl] --ocl-tile %dx%d invalid; using 8x8\n", g_tile_mr,
+            fprintf(stderr, "[ocl] --ocl-tile %dx%d invalid; using 4x8\n", g_tile_mr,
                     g_tile_nr);
-            tile_mr = PP_HASH_H;
+            tile_mr = 4;
             tile_nr = 8;
-            source = "invalid CLI, using 8x8";
+            source = "invalid CLI, using 4x8";
             case32::configure(tile_mr, tile_nr);
         } else {
             tile_mr = g_tile_mr;

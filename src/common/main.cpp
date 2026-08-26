@@ -59,7 +59,7 @@ static void print_usage(void)
     printf("  --list-devices     list devices for the selected backend and exit\n");
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
-    printf("  --ocl-tile MxN     OpenCL register tile: 8x8 (default), 4x4, 4x8, or 8x16 (auto on AMD)\n");
+    printf("  --ocl-tile MxN     OpenCL register tile: 4x8 (default), 4x4, 8x8, or 8x16 (auto on AMD)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");

@@ -15,7 +15,7 @@ void cp_opencl_worker_set_platform(int platform_index);
 /* OpenCL hash tile MR (4 or 8) and width (8 or 16) after configure. */
 int cp_opencl_hash_tile_mr(void);
 int cp_opencl_hash_tile_w(void);
-/* OpenCL register tile size. Pass mr<=0 to restore auto (8x8 default, 8x16 on AMD). */
+/* OpenCL register tile size. Pass mr<=0 to restore auto (4x8 default, 8x16 on AMD). */
 void cp_opencl_worker_set_tile(int mr, int nr);
 /* OpenCL GEMM issue: 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
 void cp_opencl_worker_set_issue_mode(int mode);

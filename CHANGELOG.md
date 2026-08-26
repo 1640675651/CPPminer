@@ -14,7 +14,7 @@
 - Switch to cert V3 to align with the salted seed hardfork. Old cert V2 shares are no longer accepted by the network.
 - Separate OpenCL kernel compilation process with error handling. Improve compatibility for driver/compiler that crashes on specific compilation failure.
 - Skip matrix prep kernel if --cpu-gen is on. This fixes unsupported intrinsics on some drivers like beignet.
-- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`) to further reduce register pressure on small GPUs.
+- Add OpenCL **4×8** hash tile (`--ocl-tile 4x8`) to further reduce register pressure on small GPUs; make **4×8** the default OpenCL tile (AMD still auto-selects **8×16**).
 - OpenCL issue mode `--ocl-issue auto|broadcast|packed` (default **auto** = DP4A detection then broadcast fallback).
 - OpenCL int8 promotion selection `--ocl-cpm-type float|int`: broadcast B scalar in float (default) or int32. 
 
