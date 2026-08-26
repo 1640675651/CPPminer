@@ -333,25 +333,6 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
 #endif
 }
 
-#if CASE32_PACKED_DOT
-inline void case32_accum_kgroup_refill_b(__private int *acc,
-                                         __private const int *a_pack,
-                                         __private int *b_pack,
-                                         __global const char *next_b_kg) {
-    #pragma unroll
-    for (int j = 0; j < NR; ++j) {
-        const int base = j * MR;
-        const int b0 = b_pack[j];
-        #pragma unroll
-        for (int i = 0; i < MR; ++i) {
-            acc[base + i] = case32_dot4(acc[base + i], a_pack[i], b0);
-        }
-        /* This column is dead for the current K-group; rotate in the next one. */
-        b_pack[j] = as_int(vload4(0, next_b_kg + (size_t)j * RANK));
-    }
-}
-#endif
-
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -496,35 +477,6 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             barrier(CLK_LOCAL_MEM_FENCE);
         }
 #else
-#if CASE32_PACKED_DOT
-        __global const char *b_kg =
-                b_pre + b_kb_base + (size_t)tc * (size_t)KG_SLICE_B;
-        int b_pack[NR];
-        #pragma unroll
-        for (int j = 0; j < NR; ++j) {
-            b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-        }
-
-        for (int kg = 0; kg < KGROUPS; ++kg) {
-            __global const char *a_kg =
-                    a_pre + a_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
-                    (size_t)tr * (size_t)KG_BYTES_A;
-            int a_pack[MR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
-            if (kg + 1 < KGROUPS) {
-                __global const char *next_b_kg =
-                        b_kg + (size_t)MACRO_KG_STRIP_B;
-                case32_accum_kgroup_refill_b(acc, a_pack, b_pack, next_b_kg);
-                b_kg = next_b_kg;
-            } else {
-                case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
-            }
-        }
-#else
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg =
                     a_pre + a_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
@@ -556,7 +508,6 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             case32_accum_kgroup(acc, cpm, a_pack, b_pack);
 #endif
         }
-#endif
 #endif
 #else
         __global const char *a_tile = a_pre + (size_t)tr_global * (size_t)blocks_k *
