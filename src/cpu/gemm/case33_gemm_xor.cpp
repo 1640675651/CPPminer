@@ -335,7 +335,7 @@ void micro_gemm_xor_milestones(const int8_t *a_base, const int8_t *b_base, int b
                            use_fast_u8s8, isa, sse_tile, xor_after_milestone, tile_xor_out);
 }
 
-// Case 3.2 macro schedule: 2D OpenMP over macro blocks, tc outer / tr inner (B reuse).
+// Case 3.2 macro schedule: 2D OpenMP (dynamic) over macro blocks, tc outer / tr inner (B reuse).
 void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, int blocks_k,
                              int blocks_per_milestone, int num_milestones, int macro_rows,
                              int macro_cols, int tile_cols, size_t tile_count,
@@ -348,8 +348,10 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
             static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelB);
     const int macro_blocks = macro_cols * macro_rows;
 
+    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~1k amortizes dispatch
+     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 1024)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         const int jm = mb / macro_rows;
@@ -410,8 +412,10 @@ bool run_online_tile_scan(
     const int macro_blocks = macro_cols * macro_rows;
     std::atomic<int> stop{0};
 
+    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~4k amortizes dispatch
+     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 4096)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         if (stop.load(std::memory_order_relaxed)) {

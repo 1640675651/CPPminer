@@ -5,6 +5,7 @@
 - AVX-VNNI support (DONE)
 - Termux OpenCL support (DONE)
 - OpenCL `--ocl-lds on|off` for optional `__local` A/B staging (default off) (DONE)
+- Dynamic openmp schedule for CPU with big and small cores (DONE)
 - Lightweight random matrix generation, only sparsely fill matrix elements (TODO)
 - Zero-B on cuda worker (TODO)
 - Smaller matrix low-memory mode (TODO)
