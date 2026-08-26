@@ -27,16 +27,13 @@ void pack_a_panel(const int8_t *a, int row0, int k_base, int K, int8_t *a_tile,
 }
 
 void pack_b_panel(const int8_t *b, int col0, int k_base, int K, int8_t *b_tile) {
-    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-        for (int kg = 0; kg < kKGroups; ++kg) {
-            int8_t *dst = b_tile + (jg * kKGroups + kg) * kKgGroupBytes;
-            for (int c = 0; c < kColsPerGroup; ++c) {
-                for (int ko = 0; ko < kRank; ++ko) {
-                    dst[c * kRank + ko] =
-                            b[static_cast<size_t>(k_base + kg * kRank + ko) +
-                              static_cast<size_t>(col0 + jg * kColsPerGroup + c) *
-                                      static_cast<size_t>(K)];
-                }
+    for (int kg = 0; kg < kKGroups; ++kg) {
+        int8_t *dst = b_tile + kg * kKgSliceB;
+        for (int j = 0; j < kNR; ++j) {
+            for (int ko = 0; ko < kRank; ++ko) {
+                dst[j * kRank + ko] =
+                        b[static_cast<size_t>(k_base + kg * kRank + ko) +
+                          static_cast<size_t>(col0 + j) * static_cast<size_t>(K)];
             }
         }
     }
@@ -223,14 +220,9 @@ void prepack_b_coalesced(const int8_t *b, int N, int K, int blocks_k, int macro_
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
                     std::vector<int8_t> tmp(static_cast<size_t>(kPanelB));
                     pack_b_panel(b, tc_global * kNR, kb * kKR, K, tmp.data());
-                    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        std::memcpy(out->data() + dst +
-                                            static_cast<size_t>(jg) * kKgGroupBytes,
-                                    tmp.data() +
-                                            static_cast<size_t>(jg * kKGroups + kg) *
-                                                    kKgGroupBytes,
-                                    static_cast<size_t>(kKgGroupBytes));
-                    }
+                    std::memcpy(out->data() + dst,
+                                tmp.data() + static_cast<size_t>(kg) * kKgSliceB,
+                                static_cast<size_t>(kKgSliceB));
                 }
             }
         }
@@ -273,21 +265,16 @@ void reference_macro_gemm(const int8_t *a_pre, const int8_t *b_pre, int32_t *c, 
                 const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
                 for (int kg = 0; kg < kKGroups; ++kg) {
                     const int8_t *a_kg = a_tile + static_cast<size_t>(kg) * kKgBytesA;
-                    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        const int8_t *b_jg =
-                                b_tile + (static_cast<size_t>(jg) * kKGroups +
-                                          static_cast<size_t>(kg)) *
-                                                 static_cast<size_t>(kKgGroupBytes);
-                        for (int col = 0; col < kColsPerGroup; ++col) {
-                            const int j = jg * kColsPerGroup + col;
-                            const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
-                            for (int i = 0; i < kMR; ++i) {
-                                for (int ko = 0; ko < kRank; ++ko) {
-                                    acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
-                                        static_cast<size_t>(i)] +=
-                                            static_cast<int32_t>(a_kg[i * kRank + ko]) *
-                                            static_cast<int32_t>(bp[ko]);
-                                }
+                    const int8_t *b_kg =
+                            b_tile + static_cast<size_t>(kg) * kKgSliceB;
+                    for (int j = 0; j < kNR; ++j) {
+                        const int8_t *bp = b_kg + static_cast<size_t>(j) * kRank;
+                        for (int i = 0; i < kMR; ++i) {
+                            for (int ko = 0; ko < kRank; ++ko) {
+                                acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                    static_cast<size_t>(i)] +=
+                                        static_cast<int32_t>(a_kg[i * kRank + ko]) *
+                                        static_cast<int32_t>(bp[ko]);
                             }
                         }
                     }
@@ -354,19 +341,14 @@ void reference_macro_gemm_coalesced(const int8_t *a_pre, const int8_t *b_pre, in
                             b_pre + b_kb_base +
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripB) +
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
-                    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        const int8_t *b_jg =
-                                b_kg + static_cast<size_t>(jg) * kKgGroupBytes;
-                        for (int col = 0; col < kColsPerGroup; ++col) {
-                            const int j = jg * kColsPerGroup + col;
-                            const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
-                            for (int i = 0; i < kMR; ++i) {
-                                for (int ko = 0; ko < kRank; ++ko) {
-                                    acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
-                                        static_cast<size_t>(i)] +=
-                                            static_cast<int32_t>(a_kg[i * kRank + ko]) *
-                                            static_cast<int32_t>(bp[ko]);
-                                }
+                    for (int j = 0; j < kNR; ++j) {
+                        const int8_t *bp = b_kg + static_cast<size_t>(j) * kRank;
+                        for (int i = 0; i < kMR; ++i) {
+                            for (int ko = 0; ko < kRank; ++ko) {
+                                acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                    static_cast<size_t>(i)] +=
+                                        static_cast<int32_t>(a_kg[i * kRank + ko]) *
+                                        static_cast<int32_t>(bp[ko]);
                             }
                         }
                     }
@@ -446,19 +428,14 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                             b_pre + b_kb_base +
                             static_cast<size_t>(kg) * static_cast<size_t>(kMacroKgStripB) +
                             static_cast<size_t>(tc) * static_cast<size_t>(kKgSliceB);
-                    for (int jg = 0; jg < kNR / kColsPerGroup; ++jg) {
-                        const int8_t *b_jg =
-                                b_kg + static_cast<size_t>(jg) * kKgGroupBytes;
-                        for (int col = 0; col < kColsPerGroup; ++col) {
-                            const int j = jg * kColsPerGroup + col;
-                            const int8_t *bp = b_jg + static_cast<size_t>(col) * kRank;
-                            for (int i = 0; i < kMR; ++i) {
-                                for (int ko = 0; ko < kRank; ++ko) {
-                                    panel_acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
-                                              static_cast<size_t>(i)] +=
-                                            static_cast<int32_t>(a_kg[i * kRank + ko]) *
-                                            static_cast<int32_t>(bp[ko]);
-                                }
+                    for (int j = 0; j < kNR; ++j) {
+                        const int8_t *bp = b_kg + static_cast<size_t>(j) * kRank;
+                        for (int i = 0; i < kMR; ++i) {
+                            for (int ko = 0; ko < kRank; ++ko) {
+                                panel_acc[static_cast<size_t>(j) * static_cast<size_t>(kMR) +
+                                          static_cast<size_t>(i)] +=
+                                        static_cast<int32_t>(a_kg[i * kRank + ko]) *
+                                        static_cast<int32_t>(bp[ko]);
                             }
                         }
                     }

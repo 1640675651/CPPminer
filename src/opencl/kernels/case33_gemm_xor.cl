@@ -47,9 +47,6 @@
 #ifndef PANEL_B
 #define PANEL_B (KR * NR)
 #endif
-#ifndef COLS_PER_GROUP
-#define COLS_PER_GROUP ((NR < 8) ? NR : 8)
-#endif
 #ifndef RANK
 #define RANK 4
 #endif
@@ -67,7 +64,6 @@
 #ifndef KGROUPS
 #define KGROUPS (KR / RANK)
 #endif
-#define KG_GROUP_BYTES (COLS_PER_GROUP * RANK)
 #ifndef KG_BYTES_A
 #define KG_BYTES_A (MR * RANK)
 #endif
@@ -79,7 +75,7 @@
 #endif
 #define HASH_MICRO_N (MACRO_N / HASH_NR)
 #ifndef KG_SLICE_B
-#define KG_SLICE_B ((NR / COLS_PER_GROUP) * KG_GROUP_BYTES)
+#define KG_SLICE_B (NR * RANK)
 #endif
 #ifndef MACRO_KG_STRIP_A
 #define MACRO_KG_STRIP_A (MICRO_M * KG_BYTES_A)
@@ -458,14 +454,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                         a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
                     }
                     #pragma unroll
-                    for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
-                        __local const char *b_jg =
-                                b_kg + (size_t)jg * KG_GROUP_BYTES;
-                        #pragma unroll
-                        for (int col = 0; col < COLS_PER_GROUP; ++col) {
-                            b_pack[jg * COLS_PER_GROUP + col] =
-                                    as_int(vload4(0, b_jg + (size_t)col * RANK));
-                        }
+                    for (int j = 0; j < NR; ++j) {
+                        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
                     }
 #if CASE32_PACKED_DOT
                     case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
@@ -493,14 +483,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             }
 
             #pragma unroll
-            for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
-                __global const char *b_jg =
-                        b_kg + (size_t)jg * KG_GROUP_BYTES;
-                #pragma unroll
-                for (int col = 0; col < COLS_PER_GROUP; ++col) {
-                    b_pack[jg * COLS_PER_GROUP + col] =
-                            as_int(vload4(0, b_jg + (size_t)col * RANK));
-                }
+            for (int j = 0; j < NR; ++j) {
+                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
             }
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
@@ -526,16 +510,11 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
             }
 
+            __global const char *b_kg =
+                    b_tile + (size_t)kg * (size_t)KG_SLICE_B;
             #pragma unroll
-            for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
-                __global const char *b_jg =
-                        b_tile + ((size_t)jg * (size_t)KGROUPS + (size_t)kg) *
-                                         KG_GROUP_BYTES;
-                #pragma unroll
-                for (int col = 0; col < COLS_PER_GROUP; ++col) {
-                    b_pack[jg * COLS_PER_GROUP + col] =
-                            as_int(vload4(0, b_jg + (size_t)col * RANK));
-                }
+            for (int j = 0; j < NR; ++j) {
+                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
             }
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);

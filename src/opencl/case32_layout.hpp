@@ -28,8 +28,6 @@ constexpr int kMacroWorkItemsMax = 512;
 /* Runtime tile shape and derived layout (set via configure() before OpenCL init). */
 extern int kMR;
 extern int kNR;
-extern int kColsPerGroup;
-extern int kKgGroupBytes;
 extern int kKR;
 extern int kMicroPerMacroM;
 extern int kMicroPerMacroN;

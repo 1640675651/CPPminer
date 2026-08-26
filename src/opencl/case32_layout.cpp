@@ -8,8 +8,6 @@ namespace case32 {
 
 int kMR = PP_HASH_H;
 int kNR = PP_HASH_W;
-int kColsPerGroup = 8;
-int kKgGroupBytes = kColsPerGroup * kRank;
 int kKR = R_RANK;
 int kMicroPerMacroM = kMacroM / PP_HASH_H;
 int kMicroPerMacroN = kMacroN / PP_HASH_W;
@@ -21,7 +19,7 @@ int kKGroups = kKR / kRank;
 int kMacroWorkItems = kMicroPerMacroM * kMicroPerMacroN;
 int kNumMilestones = K_DIM / R_RANK;
 int kKgBytesA = PP_HASH_H * kRank;
-int kKgSliceB = (PP_HASH_W / kColsPerGroup) * kKgGroupBytes;
+int kKgSliceB = PP_HASH_W * kRank;
 int kMacroKgStripA = kMicroPerMacroM * kKgBytesA;
 int kMacroKgStripB = kMicroPerMacroN * kKgSliceB;
 int kMacroKbBlockA = kKGroups * kMacroKgStripA;
@@ -30,8 +28,6 @@ int kMacroKbBlockB = kKGroups * kMacroKgStripB;
 namespace {
 
 void update_derived() {
-    kColsPerGroup = kNR < 8 ? kNR : 8;
-    kKgGroupBytes = kColsPerGroup * kRank;
     kKR = R_RANK;
     kMicroPerMacroM = kMacroM / kMR;
     kMicroPerMacroN = kMacroN / kNR;
@@ -43,7 +39,7 @@ void update_derived() {
     kMacroWorkItems = kHashPerMacroM * kHashPerMacroN;
     kNumMilestones = K_DIM / kKR;
     kKgBytesA = kMR * kRank;
-    kKgSliceB = (kNR / kColsPerGroup) * kKgGroupBytes;
+    kKgSliceB = kNR * kRank;
     kMacroKgStripA = kMicroPerMacroM * kKgBytesA;
     kMacroKgStripB = kMicroPerMacroN * kKgSliceB;
     kMacroKbBlockA = kKGroups * kMacroKgStripA;

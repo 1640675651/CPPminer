@@ -7,7 +7,14 @@ at least 32 cells per hash tile, so the `4x4` path assigns one work-item to a
 semantic `4x8` hash tile. It processes the two four-column halves sequentially
 with a reused 4x4 accumulator and folds both halves directly into one private
 message before BLAKE3. No inter-work-item exchange is required. The `4x4`
-path uses four-column packed-B groups; wider paths retain eight-column groups.
+path stores four B columns per register tile; wider paths store eight or sixteen.
+
+Packed B has no column-group dimension. Within each K-group, every `tc` stores
+its `NR` rank-4 column values consecutively:
+
+```text
+[macro_column][K_block][K_group][tc][column][rank4]
+```
 
 All register tiles use column-major work-item order. Within each row-tile run,
 adjacent work-items share a column tile and walk consecutive row tiles, making

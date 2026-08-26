@@ -17,12 +17,8 @@
 #define CP_ZERO_PT 16
 #define CP_B3_LINES 8
 #define K_GROUPS (KR / 4)
-#ifndef COLS_PER_GROUP
-#define COLS_PER_GROUP ((NR < 8) ? NR : 8)
-#endif
-#define KG_GROUP_BYTES (COLS_PER_GROUP * 4)
 #define KG_BYTES_A (MR * 4)
-#define KG_SLICE_B ((NR / COLS_PER_GROUP) * KG_GROUP_BYTES)
+#define KG_SLICE_B (NR * 4)
 #define MICRO_M (128 / MR)
 #define MICRO_N (128 / NR)
 #define MACRO_KG_STRIP_A (MICRO_M * KG_BYTES_A)
@@ -123,13 +119,10 @@ __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const ucha
         for (int kg = 0; kg < K_GROUPS; ++kg) {
             const size_t dst = block_base + (size_t)kg * (size_t)MACRO_KG_STRIP_B +
                                (size_t)tc * (size_t)KG_SLICE_B;
-            for (int jg = 0; jg < NR / COLS_PER_GROUP; ++jg) {
-                for (int c = 0; c < COLS_PER_GROUP; ++c) {
-                    for (int ko = 0; ko < 4; ++ko) {
-                        b_pre_out[dst + (size_t)jg * KG_GROUP_BYTES +
-                                  (size_t)c * 4 + (size_t)ko] =
-                                stripe[(size_t)(jg * COLS_PER_GROUP + c)][(size_t)kg * 4 + (size_t)ko];
-                    }
+            for (int j = 0; j < NR; ++j) {
+                for (int ko = 0; ko < 4; ++ko) {
+                    b_pre_out[dst + (size_t)j * 4 + (size_t)ko] =
+                            stripe[(size_t)j][(size_t)kg * 4 + (size_t)ko];
                 }
             }
         }
