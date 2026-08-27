@@ -317,6 +317,27 @@ int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
     return 0;
 }
 
+/* One random [-64,63] write per column; ~k stores. Does not clear other entries. */
+int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
+                                       int8_t* A_inout)
+{
+    if(!A_inout || m <= 0 || k <= 0)
+        return -1;
+
+    const uint64_t rng_seed = pearl_seed_to_u64(seed, seed_len);
+    const uint32_t m_u = (uint32_t)m;
+
+    for(int j = 0; j < k; j++){
+        uint64_t s = rng_seed ^ (uint64_t)j * 0x9E3779B97F4A7C15ULL;
+        s = pearl_splitmix64(s);
+        const int row = (int)((uint32_t)s % m_u);
+        s = pearl_splitmix64(s);
+        const int8_t val = (int8_t)((int)((uint32_t)(s >> 32) % 128u) - 64);
+        A_inout[(size_t)row * (size_t)k + (size_t)j] = val;
+    }
+    return 0;
+}
+
 void pearl_job_key(const uint8_t* header, int header_len, uint8_t out32[32]){
     uint8_t buf[128];
     memcpy(buf, header, (size_t)header_len);

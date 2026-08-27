@@ -19,8 +19,10 @@ void cp_mine_init_host_buffers(void)
 {
     size_t szAp = (size_t)g_m_active * K_DIM;
     size_t szBpT = (size_t)g_n_active * K_DIM;
-    h_Ap_global = (int8_t *)malloc(szAp);
-    h_BpT_global = (int8_t *)malloc(szBpT);
+    /* Zero once at launch: CPU/OpenCL zero-B keeps B^T as committed zeros; CPU sparse A
+     * pokes assume the rest of A stays in [-64, 63]. Do not re-zero per job/attempt. */
+    h_Ap_global = (int8_t *)calloc(1, szAp);
+    h_BpT_global = (int8_t *)calloc(1, szBpT);
     if (!h_Ap_global || !h_BpT_global) {
         fprintf(stderr, "OOM host matrices\n");
         exit(1);
@@ -130,9 +132,6 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         pearl_job_key(header, hlen, job_key_bytes);
-        if (cp_worker_worker_handles_matrix_prep()) {
-            memset(h_BpT_global, 0, szBpT);
-        }
         cp_worker_begin_job(job_key_bytes, g_m_active, g_n_active, cert_version);
         tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
                             cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());

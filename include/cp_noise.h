@@ -35,6 +35,11 @@ int pearl_generate_ab(const uint8_t* seed, int seed_len, int m, int n, int k,
 int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
                             int8_t* A_out);
 
+/* Sparse A refresh: one random in-range write per column (row and value from seed).
+ * Leaves other entries untouched — caller must ensure A starts in [-64, 63] (e.g. zeros). */
+int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
+                                       int8_t* A_inout);
+
 int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
                          uint8_t* out, int out_cap);
 

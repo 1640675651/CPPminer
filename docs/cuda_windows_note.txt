@@ -1,0 +1,3 @@
+On windows, if MSVC command line tools are installed but the full MSVC is not, cuda toolkit cannot integrate with MSVC. To use cuda toolkit, we need to manually integrate it. 
+Copy everything in C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\extras\visual_studio_integration\MSBuildExtensions\
+to C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations\

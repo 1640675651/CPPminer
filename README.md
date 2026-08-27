@@ -180,8 +180,9 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Device | ISA | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|-----|----------| ---------------------------|
 | Celeron G1840 @ 2.8GHz | SSSE3 | ~35 GH/s | ~4 GH/s |
-| Core i9 9980HK @ 2.4GHz | AVX2 | ~430 GH/s | ~300 GH/s |
+| Core i9 9980HK @ 2.4GHz | AVX2 | ~440 GH/s | ~300 GH/s |
 | Core i5 12490F @ 4.0GHz | AVX-VNNI | ~1.1 TH/s | ~400 GH/s |
+| Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | |
 | Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | ~160 GH/s | N/A |
 
 

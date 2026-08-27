@@ -166,7 +166,9 @@ static int zero_b_prepare_attempt(
         return -2;
     }
 
-    if(pearl_generate_random_a(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig) != 0)
+    /* ~K_DIM writes: random row + value per column; rest of A left as-is. */
+    if(pearl_perturb_random_a_one_per_col(a_rng, (int)sizeof(a_rng), m, K_DIM,
+                                          h_A_sig) != 0)
         return -1;
 
     pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,
