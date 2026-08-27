@@ -355,6 +355,10 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         return cp_cpu_worker_handles_matrix_prep();
 #endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return cp_cuda_worker_handles_matrix_prep();
+#endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return cp_opencl_worker_handles_matrix_prep();

@@ -27,8 +27,8 @@ int cp_gpu_mine_plain_proof(const int8_t* h_A, const int8_t* h_B,
                             int* out_t_rows, int* out_t_cols,
                             uint64_t* out_tiles_scanned);
 
-/* GPU matrix path (default): random fill + GPU commitment/noise, then scan.
- * On share, copies signal A/B^T to h_A_sig/h_Bt_sig for proof build. */
+/* GPU matrix path (default): zero-B — noisy B once/job, random A per attempt, then scan.
+ * On share, copies signal A to h_A_sig; B^T stays host zeros. */
 /* End-to-end GPU vs CPU check at given m,n (production: m=n=131072). */
 int cp_gpu_run_alignment_tests(int dev, int m, int n);
 

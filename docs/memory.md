@@ -1,6 +1,6 @@
 # Memory footprint
 
-Production dimensions (`cp_config.h`): **m = n = 131072**, **k = 4096**, **r = 256**.  
+Production dimensions (`cp_config.h`): **m = n = 131072**, **k = 4096**, **r = 128**.  
 Dev (`--dev`): **m = n = 8192**.
 
 Each full matrix (signal or coalesced prepack) is:
@@ -14,6 +14,8 @@ Host signal slots `h_Ap_global` / `h_BpT_global` are always allocated in `cp_min
 ---
 
 # CPU zero-B path
+
+The default CPU worker caches **noisy B once per job** and rebuilds **noisy A each nonce**. Signal `B^T` stays zero; only `h_Ap_global` is randomized per attempt.
 
 ## Per-buffer sizes
 
@@ -36,21 +38,6 @@ General formulas:
 |B|  = n × k
 |b_comp_ms_| = 64 × n   (16 milestones × int32 per column)
 ```
-
-## CPU zero-B layout
-
-The default CPU worker caches **noisy B once per job** and rebuilds **noisy A each nonce**. Signal `B^T` stays zero; only `h_Ap_global` is randomized per attempt.
-
-Persistent for the process lifetime:
-
-- `h_Ap_global`, `h_BpT_global` — allocated in `cp_mine_init_host_buffers()`
-
-Per job / per attempt (in `cp_cpu_worker.cpp` + `Case33GemmXor`):
-
-- `g_zero_b.B_noisy` — B scan buffer (or transient row-major before prepack)
-- `g_A_noisy` — A scan buffer (or transient row-major before prepack)
-- `g_gemm.a_pre_` / `g_gemm.b_pre_` — only in **separate** prepack mode
-- `g_gemm.b_comp_ms_` — always (FastU8S8 path)
 
 ## Prepack modes (`--prepack MODE`)
 
@@ -115,12 +102,6 @@ No full-matrix temporary. Extra memory is OpenMP thread-local stripes plus a **~
 | Share found | proof buffer | up to 512 KiB (`PLAIN_PROOF_B64_MAX`) |
 
 `pearl_commitment_seeds` (full A+B keyed digest) is **not** run on the zero-B CPU fast path; A noise seed comes from `pearl_a_noise_seed_from_a`.
-
-## Non–zero-B / legacy host path
-
-If matrix prep is not handled by the worker (`--cpu-gen` or non-CPU backend with host matrices), `cp_mine.cpp` may also allocate:
-
-- `h_A_scan`, `h_B_scan` — another **m×k + n×k** if host noisy matrices are materialized
 
 ## CPU quick reference
 
@@ -251,6 +232,19 @@ On share, both A and B^T may be handed off (`handoff_bt=1`); reclaim runs every 
 | Proof scratch | up to **512 KiB** `PLAIN_PROOF_B64_MAX` on the proof thread |
 
 Peak host matrix RAM does **not** double during proof on the GPU-prep path.
+
+# CUDA zero-B path (default)
+
+| Buffer | Role | Production |
+|--------|------|------------|
+| `d_A_sig` | Signal A (random per nonce) + D2H on hit | 512 MiB |
+| `d_Ap` | Noisy A (scan) | 512 MiB |
+| `d_BpT` | Noisy B (scan; built once/job, signal B imaginary/zero) | 512 MiB |
+| `d_Bt_sig` | **Not allocated** on zero-B path | 0 |
+
+**~1.5 GiB VRAM** for the three full matrices (plus small noise/seed/jackpot scratch). `--cpu-gen` still allocates `d_Bt_sig` as H2D staging.
+
+Flow: job → `gpu_prepare_job_b` (noise-only into `d_BpT`); each nonce → random A + hash + A-side noise into `d_Ap`. Share D2H copies A only; host `h_BpT_global` stays launch zeros.
 
 ## OpenCL quick reference
 

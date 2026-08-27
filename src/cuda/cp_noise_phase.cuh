@@ -112,7 +112,8 @@ __global__ void cp_apply_noise_b_kernel(
         int step = l / rank;
         int ri = l % rank;
         size_t dst = ((size_t)step * (size_t)n + (size_t)col) * (size_t)rank + (size_t)ri;
-        noisy[dst] = (int8_t)((int32_t)signal[src] + (int32_t)sh_noise[l]);
+        const int32_t sig = signal ? (int32_t)signal[src] : 0;
+        noisy[dst] = (int8_t)(sig + (int32_t)sh_noise[l]);
     }
 }
 
@@ -160,7 +161,8 @@ __global__ void cp_apply_noise_b_rowmajor_kernel(
 
     for(int l = (int)threadIdx.x; l < k; l += (int)blockDim.x){
         size_t idx = (size_t)col * (size_t)k + (size_t)l;
-        noisy[idx] = (int8_t)((int32_t)signal[idx] + (int32_t)sh_noise[l]);
+        const int32_t sig = signal ? (int32_t)signal[idx] : 0;
+        noisy[idx] = (int8_t)(sig + (int32_t)sh_noise[l]);
     }
 }
 

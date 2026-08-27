@@ -772,6 +772,20 @@ int main(int argc, char** argv)
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+        } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
+            if(cutlass_fused){
+                printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
+                printf("[mode] scan: CUTLASS Case 10 fused GEMM + inline XOR jackpot\n");
+            } else {
+                printf("[mode] scan: %s\n",
+                       (contiguous || no_period_gemm) ? "per-tile kernel"
+                                                      : "period GEMM + batched jackpot");
+            }
+            if(!g_cpu_matrix_gen){
+                printf("[mode] zero-B: ~%.0f MiB host A + zero B^T; ~1.5 GiB VRAM "
+                       "(A_sig + noisy A/B, no d_Bt_sig)\n",
+                       host_mib);
+            }
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
             printf("[mode] scan: CUTLASS Case 10 fused GEMM + inline XOR jackpot\n");
@@ -807,7 +821,9 @@ int main(int argc, char** argv)
         printf("[mode] matrix gen: %s\n",
                (g_cpu_matrix_gen || cp_worker_prefers_host_matrices())
                    ? "host BLAKE3 + noise"
-                   : "device random + commitment/noise");
+                   : (cp_worker_worker_handles_matrix_prep()
+                          ? "zero-B (B once/job, A per nonce)"
+                          : "device random + commitment/noise"));
         printf("[mode] verify=%d dry_run=%d max_nonce=%d mock=%d cert_version=%u%s\n",
                g_plain_verify, g_dry_run, g_max_nonce, g_mock,
                (unsigned)g_cert_version,

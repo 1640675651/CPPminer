@@ -147,8 +147,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
-        /* CUDA GPU prep uses random A/B (not zero-B); hand off both signal mats.
-         * CPU/OpenCL zero-B keeps shared zero B^T and only hands off A. */
+        /* CPU/OpenCL/CUDA zero-B: shared zero B^T, hand off A only.
+         * --cpu-gen / host matrices still hand off both signal mats. */
         handoff_bt = host_matrices || !zero_b_gpu;
         /* Defer reclaim + D2H on share when signal mats live on device between attempts
          * (CUDA / OpenCL GPU-prep). CPU always has correct A on host and must reclaim

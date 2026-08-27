@@ -33,7 +33,7 @@ Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix gene
 
 | Backend | Signal A / B^T source | Proof on share |
 |---------|------------------------|----------------|
-| **CUDA** (default) | GPU random (`cp_gen_random_matrix_kernel`; per-attempt CSPRNG via `cp_random_u64`) | `cudaMemcpy` from `d_A_sig` / `d_Bt_sig` → `h_Ap_global` / `h_BpT_global` |
+| **CUDA** (default) | Zero signal `B^T`; GPU random A per attempt; B-side noise cached per job | D2H `d_A_sig` only; host `h_BpT_global` stays zeros |
 | **CPU** (default) | Zero signal `B^T`; sparse random A per attempt (`pearl_perturb_random_a_one_per_col` — one write per column from **CSPRNG**, not header/nonce) | `h_BpT_global = 0`, sparse `h_Ap_global` |
 | **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | D2H `d_A_sig_` on share |
 
@@ -211,7 +211,7 @@ Proofs commit the actual signal strips via Merkle (`cp_proof_build` takes `a` an
 
 | Path | Fix B = 0, regen only A? | Notes |
 |------|--------------------------|-------|
-| **CUDA** (`gpu_prepare_noisy_matrices`) | **Yes** — miner chooses matrices; set `d_Bt_sig = 0`, skip B RNG, cache B-side noise | Matches production protocol; proof uses copied `h_Bt_sig` |
+| **CUDA** (`gpu_prepare_job_b` + `gpu_prepare_attempt_a`) | **Yes** — no `d_Bt_sig`; noise-only into `d_BpT` once/job; random A per nonce | Proof uses host zero `h_BpT_global`; D2H A only |
 | **CPU** (`cp_cpu_worker`, default) | **Yes** — `cp_cpu_worker_begin_job` caches noisy B; per attempt sparse A poke + A-noise only | `cp_worker_worker_handles_matrix_prep()` skips host gen in `cp_mine` |
 | **CUDA `--cpu-gen`** | **No** — legacy `pearl_generate_ab` host path in `cp_mine` | Full A/B from `ab_seed` |
 | **Pool verify** | **Yes** — recomputes noise from proof strips + `job_key`, not from header nonce | Same as any other miner-chosen B |
@@ -220,7 +220,7 @@ Proofs commit the actual signal strips via Merkle (`cp_proof_build` takes `a` an
 
 1. **A-side noisy range unchanged.** Zero-B only tightens the **B** operand; **A** remains wide int8 after noise. Jackpot correctness still requires zk-pow’s int32 MAC `(s_a + n_a) * (s_b + n_b)`; FastU8S8 on CPU is only an approximation unless verified exactly.
 2. **Search space.** Fixing B = 0 changes which `(A, B)` pairs are explored; that is a mining strategy, not a protocol violation.
-3. **CPU/OpenCL default uses zero-B.** Signal `B^T = 0`; only A is randomized per attempt from OS CSPRNG (`cp_random_bytes`), not from the stratum header/nonce.
+3. **CPU/OpenCL/CUDA default uses zero-B.** Signal `B^T = 0`; only A is randomized per attempt (CUDA/OpenCL: GPU RNG; CPU: sparse CSPRNG pokes).
 
 ### Compact dependency summary
 

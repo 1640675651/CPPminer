@@ -86,6 +86,23 @@ static int g_cutlass_fused = 0;
 /* Cert V3: bind Merkle roots with m/n before noise-seed chain. Set by begin_job. */
 static int g_salted = 1;
 
+/* Zero-B job cache: signal B^T = 0; noisy B fixed for the job. */
+static struct {
+    uint8_t job_key[32];
+    uint8_t b_noise_seed[32];
+    int m;
+    int n;
+    int ready;
+} g_zero_b = {};
+
+static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
+{
+    return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
+           memcmp(g_zero_b.job_key, job_key, 32) == 0;
+}
+
+static int gpu_prepare_job_b(GpuCtx* g, const uint8_t job_key[32], int m, int n);
+
 static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)
 {
     return (size_t)(K_DIM / R_RANK)
@@ -288,13 +305,18 @@ void cp_gpu_set_cutlass_fused(int on)
 
 void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
 {
-    (void)job_key;
-    (void)m;
-    (void)n;
     g_salted = (cert_version >= 3) ? 1 : 0;
-    printf("[gpu] job noise seeds: salted=%d (cert_version=%u)\n",
-           g_salted, (unsigned)cert_version);
+    g_zero_b.ready = 0;
+    printf("[gpu] zero-B: cache noisy B per job (salted=%d cert_version=%u)\n", g_salted,
+           (unsigned)cert_version);
     fflush(stdout);
+    if(g_ngpu <= 0 || !job_key || m <= 0 || n <= 0)
+        return;
+    GpuCtx* g0 = &g_gpus[0];
+    if(gpu_prepare_job_b(g0, job_key, m, n) != 0){
+        fprintf(stderr, "[gpu] zero-B job B prep failed\n");
+        fflush(stderr);
+    }
 }
 
 void cp_gpu_init(int* devs, int ndev)
@@ -408,11 +430,12 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
 
     CU_CHECK(cudaSetDevice(g->dev));
     if(!g->d_Ap){
-        /* d_Ap/d_BpT: noisy mats for GEMM/jackpot; layout set by PP_STEP_MAJOR_AP. */
+        /* d_Ap/d_BpT: noisy mats for GEMM/jackpot; d_A_sig: signal A for hash/proof.
+         * Zero-B path skips d_Bt_sig (~512 MiB); allocate on demand for --cpu-gen / tests. */
         CU_CHECK(cudaMalloc(&g->d_Ap, szAp));
         CU_CHECK(cudaMalloc(&g->d_BpT, szBpT));
         CU_CHECK(cudaMalloc(&g->d_A_sig, szAp));
-        CU_CHECK(cudaMalloc(&g->d_Bt_sig, szBpT));
+        g->d_Bt_sig = nullptr;
         CU_CHECK(cudaMalloc(&g->d_e_ar, (size_t)K_DIM * 2 * sizeof(uint32_t)));
         CU_CHECK(cudaMalloc(&g->d_e_bl, (size_t)K_DIM * 2 * sizeof(uint32_t)));
         CU_CHECK(cudaMalloc(&g->d_eal, (size_t)m * R_RANK));
@@ -457,12 +480,15 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     }
 }
 
-static size_t pp_ap_step_plane(int dim)
+static void ensure_bt_sig(GpuCtx* g, size_t szBpT)
 {
-    return (size_t)dim * (size_t)R_RANK;
+    if(!g->d_Bt_sig){
+        CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaMalloc(&g->d_Bt_sig, szBpT));
+    }
 }
 
-static void gpu_noise_generate(GpuCtx* g, int m, int n)
+static void gpu_noise_generate_a(GpuCtx* g, int m)
 {
     const int tpb = 256;
     const int tpr = R_RANK / 32;
@@ -471,16 +497,32 @@ static void gpu_noise_generate(GpuCtx* g, int m, int n)
 
     cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb>>>(
         0, m, R_RANK, g->d_seed_a, g->d_eal);
-    cp_gen_dense_noise_kernel<<<(n + rows_per_block - 1) / rows_per_block, tpb>>>(
-        1, n, R_RANK, g->d_seed_b, g->d_ebr);
     cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
         0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
+    CU_CHECK(cudaGetLastError());
+}
+
+static void gpu_noise_generate_b(GpuCtx* g, int n)
+{
+    const int tpb = 256;
+    const int tpr = R_RANK / 32;
+    const int rows_per_block = tpb / tpr;
+    const int perm_blocks = (K_DIM + CP_B3_LINES * tpb - 1) / (CP_B3_LINES * tpb);
+
+    cp_gen_dense_noise_kernel<<<(n + rows_per_block - 1) / rows_per_block, tpb>>>(
+        1, n, R_RANK, g->d_seed_b, g->d_ebr);
     cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
         1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
     CU_CHECK(cudaGetLastError());
 }
 
-static void gpu_noise_apply(GpuCtx* g, int m, int n)
+static void gpu_noise_generate(GpuCtx* g, int m, int n)
+{
+    gpu_noise_generate_a(g, m);
+    gpu_noise_generate_b(g, n);
+}
+
+static void gpu_noise_apply_a(GpuCtx* g, int m)
 {
     const int tpb = 256;
     const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
@@ -488,15 +530,33 @@ static void gpu_noise_apply(GpuCtx* g, int m, int n)
     if(g_step_major_ap){
         cp_apply_noise_a_kernel<<<m, tpb, smem>>>(
             g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
-        cp_apply_noise_b_kernel<<<n, tpb, smem>>>(
-            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
     } else {
         cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem>>>(
             g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
-        cp_apply_noise_b_rowmajor_kernel<<<n, tpb, smem>>>(
-            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
     }
     CU_CHECK(cudaGetLastError());
+}
+
+/* signal may be NULL (zero-B: noise-only into d_BpT). */
+static void gpu_noise_apply_b(GpuCtx* g, int n, const int8_t* d_bt_sig)
+{
+    const int tpb = 256;
+    const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
+
+    if(g_step_major_ap){
+        cp_apply_noise_b_kernel<<<n, tpb, smem>>>(
+            d_bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
+    } else {
+        cp_apply_noise_b_rowmajor_kernel<<<n, tpb, smem>>>(
+            d_bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
+    }
+    CU_CHECK(cudaGetLastError());
+}
+
+static void gpu_noise_apply(GpuCtx* g, int m, int n)
+{
+    gpu_noise_apply_a(g, m);
+    gpu_noise_apply_b(g, n, g->d_Bt_sig);
 }
 
 static void gpu_upload_rowmajor_noisy(
@@ -505,6 +565,7 @@ static void gpu_upload_rowmajor_noisy(
     const int tpb = 256;
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
+    ensure_bt_sig(g, szBpT);
     CU_CHECK(cudaMemcpy(g->d_A_sig, h_a, szAp, cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemcpy(g->d_Bt_sig, h_b, szBpT, cudaMemcpyHostToDevice));
     if(g_step_major_ap){
@@ -517,6 +578,12 @@ static void gpu_upload_rowmajor_noisy(
         CU_CHECK(cudaMemcpy(g->d_BpT, g->d_Bt_sig, szBpT, cudaMemcpyDeviceToDevice));
     }
     CU_CHECK(cudaGetLastError());
+}
+
+#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
+static size_t pp_ap_step_plane(int dim)
+{
+    return (size_t)dim * (size_t)R_RANK;
 }
 
 static void gpu_period_gemm_panel_ptrs(
@@ -539,7 +606,6 @@ static void gpu_period_gemm_panel_ptrs(
     }
 }
 
-#if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
 /*
  * cuBLAS: one fat GemmEx per rank step into C_hist[step] (rank partials only).
  * Jackpot cumulates partials across steps (no plane_add).
@@ -759,6 +825,7 @@ static int gpu_prepare_noisy_matrices(
     double t_step, t_total;
 
     CU_CHECK(cudaSetDevice(g->dev));
+    ensure_bt_sig(g, szBpT);
 
     t_total = cp_now_sec();
 
@@ -811,6 +878,97 @@ static int gpu_prepare_noisy_matrices(
     return cp_job_should_cancel() ? -1 : 0;
 }
 
+/* Job-level zero-B: hash empty B^T, build noisy B into d_BpT (no d_Bt_sig). */
+static int gpu_prepare_job_b(GpuCtx* g, const uint8_t job_key[32], int m, int n)
+{
+    size_t szBpT = (size_t)n * K_DIM;
+    double t0 = cp_now_sec();
+
+    CU_CHECK(cudaSetDevice(g->dev));
+    ensure_buffers(g, m, n);
+
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_salted, g_zero_b.b_noise_seed);
+    CU_CHECK(cudaMemcpy(g->d_seed_b, g_zero_b.b_noise_seed, 32, cudaMemcpyHostToDevice));
+
+    double t_step = cp_now_sec();
+    gpu_noise_generate_b(g, n);
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu] zero-B noise gen (EBR/perm) %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    t_step = cp_now_sec();
+    gpu_noise_apply_b(g, n, /*d_bt_sig=*/NULL);
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu] zero-B noise apply (B only) %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    for(int i = 1; i < g_ngpu; i++){
+        GpuCtx* gi = &g_gpus[i];
+        ensure_buffers(gi, m, n);
+        CU_CHECK(cudaSetDevice(gi->dev));
+        CU_CHECK(cudaMemcpy(gi->d_BpT, g->d_BpT, szBpT, cudaMemcpyDeviceToDevice));
+    }
+    CU_CHECK(cudaSetDevice(g->dev));
+
+    memcpy(g_zero_b.job_key, job_key, 32);
+    g_zero_b.m = m;
+    g_zero_b.n = n;
+    g_zero_b.ready = 1;
+    printf("[gpu] zero-B job B cached on device (%.3fs total)\n", cp_now_sec() - t0);
+    fflush(stdout);
+    return cp_job_should_cancel() ? -1 : 0;
+}
+
+/* Per-nonce: random A + hash + A-side noise into d_Ap. Reuses cached b_noise_seed. */
+static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job_key[32],
+                                 int m, int n, uint8_t a_key_out[32])
+{
+    size_t szAp = (size_t)m * K_DIM;
+    size_t pad_a = (szAp + 1023) / 1024 * 1024;
+    const int tpb = 256;
+    int total_a = m * K_DIM;
+    uint8_t hash_a[32];
+    double t_step, t_total;
+
+    CU_CHECK(cudaSetDevice(g->dev));
+    t_total = cp_now_sec();
+
+    t_step = cp_now_sec();
+    cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
+        rng_seed, 0, total_a, g->d_A_sig);
+    CU_CHECK(cudaGetLastError());
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] random A gen %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    if(cp_job_should_cancel()) return -1;
+
+    t_step = cp_now_sec();
+    if(gpu_matrix_keyed_hash(g, g->d_A_sig, szAp, pad_a, job_key, hash_a) != 0) return -1;
+    printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, hash_a, (uint32_t)m, g_salted,
+                                 a_key_out);
+    CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
+
+    t_step = cp_now_sec();
+    gpu_noise_generate_a(g, m);
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] noise gen (EAL/perm) %.3fs\n", cp_now_sec() - t_step);
+    fflush(stdout);
+
+    t_step = cp_now_sec();
+    gpu_noise_apply_a(g, m);
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu-prep] noise apply (A only) %.3fs\n", cp_now_sec() - t_step);
+    printf("[gpu-prep] attempt total %.3fs\n", cp_now_sec() - t_total);
+    fflush(stdout);
+
+    (void)n;
+    return cp_job_should_cancel() ? -1 : 0;
+}
+
 static int compare_digest(const char* label, const uint8_t a[32], const uint8_t b[32])
 {
     if(memcmp(a, b, 32) == 0) return 0;
@@ -854,6 +1012,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     cp_gpu_init(devs, 1);
     GpuCtx* g = &g_gpus[0];
     ensure_buffers(g, m, n);
+    ensure_bt_sig(g, szBpT);
     CU_CHECK(cudaSetDevice(g->dev));
 
     t0 = cp_now_sec();
@@ -1323,8 +1482,10 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     scan_profile_ensure_events(ev);
 
     prep_t0 = cp_now_sec();
-    if(gpu_prepare_noisy_matrices(g, cp_gpu_fresh_rng_seed(), job_key, m, n, a_key) != 0)
-        goto done;
+    if(gpu_prepare_noisy_matrices(g, cp_gpu_fresh_rng_seed(), job_key, m, n, a_key) != 0){
+        cp_gpu_shutdown();
+        return rc;
+    }
     printf("[profile-scan] matrix prep %.2fs (excluded from batch timings)\n",
            cp_now_sec() - prep_t0);
     fflush(stdout);
@@ -1453,7 +1614,6 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
         sweep_tiles, sweep_gpu_ms, sweep_sync_ms, gemm_mode);
     rc = 0;
 
-done:
     cp_gpu_shutdown();
     return rc;
 }
@@ -1648,8 +1808,6 @@ int cp_gpu_mine_plain_proof(
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned)
 {
-    size_t szAp  = (size_t)m * K_DIM;
-    size_t szBpT = (size_t)n * K_DIM;
     uint32_t a_key32[8];
     memcpy(a_key32, a_key, 32);
     int zero = 0;
@@ -1679,11 +1837,12 @@ int cp_gpu_mine_attempt(
     uint64_t* out_tiles_scanned)
 {
     if(g_ngpu <= 0) return -1;
+    (void)ab_seed;
+    (void)ab_seed_len;
     (void)h_A_sig;
     (void)h_Bt_sig;
     const double attempt_t0 = cp_now_sec();
     size_t szAp = (size_t)m * K_DIM;
-    size_t szBpT = (size_t)n * K_DIM;
     uint8_t a_key_local[32];
     const uint8_t* scan_key = a_key;
     int zero = 0;
@@ -1704,8 +1863,12 @@ int cp_gpu_mine_attempt(
             gpu_upload_rowmajor_noisy(g, h_A_noisy, h_B_noisy, m, n);
         }
     } else {
-        if(gpu_prepare_noisy_matrices(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
-                                      a_key_local) != 0)
+        if(!zero_b_cache_matches(job_key, m, n)){
+            if(gpu_prepare_job_b(g0, job_key, m, n) != 0)
+                return -1;
+        }
+        if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
+                                 a_key_local) != 0)
             return -1;
         scan_key = a_key_local;
         uint32_t a_key32[8];
@@ -1718,7 +1881,7 @@ int cp_gpu_mine_attempt(
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
             CU_CHECK(cudaMemcpy(g->d_Ap, g0->d_Ap, szAp, cudaMemcpyDeviceToDevice));
-            CU_CHECK(cudaMemcpy(g->d_BpT, g0->d_BpT, szBpT, cudaMemcpyDeviceToDevice));
+            /* d_BpT already mirrored in gpu_prepare_job_b. */
             CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
             CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
         }
@@ -1746,6 +1909,7 @@ int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
     size_t szBpT = (size_t)n * K_DIM;
     CU_CHECK(cudaSetDevice(g0->dev));
     CU_CHECK(cudaMemcpy(h_A_sig, g0->d_A_sig, szAp, cudaMemcpyDeviceToHost));
+    /* Zero-B: host h_BpT stays launch-zeroed; only copy B if a signal buffer exists. */
     if(h_Bt_sig && g0->d_Bt_sig){
         CU_CHECK(cudaMemcpy(h_Bt_sig, g0->d_Bt_sig, szBpT, cudaMemcpyDeviceToHost));
     }
