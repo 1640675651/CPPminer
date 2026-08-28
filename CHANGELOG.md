@@ -1,14 +1,12 @@
 # Changelog
 
-## v0.4 (tentative)
-- ARM CPU support with NEON (DONE)
-- AVX-VNNI support (DONE)
-- Termux OpenCL support (DONE)
-- OpenCL `--ocl-lds on|off` for optional `__local` A/B staging (default off) (DONE)
-- Dynamic openmp schedule for CPUs with big and small cores (DONE)
-- Lightweight random matrix generation, only sparsely fill matrix elements (CPU DONE; one random write per column)
-- Zero-B on cuda worker (DONE; noisy B cached per job, 2GiB -> 1.5 GiB VRAM)
-- Smaller matrix low-memory mode (TODO)
+## v0.4
+- ARM CPU + NEON support.
+- AVX-VNNI support.
+- Termux OpenCL support.
+- Dynamic openmp schedule for CPUs with big and small cores.
+- Lightweight random matrix generation on CPU, only sparsely fill matrix elements (one random write per column).
+- Zero-B on cuda worker (reduce VRAM usage, 2GiB -> 1.5 GiB).
 
 
 ## v0.3

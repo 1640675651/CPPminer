@@ -173,7 +173,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 |--------|-----------|----------|
 | Intel HD graphics 10EU (Haswell) scalar | 4x8 | ~25 GH/s |
 | Intel UHD 630 scalar | 4x8 | ~130 GH/s |
-| Mali-G57 MC2 DP4A | 4x8 | ~100GH/s |
+| Mali-G57 MC2 DP4A | 4x8 | ~100 GH/s |
 
 ### CPU
 
@@ -182,7 +182,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Celeron G1840 @ 2.8GHz | SSSE3 | ~35 GH/s | ~4 GH/s |
 | Core i9 9980HK @ 2.4GHz | AVX2 | ~440 GH/s | ~300 GH/s |
 | Core i5 12490F @ 4.0GHz | AVX-VNNI | ~1.1 TH/s | ~400 GH/s |
-| Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | |
+| Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | ~920 GH/s |
 | Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | ~160 GH/s | N/A |
 
 
