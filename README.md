@@ -9,6 +9,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 | CPU | `src/cpu/` | Fused GEMM+XOR (contiguous 8×16) |
 | CUDA | `src/cuda/` | Pascal CUTLASS Fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
+| OneDNN | `src/onednn/` | Intel GPU gemmstone GEMM + tile XOR + host jackpot |
 
 ## Requirements
 
@@ -17,6 +18,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 - **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX2/SSSE3/scalar and AArch64 DotProd/NEON/scalar (`--simd`)
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
+- **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
 
 ## Build options (CMake)
 
@@ -24,7 +26,8 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 cmake -S . -B build \
   -DCP_ENABLE_CPU=ON \
   -DCP_ENABLE_CUDA=OFF \
-  -DCP_ENABLE_OPENCL=OFF
+  -DCP_ENABLE_OPENCL=OFF \
+  -DCP_ENABLE_ONEDNN=OFF
 cmake --build build --config Release
 ```
 
@@ -33,10 +36,11 @@ cmake --build build --config Release
 | `CP_ENABLE_CPU` | ON | CPU worker |
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
+| `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
-Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda|opencl`.
+Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda|opencl|onednn`.
 
 ## Build (Windows)
 
@@ -50,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 CUDA, OpenCL, or combinations (comma-separated list):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl,OneDnn
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 # Optional debug: link cuBLAS (large DLLs; not needed for production CUTLASS path)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
@@ -60,7 +64,7 @@ Produces `cppminer.exe` in the repo root.
 
 ## Build (*nix)
 ```bash
-./build.sh --backend cpu,opencl,cuda
+./build.sh --backend cpu,opencl,onednn,cuda
 ```
 This scipt pulls third-party dependencies and execute cmake.
 ## Run
@@ -81,7 +85,12 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
+# OneDNN (Intel GPU gemmstone + host jackpot)
+.\cppminer.exe --backend onednn --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
+  --wallet prl1... --worker worker_name
+
 # Offline mock: first share + zk-pow verify (no pool)
+.\cppminer.exe --backend onednn --mock
 .\cppminer.exe --backend cuda --mock
 .\cppminer.exe --backend opencl --mock
 .\cppminer.exe --backend cpu --mock
@@ -91,7 +100,7 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--backend` | `cpu` / `cuda` / `opencl` (must be compiled in) |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` (must be compiled in) |
 | `--pool` | `stratum+tcp://host:port` |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |

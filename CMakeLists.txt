@@ -4,6 +4,7 @@ cmake_minimum_required(VERSION 3.18)
 option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
 option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
+option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -19,8 +20,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN")
 endif()
 
 set(_cp_langs CXX C)
@@ -53,6 +54,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/cpu
     ${CMAKE_SOURCE_DIR}/src/cuda
     ${CMAKE_SOURCE_DIR}/src/opencl
+    ${CMAKE_SOURCE_DIR}/src/onednn
 )
 
 # BLAKE3
@@ -187,7 +189,7 @@ else()
     add_compile_definitions(CP_ENABLE_CUDA=0 CP_ENABLE_CUBLAS=0)
 endif()
 
-if(CP_ENABLE_OPENCL)
+if(CP_ENABLE_OPENCL OR CP_ENABLE_ONEDNN)
     # Prefer vendored Khronos headers + Windows x64 import lib (no vendor SDK).
     set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
     set(_OCL_LIB_WIN "${CMAKE_SOURCE_DIR}/third_party/opencl/lib/x64/OpenCL.lib")
@@ -250,19 +252,77 @@ if(CP_ENABLE_OPENCL)
         find_package(OpenCL REQUIRED)
     endif()
     unset(_cp_termux_ocl)
-    list(APPEND CP_SOURCES
-        src/opencl/cp_opencl_worker.cpp
-        src/opencl/case33_gemm_ocl.cpp
-        src/opencl/case33_ocl_prep.cpp
-        src/opencl/cp_ocl_align_test.cpp
-        src/opencl/cp_ocl_prep_profile.cpp
-        src/opencl/case32_prepack.cpp
-        src/opencl/case32_layout.cpp
-        src/opencl/opencl_context.cpp
-    )
-    add_compile_definitions(CP_ENABLE_OPENCL=1)
+    if(CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES
+            src/opencl/cp_opencl_worker.cpp
+            src/opencl/case33_gemm_ocl.cpp
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/cp_ocl_align_test.cpp
+            src/opencl/cp_ocl_prep_profile.cpp
+            src/opencl/case32_prepack.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp
+        )
+        add_compile_definitions(CP_ENABLE_OPENCL=1)
+    else()
+        add_compile_definitions(CP_ENABLE_OPENCL=0)
+    endif()
+    set(_CP_NEEDS_OPENCL_LINK TRUE)
 else()
     add_compile_definitions(CP_ENABLE_OPENCL=0)
+endif()
+
+if(CP_ENABLE_ONEDNN)
+    set(_ONEDNN_DIR "${CMAKE_SOURCE_DIR}/src/onednn")
+    set(_GEMMSTONE_ROOT "${_ONEDNN_DIR}/third_party/gemmstone")
+    set(_ONEDNN_SRC "${_ONEDNN_DIR}/third_party/onednn-src")
+    set(_ONEDNN_GEMM_JIT "${_ONEDNN_SRC}/src/gpu/intel/gemm/jit")
+    set(_ONEDNN_KERNEL_DB "${_ONEDNN_GEMM_JIT}/selector/db/kernel.db")
+    if(NOT EXISTS "${_ONEDNN_KERNEL_DB}")
+        message(FATAL_ERROR
+            "CP_ENABLE_ONEDNN requires oneDNN sources at src/onednn/third_party/onednn-src "
+            "(missing ${_ONEDNN_KERNEL_DB}). Run src/onednn/prepare_onednn_deps.bat")
+    endif()
+    file(GLOB _GEMMSTONE_PIECE_SOURCES CONFIGURE_DEPENDS
+        "${_GEMMSTONE_ROOT}/generator/pieces/*.cpp")
+    set(_ONEDNN_GEMMSTONE_SOURCES
+        src/onednn/case5_generator.cpp
+        src/onednn/case5_catalog.cpp
+        src/onednn/case5_kernel_select.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_selector.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_evaluator.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy_parser.cpp
+        ${_GEMMSTONE_PIECE_SOURCES}
+        src/onednn/third_party/ngen/ngen_register_allocator.cpp)
+    list(APPEND CP_SOURCES
+        src/onednn/cp_onednn_worker.cpp
+        src/onednn/case33_gemm_onednn.cpp
+        src/onednn/case5_gemm_launch.cpp
+        src/onednn/case5_ngen_gemm.cpp
+        ${_ONEDNN_GEMMSTONE_SOURCES})
+    if(NOT CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES src/opencl/opencl_context.cpp)
+    endif()
+    list(APPEND CP_INCLUDE_DIRS
+        ${_ONEDNN_DIR}
+        ${_GEMMSTONE_ROOT}
+        ${_GEMMSTONE_ROOT}/include
+        ${_GEMMSTONE_ROOT}/generator
+        ${_ONEDNN_GEMM_JIT}
+        ${_ONEDNN_DIR}/third_party/ngen)
+    add_compile_definitions(CP_ENABLE_ONEDNN=1
+        NGEN_SAFE
+        NGEN_SHORT_NAMES
+        NGEN_LINK_OPENCL
+        NGEN_NO_OP_NAMES
+        NGEN_NAMESPACE=ngen
+        NGEN_CONFIG
+        GEMMSTONE_CONFIG
+        GEMMSTONE_BUILD_12LP
+        _CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_definitions(CP_ENABLE_ONEDNN=0)
 endif()
 
 add_executable(cppminer ${CP_SOURCES})
@@ -292,6 +352,8 @@ if(CP_ENABLE_OPENCL)
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
             "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
         COMMENT "Copy OpenCL kernels next to cppminer")
+elseif(CP_ENABLE_ONEDNN)
+    target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
 endif()
 
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
@@ -395,6 +457,14 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
+    if(CP_ENABLE_ONEDNN)
+        set_source_files_properties(
+            src/onednn/case5_generator.cpp
+            src/onednn/case5_ngen_gemm.cpp
+            src/onednn/case5_kernel_select.cpp
+            PROPERTIES COMPILE_OPTIONS "/bigobj;/Zm200")
+        target_link_options(cppminer PRIVATE /STACK:8388608)
+    endif()
     # AVX2 / AVX-VNNI only in dedicated x86 ukernel translation units.
     if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
@@ -508,4 +578,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} CUBLAS=${CP_ENABLE_CUBLAS}")

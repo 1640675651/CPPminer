@@ -5,15 +5,15 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OneDnn
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl,OneDnn -CudaArch 75
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
 #
 # Requires: MSVC, CMake, and (for proofs) cargo. OpenCL headers/CUTLASS are
 # fetched as needed. The script snapshots and restores your shell environment.
 
 param(
-    [ValidateSet("Cpu", "Cuda", "OpenCl")]
+    [ValidateSet("Cpu", "Cuda", "OpenCl", "OneDnn")]
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = "",
@@ -31,11 +31,20 @@ $BackendList = @($Backend | ForEach-Object { "$_".Trim() } | Where-Object { $_ }
 if ($BackendList.Count -eq 0) {
     $BackendList = @("Cpu")
 }
+foreach ($i in 0..($BackendList.Count - 1)) {
+    switch -Regex ($BackendList[$i]) {
+        '^(?i)onednn$' { $BackendList[$i] = 'OneDnn' }
+        '^(?i)opencl$' { $BackendList[$i] = 'OpenCl' }
+        '^(?i)cuda$'   { $BackendList[$i] = 'Cuda' }
+        '^(?i)cpu$'    { $BackendList[$i] = 'Cpu' }
+    }
+}
 $EnableCpu = $BackendList -contains "Cpu"
 $EnableCuda = $BackendList -contains "Cuda"
 $EnableOpenCl = $BackendList -contains "OpenCl"
-if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl)) {
-    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl"
+$EnableOneDnn = $BackendList -contains "OneDnn"
+if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn)) {
+    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn"
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
@@ -245,6 +254,25 @@ function Copy-OpenClKernels {
     }
 }
 
+function Ensure-OneDnnDeps {
+    $onednnDir = Join-Path $Root "src\onednn"
+    $kernelDb = Join-Path $onednnDir "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
+    if (Test-Path $kernelDb) { return }
+    Write-Host "=== Fetching oneDNN/gemmstone deps for Intel GPU backend ==="
+    $prep = Join-Path $onednnDir "prepare_onednn_deps.bat"
+    if (-not (Test-Path $prep)) { throw "Missing $prep" }
+    Push-Location $onednnDir
+    try {
+        cmd /c "prepare_onednn_deps.bat"
+        if ($LASTEXITCODE -ne 0) { throw "prepare_onednn_deps.bat failed" }
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path $kernelDb)) {
+        throw "OneDNN deps missing after prepare_onednn_deps.bat ($kernelDb)"
+    }
+}
+
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
     $b3Header = Join-Path $b3Src "blake3.h"
@@ -309,11 +337,14 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl CUBLAS=$EnableCublas) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn CUBLAS=$EnableCublas) ==="
 
-    if ($EnableOpenCl) {
+    if ($EnableOpenCl -or $EnableOneDnn) {
         $null = Ensure-OpenClHeaders
         $null = Find-OpenClLib
+    }
+    if ($EnableOneDnn) {
+        Ensure-OneDnnDeps
     }
     if ($EnableCuda) {
         $null = Ensure-Cutlass
@@ -332,6 +363,7 @@ try {
         "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {

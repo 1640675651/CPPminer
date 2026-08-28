@@ -68,13 +68,15 @@ done
 ENABLE_CPU=0
 ENABLE_CUDA=0
 ENABLE_OPENCL=0
+ENABLE_ONEDNN=0
 for b in "${BACKENDS[@]}"; do
     case "$b" in
         cpu)    ENABLE_CPU=1 ;;
         cuda)   ENABLE_CUDA=1 ;;
         opencl) ENABLE_OPENCL=1 ;;
+        onednn) ENABLE_ONEDNN=1 ;;
         *)
-            echo "Unknown backend: $b (valid: cpu, cuda, opencl)" >&2
+            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn)" >&2
             exit 1
             ;;
     esac
@@ -86,8 +88,8 @@ fi
 if (( ENABLE_CUBLAS && ENABLE_CUDA == 0 )); then
     echo "--enable-cublas requires --backend cuda" >&2; exit 1
 fi
-if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 )); then
-    echo "Enable at least one backend: --backend cpu,cuda,OpenCl" >&2; exit 1
+if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 )); then
+    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn" >&2; exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -129,6 +131,23 @@ ensure_blake3() {
     # Copy to build staging
     mkdir -p "${B3_DIR}"
     cp "${src_dir}"/* "${B3_DIR}/"
+}
+
+ensure_onednn_deps() {
+    local onednn_dir="${PROJECT_ROOT}/src/onednn"
+    local kernel_db="${onednn_dir}/third_party/onednn-src/src/gpu/intel/gemm/jit/selector/db/kernel.db"
+    if [[ -f "${kernel_db}" ]]; then
+        log "oneDNN/gemmstone deps already present"
+        return
+    fi
+    log "Fetching oneDNN/gemmstone deps for Intel GPU backend"
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+        (cd "${onednn_dir}" && cmd /c prepare_onednn_deps.bat) \
+            || fail "prepare_onednn_deps.bat failed"
+    else
+        fail "OneDNN backend on Unix: vendor deps via src/onednn/prepare_onednn_deps.bat (Wine) or set ONEDNN_SRC"
+    fi
+    [[ -f "${kernel_db}" ]] || fail "OneDNN deps missing after prepare script"
 }
 
 # ── Ensure-OpenCL-Headers ─────────────────────────────────────────────────────
@@ -242,7 +261,7 @@ find_cmake() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} CUBLAS=${ENABLE_CUBLAS}"
+log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} CUBLAS=${ENABLE_CUBLAS}"
 
 ensure_blake3
 
@@ -254,8 +273,12 @@ if (( ENABLE_CUDA )); then
     ensure_cutlass
 fi
 
-if (( ENABLE_OPENCL )); then
+if (( ENABLE_OPENCL || ENABLE_ONEDNN )); then
     ensure_opencl_headers
+fi
+
+if (( ENABLE_ONEDNN )); then
+    ensure_onednn_deps
 fi
 
 # ── CMake build (if cmake available) ─────────────────────────────────────────
@@ -277,6 +300,7 @@ if [[ -n "$CMAKE_EXE" ]]; then
         -DCP_ENABLE_CPU=$(( ENABLE_CPU ? 1 : 0 ))
         -DCP_ENABLE_CUDA=$(( ENABLE_CUDA ? 1 : 0 ))
         -DCP_ENABLE_OPENCL=$(( ENABLE_OPENCL ? 1 : 0 ))
+        -DCP_ENABLE_ONEDNN=$(( ENABLE_ONEDNN ? 1 : 0 ))
         -DCP_ENABLE_CUBLAS=$(( ENABLE_CUBLAS ? 1 : 0 ))
     )
 

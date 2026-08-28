@@ -27,6 +27,10 @@
 #include "cp_opencl_prep_profile.h"
 #endif
 
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+#include "cp_onednn_worker.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,20 +49,30 @@ static void print_usage(void)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("|opencl");
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("|onednn");
+#endif
     printf(" (built: ");
     {
         int first = 1;
         if(cp_worker_has_cpu()){ printf("%scpu", first ? "" : ","); first = 0; }
         if(cp_worker_has_cuda()){ printf("%scuda", first ? "" : ","); first = 0; }
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
+        if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
     printf("  --devices N[,M]    device index(es): CUDA ids, or OpenCL flat index\n");
     printf("                     (default: 0; OpenCL prefers discrete GPU first)\n");
     printf("  --list-devices     list devices for the selected backend and exit\n");
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("  --ocl-platform P   OpenCL/OneDNN: only enumerate platform index P\n");
+#else
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
+#endif
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-tile MxN     OpenCL register tile: 4x8 (default), 4x4, 8x8, or 8x16 (auto on AMD)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
@@ -270,6 +284,7 @@ int main(int argc, char** argv)
             if(!strcmp(b, "cpu")) backend_sel = CP_BACKEND_CPU;
             else if(!strcmp(b, "cuda")) backend_sel = CP_BACKEND_CUDA;
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
+            else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -500,16 +515,32 @@ int main(int argc, char** argv)
                 n += cp_worker_list_devices();
             }
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+            if(cp_worker_has_onednn()){
+                if(ocl_platform >= 0)
+                    cp_worker_set_onednn_platform(ocl_platform);
+                if(cp_worker_select(CP_BACKEND_ONEDNN) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
             if(n <= 0){
-                printf("[list-devices] no CUDA/OpenCL backends in this build\n");
+                printf("[list-devices] no CUDA/OpenCL/OneDNN backends in this build\n");
                 return 1;
             }
             return 0;
         }
         if(cp_worker_select(backend_sel) != 0) return 1;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(ocl_platform >= 0)
+        cp_worker_set_ocl_platform(ocl_platform);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(ocl_platform >= 0)
+        cp_worker_set_onednn_platform(ocl_platform);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
         if(ocl_platform >= 0)
-            cp_worker_set_ocl_platform(ocl_platform);
+            cp_worker_set_onednn_platform(ocl_platform);
 #endif
         n = cp_worker_list_devices();
         return n > 0 ? 0 : 1;
@@ -694,6 +725,13 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone. */
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+        cp_onednn_worker_init(devs, ndev);
+        cp_worker_apply_backend_defaults();
+    }
+#endif
     cp_worker_set_period_batch(period_batch);
     cp_worker_set_row_period_batch(row_period_batch);
     cp_worker_set_step_major_ap(step_major_ap);
@@ -743,6 +781,7 @@ int main(int argc, char** argv)
         int col_parts = cp_pp_num_col_parts(g_n_active, contiguous);
         const char *tile_layout_name =
             cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) ? "contiguous 16x16 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -772,6 +811,16 @@ int main(int argc, char** argv)
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+        } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+            printf("[mode] scan: oneDNN gemmstone GEMM + tile XOR + host jackpot\n");
+            printf("[mode] period batch: row=%d col=%d (~%.0f MiB tile_xor/panel)\n",
+                   row_period_batch, period_batch,
+                   (double)row_period_batch * (double)period_batch
+                   * (double)(K_DIM / R_RANK)
+                   * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
+                   * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
+            printf("[mode] host signal ~%.0f MiB; column-major NNN buffers on Intel GPU\n",
+                   host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
@@ -835,6 +884,10 @@ int main(int argc, char** argv)
     fflush(stdout);
 
     cp_worker_init(devs, ndev);
+    if(!cp_worker_is_ready()){
+        fprintf(stderr, "[%s] backend init failed; exiting\n", cp_worker_backend_name());
+        return 1;
+    }
     {
         const int contiguous = cp_worker_uses_contiguous_tiles();
         const uint64_t t_tiles =

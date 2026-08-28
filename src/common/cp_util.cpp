@@ -284,8 +284,13 @@ static int g_pp_hash_w_override = 0;
 
 void cp_pp_set_hash_tile(int h, int w)
 {
-    g_pp_hash_h_override = (h == 4 || h == PP_HASH_H) ? h : 0;
-    g_pp_hash_w_override = (w == 8 || w == 16) ? w : 0;
+    if(h > 0 && w > 0){
+        g_pp_hash_h_override = h;
+        g_pp_hash_w_override = w;
+    } else {
+        g_pp_hash_h_override = 0;
+        g_pp_hash_w_override = 0;
+    }
 }
 
 static int cp_active_hash_h(void)
@@ -300,6 +305,16 @@ static int cp_active_hash_w(void)
     if(g_cutlass_fused) return CP_CUTLASS_HASH_W;
     if(g_pp_hash_w_override > 0) return g_pp_hash_w_override;
     return PP_HASH_W;
+}
+
+int cp_pp_hash_tile_h(void)
+{
+    return cp_active_hash_h();
+}
+
+int cp_pp_hash_tile_w(void)
+{
+    return cp_active_hash_w();
 }
 
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])

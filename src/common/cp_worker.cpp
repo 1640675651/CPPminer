@@ -15,6 +15,9 @@
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_opencl_worker.h"
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+#include "cp_onednn_worker.h"
+#endif
 
 static CpBackendId g_backend = CP_BACKEND_NONE;
 
@@ -45,10 +48,21 @@ extern "C" int cp_worker_has_opencl(void)
 #endif
 }
 
+extern "C" int cp_worker_has_onednn(void)
+{
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static CpBackendId default_backend(void)
 {
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     return CP_BACKEND_CUDA;
+#elif defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    return CP_BACKEND_ONEDNN;
 #elif defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
     return CP_BACKEND_CPU;
 #elif defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -77,6 +91,11 @@ extern "C" int cp_worker_select(CpBackendId id)
         g_backend = CP_BACKEND_OPENCL;
         return 0;
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        g_backend = CP_BACKEND_ONEDNN;
+        return 0;
+#endif
     default:
         fprintf(stderr, "[worker] backend %d not built into this binary\n", (int)id);
         return -1;
@@ -96,6 +115,7 @@ extern "C" const char* cp_worker_backend_name(void)
     case CP_BACKEND_CPU: return "cpu";
     case CP_BACKEND_CUDA: return "cuda";
     case CP_BACKEND_OPENCL: return "opencl";
+    case CP_BACKEND_ONEDNN: return "onednn";
     default: return "none";
     }
 }
@@ -121,9 +141,26 @@ extern "C" void cp_worker_init(int* devices, int ndev)
         cp_opencl_worker_init(devices, ndev);
         return;
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        cp_onednn_worker_init(devices, ndev);
+        return;
+#endif
     default:
         fprintf(stderr, "[worker] no backend available\n");
         break;
+    }
+}
+
+extern "C" int cp_worker_is_ready(void)
+{
+    switch(cp_worker_backend_id()){
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        return cp_onednn_worker_is_ready();
+#endif
+    default:
+        return 1;
     }
 }
 
@@ -131,6 +168,15 @@ extern "C" void cp_worker_set_ocl_platform(int platform_index)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     cp_opencl_worker_set_platform(platform_index);
+#else
+    (void)platform_index;
+#endif
+}
+
+extern "C" void cp_worker_set_onednn_platform(int platform_index)
+{
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    cp_onednn_worker_set_platform(platform_index);
 #else
     (void)platform_index;
 #endif
@@ -200,6 +246,10 @@ extern "C" int cp_worker_list_devices(void)
     case CP_BACKEND_OPENCL:
         return cp_opencl_worker_list_devices();
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        return cp_onednn_worker_list_devices();
+#endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     case CP_BACKEND_CUDA:
         return cp_gpu_list_devices();
@@ -225,6 +275,9 @@ extern "C" void cp_worker_shutdown(void)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     case CP_BACKEND_OPENCL: cp_opencl_worker_shutdown(); break;
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN: cp_onednn_worker_shutdown(); break;
+#endif
     default: break;
     }
 }
@@ -234,7 +287,7 @@ extern "C" void cp_worker_apply_backend_defaults(void)
     const int layout = cp_worker_default_tile_layout();
     const int contiguous =
         (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
-         layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8);
+         layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8 || layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16);
     pearl_set_contiguous_tiles(contiguous);
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
@@ -249,7 +302,7 @@ extern "C" int cp_worker_uses_contiguous_tiles(void)
 {
     const int layout = cp_worker_default_tile_layout();
     return layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
-           layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8;
+           layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8 || layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16;
 }
 
 extern "C" void cp_worker_set_period_gemm(int on)
@@ -272,6 +325,10 @@ extern "C" void cp_worker_set_period_batch(int batch)
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         cp_opencl_worker_set_macro_batch(batch);
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        cp_onednn_worker_set_col_period_batch(batch);
+#endif
     (void)batch;
 }
 
@@ -280,9 +337,12 @@ extern "C" void cp_worker_set_row_period_batch(int batch)
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_row_period_batch(batch);
-#else
-    (void)batch;
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        cp_onednn_worker_set_row_period_batch(batch);
+#endif
+    (void)batch;
 }
 
 extern "C" void cp_worker_set_col_period_batch(int batch)
@@ -294,6 +354,10 @@ extern "C" void cp_worker_set_col_period_batch(int batch)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         cp_opencl_worker_set_macro_batch(batch);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        cp_onednn_worker_set_col_period_batch(batch);
 #endif
     (void)batch;
 }
@@ -363,6 +427,10 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return cp_opencl_worker_handles_matrix_prep();
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        return cp_onednn_worker_handles_matrix_prep();
+#endif
     return 0;
 }
 
@@ -381,6 +449,10 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         cp_opencl_worker_begin_job(job_key, m, n, cert_version);
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        cp_onednn_worker_begin_job(job_key, m, n, cert_version);
+#endif
     (void)job_key;
     (void)m;
     (void)n;
@@ -391,6 +463,17 @@ extern "C" int cp_worker_default_tile_layout(void)
 {
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         return CP_TILE_LAYOUT_CONTIGUOUS;
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN) {
+        if(cp_onednn_hash_tile_mr() == 16 && cp_onednn_hash_tile_w() == 16)
+            return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
+        if(cp_onednn_hash_tile_mr() == 4 && cp_onednn_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_4x8;
+        if(cp_onednn_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+        return CP_TILE_LAYOUT_CONTIGUOUS;
+    }
+#endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL) {
         if(cp_opencl_hash_tile_mr() == 4 && cp_opencl_hash_tile_w() == 8)
@@ -437,6 +520,13 @@ extern "C" int cp_worker_mine_attempt(
             h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
             out_t_rows, out_t_cols, out_tiles_scanned);
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        return cp_onednn_worker_mine_attempt(
+            ab_seed, ab_seed_len, job_key, pool_tgt, m, n, cpu_matrices,
+            h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
+            out_t_rows, out_t_cols, out_tiles_scanned);
+#endif
     default:
         fprintf(stderr, "[worker] mine_attempt: no backend\n");
         return -1;
@@ -459,6 +549,10 @@ extern "C" int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     case CP_BACKEND_OPENCL:
         return cp_opencl_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    case CP_BACKEND_ONEDNN:
+        return cp_onednn_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
 #endif
     default:
         fprintf(stderr, "[worker] fetch_share_signals: no backend\n");
