@@ -80,6 +80,7 @@ private:
     int tile_rows_ = 0;
     int tile_count_ = 0;
     int num_milestones_ = 0;
+    int folded_msg_words_ = 0;
     int milestone_k_ = 128;
     int xor_period_ = 1;
     int row_period_batch_ = CP_ROW_PERIOD_BATCH_DEFAULT;

@@ -162,6 +162,10 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop) {
     problem.product = product;
     problem.case5TileXor = true;
     problem.case5TileXorNop = xor_nop;
+    problem.case5TileXorWrapGrf = !xor_nop;
+    problem.case5TileXorWrap = !xor_nop;
+    problem.case5TileXorWrapGrfStoreMode = 2;
+    problem.case5TileXorWrapGrfStageUnified = true;
     return problem;
 }
 
@@ -275,6 +279,13 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             problem.case5XorSubN = xsd.subN;
             problem.case5XorSubGridM = xsd.subGridM;
             problem.case5XorSubGridN = xsd.subGridN;
+            if (dims.k > 0) {
+                problem.case5XorMaxMilestones = std::max(1, dims.k / kMilestoneK);
+            }
+            if (problem.case5TileXorWrap) {
+                problem.case5XorOutputMilestones =
+                        std::max(1, problem.case5XorMaxMilestones / 2);
+            }
 
             InterfaceHandler iface(hw);
             init_case5_gemm_interface(iface, hw, problem, strategy,

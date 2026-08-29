@@ -1,5 +1,6 @@
 /* Device jackpot scan for oneDNN gemmstone milestoned tile_xor output.
- * tile_xor layout: dword_index = ms * tile_count + spatial_id (row-major tiles).
+ * tile_xor layout (raw milestones): dword_index = ms * tile_count + spatial_id.
+ * Case 5.5 wrap-GRF flush: 16 folded msg words per tile, same ms-major layout.
  * Fold + BLAKE3 match cp_jackpot.hpp / plain_proof host verify. */
 
 #define PP_JACKPOT_WORDS 16
@@ -81,7 +82,7 @@ inline bool digest_beats_target(const uint digest[8], __global const uint *bound
 
 __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_milestones,
                                      int tile_count, int panel_tile_cols, int tr_base,
-                                     int tc_base, int hash_mr, int hash_nr,
+                                     int tc_base, int hash_mr, int hash_nr, int use_folded_msg,
                                      __global const uint *a_key8, __global const uint *bound8,
                                      __global volatile int *found_flag, __global int *out_t_rows,
                                      __global int *out_t_cols) {
@@ -96,14 +97,22 @@ __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_mile
         return;
     }
 
-    uint milestone_xor[PP_MAX_MILESTONES];
-    for (int ms = 0; ms < num_milestones; ++ms) {
-        milestone_xor[ms] =
-                tile_xor[(size_t)ms * (size_t)tile_count + (size_t)sid];
-    }
-
     uint msg[PP_JACKPOT_WORDS];
-    fold_milestones(milestone_xor, num_milestones, msg);
+    if (use_folded_msg != 0) {
+        if (num_milestones != PP_JACKPOT_WORDS) {
+            return;
+        }
+        for (int w = 0; w < PP_JACKPOT_WORDS; ++w) {
+            msg[w] = tile_xor[(size_t)w * (size_t)tile_count + (size_t)sid];
+        }
+    } else {
+        uint milestone_xor[PP_MAX_MILESTONES];
+        for (int ms = 0; ms < num_milestones; ++ms) {
+            milestone_xor[ms] =
+                    tile_xor[(size_t)ms * (size_t)tile_count + (size_t)sid];
+        }
+        fold_milestones(milestone_xor, num_milestones, msg);
+    }
 
     uint digest[8];
     b3_compress64(a_key8, msg, digest);

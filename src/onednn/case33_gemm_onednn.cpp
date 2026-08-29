@@ -145,6 +145,7 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
     }
     xor_period_ = milestone_k / info_.unrollK;
     num_milestones_ = K_ / milestone_k;
+    folded_msg_words_ = cp_jackpot::kJackpotWords;
     milestone_k_ = milestone_k;
 
     int threads_m = div_up(M_, info_.unrollM);
@@ -280,7 +281,7 @@ bool Case33GemmOnednn::ensure_panel_tile_xor_buf_(int panel_tile_count) {
         tile_xor_buf_ = nullptr;
     }
     const size_t bytes =
-            static_cast<size_t>(num_milestones_) * static_cast<size_t>(panel_tile_count) *
+            static_cast<size_t>(folded_msg_words_) * static_cast<size_t>(panel_tile_count) *
             sizeof(uint32_t);
     tile_xor_buf_ = ocl_.alloc_buffer(bytes, CL_MEM_READ_WRITE);
     if (!tile_xor_buf_) {
@@ -429,12 +430,12 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
     std::snprintf(backend_, sizeof(backend_),
-                  "oneDNN gemmstone %s/%s igemm+tileXOR+GPUjackpot unroll %dx%d xor %dx%d wg %dx%d "
-                  "sg %d ms=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
+                  "oneDNN gemmstone %s/%s igemm+wrapGRF+GPUjackpot unroll %dx%d xor %dx%d wg %dx%d "
+                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
                   info_.hwName, info_.strategyName, info_.unrollM, info_.unrollN, info_.xorSubM,
                   info_.xorSubN, info_.wgM, info_.wgN, info_.subgroupSize, num_milestones_,
-                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, row_period_batch_,
-                  col_period_batch_);
+                  folded_msg_words_, tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_,
+                  row_period_batch_, col_period_batch_);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
@@ -629,16 +630,19 @@ bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_ti
 
     const int hash_mr = info_.xorSubM;
     const int hash_nr = info_.xorSubN;
+    const int jackpot_words = folded_msg_words_;
+    const int use_folded_msg = 1;
     cl_int err = CL_SUCCESS;
     int arg = 0;
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &tile_xor_buf_);
-    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &num_milestones_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &jackpot_words);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_count);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_cols);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &tr_base);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &tc_base);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_mr);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_nr);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &use_folded_msg);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &a_key_buf_);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &bound_buf_);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &found_buf_);
@@ -704,10 +708,10 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
                     static_cast<size_t>(tr) * static_cast<size_t>(panel_tile_cols) +
                     static_cast<size_t>(tc);
 
-            uint32_t milestone_xor[K_DIM / R_RANK];
-            for (int ms = 0; ms < num_milestones_; ++ms) {
-                milestone_xor[ms] =
-                        tile_xor_host_[static_cast<size_t>(ms) * static_cast<size_t>(panel_tile_count) +
+            uint32_t msg[cp_jackpot::kJackpotWords];
+            for (int w = 0; w < folded_msg_words_; ++w) {
+                msg[w] =
+                        tile_xor_host_[static_cast<size_t>(w) * static_cast<size_t>(panel_tile_count) +
                                        spatial_id];
             }
 
@@ -715,7 +719,9 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
             if (on_progress) {
                 on_progress(tiles_scanned);
             }
-            if (!cp_jackpot::tile_beats_target(milestone_xor, num_milestones_, a_key8, bound)) {
+            uint32_t digest[8];
+            cp_jackpot::b3_compress64(a_key8, msg, digest);
+            if (!cp_jackpot::digest_beats_target(digest, bound)) {
                 continue;
             }
 
