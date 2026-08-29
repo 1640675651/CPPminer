@@ -248,7 +248,8 @@ function Copy-OpenClKernels {
         "case33_gemm_xor.cl",
         "cp_ocl_blake3.cl",
         "cp_ocl_merkle.cl",
-        "cp_ocl_prep.cl"
+        "cp_ocl_prep.cl",
+        "cp_onednn_jackpot.cl"
     )) {
         Copy-Item (Join-Path $kernelSrcDir $name) (Join-Path $kernelDstDir $name) -Force
     }

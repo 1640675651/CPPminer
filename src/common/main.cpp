@@ -812,8 +812,8 @@ int main(int argc, char** argv)
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-            printf("[mode] scan: oneDNN gemmstone GEMM + tile XOR + host jackpot\n");
-            printf("[mode] period batch: row=%d col=%d (~%.0f MiB tile_xor/panel)\n",
+            printf("[mode] scan: oneDNN gemmstone GEMM + tile XOR + GPU jackpot\n");
+            printf("[mode] period batch: row=%d col=%d (~%.0f MiB tile_xor/panel on GPU)\n",
                    row_period_batch, period_batch,
                    (double)row_period_batch * (double)period_batch
                    * (double)(K_DIM / R_RANK)

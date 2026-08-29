@@ -368,6 +368,9 @@ elseif(CP_ENABLE_ONEDNN)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
             "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_onednn_jackpot.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_onednn_jackpot.cl"
         COMMENT "Copy OpenCL prep kernels next to cppminer")
 endif()
 

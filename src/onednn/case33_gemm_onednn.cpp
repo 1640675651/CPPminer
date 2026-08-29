@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 
 namespace {
 
@@ -72,6 +73,34 @@ void Case33GemmOnednn::set_col_period_batch(int batch) {
 }
 
 Case33GemmOnednn::~Case33GemmOnednn() {
+    if (jackpot_kernel_) {
+        clReleaseKernel(jackpot_kernel_);
+        jackpot_kernel_ = nullptr;
+    }
+    if (jackpot_program_) {
+        clReleaseProgram(jackpot_program_);
+        jackpot_program_ = nullptr;
+    }
+    if (a_key_buf_) {
+        clReleaseMemObject(a_key_buf_);
+        a_key_buf_ = nullptr;
+    }
+    if (bound_buf_) {
+        clReleaseMemObject(bound_buf_);
+        bound_buf_ = nullptr;
+    }
+    if (found_buf_) {
+        clReleaseMemObject(found_buf_);
+        found_buf_ = nullptr;
+    }
+    if (out_rows_buf_) {
+        clReleaseMemObject(out_rows_buf_);
+        out_rows_buf_ = nullptr;
+    }
+    if (out_cols_buf_) {
+        clReleaseMemObject(out_cols_buf_);
+        out_cols_buf_ = nullptr;
+    }
     if (kernel_) {
         clReleaseKernel(kernel_);
         kernel_ = nullptr;
@@ -264,6 +293,64 @@ bool Case33GemmOnednn::ensure_panel_tile_xor_buf_(int panel_tile_count) {
     return true;
 }
 
+bool Case33GemmOnednn::build_jackpot_kernel_() {
+    jackpot_ready_ = false;
+    if (jackpot_kernel_) {
+        clReleaseKernel(jackpot_kernel_);
+        jackpot_kernel_ = nullptr;
+    }
+    if (jackpot_program_) {
+        clReleaseProgram(jackpot_program_);
+        jackpot_program_ = nullptr;
+    }
+
+    const std::string kernel_dir = cp_ocl_kernel_dir();
+#ifdef _WIN32
+    const std::string kernel_path = kernel_dir + "\\cp_onednn_jackpot.cl";
+#else
+    const std::string kernel_path = kernel_dir + "/cp_onednn_jackpot.cl";
+#endif
+    std::ifstream in(kernel_path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "[onednn] failed to open jackpot kernel: %s\n", kernel_path.c_str());
+        return false;
+    }
+    const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!ocl_.safe_build_program_from_source(source.c_str(), "-cl-std=CL1.2")) {
+        std::fprintf(stderr, "[onednn] jackpot OpenCL build failed\n");
+        return false;
+    }
+    jackpot_program_ = ocl_.program;
+    ocl_.program = nullptr;
+
+    jackpot_kernel_ = clCreateKernel(jackpot_program_, "cp_onednn_jackpot_scan", nullptr);
+    if (!jackpot_kernel_) {
+        std::fprintf(stderr, "[onednn] failed to create cp_onednn_jackpot_scan kernel\n");
+        return false;
+    }
+    jackpot_ready_ = true;
+    return true;
+}
+
+bool Case33GemmOnednn::ensure_jackpot_bufs_() {
+    if (!a_key_buf_) {
+        a_key_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+    }
+    if (!bound_buf_) {
+        bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+    }
+    if (!found_buf_) {
+        found_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
+    }
+    if (!out_rows_buf_) {
+        out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+    }
+    if (!out_cols_buf_) {
+        out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+    }
+    return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
+}
+
 bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     available_ = false;
     context_ready_ = false;
@@ -342,8 +429,8 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
     std::snprintf(backend_, sizeof(backend_),
-                  "oneDNN gemmstone %s/%s igemm+tileXOR unroll %dx%d xor %dx%d wg %dx%d sg %d "
-                  "ms=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
+                  "oneDNN gemmstone %s/%s igemm+tileXOR+GPUjackpot unroll %dx%d xor %dx%d wg %dx%d "
+                  "sg %d ms=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
                   info_.hwName, info_.strategyName, info_.unrollM, info_.unrollN, info_.xorSubM,
                   info_.xorSubN, info_.wgM, info_.wgN, info_.subgroupSize, num_milestones_,
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, row_period_batch_,
@@ -352,6 +439,10 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
         std::fprintf(stderr, "[onednn] GPU matrix prep init failed; using CPU fallback\n");
+    }
+    if (!build_jackpot_kernel_()) {
+        std::fprintf(stderr, "[onednn] GPU jackpot kernel init failed\n");
+        return false;
     }
     available_ = false;
     return true;
@@ -524,11 +615,72 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
 
-    return ocl_.read_buffer(tile_xor_buf_, tile_xor_host_.data(),
-                            tile_xor_host_.size() * sizeof(uint32_t));
+    return true;
 }
 
-bool Case33GemmOnednn::scan_tile_xor_panel_(const uint32_t a_key8[8], const uint32_t bound[8],
+bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_tile_cols,
+                                              int tr_base, int tc_base, int *out_found) {
+    if (!jackpot_ready_ || !jackpot_kernel_ || !tile_xor_buf_ || panel_tile_count <= 0) {
+        return false;
+    }
+    if (!ensure_jackpot_bufs_()) {
+        return false;
+    }
+
+    const int hash_mr = info_.xorSubM;
+    const int hash_nr = info_.xorSubN;
+    cl_int err = CL_SUCCESS;
+    int arg = 0;
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &tile_xor_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &num_milestones_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_count);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_cols);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &tr_base);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &tc_base);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_mr);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_nr);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &a_key_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &bound_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &found_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &out_rows_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &out_cols_buf_);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[onednn] jackpot clSetKernelArg failed (%d)\n", err);
+        return false;
+    }
+
+    size_t local = 256;
+    if (static_cast<size_t>(panel_tile_count) < local) {
+        local = static_cast<size_t>(panel_tile_count);
+    }
+    while (local > 1 && (static_cast<size_t>(panel_tile_count) % local) != 0) {
+        local >>= 1;
+    }
+    const size_t global = static_cast<size_t>(panel_tile_count);
+    err = clEnqueueNDRangeKernel(ocl_.queue, jackpot_kernel_, 1, nullptr, &global,
+                                 local > 1 ? &local : nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[onednn] jackpot enqueue failed (%d): %s\n", err,
+                     OpenClContext::error_string(err).c_str());
+        return false;
+    }
+    err = clFinish(ocl_.queue);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[onednn] jackpot clFinish failed (%d)\n", err);
+        return false;
+    }
+
+    int found = 0;
+    if (!ocl_.read_buffer(found_buf_, &found, sizeof(found))) {
+        return false;
+    }
+    if (out_found) {
+        *out_found = found;
+    }
+    return true;
+}
+
+bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
                                             int panel_tile_rows, int panel_tile_cols,
                                             int panel_tile_count, int tr_base, int tc_base,
                                             int *out_found, int *out_t_rows, int *out_t_cols,
@@ -598,7 +750,10 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
                                       uint64_t *out_tiles_scanned,
                                       const std::function<bool()> &should_cancel,
                                       const std::function<void(uint64_t)> &on_progress) {
-    if (!available_ || !a_key8 || !bound) {
+    if (!available_ || !a_key8 || !bound || !jackpot_ready_) {
+        return false;
+    }
+    if (!ensure_jackpot_bufs_()) {
         return false;
     }
 
@@ -613,6 +768,15 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     }
     if (out_tiles_scanned) {
         *out_tiles_scanned = 0;
+    }
+
+    if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t)) ||
+        !ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
+        return false;
+    }
+    const int zero = 0;
+    if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero))) {
+        return false;
     }
 
     const int row_periods = hash_tile_rows_;
@@ -657,8 +821,6 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {
                 return false;
             }
-            tile_xor_host_.resize(static_cast<size_t>(num_milestones_) *
-                                  static_cast<size_t>(panel_tile_count));
 
             if (!run_gemm_panel_(m_panel, n_panel, offset_a_rows, offset_b_cols, panel_tile_count,
                                  panel_tile_cols)) {
@@ -667,10 +829,25 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
 
             const int tr_base = rpi0;
             const int tc_base = cpi0;
-            if (!scan_tile_xor_panel_(a_key8, bound, panel_tile_rows, panel_tile_cols,
-                                      panel_tile_count, tr_base, tc_base, &found, out_t_rows,
-                                      out_t_cols, &tiles_scanned, should_cancel, on_progress)) {
+            int panel_found = 0;
+            if (!run_gpu_jackpot_panel_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
+                                        &panel_found)) {
                 return false;
+            }
+
+            tiles_scanned += static_cast<uint64_t>(panel_tile_count);
+            if (on_progress) {
+                on_progress(tiles_scanned);
+            }
+
+            if (panel_found) {
+                found = 1;
+                if (out_t_rows && !ocl_.read_buffer(out_rows_buf_, out_t_rows, sizeof(int))) {
+                    return false;
+                }
+                if (out_t_cols && !ocl_.read_buffer(out_cols_buf_, out_t_cols, sizeof(int))) {
+                    return false;
+                }
             }
         }
     }
