@@ -381,7 +381,7 @@ try {
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
     Copy-Item $built $OutExe -Force
-    if ($EnableOpenCl) {
+    if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
     }
 

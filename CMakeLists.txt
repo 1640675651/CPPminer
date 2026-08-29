@@ -302,7 +302,10 @@ if(CP_ENABLE_ONEDNN)
         src/onednn/case5_ngen_gemm.cpp
         ${_ONEDNN_GEMMSTONE_SOURCES})
     if(NOT CP_ENABLE_OPENCL)
-        list(APPEND CP_SOURCES src/opencl/opencl_context.cpp)
+        list(APPEND CP_SOURCES
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp)
     endif()
     list(APPEND CP_INCLUDE_DIRS
         ${_ONEDNN_DIR}
@@ -354,6 +357,18 @@ if(CP_ENABLE_OPENCL)
         COMMENT "Copy OpenCL kernels next to cppminer")
 elseif(CP_ENABLE_ONEDNN)
     target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_blake3.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_merkle.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMENT "Copy OpenCL prep kernels next to cppminer")
 endif()
 
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).

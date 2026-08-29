@@ -1,6 +1,7 @@
 #pragma once
 
 #include "case5_ngen_gemm.hpp"
+#include "case33_ocl_prep.hpp"
 #include "cp_config.h"
 #include "opencl_context.hpp"
 
@@ -21,7 +22,10 @@ struct Case33GemmOnednn {
 
     bool init_context(int device_index = 0, int platform_filter = -1);
     bool prepare_job(int M, int N, int K, const int8_t *b_rowmajor);
+    bool prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]);
     bool prepare_attempt_a(const int8_t *a_rowmajor);
+    bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
+                             const uint8_t b_noise_seed[32], int salted, uint8_t a_key_out[32]);
     bool read_A_sig(int8_t *h_A_sig);
 
     bool available() const { return available_; }
@@ -36,6 +40,7 @@ struct Case33GemmOnednn {
     const char *platform_name() const { return platform_name_.c_str(); }
     int device_index() const { return device_flat_index_; }
     const case5_ngen::DriverInfo &driver_info() const { return info_; }
+    bool gpu_prep_ready() const { return prep_ready_; }
 
 private:
     bool setup_dims_(int M, int N, int K);
@@ -43,7 +48,7 @@ private:
                             int &out_tile_count) const;
     bool ensure_matrix_bufs_();
     bool ensure_panel_tile_xor_buf_(int panel_tile_count);
-    bool upload_a_colmajor_(const int8_t *a_rowmajor);
+    bool upload_a_rowmajor_(const int8_t *a_rowmajor);
     bool upload_b_colmajor_(const int8_t *b_rowmajor);
     bool run_gemm_panel_(int m_panel, int n_panel, int64_t offset_a_rows, int64_t offset_b_cols,
                          int panel_tile_count, int panel_tile_cols);
@@ -56,7 +61,9 @@ private:
 
     bool context_ready_ = false;
     bool available_ = false;
+    bool prep_ready_ = false;
     OpenClContext ocl_;
+    Case33OclPrep prep_;
 
     int M_ = 0;
     int N_ = 0;
@@ -90,6 +97,7 @@ private:
     std::vector<uint32_t> tile_xor_host_;
     std::vector<int8_t> a_host_;
     std::vector<int8_t> b_host_;
+    std::vector<int8_t> pack_scratch_;
     std::string device_name_;
     std::string platform_name_;
     int device_flat_index_ = -1;

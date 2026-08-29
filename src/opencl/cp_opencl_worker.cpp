@@ -348,6 +348,11 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] max work-group size: %zu\n", g_gemm.max_work_group_size());
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
+    if (g_issue_mode == 0 && g_gemm.integer_dot_product_hw() == 0 &&
+        g_gemm.integer_dot_product()) {
+        printf("[ocl] note: DPI reports software path on this device; Intel OpenCL "
+               "dot_acc_sat may not beat cpm. Try --backend onednn for Intel GPU perf.\n");
+    }
     if (g_issue_mode == 1) {
         printf("[ocl] issue: broadcast/cpm %s (--ocl-issue broadcast%s)\n",
                g_cpm_int ? "int" : "float",

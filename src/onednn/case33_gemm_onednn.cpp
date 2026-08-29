@@ -19,11 +19,14 @@ int div_up(int a, int b) { return (a + b - 1) / b; }
 
 int rnd_up(int a, int b) { return div_up(a, b) * b; }
 
-void pack_a_colmajor(const int8_t *a_rm, int M, int K, int lda, int8_t *out) {
-    std::memset(out, 0, static_cast<size_t>(lda) * static_cast<size_t>(K));
-    for (int k = 0; k < K; ++k) {
-        for (int i = 0; i < M; ++i) {
-            out[static_cast<size_t>(k) * lda + i] = a_rm[static_cast<size_t>(i) * K + k];
+// Row-major MxK with leading dimension lda (>= K); zero-pad each row if lda > K.
+void pack_a_rowmajor(const int8_t *a_rm, int M, int K, int lda, int8_t *out) {
+    const size_t row_bytes = static_cast<size_t>(lda);
+    for (int i = 0; i < M; ++i) {
+        int8_t *row = out + static_cast<size_t>(i) * row_bytes;
+        std::memcpy(row, a_rm + static_cast<size_t>(i) * K, K);
+        if (lda > K) {
+            std::memset(row + K, 0, static_cast<size_t>(lda - K));
         }
     }
 }
@@ -95,7 +98,8 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
-    lda_ = case5_ngen::pad_ld_int8(M_);
+    // A row-major (lda>=K); B column-major (ldb>=K). ldc kept for ABI only.
+    lda_ = case5_ngen::pad_ld_int8(K_);
     ldb_ = case5_ngen::pad_ld_int8(K_);
     ldc_ = case5_ngen::pad_ld_int8(M_);
 
@@ -204,7 +208,7 @@ void Case33GemmOnednn::compute_tile_grid_(int m, int n, int &out_tile_rows, int 
 }
 
 bool Case33GemmOnednn::ensure_matrix_bufs_() {
-    const size_t a_bytes = static_cast<size_t>(lda_) * static_cast<size_t>(K_);
+    const size_t a_bytes = static_cast<size_t>(lda_) * static_cast<size_t>(M_);
     const size_t b_bytes = static_cast<size_t>(ldb_) * static_cast<size_t>(N_);
 
     if (a_buf_ && a_buf_bytes_ != a_bytes) {
@@ -304,7 +308,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     constexpr int kKernelSelectM = 256;
     constexpr int kKernelSelectN = 256;
     case5_ngen::BuildParams build_dims{kKernelSelectM, kKernelSelectN, K_DIM, 0, 0, 0};
-    build_dims.lda = case5_ngen::pad_ld_int8(build_dims.m);
+    build_dims.lda = case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldb = case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldc = case5_ngen::pad_ld_int8(build_dims.m);
 
@@ -345,17 +349,26 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, row_period_batch_,
                   col_period_batch_);
     context_ready_ = true;
+    prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
+    if (!prep_ready_) {
+        std::fprintf(stderr, "[onednn] GPU matrix prep init failed; using CPU fallback\n");
+    }
     available_ = false;
     return true;
 }
 
-bool Case33GemmOnednn::upload_a_colmajor_(const int8_t *a_rowmajor) {
+bool Case33GemmOnednn::upload_a_rowmajor_(const int8_t *a_rowmajor) {
     if (!a_rowmajor) {
         return false;
     }
-    const size_t bytes = static_cast<size_t>(lda_) * static_cast<size_t>(K_);
+    const size_t raw_bytes = static_cast<size_t>(M_) * static_cast<size_t>(K_);
+    const size_t bytes = static_cast<size_t>(lda_) * static_cast<size_t>(M_);
+    if (lda_ == K_) {
+        a_host_.assign(a_rowmajor, a_rowmajor + raw_bytes);
+        return ocl_.write_buffer(a_buf_, a_rowmajor, bytes);
+    }
     a_host_.resize(bytes);
-    pack_a_colmajor(a_rowmajor, M_, K_, lda_, a_host_.data());
+    pack_a_rowmajor(a_rowmajor, M_, K_, lda_, a_host_.data());
     return ocl_.write_buffer(a_buf_, a_host_.data(), bytes);
 }
 
@@ -387,23 +400,66 @@ bool Case33GemmOnednn::prepare_job(int M, int N, int K, const int8_t *b_rowmajor
     return true;
 }
 
+bool Case33GemmOnednn::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]) {
+    available_ = false;
+    if (!context_ready_ || !kernel_ || !b_noise_seed || !prep_ready_) {
+        return false;
+    }
+    if (!setup_dims_(M, N, K)) {
+        return false;
+    }
+    if (!ensure_matrix_bufs_()) {
+        return false;
+    }
+    if (!prep_.prepare_job_b_colmajor(b_buf_, b_noise_seed, N_, K_, ldb_)) {
+        return false;
+    }
+    available_ = true;
+    return true;
+}
+
 bool Case33GemmOnednn::prepare_attempt_a(const int8_t *a_rowmajor) {
     if (!available_ || !a_rowmajor) {
         return false;
     }
-    return upload_a_colmajor_(a_rowmajor);
+    return upload_a_rowmajor_(a_rowmajor);
+}
+
+bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
+                                           const uint8_t job_key[32],
+                                           const uint8_t b_noise_seed[32], int salted,
+                                           uint8_t a_key_out[32]) {
+    if (!available_ || !ab_seed || !job_key || !b_noise_seed || !a_key_out || !prep_ready_) {
+        return false;
+    }
+    if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
+        return false;
+    }
+    return prep_.prepare_attempt_a_rowmajor(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed,
+                                            M_, K_, lda_, salted, a_key_out);
 }
 
 bool Case33GemmOnednn::read_A_sig(int8_t *h_A_sig) {
-    if (!h_A_sig || M_ <= 0 || K_ <= 0 || a_host_.empty()) {
+    if (!h_A_sig || M_ <= 0 || K_ <= 0) {
+        return false;
+    }
+    if (prep_ready_) {
+        return prep_.read_A_sig(h_A_sig, static_cast<size_t>(M_) * static_cast<size_t>(K_));
+    }
+    if (a_host_.empty()) {
         return false;
     }
     const size_t need = static_cast<size_t>(M_) * static_cast<size_t>(K_);
-    for (int k = 0; k < K_; ++k) {
-        for (int i = 0; i < M_; ++i) {
-            h_A_sig[static_cast<size_t>(i) * K_ + k] =
-                    a_host_[static_cast<size_t>(k) * lda_ + i];
-        }
+    if (a_host_.size() < need) {
+        return false;
+    }
+    if (lda_ == K_) {
+        std::memcpy(h_A_sig, a_host_.data(), need);
+        return true;
+    }
+    for (int i = 0; i < M_; ++i) {
+        std::memcpy(h_A_sig + static_cast<size_t>(i) * K_, a_host_.data() + static_cast<size_t>(i) * lda_,
+                    K_);
     }
     return true;
 }
@@ -420,7 +476,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     bufs.b = b_buf_;
     bufs.c = c_buf_;
     bufs.tile_xor = tile_xor_buf_;
-    bufs.offset_a = offset_a_rows;
+    bufs.offset_a = offset_a_rows * static_cast<int64_t>(lda_);
     bufs.offset_b = offset_b_cols;
     bufs.offset_c = 0;
     bufs.lda = lda_;
@@ -442,6 +498,9 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     problem.beta = 0;
     problem.case5TileXor = true;
     problem.case5TileXorNop = false;
+    problem.A.layout = gemmstone::MatrixLayout::T;
+    problem.B.layout = gemmstone::MatrixLayout::N;
+    problem.C.layout = gemmstone::MatrixLayout::N;
 
     const case5_ngen::LaunchDims dims =
             case5_ngen::compute_case5_launch_dims(info_, m_panel, n_panel);

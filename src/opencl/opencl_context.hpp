@@ -24,6 +24,7 @@ struct OclDeviceInfo {
     std::string vendor_name;
     bool discrete = false; /* GPU with CL_DEVICE_HOST_UNIFIED_MEMORY == false */
     bool integer_dot_product = false;
+    bool integer_dot_product_hw = false;
 };
 
 struct OpenClContext {
@@ -39,6 +40,7 @@ struct OpenClContext {
     int device_flat_index = -1;
     bool discrete_gpu = false;
     bool has_integer_dot_product = false;
+    bool has_integer_dot_product_hw = false;
     size_t max_work_group_size = 256;
 
     ~OpenClContext();
@@ -51,8 +53,12 @@ struct OpenClContext {
 
     /* Select by flat index from enumerate_devices(). Fails if out of range. */
     bool init(int device_index = 0, int platform_filter = -1);
-    bool build_program_from_file(const char *cl_path, const char *build_options = "");
-    bool build_program_from_source(const char *source, const char *build_options = "");
+    /* Bind an already-enumerated device (e.g. Intel-only list for oneDNN). */
+    bool init(const OclDeviceInfo &pick);
+    bool build_program_from_file(const char *cl_path, const char *build_options = "",
+                                 bool quiet = false);
+    bool build_program_from_source(const char *source, const char *build_options = "",
+                                   bool quiet = false);
 
     /* Probe clBuildProgram in a child process first. Drivers that abort() inside
        the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill only the child;

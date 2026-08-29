@@ -27,6 +27,7 @@ struct ZeroBCache {
     int m = 0;
     int n = 0;
     int ready = 0;
+    int use_gpu_prep = 0;
     int salted = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<int8_t> B_noisy;
@@ -39,17 +40,18 @@ static int g_context_ready = 0;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 
-static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n) {
+static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n, int gpu_prep) {
     return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
-           memcmp(g_zero_b.job_key, job_key, 32) == 0;
+           g_zero_b.use_gpu_prep == gpu_prep && memcmp(g_zero_b.job_key, job_key, 32) == 0;
 }
 
-static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n) {
+static int zero_b_prepare_job_host(const uint8_t job_key[32], int m, int n) {
     const size_t szB = static_cast<size_t>(n) * static_cast<size_t>(K_DIM);
     g_zero_b.B_noisy.resize(szB);
     memcpy(g_zero_b.job_key, job_key, 32);
     g_zero_b.m = m;
     g_zero_b.n = n;
+    g_zero_b.use_gpu_prep = 0;
 
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, g_zero_b.b_noise_seed);
     if (pearl_build_noisy_b(n, K_DIM, R_RANK, g_zero_b.b_noise_seed, NULL,
@@ -68,17 +70,41 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n) {
     return 0;
 }
 
-static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
-                                  int m, int n, int8_t *h_A_sig, uint8_t a_key_out[32]) {
-    (void)ab_seed;
-    (void)ab_seed_len;
+static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
+    memcpy(g_zero_b.job_key, job_key, 32);
+    g_zero_b.m = m;
+    g_zero_b.n = n;
+    g_zero_b.use_gpu_prep = 1;
+    g_zero_b.B_noisy.clear();
+
+    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, g_zero_b.b_noise_seed);
+    if (!g_gemm.prepare_job_gpu(m, n, K_DIM, g_zero_b.b_noise_seed)) {
+        g_zero_b.ready = 0;
+        fprintf(stderr, "[onednn] prepare_job_gpu failed\n");
+        return -2;
+    }
+
+    g_zero_b.ready = 1;
+    return 0;
+}
+
+static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n) {
+    if (g_gemm.gpu_prep_ready()) {
+        return zero_b_prepare_job_gpu(job_key, m, n);
+    }
+    return zero_b_prepare_job_host(job_key, m, n);
+}
+
+static int zero_b_prepare_attempt_host(const uint8_t *ab_seed, int ab_seed_len,
+                                       const uint8_t job_key[32], int m, int n, int8_t *h_A_sig,
+                                       uint8_t a_key_out[32]) {
     if (!h_A_sig) {
         fprintf(stderr, "[onednn] zero-B requires h_Ap_global (A_sig buffer)\n");
         return -2;
     }
 
-    if (!zero_b_cache_matches(job_key, m, n)) {
-        if (zero_b_prepare_job(job_key, m, n) != 0) {
+    if (!zero_b_cache_matches(job_key, m, n, 0)) {
+        if (zero_b_prepare_job_host(job_key, m, n) != 0) {
             return -1;
         }
     }
@@ -108,6 +134,39 @@ static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len, const
     }
 
     return 0;
+}
+
+static int zero_b_prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
+                                        const uint8_t job_key[32], int m, int n,
+                                        uint8_t a_key_out[32]) {
+    if (!zero_b_cache_matches(job_key, m, n, 1)) {
+        if (zero_b_prepare_job_gpu(job_key, m, n) != 0) {
+            return -1;
+        }
+    }
+
+    uint8_t a_rng[32];
+    if (cp_random_bytes(a_rng, sizeof(a_rng)) != 0) {
+        fprintf(stderr, "[onednn] CSPRNG failed for random A\n");
+        return -2;
+    }
+
+    if (!g_gemm.prepare_attempt_gpu(a_rng, (int)sizeof(a_rng), job_key, g_zero_b.b_noise_seed,
+                                    g_zero_b.salted, a_key_out)) {
+        fprintf(stderr, "[onednn] prepare_attempt_gpu failed\n");
+        return -2;
+    }
+
+    return 0;
+}
+
+static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
+                                  int m, int n, int8_t *h_A_sig, uint8_t a_key_out[32]) {
+    (void)h_A_sig;
+    if (g_gemm.gpu_prep_ready()) {
+        return zero_b_prepare_attempt_gpu(ab_seed, ab_seed_len, job_key, m, n, a_key_out);
+    }
+    return zero_b_prepare_attempt_host(ab_seed, ab_seed_len, job_key, m, n, h_A_sig, a_key_out);
 }
 
 static void configure_hash_tile_from_kernel(void) {
@@ -185,7 +244,11 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     printf("[onednn] %s\n", g_gemm.backend());
     printf("[onednn] hash tile: %dx%d logical (unroll %dx%d, split=%s)\n", di.xorSubM, di.xorSubN,
            di.unrollM, di.unrollN, case5_ngen::case5_xor_subtile_split_mode_name());
-    printf("[onednn] host matrix prep (column-major NNN for gemmstone)\n");
+    if (g_gemm.gpu_prep_ready()) {
+        printf("[onednn] matrix prep: GPU-only A/B prep (TNN, no matrix D2H on scan path)\n");
+    } else {
+        printf("[onednn] matrix prep: CPU random A + noise (TNN: row-major A, column-major B)\n");
+    }
     printf("[onednn] period batch: row=%d col=%d (%d hash rows x %d hash cols/panel at defaults)\n",
            g_row_period_batch, g_col_period_batch,
            g_row_period_batch * di.xorSubM, g_col_period_batch * di.xorSubN);
@@ -206,8 +269,12 @@ extern "C" void cp_onednn_worker_begin_job(const uint8_t job_key[32], int m, int
     g_zero_b.ready = 0;
     g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     if (zero_b_prepare_job(job_key, m, n) == 0) {
-        printf("[onednn] zero-B: host noise + column-major B on device (salted=%d)\n",
-               g_zero_b.salted);
+        if (g_zero_b.use_gpu_prep) {
+            printf("[onednn] zero-B: GPU noisy B on device (salted=%d)\n", g_zero_b.salted);
+        } else {
+            printf("[onednn] zero-B: host noise + column-major B on device (salted=%d)\n",
+                   g_zero_b.salted);
+        }
         fflush(stdout);
     }
 }
@@ -243,7 +310,7 @@ extern "C" int cp_onednn_worker_mine_attempt(
     const uint8_t *scan_key = a_key;
 
     if (!scan_key) {
-        if (!h_A_sig) {
+        if (!h_A_sig && !g_gemm.gpu_prep_ready()) {
             fprintf(stderr, "[onednn] mine_attempt requires h_Ap_global\n");
             return -2;
         }
@@ -382,10 +449,18 @@ extern "C" int cp_onednn_worker_mine_attempt(
 }
 
 extern "C" int cp_onednn_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig) {
-    (void)h_A_sig;
     (void)h_Bt_sig;
-    /* Signal A already lives in h_Ap_global (zero-B path). Do not replace it with
-     * noisy A from the device — proof/zk-pow expect signal strips in [-64, 64]. */
+    if (!h_A_sig) {
+        return -1;
+    }
+    if (!g_gemm.gpu_prep_ready()) {
+        /* Signal A already lives in h_Ap_global (CPU prep). */
+        return 0;
+    }
+    if (!g_gemm.read_A_sig(h_A_sig)) {
+        fprintf(stderr, "[onednn] failed to read A_sig for proof\n");
+        return -1;
+    }
     return 0;
 }
 

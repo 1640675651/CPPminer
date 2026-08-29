@@ -819,7 +819,7 @@ int main(int argc, char** argv)
                    * (double)(K_DIM / R_RANK)
                    * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
                    * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
-            printf("[mode] host signal ~%.0f MiB; column-major NNN buffers on Intel GPU\n",
+            printf("[mode] host signal ~%.0f MiB; TNN buffers (row-major A, column-major B) on Intel GPU\n",
                    host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){

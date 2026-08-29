@@ -151,7 +151,7 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop) {
     problem.Ts = Type::f32;
     problem.alpha = 1;
     problem.beta = 0;
-    problem.A.layout = MatrixLayout::N;
+    problem.A.layout = MatrixLayout::T;
     problem.B.layout = MatrixLayout::N;
     problem.C.layout = MatrixLayout::N;
     problem.A.crosspack = problem.B.crosspack = problem.C.crosspack = 1;

@@ -135,6 +135,18 @@ Case33GemmOcl::~Case33GemmOcl() {
 }
 
 bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
+    auto with_cl_std = [](std::string opts, const char *ver) {
+        const std::string needle = "-cl-std=CL1.2";
+        const size_t pos = opts.find(needle);
+        const std::string repl = std::string("-cl-std=") + ver;
+        if (pos != std::string::npos) {
+            opts.replace(pos, needle.size(), repl);
+        } else {
+            opts = repl + " " + opts;
+        }
+        return opts;
+    };
+
     auto try_build = [&](bool use_dot, bool force_ext, bool use_asm, bool use_builtin,
                          const char *label) -> bool {
         const bool scalar = !use_dot && !use_asm && !use_builtin;
@@ -172,8 +184,32 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 build_opts += " -Dcl_khr_integer_dot_product";
             }
         }
-        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
-            if (use_dot && force_ext && !use_asm && !use_builtin) {
+
+        auto adopt_kernel = [&](const char *status_label) -> bool {
+            if (kernel_) {
+                clReleaseKernel(kernel_);
+                kernel_ = nullptr;
+            }
+            kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
+            if (!kernel_) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: kernel create FAILED",
+                              label);
+                return false;
+            }
+            using_integer_dot_ = use_dot && !use_asm && !use_builtin;
+            using_asm_dot_ = use_asm;
+            using_builtin_dot_ = use_builtin;
+            using_cpm_ = scalar && issue_mode_ != 2;
+            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", status_label);
+            return true;
+        };
+
+        if (use_dot && !use_asm && !use_builtin) {
+            /* Primary: CL1.2 + extension macro (NVIDIA, AMD, and other KHR DPI drivers). */
+            if (ocl_.build_program_from_file(kernel_cl_path, build_opts.c_str(), true)) {
+                return adopt_kernel(label);
+            }
+            if (force_ext) {
                 std::string build_opts2 =
                         "-cl-std=CL1.2 -cl-ext=+cl_khr_integer_dot_product "
                         "-DCASE32_FORCE_DPI=1 -DMR=" +
@@ -187,42 +223,32 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
-                if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
-                    if (kernel_) {
-                        clReleaseKernel(kernel_);
-                        kernel_ = nullptr;
-                    }
-                    kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
-                    if (kernel_) {
-                        using_integer_dot_ = true;
-                        using_asm_dot_ = false;
-                        using_builtin_dot_ = false;
-                        using_cpm_ = false;
-                        std::snprintf(dpi_status_, sizeof(dpi_status_), "%s (-cl-ext): OK",
-                                      label);
-                        return true;
-                    }
+                if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
+                    return adopt_kernel(label);
+                }
+            }
+            /* Intel NEO: advertises the extension but only exposes dot_acc_sat under CL3.0. */
+            if (ocl_.has_integer_dot_product) {
+                const std::string cl30_opts =
+                        with_cl_std(build_opts, "CL3.0") + " -DCASE32_FORCE_DPI=1";
+                if (ocl_.build_program_from_file(kernel_cl_path, cl30_opts.c_str(), true)) {
+                    return adopt_kernel(label);
                 }
             }
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
         }
-        if (kernel_) {
-            clReleaseKernel(kernel_);
-            kernel_ = nullptr;
-        }
-        kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
-        if (!kernel_) {
-            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: kernel create FAILED", label);
+
+        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
+            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
         }
-        using_integer_dot_ = use_dot && !use_asm && !use_builtin;
-        using_asm_dot_ = use_asm;
-        using_builtin_dot_ = use_builtin;
-        using_cpm_ = scalar && issue_mode_ != 2;
-        std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", label);
-        return true;
+        return adopt_kernel(label);
     };
+
+    const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
+                               ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+    const bool vendor_is_intel = ocl_.vendor_name.find("Intel") != std::string::npos;
 
     bool built = false;
     /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
@@ -272,9 +298,11 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
         /* Default cascade: AMD builtin → KHR → scalar cpm. */
-        built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
+        if (vendor_is_amd) {
+            built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
+        }
         if (!built) {
-            built = try_build(true, false, false, false, "KHR dot_acc_sat");
+            built = try_build(true, true, false, false, "KHR dot_acc_sat");
         }
         if (!built) {
             built = try_build(false, false, false, false,

@@ -173,6 +173,56 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
     }
 }
 
+/* Pearl noisy matrix in native row layout: A is M×K (row*K+k), B^T is N×K (col*K+k). */
+__kernel void ocl_noisy_matrix_rowmajor(__global char *out, __global const uchar *noise_seed,
+                                        __global const uint *pairs, int rows, int K, int rank,
+                                        int is_b, int has_signal,
+                                        __global const char *signal, int out_lda) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows) {
+        return;
+    }
+    if (out_lda < K) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(row, rank, noise_seed, is_b, el);
+    __global char *dst = out + (size_t)row * (size_t)out_lda;
+    for (int l = 0; l < K; ++l) {
+        const int pos = (int)(char)el[pairs[(size_t)l * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
+        int sig = 0;
+        if (has_signal) {
+            sig = (int)signal[(size_t)row * (size_t)K + (size_t)l];
+        }
+        dst[l] = (char)(sig + (pos - neg));
+    }
+    for (int l = K; l < out_lda; ++l) {
+        dst[l] = 0;
+    }
+}
+
+/* gemmstone column-major B (zero signal): column j at out + j*ldb, element (k,j) at j*ldb+k. */
+__kernel void ocl_noisy_matrix_colmajor(__global char *out, __global const uchar *noise_seed,
+                                        __global const uint *pairs, int cols, int K, int rank,
+                                        int is_b, int ldb) {
+    const int col = (int)get_global_id(0);
+    if (col >= cols || ldb < K) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(col, rank, noise_seed, is_b, el);
+    __global char *dst = out + (size_t)col * (size_t)ldb;
+    for (int k = 0; k < K; ++k) {
+        const int pos = (int)(char)el[pairs[(size_t)k * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)k * 2 + 1]];
+        dst[k] = (char)(pos - neg);
+    }
+    for (int k = K; k < ldb; ++k) {
+        dst[k] = 0;
+    }
+}
+
 /* Align-test: device get_random_hash spot check. */
 __kernel void ocl_test_get_random_hash(int index, __global const uchar *seed, int is_b,
                                        int prepend_index, __global uchar *out) {

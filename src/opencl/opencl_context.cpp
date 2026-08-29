@@ -25,6 +25,28 @@ void log_cl_error(const char *what, cl_int err) {
                  OpenClContext::error_string(err).c_str());
 }
 
+#ifndef CL_DEVICE_INTEGER_DOT_PRODUCT_CAPABILITIES_KHR
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_CAPABILITIES_KHR 0x1073
+#endif
+#ifndef CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_KHR
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_KHR (1 << 1)
+#endif
+#ifndef CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR (1 << 0)
+#endif
+#ifndef CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR 0x1075
+#endif
+
+typedef struct _cl_device_integer_dot_product_acceleration_properties_khr {
+    cl_bool signed_accelerated;
+    cl_bool unsigned_accelerated;
+    cl_bool mixed_signedness_accelerated;
+    cl_bool accumulating_saturating_signed_accelerated;
+    cl_bool accumulating_saturating_unsigned_accelerated;
+    cl_bool accumulating_saturating_mixed_signedness_accelerated;
+} cl_device_integer_dot_product_acceleration_properties_khr;
+
 bool extension_enabled(cl_device_id device, const char *ext_name) {
     size_t nbytes = 0;
     if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &nbytes) != CL_SUCCESS ||
@@ -37,6 +59,49 @@ bool extension_enabled(cl_device_id device, const char *ext_name) {
         return false;
     }
     return std::strstr(buf.data(), ext_name) != nullptr;
+}
+
+bool device_supports_integer_dot_product(cl_device_id device, bool *hw_accel_out) {
+    if (hw_accel_out) {
+        *hw_accel_out = false;
+    }
+    if (!extension_enabled(device, "cl_khr_integer_dot_product")) {
+        return false;
+    }
+    cl_bitfield caps = 0;
+    const cl_int err = clGetDeviceInfo(device, CL_DEVICE_INTEGER_DOT_PRODUCT_CAPABILITIES_KHR,
+                                       sizeof(caps), &caps, nullptr);
+    const bool has_caps =
+            err == CL_SUCCESS &&
+            ((caps & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_KHR) != 0 ||
+             (caps & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR) != 0);
+    if (!has_caps) {
+        if (err != CL_SUCCESS) {
+            char ver[256] = {};
+            if (clGetDeviceInfo(device, CL_DEVICE_VERSION, sizeof(ver), ver, nullptr) !=
+                CL_SUCCESS) {
+                return false;
+            }
+            int major = 0;
+            int minor = 0;
+            if (std::sscanf(ver, "OpenCL %d.%d", &major, &minor) != 2) {
+                return false;
+            }
+            if (major < 3) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    cl_device_integer_dot_product_acceleration_properties_khr accel = {};
+    if (clGetDeviceInfo(device,
+                        CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR,
+                        sizeof(accel), &accel, nullptr) == CL_SUCCESS &&
+        hw_accel_out) {
+        *hw_accel_out = accel.accumulating_saturating_signed_accelerated == CL_TRUE;
+    }
+    return true;
 }
 
 bool device_is_discrete_gpu(cl_device_id device, cl_device_type type) {
@@ -77,7 +142,7 @@ void append_devices_of_type(cl_platform_id plat, int platform_index, const char 
         info.device_name = dname;
         info.vendor_name = vname;
         info.discrete = device_is_discrete_gpu(dev, type);
-        info.integer_dot_product = extension_enabled(dev, "cl_khr_integer_dot_product");
+        info.integer_dot_product = device_supports_integer_dot_product(dev, &info.integer_dot_product_hw);
         out->push_back(info);
     }
 }
@@ -204,27 +269,14 @@ int OpenClContext::list_devices(int platform_filter) {
         std::printf("  [%d] %s\n", d.flat_index, d.device_name.c_str());
         std::printf("      platform[%d]=%s  %s%s\n", d.platform_index,
                     d.platform_name.c_str(), kind,
-                    d.integer_dot_product ? "  int-dot" : "");
+                    d.integer_dot_product
+                            ? (d.integer_dot_product_hw ? "  int-dot" : "  int-dot (sw)")
+                            : "");
     }
     return static_cast<int>(devices.size());
 }
 
-bool OpenClContext::init(int device_index, int platform_filter) {
-    const std::vector<OclDeviceInfo> candidates = enumerate_devices(platform_filter);
-    if (candidates.empty()) {
-        std::fprintf(stderr, "No OpenCL GPU or CPU devices found\n");
-        return false;
-    }
-
-    if (device_index < 0 || device_index >= static_cast<int>(candidates.size())) {
-        std::fprintf(stderr,
-                     "[ocl] invalid --devices %d (valid: 0..%d). Available:\n",
-                     device_index, static_cast<int>(candidates.size()) - 1);
-        list_devices(platform_filter);
-        return false;
-    }
-
-    const OclDeviceInfo &pick = candidates[static_cast<size_t>(device_index)];
+bool OpenClContext::init(const OclDeviceInfo &pick) {
     platform = pick.platform;
     device = pick.device;
     platform_name = pick.platform_name;
@@ -233,6 +285,7 @@ bool OpenClContext::init(int device_index, int platform_filter) {
     device_flat_index = pick.flat_index;
     discrete_gpu = pick.discrete;
     has_integer_dot_product = pick.integer_dot_product;
+    has_integer_dot_product_hw = pick.integer_dot_product_hw;
 
     size_t max_wg = 0;
     if (clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg,
@@ -262,8 +315,26 @@ bool OpenClContext::init(int device_index, int platform_filter) {
     return true;
 }
 
-bool OpenClContext::build_program_from_source(const char *source,
-                                              const char *build_options) {
+bool OpenClContext::init(int device_index, int platform_filter) {
+    const std::vector<OclDeviceInfo> candidates = enumerate_devices(platform_filter);
+    if (candidates.empty()) {
+        std::fprintf(stderr, "No OpenCL GPU or CPU devices found\n");
+        return false;
+    }
+
+    if (device_index < 0 || device_index >= static_cast<int>(candidates.size())) {
+        std::fprintf(stderr,
+                     "[ocl] invalid --devices %d (valid: 0..%d). Available:\n",
+                     device_index, static_cast<int>(candidates.size()) - 1);
+        list_devices(platform_filter);
+        return false;
+    }
+
+    return init(candidates[static_cast<size_t>(device_index)]);
+}
+
+bool OpenClContext::build_program_from_source(const char *source, const char *build_options,
+                                              bool quiet) {
     if (!context || !device || source == nullptr) {
         return false;
     }
@@ -283,26 +354,32 @@ bool OpenClContext::build_program_from_source(const char *source,
 
     err = clBuildProgram(program, 1, &device, build_options, nullptr, nullptr);
     if (err != CL_SUCCESS) {
-        size_t log_size = 0;
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-        std::vector<char> log(std::max(log_size, size_t{1}));
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size(), log.data(),
-                              nullptr);
-        std::fprintf(stderr, "OpenCL build log:\n%s\n", log.data());
-        log_cl_error("clBuildProgram", err);
+        if (!quiet) {
+            size_t log_size = 0;
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+            std::vector<char> log(std::max(log_size, size_t{1}));
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size(), log.data(),
+                                  nullptr);
+            std::fprintf(stderr, "OpenCL build log:\n%s\n", log.data());
+            log_cl_error("clBuildProgram", err);
+        }
+        clReleaseProgram(program);
+        program = nullptr;
         return false;
     }
     return true;
 }
 
-bool OpenClContext::build_program_from_file(const char *cl_path,
-                                            const char *build_options) {
+bool OpenClContext::build_program_from_file(const char *cl_path, const char *build_options,
+                                            bool quiet) {
     const std::string source = read_text_file(cl_path);
     if (source.empty()) {
-        std::fprintf(stderr, "Failed to read OpenCL source: %s\n", cl_path);
+        if (!quiet) {
+            std::fprintf(stderr, "Failed to read OpenCL source: %s\n", cl_path);
+        }
         return false;
     }
-    return build_program_from_source(source.c_str(), build_options);
+    return build_program_from_source(source.c_str(), build_options, quiet);
 }
 
 #ifndef _WIN32
@@ -415,7 +492,8 @@ cl_mem OpenClContext::alloc_buffer(size_t bytes, cl_mem_flags flags) const {
     cl_int err = CL_SUCCESS;
     cl_mem buf = clCreateBuffer(context, flags, bytes, nullptr, &err);
     if (!buf || err != CL_SUCCESS) {
-        log_cl_error("clCreateBuffer", err);
+        std::fprintf(stderr, "OpenCL clCreateBuffer(%zu bytes) failed (%d): %s\n", bytes, err,
+                     error_string(err).c_str());
         return nullptr;
     }
     return buf;
