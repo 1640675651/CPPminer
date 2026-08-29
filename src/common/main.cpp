@@ -101,6 +101,10 @@ static void print_usage(void)
            ""
 #endif
            );
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("  --fused-jackpot       oneDNN Case 5.5 wrap-GRF fold in GEMM (future fused BLAKE)\n");
+    printf("  --no-fused-jackpot    oneDNN Case 5 GEMM + device fold/BLAKE jackpot (default)\n");
+#endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
@@ -223,6 +227,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
+    int onednn_fused_jackpot = 0;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
     int simd_env_invalid = 0;
@@ -399,6 +404,10 @@ int main(int argc, char** argv)
 #endif
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
+        } else if(!strcmp(argv[i], "--fused-jackpot")){
+            onednn_fused_jackpot = 1;
+        } else if(!strcmp(argv[i], "--no-fused-jackpot")){
+            onednn_fused_jackpot = 0;
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
@@ -728,6 +737,7 @@ int main(int argc, char** argv)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone. */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+        cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
         cp_onednn_worker_init(devs, ndev);
         cp_worker_apply_backend_defaults();
     }
@@ -812,11 +822,16 @@ int main(int argc, char** argv)
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-            printf("[mode] scan: oneDNN gemmstone GEMM + tile XOR + GPU jackpot\n");
+            const int tile_xor_words = onednn_fused_jackpot ? 16 : (K_DIM / R_RANK);
+            if(onednn_fused_jackpot){
+                printf("[mode] scan: oneDNN Case 5.5 GEMM (wrap-GRF fold) + GPU jackpot\n");
+            } else {
+                printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");
+            }
             printf("[mode] period batch: row=%d col=%d (~%.0f MiB tile_xor/panel on GPU)\n",
                    row_period_batch, period_batch,
                    (double)row_period_batch * (double)period_batch
-                   * (double)(K_DIM / R_RANK)
+                   * (double)tile_xor_words
                    * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
                    * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
             printf("[mode] host signal ~%.0f MiB; TNN buffers (row-major A, column-major B) on Intel GPU\n",

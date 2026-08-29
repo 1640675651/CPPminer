@@ -12,6 +12,7 @@ int cp_onednn_worker_is_ready(void);
 void cp_onednn_worker_shutdown(void);
 void cp_onednn_worker_set_row_period_batch(int batch);
 void cp_onednn_worker_set_col_period_batch(int batch);
+void cp_onednn_worker_set_fused_jackpot(int on);
 void cp_onednn_worker_set_platform(int platform_index);
 int cp_onednn_worker_list_devices(void);
 int cp_onednn_worker_handles_matrix_prep(void);

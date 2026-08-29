@@ -58,6 +58,7 @@ void cp_worker_set_row_period_batch(int batch);
 void cp_worker_set_col_period_batch(int batch);
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
+void cp_worker_set_onednn_fused_jackpot(int on);
 
 typedef enum {
     CP_PREPACK_SEPARATE = 0, /* row-major noisy + persistent a_pre_/b_pre_ */

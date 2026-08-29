@@ -143,7 +143,7 @@ void fill_xor_subtile_driver_info(DriverInfo &out, const XorSubtileDims &xsd) {
     out.xorOwnedN = xsd.ownedN;
 }
 
-GEMMProblem makeProblem(const Product &product, bool xor_nop) {
+GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot) {
     GEMMProblem problem;
     problem.Ta = problem.Ta_ext = Type::s8;
     problem.Tb = problem.Tb_ext = Type::s8;
@@ -162,10 +162,12 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop) {
     problem.product = product;
     problem.case5TileXor = true;
     problem.case5TileXorNop = xor_nop;
-    problem.case5TileXorWrapGrf = !xor_nop;
-    problem.case5TileXorWrap = !xor_nop;
-    problem.case5TileXorWrapGrfStoreMode = 2;
-    problem.case5TileXorWrapGrfStageUnified = true;
+    problem.case5TileXorWrapGrf = fused_jackpot && !xor_nop;
+    problem.case5TileXorWrap = fused_jackpot && !xor_nop;
+    if (problem.case5TileXorWrapGrf) {
+        problem.case5TileXorWrapGrfStoreMode = 2;
+        problem.case5TileXorWrapGrfStageUnified = true;
+    }
     return problem;
 }
 
@@ -238,10 +240,10 @@ void log_strategy_fallback(const char *chosen, const std::vector<std::string> &r
 template <HW hw>
 cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product product,
                                   const BuildParams &dims, DriverInfo *info, std::string *err,
-                                  bool xor_nop) {
+                                  bool xor_nop, bool fused_jackpot) {
     set_binary_packaging(hw, device);
 
-    auto problem = makeProblem(product, xor_nop);
+    auto problem = makeProblem(product, xor_nop, fused_jackpot);
     const auto selection = select_case5_candidates(hw, product, device, problem, dims);
     product.stepping = selection.stepping;
 
@@ -342,7 +344,8 @@ bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) 
 }
 
 cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildParams *dims,
-                             DriverInfo *info, std::string *err, bool xor_nop) {
+                             DriverInfo *info, std::string *err, bool xor_nop,
+                             bool fused_jackpot) {
     BuildParams build_dims;
     if (dims) {
         build_dims = *dims;
@@ -359,10 +362,10 @@ cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildPar
         switch (hw) {
         case HW::Gen12LP:
             return build_igemm_kernel_impl<HW::Gen12LP>(ctx, device, product, build_dims, info,
-                    err, xor_nop);
+                    err, xor_nop, fused_jackpot);
         case HW::XeHPG:
             return build_igemm_kernel_impl<HW::XeHPG>(ctx, device, product, build_dims, info, err,
-                    xor_nop);
+                    xor_nop, fused_jackpot);
         default:
             throw std::runtime_error("internal error: unsupported HW selection");
         }

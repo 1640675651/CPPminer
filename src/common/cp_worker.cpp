@@ -382,6 +382,16 @@ extern "C" void cp_worker_set_cutlass_fused(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_onednn_fused_jackpot(int on)
+{
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        cp_onednn_worker_set_fused_jackpot(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_set_prepack_mode(CpPrepackMode mode)
 {
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU

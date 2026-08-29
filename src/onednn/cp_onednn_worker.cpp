@@ -39,6 +39,7 @@ static int g_platform_filter = -1;
 static int g_context_ready = 0;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
+static int g_fused_jackpot = 0;
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n, int gpu_prep) {
     return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
@@ -202,6 +203,14 @@ extern "C" void cp_onednn_worker_set_col_period_batch(int batch) {
     g_gemm.set_col_period_batch(batch);
 }
 
+extern "C" void cp_onednn_worker_set_fused_jackpot(int on) {
+    if (g_context_ready) {
+        fprintf(stderr, "[onednn] set_fused_jackpot ignored after init\n");
+        return;
+    }
+    g_fused_jackpot = on ? 1 : 0;
+}
+
 extern "C" void cp_onednn_worker_set_platform(int platform_index) {
     g_platform_filter = platform_index;
 }
@@ -230,6 +239,7 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
 
     g_gemm.set_row_period_batch(g_row_period_batch);
     g_gemm.set_col_period_batch(g_col_period_batch);
+    g_gemm.set_fused_jackpot(g_fused_jackpot != 0);
     if (!g_gemm.init_context(g_device_index, g_platform_filter)) {
         fprintf(stderr, "[onednn] init failed (device=%d)\n", g_device_index);
         g_context_ready = 0;
