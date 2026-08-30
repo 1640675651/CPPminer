@@ -448,7 +448,7 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
         iface.newArgument("offset_Bq", DataType::q);
     }
 
-    // Fused Blake3: fold stays in wrap-GRF; only blake3_out is a global result buffer.
+    // Fused Blake3: fold in wrap-GRF; digests + per-tile beats + found/coords.
     if (!problem.case5TileXorBlake3) {
         iface.newArgument("tile_xor", ExternalArgumentType::GlobalPtr, c_access);
     }
@@ -461,8 +461,9 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
             iface.newArgument("blake3_k" + std::to_string(i), DataType::ud);
         }
         if (problem.case5FuseJackpot) {
-            // Bound via global buffer: scalar blake3_b* args read as garbage on Intel UHD/OpenCL.
-            iface.newArgument("blake3_bound", ExternalArgumentType::GlobalPtr,
+            iface.newArgument("blake3_beats", ExternalArgumentType::GlobalPtr,
+                              GlobalAccessType::Stateless);
+            iface.newArgument("blake3_cmp_dump", ExternalArgumentType::GlobalPtr,
                               GlobalAccessType::Stateless);
             iface.newArgument("found_flag", ExternalArgumentType::GlobalPtr,
                               GlobalAccessType::Stateless);
@@ -472,12 +473,15 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
                               GlobalAccessType::Stateless);
             iface.newArgument("tr_base", DataType::ud);
             iface.newArgument("tc_base", DataType::ud);
+            for (int i = 0; i < 8; i++) {
+                iface.newArgument("blake3_b" + std::to_string(i), DataType::ud);
+            }
         }
     }
 
-    if (hw >= HW::XeHPG) {
-        iface.allowArgumentRearrangement(false);
-    }
+    // Host bind_case5_kernel_args sets args in declaration order. Rearrangement on
+    // Gen12LP scrambled blake3_bound/found_flag and caused false jackpot claims.
+    iface.allowArgumentRearrangement(false);
     iface.externalName(kernel_name);
 }
 
@@ -638,12 +642,16 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
             err |= set_arg(kernel, arg, sizeof(uint32_t), &bufs.blake3_key_words[i]);
         }
         if (problem.case5FuseJackpot) {
-            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_bound);
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_beats);
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_cmp_dump);
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.found_flag);
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_rows);
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_cols);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tr_base);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tc_base);
+            for (int i = 0; i < 8; i++) {
+                err |= set_arg(kernel, arg, sizeof(uint32_t), &bufs.blake3_bound_words[i]);
+            }
         }
     }
 

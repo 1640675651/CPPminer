@@ -102,7 +102,7 @@ static void print_usage(void)
 #endif
            );
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
-    printf("  --fused-jackpot       oneDNN fused GEMM+XOR+BLAKE3+jackpot (no tile_xor global I/O)\n");
+    printf("  --fused-jackpot       oneDNN in-reg fold + flush + GPU jackpot (found flag only)\n");
     printf("  --no-fused-jackpot    oneDNN GEMM + separate device fold/BLAKE jackpot (default)\n");
 #endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
@@ -827,9 +827,7 @@ int main(int argc, char** argv)
                     (double)row_period_batch * (double)period_batch;
             if(onednn_fused_jackpot){
                 printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
-                printf("[mode] period batch: row=%d col=%d (~%.1f MiB digests/panel on GPU)\n",
-                       row_period_batch, period_batch,
-                       panel_tiles * 8.0 * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
+                printf("[mode] period batch: row=%d col=%d\n", row_period_batch, period_batch);
             } else {
                 const int tile_xor_words = K_DIM / R_RANK;
                 printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");

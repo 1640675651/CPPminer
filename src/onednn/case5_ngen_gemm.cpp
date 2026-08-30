@@ -162,13 +162,12 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot
     problem.product = product;
     problem.case5TileXor = true;
     problem.case5TileXorNop = xor_nop;
+    // Fused jackpot: in-reg fold + Case5.6 BLAKE3 + in-kernel compare (diagnostic dumps digests/beats).
     problem.case5TileXorWrapGrf = fused_jackpot && !xor_nop;
     problem.case5TileXorWrap = fused_jackpot && !xor_nop;
     problem.case5TileXorBlake3 = fused_jackpot && !xor_nop;
     problem.case5FuseJackpot = fused_jackpot && !xor_nop;
     if (problem.case5TileXorWrapGrf) {
-        // 0 = keep fold in wrap-GRF only (BLAKE3 path writes digests, not tile_xor).
-        // Non-Blake wrap-GRF uses storeMode 2 (epilogue flush) elsewhere.
         problem.case5TileXorWrapGrfStoreMode = problem.case5TileXorBlake3 ? 0 : 2;
         problem.case5TileXorWrapGrfStageUnified = true;
     }

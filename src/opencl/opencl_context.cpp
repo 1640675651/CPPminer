@@ -468,9 +468,9 @@ cl_kernel OpenClContext::create_kernel(const char *name) const {
     return kernel;
 }
 
-bool OpenClContext::write_buffer(cl_mem buf, const void *host, size_t bytes) const {
+bool OpenClContext::write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset) const {
     const cl_int err =
-            clEnqueueWriteBuffer(queue, buf, CL_TRUE, 0, bytes, host, 0, nullptr, nullptr);
+            clEnqueueWriteBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         log_cl_error("clEnqueueWriteBuffer", err);
         return false;
@@ -478,9 +478,9 @@ bool OpenClContext::write_buffer(cl_mem buf, const void *host, size_t bytes) con
     return true;
 }
 
-bool OpenClContext::read_buffer(cl_mem buf, void *host, size_t bytes) const {
+bool OpenClContext::read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset) const {
     const cl_int err =
-            clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bytes, host, 0, nullptr, nullptr);
+            clEnqueueReadBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         log_cl_error("clEnqueueReadBuffer", err);
         return false;

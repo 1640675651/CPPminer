@@ -35,9 +35,12 @@ struct LaunchBuffers {
     int tile_count = 0;
     int tile_cols = 0;
     int xor_period = 1;
-    cl_mem blake3_out = nullptr;
+    cl_mem blake3_out = nullptr;   // digest[spatial*8+w]
+    cl_mem blake3_beats = nullptr; // u32[spatial]: GPU digest_beats_target result
+    cl_mem blake3_cmp_dump = nullptr; // u32[spatial*16]: bound[0..7], cmp code[8..15] per tile
     uint32_t blake3_key_words[8] = {};
-    cl_mem blake3_bound = nullptr; // 8 u32 target; scalar bounds are unreliable on Intel OpenCL
+    uint32_t blake3_bound_words[8] = {};
+    cl_mem blake3_bound = nullptr; // optional legacy global bound buffer (unused by kernel)
     cl_mem found_flag = nullptr;
     cl_mem out_t_rows = nullptr;
     cl_mem out_t_cols = nullptr;

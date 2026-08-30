@@ -72,8 +72,8 @@ struct OpenClContext {
 
     cl_kernel create_kernel(const char *name) const;
 
-    bool write_buffer(cl_mem buf, const void *host, size_t bytes) const;
-    bool read_buffer(cl_mem buf, void *host, size_t bytes) const;
+    bool write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset = 0) const;
+    bool read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset = 0) const;
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
