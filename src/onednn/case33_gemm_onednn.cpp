@@ -424,8 +424,6 @@ void Case33GemmOnednn::dump_fused_jackpot_hit_(int t_rows, int t_cols) {
     std::fprintf(stderr, "[onednn] fused jackpot debug at t_rows=%d t_cols=%d (lr=%d lc=%d)\n",
                  t_rows, t_cols, lr, lc);
     if (hit_gpu_valid_) {
-        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg    = ", hit_gpu_msg_,
-                                             cp_jackpot::kJackpotWords);
         case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU digest = ", hit_gpu_digest_, 8);
         std::fprintf(stderr, "  GPU beats target = %s  (share decision)\n",
                      cp_jackpot::digest_beats_target(hit_gpu_digest_, scan_jackpot_bound_) ? "yes"
@@ -458,8 +456,9 @@ void Case33GemmOnednn::dump_fused_jackpot_hit_(int t_rows, int t_cols) {
     std::fprintf(stderr, "  CPU beats target = %s  (A×B host ref)\n",
                  cp_jackpot::digest_beats_target(cpu_digest, scan_jackpot_bound_) ? "yes" : "no");
     if (hit_gpu_valid_) {
-        std::fprintf(stderr, "  GPU msg == CPU msg = %s\n",
-                     std::memcmp(hit_gpu_msg_, cpu_msg, sizeof(hit_gpu_msg_)) == 0 ? "yes" : "no");
+        std::fprintf(stderr, "  GPU digest == CPU digest = %s\n",
+                     std::memcmp(hit_gpu_digest_, cpu_digest, sizeof(hit_gpu_digest_)) == 0 ? "yes"
+                                                                                            : "no");
     }
     std::fflush(stderr);
 }
@@ -677,10 +676,11 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     if (!available_ || !kernel_) {
         return false;
     }
-    if (!tile_xor_buf_) {
-        return false;
-    }
-    if (fused_jackpot_ && !digest_buf_) {
+    if (fused_jackpot_) {
+        if (!digest_buf_) {
+            return false;
+        }
+    } else if (!tile_xor_buf_) {
         return false;
     }
 
@@ -688,7 +688,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     bufs.a = a_buf_;
     bufs.b = b_buf_;
     bufs.c = c_buf_;
-    bufs.tile_xor = tile_xor_buf_;
+    bufs.tile_xor = fused_jackpot_ ? nullptr : tile_xor_buf_;
     bufs.offset_a = offset_a_rows * static_cast<int64_t>(lda_);
     bufs.offset_b = offset_b_cols;
     bufs.offset_c = 0;
@@ -895,20 +895,14 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
         int *out_t_cols, uint64_t *out_tiles_scanned,
         const std::function<bool()> &should_cancel,
         const std::function<void(uint64_t)> &on_progress) {
-    if (!digest_buf_ || !tile_xor_buf_ || panel_tile_count <= 0) {
+    if (!digest_buf_ || panel_tile_count <= 0) {
         return false;
     }
     const size_t digest_words = static_cast<size_t>(8) * static_cast<size_t>(panel_tile_count);
-    const size_t msg_words =
-            static_cast<size_t>(folded_msg_words_) * static_cast<size_t>(panel_tile_count);
     if (digest_host_.size() < digest_words) {
         digest_host_.resize(digest_words);
     }
-    if (tile_xor_host_.size() < msg_words) {
-        tile_xor_host_.resize(msg_words);
-    }
-    if (!ocl_.read_buffer(digest_buf_, digest_host_.data(), digest_words * sizeof(uint32_t)) ||
-        !ocl_.read_buffer(tile_xor_buf_, tile_xor_host_.data(), msg_words * sizeof(uint32_t))) {
+    if (!ocl_.read_buffer(digest_buf_, digest_host_.data(), digest_words * sizeof(uint32_t))) {
         return false;
     }
 
@@ -926,15 +920,15 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
         a_scratch.resize(static_cast<size_t>(lda_) * static_cast<size_t>(M_));
         b_scratch.resize(static_cast<size_t>(ldb_) * static_cast<size_t>(N_));
     }
-    const bool have_ab = verify_gpu && read_A_sig(a_scratch.data()) &&
-                         ocl_.read_buffer(b_buf_, b_scratch.data(),
-                                          b_scratch.size() * sizeof(int8_t));
+    const bool have_ab =
+            verify_gpu &&
+            ocl_.read_buffer(a_buf_, a_scratch.data(), a_scratch.size() * sizeof(int8_t)) &&
+            ocl_.read_buffer(b_buf_, b_scratch.data(), b_scratch.size() * sizeof(int8_t));
 
     uint64_t tiles_scanned = out_tiles_scanned ? *out_tiles_scanned : 0;
     int found = 0;
     int hit_rows = -1;
     int hit_cols = -1;
-    int msg_mismatches = 0;
     int digest_mismatches = 0;
 
     for (int tr = 0; tr < panel_tile_rows && !found; ++tr) {
@@ -949,12 +943,7 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
                     static_cast<size_t>(tr) * static_cast<size_t>(panel_tile_cols) +
                     static_cast<size_t>(tc);
 
-            uint32_t gpu_msg[cp_jackpot::kJackpotWords] = {};
             uint32_t gpu_digest[8] = {};
-            for (int w = 0; w < folded_msg_words_; ++w) {
-                gpu_msg[w] = tile_xor_host_[static_cast<size_t>(w) * static_cast<size_t>(panel_tile_count) +
-                                            spatial_id];
-            }
             for (int w = 0; w < 8; ++w) {
                 gpu_digest[w] = digest_host_[spatial_id * 8 + static_cast<size_t>(w)];
             }
@@ -966,21 +955,6 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
 
             const int lr = tr_base + tr;
             const int lc = tc_base + tc;
-            uint32_t cpu_digest[8] = {};
-            cp_jackpot::b3_compress64(a_key8, gpu_msg, cpu_digest);
-            if (std::memcmp(gpu_digest, cpu_digest, sizeof(gpu_digest)) != 0) {
-                ++digest_mismatches;
-                if (digest_mismatches <= 3) {
-                    std::fprintf(stderr,
-                                 "[onednn] case5.6 digest mismatch at lr=%d lc=%d (spatial=%zu)\n",
-                                 lr, lc, spatial_id);
-                    case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU digest = ", gpu_digest, 8);
-                    case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU digest = ", cpu_digest, 8);
-                    case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg    = ", gpu_msg,
-                                                         cp_jackpot::kJackpotWords);
-                }
-                continue;
-            }
 
             if (have_ab) {
                 uint32_t cpu_msg[cp_jackpot::kJackpotWords] = {};
@@ -990,16 +964,16 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
                         milestone_k_, info_.unrollM, info_.unrollN, info_.xorSubM, info_.xorSubN,
                         info_.xorSubGridM, info_.xorSubGridN, lr, lc, a_key8, nullptr, cpu_msg,
                         cpu_ref_digest);
-                if (std::memcmp(gpu_msg, cpu_msg, sizeof(gpu_msg)) != 0) {
-                    ++msg_mismatches;
-                    if (msg_mismatches <= 3) {
+                if (std::memcmp(gpu_digest, cpu_ref_digest, sizeof(gpu_digest)) != 0) {
+                    ++digest_mismatches;
+                    if (digest_mismatches <= 3) {
                         std::fprintf(stderr,
-                                     "[onednn] fused msg mismatch at lr=%d lc=%d (spatial=%zu)\n",
+                                     "[onednn] fused digest mismatch at lr=%d lc=%d (spatial=%zu)\n",
                                      lr, lc, spatial_id);
-                        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg = ", gpu_msg,
-                                                             cp_jackpot::kJackpotWords);
-                        case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU msg = ", cpu_msg,
-                                                             cp_jackpot::kJackpotWords);
+                        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU digest = ", gpu_digest,
+                                                             8);
+                        case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU digest = ",
+                                                             cpu_ref_digest, 8);
                     }
                     continue;
                 }
@@ -1009,7 +983,7 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
                 continue;
             }
 
-            std::memcpy(hit_gpu_msg_, gpu_msg, sizeof(hit_gpu_msg_));
+            std::memset(hit_gpu_msg_, 0, sizeof(hit_gpu_msg_));
             std::memcpy(hit_gpu_digest_, gpu_digest, sizeof(hit_gpu_digest_));
             hit_gpu_valid_ = true;
 
@@ -1019,14 +993,13 @@ bool Case33GemmOnednn::scan_digest_panel_host_(
         }
     }
 
-    if (msg_mismatches > 0 || digest_mismatches > 0) {
+    if (digest_mismatches > 0) {
         std::fprintf(stderr,
-                     "[onednn] fused panel verify: msg_mismatches=%d digest_mismatches=%d "
-                     "(logged first 3 each)\n",
-                     msg_mismatches, digest_mismatches);
-    } else if (panel_tile_count > 0) {
+                     "[onednn] fused panel verify: digest_mismatches=%d (logged first 3)\n",
+                     digest_mismatches);
+    } else if (have_ab && panel_tile_count > 0) {
         std::fprintf(stderr,
-                     "[onednn] case5.6 GPU BLAKE3 matches CPU compress(msg) on %d tiles\n",
+                     "[onednn] fused GPU digests match A×B host ref on %d tiles\n",
                      panel_tile_count);
     }
 
@@ -1207,9 +1180,6 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             compute_tile_grid_(m_panel, n_panel, panel_tile_rows, panel_tile_cols, panel_tile_count);
 
             if (fused_jackpot_) {
-                if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {
-                    return false;
-                }
                 if (!ensure_panel_digest_bufs_(panel_tile_count)) {
                     return false;
                 }

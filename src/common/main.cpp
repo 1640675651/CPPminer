@@ -822,18 +822,22 @@ int main(int argc, char** argv)
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-            const int tile_xor_words = onednn_fused_jackpot ? 16 : (K_DIM / R_RANK);
+            /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
+            const double panel_tiles =
+                    (double)row_period_batch * (double)period_batch;
             if(onednn_fused_jackpot){
-                printf("[mode] scan: oneDNN fused GEMM + XOR + BLAKE3 + device jackpot\n");
+                printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3; CPU digests judge\n");
+                printf("[mode] period batch: row=%d col=%d (~%.1f MiB digests/panel on GPU)\n",
+                       row_period_batch, period_batch,
+                       panel_tiles * 8.0 * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
             } else {
+                const int tile_xor_words = K_DIM / R_RANK;
                 printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");
+                printf("[mode] period batch: row=%d col=%d (~%.1f MiB tile_xor/panel on GPU)\n",
+                       row_period_batch, period_batch,
+                       panel_tiles * (double)tile_xor_words * (double)sizeof(uint32_t)
+                               / (1024.0 * 1024.0));
             }
-            printf("[mode] period batch: row=%d col=%d (~%.0f MiB tile_xor/panel on GPU)\n",
-                   row_period_batch, period_batch,
-                   (double)row_period_batch * (double)period_batch
-                   * (double)tile_xor_words
-                   * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
-                   * (double)sizeof(uint32_t) / (1024.0 * 1024.0));
             printf("[mode] host signal ~%.0f MiB; TNN buffers (row-major A, column-major B) on Intel GPU\n",
                    host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){

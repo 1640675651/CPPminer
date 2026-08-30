@@ -167,7 +167,9 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot
     problem.case5TileXorBlake3 = fused_jackpot && !xor_nop;
     problem.case5FuseJackpot = fused_jackpot && !xor_nop;
     if (problem.case5TileXorWrapGrf) {
-        problem.case5TileXorWrapGrfStoreMode = 2;
+        // 0 = keep fold in wrap-GRF only (BLAKE3 path writes digests, not tile_xor).
+        // Non-Blake wrap-GRF uses storeMode 2 (epilogue flush) elsewhere.
+        problem.case5TileXorWrapGrfStoreMode = problem.case5TileXorBlake3 ? 0 : 2;
         problem.case5TileXorWrapGrfStageUnified = true;
     }
     return problem;

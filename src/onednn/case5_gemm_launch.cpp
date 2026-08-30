@@ -448,7 +448,10 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
         iface.newArgument("offset_Bq", DataType::q);
     }
 
-    iface.newArgument("tile_xor", ExternalArgumentType::GlobalPtr, c_access);
+    // Fused Blake3: fold stays in wrap-GRF; only blake3_out is a global result buffer.
+    if (!problem.case5TileXorBlake3) {
+        iface.newArgument("tile_xor", ExternalArgumentType::GlobalPtr, c_access);
+    }
     iface.newArgument("tile_count", DataType::d);
     iface.newArgument("tile_cols", DataType::d);
     iface.newArgument("xor_period", DataType::d);
@@ -610,7 +613,9 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
         err |= CL_INVALID_ARG_VALUE;
     }
 
-    err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.tile_xor);
+    if (!problem.case5TileXorBlake3) {
+        err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.tile_xor);
+    }
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_count);
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_cols);
     err |= set_arg(kernel, arg, sizeof(int), &bufs.xor_period);
