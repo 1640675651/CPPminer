@@ -137,3 +137,24 @@ __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_mile
         *out_t_cols = t_cols;
     }
 }
+
+/* GPU BLAKE3 on folded tile_xor panel; digest layout w*tile_count+sid. CPU judges difficulty. */
+__kernel void cp_onednn_blake3_panel(__global const uint *tile_xor, int num_words, int tile_count,
+                                       __global const uint *a_key8, __global uint *digest_out) {
+    const int sid = get_global_id(0);
+    if (sid >= tile_count || num_words <= 0) {
+        return;
+    }
+    uint msg[PP_JACKPOT_WORDS];
+    for (int w = 0; w < num_words && w < PP_JACKPOT_WORDS; ++w) {
+        msg[w] = tile_xor[(size_t)w * (size_t)tile_count + (size_t)sid];
+    }
+    for (int w = num_words; w < PP_JACKPOT_WORDS; ++w) {
+        msg[w] = 0u;
+    }
+    uint digest[8];
+    b3_compress64(a_key8, msg, digest);
+    for (int w = 0; w < 8; ++w) {
+        digest_out[(size_t)w * (size_t)tile_count + (size_t)sid] = digest[w];
+    }
+}

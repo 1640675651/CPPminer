@@ -35,6 +35,8 @@ struct LaunchBuffers {
     int tile_count = 0;
     int tile_cols = 0;
     int xor_period = 1;
+    cl_mem blake3_out = nullptr;
+    uint32_t blake3_key_words[8] = {};
 };
 
 struct LaunchDims {
@@ -51,6 +53,8 @@ LaunchDims compute_case5_launch_dims(const DriverInfo &info, int m, int n);
 
 void case5_launch_dims_for_walk_order(const LaunchDims &dims, int subgroup_size,
         size_t wg_gws[2], size_t wg_lws[2]);
+
+void apply_linear_order_launch_dims(const DriverInfo &info, LaunchDims &dims, int m, int n, int k);
 
 cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
         const gemmstone::GEMMProblem &problem, const LaunchBuffers &bufs,

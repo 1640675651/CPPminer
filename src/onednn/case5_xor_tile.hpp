@@ -132,6 +132,74 @@ inline void case5_thread_c_origin(int id_m, int id_n, int unroll_m, int unroll_n
     col0 = id_n * unroll_n;
 }
 
+// CPU reference for one hash tile: milestone XORs, folded msg, BLAKE3 digest (matches cp_jackpot).
+// A is row-major (lda>=K); B is column-major (ldb>=K), same layout as Case33GemmOnednn device buffers.
+inline void compute_single_hash_tile_jackpot(
+        const int8_t *a, int lda, const int8_t *b_colmajor, int ldb, int M, int N, int K,
+        int num_ms, int milestone_k, int unroll_m, int unroll_n, int sub_m, int sub_n,
+        int sub_grid_m, int sub_grid_n, int lr, int lc, const uint32_t key8[8],
+        uint32_t out_milestones[], uint32_t out_msg[cp_jackpot::kJackpotWords],
+        uint32_t out_digest[8]) {
+    const int id_m = lr / sub_grid_m;
+    const int sr = lr % sub_grid_m;
+    const int id_n = lc / sub_grid_n;
+    const int sc = lc % sub_grid_n;
+
+    int row0 = 0;
+    int col0 = 0;
+    case5_thread_c_origin(id_m, id_n, unroll_m, unroll_n, row0, col0);
+
+    const int row0_sub = row0 + sr * sub_m;
+    const int col0_sub = col0 + sc * sub_n;
+    const int n_cells = sub_m * sub_n;
+    std::vector<int32_t> cell_c(static_cast<size_t>(n_cells), 0);
+    uint32_t local_ms[64] = {};
+    uint32_t *ms_buf = out_milestones ? out_milestones : local_ms;
+
+    for (int ms = 0; ms < num_ms; ++ms) {
+        const int k_begin = ms * milestone_k;
+        const int k_end = (ms + 1) * milestone_k;
+        for (int k = k_begin; k < k_end; ++k) {
+            int idx = 0;
+            for (int i = 0; i < sub_m; ++i) {
+                for (int j = 0; j < sub_n; ++j) {
+                    const int gr = row0_sub + i;
+                    const int gc = col0_sub + j;
+                    if (gr < 0 || gr >= M || gc < 0 || gc >= N) {
+                        ++idx;
+                        continue;
+                    }
+                    const int32_t av = static_cast<int32_t>(a[static_cast<size_t>(gr) * lda + k]);
+                    const int32_t bv =
+                            static_cast<int32_t>(b_colmajor[static_cast<size_t>(gc) * ldb + k]);
+                    cell_c[static_cast<size_t>(idx)] += av * bv;
+                    ++idx;
+                }
+            }
+        }
+
+        uint32_t x = 0u;
+        for (int i = 0; i < n_cells; ++i) {
+            uint32_t u = 0u;
+            std::memcpy(&u, &cell_c[static_cast<size_t>(i)], sizeof(u));
+            x ^= u;
+        }
+        ms_buf[ms] = x;
+    }
+
+    cp_jackpot::fold_milestones(ms_buf, num_ms, out_msg);
+    cp_jackpot::b3_compress64(key8, out_msg, out_digest);
+}
+
+inline void fprint_jackpot_words_hex(FILE *out, const char *label, const uint32_t *words,
+                                     int count) {
+    std::fprintf(out, "%s", label);
+    for (int i = 0; i < count; ++i) {
+        std::fprintf(out, "%08x", words[i]);
+    }
+    std::fprintf(out, "\n");
+}
+
 // Set CASE5_DUMP_TILE_XOR=1 to print tile_xor[ms * tile_count + lr * tile_cols + lc] after readback.
 // Optional CASE5_DUMP_TILE_XOR_VERBOSE=1 lists every non-zero slot with (ms, lr, lc, idx).
 inline bool case5_dump_tile_xor_enabled() {

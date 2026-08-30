@@ -49,23 +49,34 @@ private:
                             int &out_tile_count) const;
     bool ensure_matrix_bufs_();
     bool ensure_panel_tile_xor_buf_(int panel_tile_count);
+    bool ensure_panel_digest_bufs_(int panel_tile_count);
     bool build_jackpot_kernel_();
     bool ensure_jackpot_bufs_();
+    void dump_fused_jackpot_hit_(int t_rows, int t_cols);
     bool upload_a_rowmajor_(const int8_t *a_rowmajor);
     bool upload_b_colmajor_(const int8_t *b_rowmajor);
     bool run_gemm_panel_(int m_panel, int n_panel, int64_t offset_a_rows, int64_t offset_b_cols,
-                         int panel_tile_count, int panel_tile_cols, bool finish_queue);
+                         int panel_tile_count, int panel_tile_cols, int tr_base, int tc_base,
+                         bool finish_queue, int *out_found = nullptr);
     bool run_gpu_jackpot_panel_(int panel_tile_count, int panel_tile_cols, int tr_base,
                                 int tc_base, int *out_found, bool finish_queue);
+    bool run_gpu_blake3_panel_(int panel_tile_count, bool finish_queue);
     bool run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t offset_a_rows,
                                  int64_t offset_b_cols, int panel_tile_count, int panel_tile_cols,
-                                 int tr_base, int tc_base, int *out_found);
+                                 int tr_base, int tc_base, int *out_found, int *out_t_rows = nullptr,
+                                 int *out_t_cols = nullptr);
     bool scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
                                    int panel_tile_rows, int panel_tile_cols, int panel_tile_count,
                                    int tr_base, int tc_base, int *out_found, int *out_t_rows,
                                    int *out_t_cols, uint64_t *out_tiles_scanned,
                                    const std::function<bool()> &should_cancel,
                                    const std::function<void(uint64_t)> &on_progress);
+    bool scan_digest_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
+                                 int panel_tile_rows, int panel_tile_cols, int panel_tile_count,
+                                 int tr_base, int tc_base, int *out_found, int *out_t_rows,
+                                 int *out_t_cols, uint64_t *out_tiles_scanned,
+                                 const std::function<bool()> &should_cancel,
+                                 const std::function<void(uint64_t)> &on_progress);
 
     bool context_ready_ = false;
     bool available_ = false;
@@ -87,6 +98,11 @@ private:
     int folded_msg_words_ = 0;
     int milestone_k_ = 128;
     bool fused_jackpot_ = false;
+    uint32_t scan_jackpot_key_[8] = {};
+    uint32_t scan_jackpot_bound_[8] = {};
+    uint32_t hit_gpu_msg_[16] = {};
+    uint32_t hit_gpu_digest_[8] = {};
+    bool hit_gpu_valid_ = false;
     int xor_period_ = 1;
     int row_period_batch_ = CP_ROW_PERIOD_BATCH_DEFAULT;
     int col_period_batch_ = CP_PERIOD_BATCH_DEFAULT;
@@ -99,8 +115,10 @@ private:
     cl_mem b_buf_ = nullptr;
     cl_mem c_buf_ = nullptr;
     cl_mem tile_xor_buf_ = nullptr;
+    cl_mem digest_buf_ = nullptr;
     cl_program jackpot_program_ = nullptr;
     cl_kernel jackpot_kernel_ = nullptr;
+    cl_kernel blake3_kernel_ = nullptr;
     cl_mem a_key_buf_ = nullptr;
     cl_mem bound_buf_ = nullptr;
     cl_mem found_buf_ = nullptr;
@@ -110,9 +128,11 @@ private:
     size_t a_buf_bytes_ = 0;
     size_t b_buf_bytes_ = 0;
     int panel_tile_xor_cap_ = 0;
+    int panel_digest_cap_ = 0;
     bool jackpot_ready_ = false;
 
     std::vector<uint32_t> tile_xor_host_;
+    std::vector<uint32_t> digest_host_;
     std::vector<int8_t> a_host_;
     std::vector<int8_t> b_host_;
     std::vector<int8_t> pack_scratch_;

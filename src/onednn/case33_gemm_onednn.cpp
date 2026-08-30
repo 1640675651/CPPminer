@@ -1,6 +1,7 @@
 #include "case33_gemm_onednn.hpp"
 
 #include "case5_gemm_launch.hpp"
+#include "case5_xor_tile.hpp"
 #include "cp_config.h"
 #include "cp_jackpot.hpp"
 #include "cp_state.h"
@@ -85,6 +86,10 @@ Case33GemmOnednn::~Case33GemmOnednn() {
         clReleaseKernel(jackpot_kernel_);
         jackpot_kernel_ = nullptr;
     }
+    if (blake3_kernel_) {
+        clReleaseKernel(blake3_kernel_);
+        blake3_kernel_ = nullptr;
+    }
     if (jackpot_program_) {
         clReleaseProgram(jackpot_program_);
         jackpot_program_ = nullptr;
@@ -128,6 +133,10 @@ Case33GemmOnednn::~Case33GemmOnednn() {
     if (tile_xor_buf_) {
         clReleaseMemObject(tile_xor_buf_);
         tile_xor_buf_ = nullptr;
+    }
+    if (digest_buf_) {
+        clReleaseMemObject(digest_buf_);
+        digest_buf_ = nullptr;
     }
 }
 
@@ -303,11 +312,40 @@ bool Case33GemmOnednn::ensure_panel_tile_xor_buf_(int panel_tile_count) {
     return true;
 }
 
+bool Case33GemmOnednn::ensure_panel_digest_bufs_(int panel_tile_count) {
+    if (panel_tile_count <= 0) {
+        return false;
+    }
+    if (digest_buf_ && panel_digest_cap_ >= panel_tile_count) {
+        return true;
+    }
+    if (digest_buf_) {
+        clReleaseMemObject(digest_buf_);
+        digest_buf_ = nullptr;
+    }
+    const size_t digest_bytes =
+            static_cast<size_t>(8) * static_cast<size_t>(panel_tile_count) * sizeof(uint32_t);
+    digest_buf_ = ocl_.alloc_buffer(digest_bytes, CL_MEM_READ_WRITE);
+    if (!digest_buf_) {
+        std::fprintf(stderr,
+                     "[onednn] failed to allocate fused digest panel buffer (%zu bytes, %d tiles)\n",
+                     digest_bytes, panel_tile_count);
+        return false;
+    }
+    panel_digest_cap_ = panel_tile_count;
+    digest_host_.assign(static_cast<size_t>(8) * static_cast<size_t>(panel_tile_count), 0u);
+    return true;
+}
+
 bool Case33GemmOnednn::build_jackpot_kernel_() {
     jackpot_ready_ = false;
     if (jackpot_kernel_) {
         clReleaseKernel(jackpot_kernel_);
         jackpot_kernel_ = nullptr;
+    }
+    if (blake3_kernel_) {
+        clReleaseKernel(blake3_kernel_);
+        blake3_kernel_ = nullptr;
     }
     if (jackpot_program_) {
         clReleaseProgram(jackpot_program_);
@@ -338,6 +376,11 @@ bool Case33GemmOnednn::build_jackpot_kernel_() {
         std::fprintf(stderr, "[onednn] failed to create cp_onednn_jackpot_scan kernel\n");
         return false;
     }
+    blake3_kernel_ = clCreateKernel(jackpot_program_, "cp_onednn_blake3_panel", nullptr);
+    if (!blake3_kernel_) {
+        std::fprintf(stderr, "[onednn] failed to create cp_onednn_blake3_panel kernel\n");
+        return false;
+    }
     jackpot_ready_ = true;
     return true;
 }
@@ -359,6 +402,66 @@ bool Case33GemmOnednn::ensure_jackpot_bufs_() {
         out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
     }
     return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
+}
+
+void Case33GemmOnednn::dump_fused_jackpot_hit_(int t_rows, int t_cols) {
+    if (!fused_jackpot_) {
+        return;
+    }
+
+    const int hash_mr = info_.xorSubM;
+    const int hash_nr = info_.xorSubN;
+    if (hash_mr <= 0 || hash_nr <= 0 || (t_rows % hash_mr) != 0 || (t_cols % hash_nr) != 0) {
+        std::fprintf(stderr,
+                     "[onednn] fused jackpot debug: invalid hit coords t_rows=%d t_cols=%d "
+                     "(hash_mr=%d hash_nr=%d)\n",
+                     t_rows, t_cols, hash_mr, hash_nr);
+        return;
+    }
+    const int lr = t_rows / hash_mr;
+    const int lc = t_cols / hash_nr;
+
+    std::fprintf(stderr, "[onednn] fused jackpot debug at t_rows=%d t_cols=%d (lr=%d lc=%d)\n",
+                 t_rows, t_cols, lr, lc);
+    if (hit_gpu_valid_) {
+        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg    = ", hit_gpu_msg_,
+                                             cp_jackpot::kJackpotWords);
+        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU digest = ", hit_gpu_digest_, 8);
+        std::fprintf(stderr, "  GPU beats target = %s  (share decision)\n",
+                     cp_jackpot::digest_beats_target(hit_gpu_digest_, scan_jackpot_bound_) ? "yes"
+                                                                                          : "no");
+    }
+
+    // Must use the same matrices as GEMM: noisy A in a_buf_ (lda_), not clean d_A_sig_.
+    std::vector<int8_t> a_scratch(static_cast<size_t>(lda_) * static_cast<size_t>(M_));
+    std::vector<int8_t> b_scratch(static_cast<size_t>(ldb_) * static_cast<size_t>(N_));
+    if (!ocl_.read_buffer(a_buf_, a_scratch.data(), a_scratch.size() * sizeof(int8_t))) {
+        std::fprintf(stderr, "[onednn] fused jackpot debug: failed to read A (noisy) from device\n");
+        return;
+    }
+    if (!ocl_.read_buffer(b_buf_, b_scratch.data(), b_scratch.size() * sizeof(int8_t))) {
+        std::fprintf(stderr, "[onednn] fused jackpot debug: failed to read B from device\n");
+        return;
+    }
+
+    uint32_t milestones[K_DIM / R_RANK] = {};
+    uint32_t cpu_msg[cp_jackpot::kJackpotWords] = {};
+    uint32_t cpu_digest[8] = {};
+    case5_ngen::compute_single_hash_tile_jackpot(
+            a_scratch.data(), lda_, b_scratch.data(), ldb_, M_, N_, K_, num_milestones_,
+            milestone_k_, info_.unrollM, info_.unrollN, info_.xorSubM, info_.xorSubN,
+            info_.xorSubGridM, info_.xorSubGridN, lr, lc, scan_jackpot_key_, milestones, cpu_msg,
+            cpu_digest);
+
+    case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU msg    = ", cpu_msg, cp_jackpot::kJackpotWords);
+    case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU digest = ", cpu_digest, 8);
+    std::fprintf(stderr, "  CPU beats target = %s  (A×B host ref)\n",
+                 cp_jackpot::digest_beats_target(cpu_digest, scan_jackpot_bound_) ? "yes" : "no");
+    if (hit_gpu_valid_) {
+        std::fprintf(stderr, "  GPU msg == CPU msg = %s\n",
+                     std::memcmp(hit_gpu_msg_, cpu_msg, sizeof(hit_gpu_msg_)) == 0 ? "yes" : "no");
+    }
+    std::fflush(stderr);
 }
 
 bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
@@ -439,7 +542,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
     const char *scan_mode =
-            fused_jackpot_ ? "igemm+wrapGRF+GPUjackpot" : "igemm+tileXOR+GPUjackpot";
+            fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+cpuJudge" : "igemm+tileXOR+GPUjackpot";
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s unroll %dx%d xor %dx%d wg %dx%d "
                   "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
@@ -569,8 +672,15 @@ bool Case33GemmOnednn::read_A_sig(int8_t *h_A_sig) {
 
 bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_a_rows,
                                        int64_t offset_b_cols, int panel_tile_count,
-                                       int panel_tile_cols, bool finish_queue) {
-    if (!available_ || !kernel_ || !tile_xor_buf_) {
+                                       int panel_tile_cols, int tr_base, int tc_base,
+                                       bool finish_queue, int *out_found) {
+    if (!available_ || !kernel_) {
+        return false;
+    }
+    if (!tile_xor_buf_) {
+        return false;
+    }
+    if (fused_jackpot_ && !digest_buf_) {
         return false;
     }
 
@@ -591,6 +701,10 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     bufs.tile_count = panel_tile_count;
     bufs.tile_cols = panel_tile_cols;
     bufs.xor_period = xor_period_;
+    if (fused_jackpot_) {
+        bufs.blake3_out = digest_buf_;
+        std::memcpy(bufs.blake3_key_words, scan_jackpot_key_, sizeof(bufs.blake3_key_words));
+    }
 
     gemmstone::GEMMProblem problem;
     problem.Ta = problem.Ta_ext = gemmstone::Type::s8;
@@ -601,6 +715,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     problem.beta = 0;
     problem.case5TileXor = true;
     problem.case5TileXorNop = false;
+    problem.case5FuseJackpot = fused_jackpot_;
+    problem.case5TileXorBlake3 = fused_jackpot_;
     problem.A.layout = gemmstone::MatrixLayout::T;
     problem.B.layout = gemmstone::MatrixLayout::N;
     problem.C.layout = gemmstone::MatrixLayout::N;
@@ -624,7 +740,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     if (finish_queue) {
         err = clFinish(ocl_.queue);
         if (err != CL_SUCCESS) {
-            std::fprintf(stderr, "[onednn] clFinish failed (%d)\n", err);
+            std::fprintf(stderr, "[onednn] clFinish failed (%d): %s\n", err,
+                         OpenClContext::error_string(err).c_str());
             return false;
         }
     }
@@ -701,17 +818,231 @@ bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_ti
     return true;
 }
 
+bool Case33GemmOnednn::run_gpu_blake3_panel_(int panel_tile_count, bool finish_queue) {
+    if (!jackpot_ready_ || !blake3_kernel_ || !tile_xor_buf_ || !digest_buf_ || panel_tile_count <= 0) {
+        return false;
+    }
+    if (!ensure_jackpot_bufs_()) {
+        return false;
+    }
+    if (!ocl_.write_buffer(a_key_buf_, scan_jackpot_key_, 8 * sizeof(uint32_t))) {
+        return false;
+    }
+
+    const int num_words = folded_msg_words_;
+    cl_int err = CL_SUCCESS;
+    int arg = 0;
+    err |= clSetKernelArg(blake3_kernel_, arg++, sizeof(cl_mem), &tile_xor_buf_);
+    err |= clSetKernelArg(blake3_kernel_, arg++, sizeof(int), &num_words);
+    err |= clSetKernelArg(blake3_kernel_, arg++, sizeof(int), &panel_tile_count);
+    err |= clSetKernelArg(blake3_kernel_, arg++, sizeof(cl_mem), &a_key_buf_);
+    err |= clSetKernelArg(blake3_kernel_, arg++, sizeof(cl_mem), &digest_buf_);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[onednn] blake3 clSetKernelArg failed (%d)\n", err);
+        return false;
+    }
+
+    size_t local = 256;
+    if (static_cast<size_t>(panel_tile_count) < local) {
+        local = static_cast<size_t>(panel_tile_count);
+    }
+    while (local > 1 && (static_cast<size_t>(panel_tile_count) % local) != 0) {
+        local >>= 1;
+    }
+    const size_t global = static_cast<size_t>(panel_tile_count);
+    err = clEnqueueNDRangeKernel(ocl_.queue, blake3_kernel_, 1, nullptr, &global,
+                                 local > 1 ? &local : nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[onednn] blake3 enqueue failed (%d): %s\n", err,
+                     OpenClContext::error_string(err).c_str());
+        return false;
+    }
+    if (finish_queue) {
+        err = clFinish(ocl_.queue);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[onednn] blake3 clFinish failed (%d)\n", err);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t offset_a_rows,
                                                int64_t offset_b_cols, int panel_tile_count,
                                                int panel_tile_cols, int tr_base, int tc_base,
-                                               int *out_found) {
+                                               int *out_found, int *out_t_rows, int *out_t_cols) {
     if (!run_gemm_panel_(m_panel, n_panel, offset_a_rows, offset_b_cols, panel_tile_count,
-                         panel_tile_cols, false)) {
+                         panel_tile_cols, tr_base, tc_base, fused_jackpot_, nullptr)) {
         return false;
+    }
+    if (fused_jackpot_) {
+        const int panel_tile_rows =
+                panel_tile_cols > 0 ? panel_tile_count / panel_tile_cols : panel_tile_count;
+        return scan_digest_panel_host_(scan_jackpot_key_, scan_jackpot_bound_, panel_tile_rows,
+                                       panel_tile_cols, panel_tile_count, tr_base, tc_base,
+                                       out_found, out_t_rows, out_t_cols, nullptr, {}, {});
     }
     if (!run_gpu_jackpot_panel_(panel_tile_count, panel_tile_cols, tr_base, tc_base, out_found,
                                 true)) {
         return false;
+    }
+    return true;
+}
+
+bool Case33GemmOnednn::scan_digest_panel_host_(
+        const uint32_t a_key8[8], const uint32_t bound[8], int panel_tile_rows, int panel_tile_cols,
+        int panel_tile_count, int tr_base, int tc_base, int *out_found, int *out_t_rows,
+        int *out_t_cols, uint64_t *out_tiles_scanned,
+        const std::function<bool()> &should_cancel,
+        const std::function<void(uint64_t)> &on_progress) {
+    if (!digest_buf_ || !tile_xor_buf_ || panel_tile_count <= 0) {
+        return false;
+    }
+    const size_t digest_words = static_cast<size_t>(8) * static_cast<size_t>(panel_tile_count);
+    const size_t msg_words =
+            static_cast<size_t>(folded_msg_words_) * static_cast<size_t>(panel_tile_count);
+    if (digest_host_.size() < digest_words) {
+        digest_host_.resize(digest_words);
+    }
+    if (tile_xor_host_.size() < msg_words) {
+        tile_xor_host_.resize(msg_words);
+    }
+    if (!ocl_.read_buffer(digest_buf_, digest_host_.data(), digest_words * sizeof(uint32_t)) ||
+        !ocl_.read_buffer(tile_xor_buf_, tile_xor_host_.data(), msg_words * sizeof(uint32_t))) {
+        return false;
+    }
+
+    std::vector<int8_t> a_scratch;
+    std::vector<int8_t> b_scratch;
+    const bool verify_gpu =
+            [] {
+                static const bool on = [] {
+                    const char *v = std::getenv("ONEDNN_FUSED_VERIFY_ALL");
+                    return v && v[0] != '0';
+                }();
+                return on;
+            }();
+    if (verify_gpu) {
+        a_scratch.resize(static_cast<size_t>(lda_) * static_cast<size_t>(M_));
+        b_scratch.resize(static_cast<size_t>(ldb_) * static_cast<size_t>(N_));
+    }
+    const bool have_ab = verify_gpu && read_A_sig(a_scratch.data()) &&
+                         ocl_.read_buffer(b_buf_, b_scratch.data(),
+                                          b_scratch.size() * sizeof(int8_t));
+
+    uint64_t tiles_scanned = out_tiles_scanned ? *out_tiles_scanned : 0;
+    int found = 0;
+    int hit_rows = -1;
+    int hit_cols = -1;
+    int msg_mismatches = 0;
+    int digest_mismatches = 0;
+
+    for (int tr = 0; tr < panel_tile_rows && !found; ++tr) {
+        if (should_cancel && should_cancel()) {
+            return false;
+        }
+        for (int tc = 0; tc < panel_tile_cols && !found; ++tc) {
+            if (should_cancel && should_cancel()) {
+                return false;
+            }
+            const size_t spatial_id =
+                    static_cast<size_t>(tr) * static_cast<size_t>(panel_tile_cols) +
+                    static_cast<size_t>(tc);
+
+            uint32_t gpu_msg[cp_jackpot::kJackpotWords] = {};
+            uint32_t gpu_digest[8] = {};
+            for (int w = 0; w < folded_msg_words_; ++w) {
+                gpu_msg[w] = tile_xor_host_[static_cast<size_t>(w) * static_cast<size_t>(panel_tile_count) +
+                                            spatial_id];
+            }
+            for (int w = 0; w < 8; ++w) {
+                gpu_digest[w] = digest_host_[spatial_id * 8 + static_cast<size_t>(w)];
+            }
+
+            ++tiles_scanned;
+            if (on_progress) {
+                on_progress(tiles_scanned);
+            }
+
+            const int lr = tr_base + tr;
+            const int lc = tc_base + tc;
+            uint32_t cpu_digest[8] = {};
+            cp_jackpot::b3_compress64(a_key8, gpu_msg, cpu_digest);
+            if (std::memcmp(gpu_digest, cpu_digest, sizeof(gpu_digest)) != 0) {
+                ++digest_mismatches;
+                if (digest_mismatches <= 3) {
+                    std::fprintf(stderr,
+                                 "[onednn] case5.6 digest mismatch at lr=%d lc=%d (spatial=%zu)\n",
+                                 lr, lc, spatial_id);
+                    case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU digest = ", gpu_digest, 8);
+                    case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU digest = ", cpu_digest, 8);
+                    case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg    = ", gpu_msg,
+                                                         cp_jackpot::kJackpotWords);
+                }
+                continue;
+            }
+
+            if (have_ab) {
+                uint32_t cpu_msg[cp_jackpot::kJackpotWords] = {};
+                uint32_t cpu_ref_digest[8] = {};
+                case5_ngen::compute_single_hash_tile_jackpot(
+                        a_scratch.data(), lda_, b_scratch.data(), ldb_, M_, N_, K_, num_milestones_,
+                        milestone_k_, info_.unrollM, info_.unrollN, info_.xorSubM, info_.xorSubN,
+                        info_.xorSubGridM, info_.xorSubGridN, lr, lc, a_key8, nullptr, cpu_msg,
+                        cpu_ref_digest);
+                if (std::memcmp(gpu_msg, cpu_msg, sizeof(gpu_msg)) != 0) {
+                    ++msg_mismatches;
+                    if (msg_mismatches <= 3) {
+                        std::fprintf(stderr,
+                                     "[onednn] fused msg mismatch at lr=%d lc=%d (spatial=%zu)\n",
+                                     lr, lc, spatial_id);
+                        case5_ngen::fprint_jackpot_words_hex(stderr, "  GPU msg = ", gpu_msg,
+                                                             cp_jackpot::kJackpotWords);
+                        case5_ngen::fprint_jackpot_words_hex(stderr, "  CPU msg = ", cpu_msg,
+                                                             cp_jackpot::kJackpotWords);
+                    }
+                    continue;
+                }
+            }
+
+            if (!cp_jackpot::digest_beats_target(gpu_digest, bound)) {
+                continue;
+            }
+
+            std::memcpy(hit_gpu_msg_, gpu_msg, sizeof(hit_gpu_msg_));
+            std::memcpy(hit_gpu_digest_, gpu_digest, sizeof(hit_gpu_digest_));
+            hit_gpu_valid_ = true;
+
+            found = 1;
+            hit_rows = lr * info_.xorSubM;
+            hit_cols = lc * info_.xorSubN;
+        }
+    }
+
+    if (msg_mismatches > 0 || digest_mismatches > 0) {
+        std::fprintf(stderr,
+                     "[onednn] fused panel verify: msg_mismatches=%d digest_mismatches=%d "
+                     "(logged first 3 each)\n",
+                     msg_mismatches, digest_mismatches);
+    } else if (panel_tile_count > 0) {
+        std::fprintf(stderr,
+                     "[onednn] case5.6 GPU BLAKE3 matches CPU compress(msg) on %d tiles\n",
+                     panel_tile_count);
+    }
+
+    if (out_tiles_scanned) {
+        *out_tiles_scanned = tiles_scanned;
+    }
+    if (out_found) {
+        *out_found = found;
+    }
+    if (found) {
+        if (out_t_rows) {
+            *out_t_rows = hit_rows;
+        }
+        if (out_t_cols) {
+            *out_t_cols = hit_cols;
+        }
     }
     return true;
 }
@@ -800,7 +1131,10 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
                                       uint64_t *out_tiles_scanned,
                                       const std::function<bool()> &should_cancel,
                                       const std::function<void(uint64_t)> &on_progress) {
-    if (!available_ || !a_key8 || !bound || !jackpot_ready_) {
+    if (!available_ || !a_key8 || !bound) {
+        return false;
+    }
+    if (!jackpot_ready_) {
         return false;
     }
     if (!ensure_jackpot_bufs_()) {
@@ -819,6 +1153,10 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     if (out_tiles_scanned) {
         *out_tiles_scanned = 0;
     }
+
+    std::memcpy(scan_jackpot_key_, a_key8, sizeof(scan_jackpot_key_));
+    std::memcpy(scan_jackpot_bound_, bound, sizeof(scan_jackpot_bound_));
+    hit_gpu_valid_ = false;
 
     if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t)) ||
         !ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
@@ -868,16 +1206,25 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             int panel_tile_count = 0;
             compute_tile_grid_(m_panel, n_panel, panel_tile_rows, panel_tile_cols, panel_tile_count);
 
-            if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {
+            if (fused_jackpot_) {
+                if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {
+                    return false;
+                }
+                if (!ensure_panel_digest_bufs_(panel_tile_count)) {
+                    return false;
+                }
+            } else if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {
                 return false;
             }
 
             const int tr_base = rpi0;
             const int tc_base = cpi0;
             int panel_found = 0;
+            int panel_t_rows = -1;
+            int panel_t_cols = -1;
             if (!run_gemm_jackpot_panel_(m_panel, n_panel, offset_a_rows, offset_b_cols,
                                          panel_tile_count, panel_tile_cols, tr_base, tc_base,
-                                         &panel_found)) {
+                                         &panel_found, &panel_t_rows, &panel_t_cols)) {
                 return false;
             }
 
@@ -888,11 +1235,21 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
 
             if (panel_found) {
                 found = 1;
-                if (out_t_rows && !ocl_.read_buffer(out_rows_buf_, out_t_rows, sizeof(int))) {
-                    return false;
-                }
-                if (out_t_cols && !ocl_.read_buffer(out_cols_buf_, out_t_cols, sizeof(int))) {
-                    return false;
+                if (fused_jackpot_) {
+                    if (out_t_rows) {
+                        *out_t_rows = panel_t_rows;
+                    }
+                    if (out_t_cols) {
+                        *out_t_cols = panel_t_cols;
+                    }
+                    dump_fused_jackpot_hit_(panel_t_rows, panel_t_cols);
+                } else {
+                    if (out_t_rows && !ocl_.read_buffer(out_rows_buf_, out_t_rows, sizeof(int))) {
+                        return false;
+                    }
+                    if (out_t_cols && !ocl_.read_buffer(out_cols_buf_, out_t_cols, sizeof(int))) {
+                        return false;
+                    }
                 }
             }
         }

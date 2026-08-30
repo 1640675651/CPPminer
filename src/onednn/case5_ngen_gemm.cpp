@@ -164,6 +164,8 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot
     problem.case5TileXorNop = xor_nop;
     problem.case5TileXorWrapGrf = fused_jackpot && !xor_nop;
     problem.case5TileXorWrap = fused_jackpot && !xor_nop;
+    problem.case5TileXorBlake3 = fused_jackpot && !xor_nop;
+    problem.case5FuseJackpot = fused_jackpot && !xor_nop;
     if (problem.case5TileXorWrapGrf) {
         problem.case5TileXorWrapGrfStoreMode = 2;
         problem.case5TileXorWrapGrfStageUnified = true;
@@ -247,9 +249,11 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
     const auto selection = select_case5_candidates(hw, product, device, problem, dims);
     product.stepping = selection.stepping;
 
+    std::vector<CatalogCandidate> candidates = selection.candidates;
+
     std::string last_err;
     std::vector<std::string> rejected;
-    for (const auto &candidate : selection.candidates) {
+    for (const auto &candidate : candidates) {
         if (case5_debug_select()) {
             std::fprintf(stderr, "Case5 trying %s\n", candidate.label.c_str());
             std::fflush(stderr);

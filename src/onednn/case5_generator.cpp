@@ -23,6 +23,7 @@
 #include "pieces/gemm_setup.cxx"
 #include "pieces/gemm.cxx"
 #include "pieces/case5_tile_xor.cxx"
+#include "pieces/case5_blake3.cxx"
 #include "pieces/k_loop_setup.cxx"
 #include "pieces/k_loop.cxx"
 #include "pieces/layout_setup.cxx"

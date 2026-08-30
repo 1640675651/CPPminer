@@ -452,6 +452,12 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
     iface.newArgument("tile_count", DataType::d);
     iface.newArgument("tile_cols", DataType::d);
     iface.newArgument("xor_period", DataType::d);
+    if (problem.case5TileXorBlake3) {
+        iface.newArgument("blake3_out", ExternalArgumentType::GlobalPtr, GlobalAccessType::Stateless);
+        for (int i = 0; i < 8; i++) {
+            iface.newArgument("blake3_k" + std::to_string(i), DataType::ud);
+        }
+    }
 
     if (hw >= HW::XeHPG) {
         iface.allowArgumentRearrangement(false);
@@ -500,6 +506,28 @@ void case5_launch_dims_for_walk_order(const LaunchDims &dims, int subgroup_size,
     wg_gws[1] = dims.gws[1];
     wg_lws[0] = dims.lws[0] / sg;
     wg_lws[1] = dims.lws[1];
+}
+
+void apply_linear_order_launch_dims(const DriverInfo &info, LaunchDims &dims, int m, int n, int k) {
+    if (!info.commonDriver.isLinearOrder()) {
+        return;
+    }
+
+    size_t wg_gws[2] = {};
+    size_t wg_lws[2] = {};
+    case5_launch_dims_for_walk_order(dims, info.subgroupSize, wg_gws, wg_lws);
+
+    const WalkOrderArgs walk = compute_walk_order_args(
+            info.strategy, info.commonDriver, info.euCount, info.hw, m, n, k, wg_gws, wg_lws);
+
+    uint32_t group_count = walk.group_count_m * walk.group_count_n;
+    if (walk.has_group_stride) {
+        group_count = walk.group_stride;
+    }
+
+    const size_t extra = static_cast<size_t>(info.commonDriver.extraWGs());
+    dims.gws[0] = dims.lws[0] * (static_cast<size_t>(group_count) + extra);
+    dims.gws[1] = dims.lws[1];
 }
 
 cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
@@ -586,6 +614,12 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_count);
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_cols);
     err |= set_arg(kernel, arg, sizeof(int), &bufs.xor_period);
+    if (problem.case5TileXorBlake3) {
+        err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_out);
+        for (int i = 0; i < 8; i++) {
+            err |= set_arg(kernel, arg, sizeof(uint32_t), &bufs.blake3_key_words[i]);
+        }
+    }
 
     if (out_arg_count) {
         *out_arg_count = arg;

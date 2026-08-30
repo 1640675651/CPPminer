@@ -102,8 +102,8 @@ static void print_usage(void)
 #endif
            );
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
-    printf("  --fused-jackpot       oneDNN Case 5.5 wrap-GRF fold in GEMM (future fused BLAKE)\n");
-    printf("  --no-fused-jackpot    oneDNN Case 5 GEMM + device fold/BLAKE jackpot (default)\n");
+    printf("  --fused-jackpot       oneDNN fused GEMM+XOR+BLAKE3+jackpot (no tile_xor global I/O)\n");
+    printf("  --no-fused-jackpot    oneDNN GEMM + separate device fold/BLAKE jackpot (default)\n");
 #endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
@@ -824,7 +824,7 @@ int main(int argc, char** argv)
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
             const int tile_xor_words = onednn_fused_jackpot ? 16 : (K_DIM / R_RANK);
             if(onednn_fused_jackpot){
-                printf("[mode] scan: oneDNN Case 5.5 GEMM (wrap-GRF fold) + GPU jackpot\n");
+                printf("[mode] scan: oneDNN fused GEMM + XOR + BLAKE3 + device jackpot\n");
             } else {
                 printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");
             }

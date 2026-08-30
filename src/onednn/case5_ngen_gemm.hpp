@@ -82,7 +82,7 @@ struct BuildParams {
 
 // Build OpenCL kernel via gemmstone. Caller owns with clReleaseKernel.
 // dims may be null (defaults to 4096³). Pass M/N/K/lda/ldb/ldc for catalog selection.
-// fused_jackpot: Case 5.5 wrap-GRF fold in GEMM; false = Case 5 raw milestone XOR only.
+// fused_jackpot: Case 5.6 fused GEMM+XOR+BLAKE3+jackpot in one kernel (no tile_xor global I/O).
 cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildParams *dims,
                              DriverInfo *info, std::string *err = nullptr, bool xor_nop = false,
                              bool fused_jackpot = false);
