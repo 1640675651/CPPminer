@@ -227,12 +227,14 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                     return adopt_kernel(label);
                 }
             }
-            /* Intel NEO: advertises the extension but only exposes dot_acc_sat under CL3.0. */
-            if (ocl_.has_integer_dot_product) {
+            /* Intel NEO: CL1.2 advertises KHR DPI but dot_acc_sat(char4) needs CL3.0.
+             * Kernel uses __opencl_c_integer_dot_product_input_4x8bit only (no packed API). */
+            if (ocl_.has_integer_dot_product &&
+                ocl_.vendor_name.find("Intel") != std::string::npos) {
                 const std::string cl30_opts =
                         with_cl_std(build_opts, "CL3.0") + " -DCASE32_FORCE_DPI=1";
                 if (ocl_.build_program_from_file(kernel_cl_path, cl30_opts.c_str(), true)) {
-                    return adopt_kernel(label);
+                    return adopt_kernel("Intel CL3.0 dot_acc_sat");
                 }
             }
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);

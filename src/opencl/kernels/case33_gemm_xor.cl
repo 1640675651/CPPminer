@@ -214,7 +214,7 @@ inline int case32_dot4(int acc, int a_pack, int b_pack) {
 #elif defined(CASE32_USE_BUILTIN_SDOT4)
     return __builtin_amdgcn_sdot4(a_pack, b_pack, acc, false);
 #elif defined(CASE32_USE_DOT)
-    return dot_acc_sat_4x8packed_ss_int(acc, as_uint(a_pack), as_uint(b_pack));
+    return dot_acc_sat(as_char4(a_pack), as_char4(b_pack), acc);
 #else
     char4 a = as_char4(a_pack);
     char4 b = as_char4(b_pack);
