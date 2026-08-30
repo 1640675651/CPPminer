@@ -68,24 +68,10 @@ private:
                                    int *out_t_cols, uint64_t *out_tiles_scanned,
                                    const std::function<bool()> &should_cancel,
                                    const std::function<void(uint64_t)> &on_progress);
-    bool ensure_panel_digest_bufs_(int panel_tile_count);
-    void dump_compare_panel_(int panel_tile_count);
-    bool read_tile_jackpot_(int spat, uint32_t digest[8], uint32_t *gpu_beat_raw,
-                            uint32_t gpu_digest_at_cmp[8], uint32_t gpu_bound[8],
-                            uint32_t gpu_cmp[8], uint32_t gpu_f1_gt[8] = nullptr,
-                            uint32_t gpu_f1_lt[8] = nullptr, uint32_t gpu_fall_gt[8] = nullptr,
-                            uint32_t gpu_fall_lt[8] = nullptr, uint32_t gpu_fall_store[8] = nullptr,
-                            uint32_t *gpu_reach_store = nullptr) const;
-    bool log_tile_jackpot_compare_(int spat, int t_rows, int t_cols, const char *tag);
+    bool ensure_panel_beats_buf_(int panel_tile_count);
     bool find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols, int tr_base,
-                               int tc_base, int *out_t_rows, int *out_t_cols, int *out_spat);
-    bool read_device_ab_for_recompute_();
-    void log_cpu_recompute_hit_(int t_rows, int t_cols, const uint32_t gpu_digest[8],
-                                const uint32_t gpu_digest_at_cmp[8], const uint32_t gpu_bound[8],
-                                const uint32_t gpu_cmp[8], const uint32_t gpu_f1_gt[8],
-                                const uint32_t gpu_f1_lt[8], const uint32_t gpu_fall_gt[8],
-                                const uint32_t gpu_fall_lt[8], const uint32_t gpu_fall_store[8],
-                                uint32_t gpu_reach_store);
+                               int tc_base, int *out_t_rows, int *out_t_cols,
+                               const uint32_t hit_digest[8]);
 
     bool context_ready_ = false;
     bool available_ = false;
@@ -129,23 +115,16 @@ private:
     cl_mem found_buf_ = nullptr;
     cl_mem out_rows_buf_ = nullptr;
     cl_mem out_cols_buf_ = nullptr;
-    cl_mem digest_buf_ = nullptr;
     cl_mem beats_buf_ = nullptr;
-    cl_mem cmp_dump_buf_ = nullptr;
 
     size_t a_buf_bytes_ = 0;
     size_t b_buf_bytes_ = 0;
     int panel_tile_xor_cap_ = 0;
-    int panel_digest_cap_ = 0;
+    int panel_beats_cap_ = 0;
     bool jackpot_ready_ = false;
-    bool compare_dump_done_ = false;
 
     std::vector<uint32_t> tile_xor_host_;
-    std::vector<uint32_t> digest_host_;
     std::vector<uint32_t> beats_host_;
-    std::vector<uint32_t> cmp_dump_host_;
-    mutable std::vector<int8_t> recompute_a_scratch_;
-    mutable std::vector<int8_t> recompute_b_scratch_;
     std::vector<int8_t> a_host_;
     std::vector<int8_t> b_host_;
     std::vector<int8_t> pack_scratch_;

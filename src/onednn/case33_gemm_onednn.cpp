@@ -1,4 +1,4 @@
-#include "case33_gemm_onednn.hpp"
+﻿#include "case33_gemm_onednn.hpp"
 
 #include "case5_gemm_launch.hpp"
 #include "case5_xor_tile.hpp"
@@ -18,19 +18,11 @@
 
 namespace {
 
-constexpr size_t kJackpotCmpDumpDigestOff = 0u;
-constexpr size_t kJackpotCmpDumpBoundOff = 8u;
-constexpr size_t kJackpotCmpDumpCodeOff = 16u;
-constexpr size_t kJackpotCmpDumpFlagGtOff = 24u;
-constexpr size_t kJackpotCmpDumpFlagLtOff = 32u;
-constexpr size_t kJackpotCmpDumpFallGtOff = 40u;
-constexpr size_t kJackpotCmpDumpFallLtOff = 48u;
-constexpr size_t kJackpotCmpDumpFallStoreOff = 56u;
-constexpr size_t kJackpotCmpDumpReachStoreBeatOff = 64u;
-constexpr size_t kJackpotCmpDumpWordsPerTile = 65u;
-constexpr uint32_t kGpuCmpUnevaluated = 0xFFFFFFFFu;
 constexpr size_t kJackpotFoundFlagOff = 8u * sizeof(uint32_t);
-constexpr size_t kJackpotFoundBufBytes = kJackpotFoundFlagOff + sizeof(uint32_t);
+constexpr size_t kJackpotHitDigestOff = kJackpotFoundFlagOff + sizeof(uint32_t);
+constexpr size_t kJackpotHitRowsOff = kJackpotHitDigestOff + 8u * sizeof(uint32_t);
+constexpr size_t kJackpotHitColsOff = kJackpotHitRowsOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundBufBytes = kJackpotHitColsOff + sizeof(uint32_t);
 
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -129,17 +121,9 @@ Case33GemmOnednn::~Case33GemmOnednn() {
         clReleaseMemObject(out_cols_buf_);
         out_cols_buf_ = nullptr;
     }
-    if (digest_buf_) {
-        clReleaseMemObject(digest_buf_);
-        digest_buf_ = nullptr;
-    }
     if (beats_buf_) {
         clReleaseMemObject(beats_buf_);
         beats_buf_ = nullptr;
-    }
-    if (cmp_dump_buf_) {
-        clReleaseMemObject(cmp_dump_buf_);
-        cmp_dump_buf_ = nullptr;
     }
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -441,7 +425,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     const int init_m = g_m_active > 0 ? g_m_active : M_DIM;
     const int init_n = g_n_active > 0 ? g_n_active : N_DIM;
 
-    /* Kernel JIT/catalog ranking uses modest probe dims (gemm_xor default 256³); the
+    /* Kernel JIT/catalog ranking uses modest probe dims (gemm_xor default 256鲁); the
      * OpenCL kernel is size-independent. Production M/N only affect host tile grids. */
     constexpr int kKernelSelectM = 256;
     constexpr int kKernelSelectN = 256;
@@ -616,23 +600,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
     if (fused_jackpot_) {
-        if (!digest_buf_ || !beats_buf_ || !cmp_dump_buf_ || !found_buf_ || !out_rows_buf_ || !out_cols_buf_
-                || !bound_buf_) {
+        if (!found_buf_ || !beats_buf_ || !bound_buf_) {
             return false;
-        }
-        // Sentinel so unwritten beats/cmp show up in the dump.
-        if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
-            beats_host_.assign(static_cast<size_t>(panel_tile_count), 0xFFFFFFFFu);
-        } else {
-            std::fill(beats_host_.begin(), beats_host_.begin() + panel_tile_count, 0xFFFFFFFFu);
-        }
-        const size_t cmp_dump_words =
-                static_cast<size_t>(panel_tile_count) * kJackpotCmpDumpWordsPerTile;
-        if (cmp_dump_host_.size() < cmp_dump_words) {
-            cmp_dump_host_.assign(cmp_dump_words, kGpuCmpUnevaluated);
-        } else {
-            std::fill(cmp_dump_host_.begin(), cmp_dump_host_.begin() + cmp_dump_words,
-                      kGpuCmpUnevaluated);
         }
         if (!ocl_.write_buffer(found_buf_, scan_jackpot_bound_, 8u * sizeof(uint32_t), 0)) {
             return false;
@@ -641,12 +610,13 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
             return false;
         }
+        if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
+            beats_host_.assign(static_cast<size_t>(panel_tile_count), 0u);
+        } else {
+            std::fill(beats_host_.begin(), beats_host_.begin() + panel_tile_count, 0u);
+        }
         if (!ocl_.write_buffer(beats_buf_, beats_host_.data(),
                                static_cast<size_t>(panel_tile_count) * sizeof(uint32_t))) {
-            return false;
-        }
-        if (!ocl_.write_buffer(cmp_dump_buf_, cmp_dump_host_.data(),
-                               cmp_dump_words * sizeof(uint32_t))) {
             return false;
         }
     } else if (!tile_xor_buf_) {
@@ -673,12 +643,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     if (fused_jackpot_) {
         std::memcpy(bufs.blake3_key_words, scan_jackpot_key_, sizeof(bufs.blake3_key_words));
         std::memcpy(bufs.blake3_bound_words, scan_jackpot_bound_, sizeof(bufs.blake3_bound_words));
-        bufs.blake3_out = digest_buf_;
-        bufs.blake3_beats = beats_buf_;
-        bufs.blake3_cmp_dump = cmp_dump_buf_;
         bufs.found_flag = found_buf_;
-        bufs.out_t_rows = out_rows_buf_;
-        bufs.out_t_cols = out_cols_buf_;
+        bufs.blake3_beats = beats_buf_;
         bufs.tr_base = tr_base;
         bufs.tc_base = tc_base;
     }
@@ -805,15 +771,6 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
         return false;
     }
     if (fused_jackpot_) {
-        static const bool dump_compare = [] {
-            const char *v = std::getenv("ONEDNN_DUMP_COMPARE");
-            return v && v[0] != '0';
-        }();
-        if (dump_compare && !compare_dump_done_) {
-            dump_compare_panel_(panel_tile_count);
-            compare_dump_done_ = true;
-        }
-
         int found = 0;
         if (!ocl_.read_buffer(found_buf_, &found, sizeof(found), kJackpotFoundFlagOff)) {
             return false;
@@ -822,35 +779,26 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
             *out_found = found ? 1 : 0;
         }
         if (found) {
+            uint32_t digest[8] = {};
+            if (!ocl_.read_buffer(found_buf_, digest, 8u * sizeof(uint32_t), kJackpotHitDigestOff)) {
+                return false;
+            }
+            if (!cp_jackpot::digest_beats_target(digest, scan_jackpot_bound_)) {
+                found = 0;
+                if (out_found) {
+                    *out_found = 0;
+                }
+                return true;
+            }
             int t_rows = -1;
             int t_cols = -1;
-            int spat = -1;
             if (!find_fused_panel_hit_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
-                                       &t_rows, &t_cols, &spat)) {
-                std::fprintf(stderr,
-                             "[onednn] ignoring GPU jackpot claim (found_flag set, no CPU-valid "
-                             "beat in beats buffer)\n");
-                std::fflush(stderr);
+                                       &t_rows, &t_cols, digest)) {
                 found = 0;
                 if (out_found) {
                     *out_found = 0;
                 }
                 return true;
-            }
-            const bool cpu_beat =
-                    log_tile_jackpot_compare_(spat, t_rows, t_cols, "jackpot hit compare");
-            if (!cpu_beat) {
-                std::fprintf(stderr,
-                             "[onednn] ignoring GPU jackpot claim (cpu_beat=0 on GPU digest)\n");
-                std::fflush(stderr);
-                found = 0;
-                if (out_found) {
-                    *out_found = 0;
-                }
-                return true;
-            }
-            if (dump_compare) {
-                dump_compare_panel_(panel_tile_count);
             }
             if (out_t_rows) {
                 *out_t_rows = t_rows;
@@ -876,282 +824,32 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
     return true;
 }
 
-bool Case33GemmOnednn::ensure_panel_digest_bufs_(int panel_tile_count) {
+bool Case33GemmOnednn::ensure_panel_beats_buf_(int panel_tile_count) {
     if (panel_tile_count <= 0) {
         return false;
     }
-    if (panel_digest_cap_ >= panel_tile_count && digest_buf_ && beats_buf_ && cmp_dump_buf_) {
+    if (panel_beats_cap_ >= panel_tile_count && beats_buf_) {
         return true;
-    }
-    if (digest_buf_) {
-        clReleaseMemObject(digest_buf_);
-        digest_buf_ = nullptr;
     }
     if (beats_buf_) {
         clReleaseMemObject(beats_buf_);
         beats_buf_ = nullptr;
     }
-    if (cmp_dump_buf_) {
-        clReleaseMemObject(cmp_dump_buf_);
-        cmp_dump_buf_ = nullptr;
-    }
-    const size_t digest_bytes =
-            static_cast<size_t>(panel_tile_count) * 8u * sizeof(uint32_t);
     const size_t beats_bytes = static_cast<size_t>(panel_tile_count) * sizeof(uint32_t);
-    const size_t cmp_dump_bytes =
-            static_cast<size_t>(panel_tile_count) * kJackpotCmpDumpWordsPerTile * sizeof(uint32_t);
-    digest_buf_ = ocl_.alloc_buffer(digest_bytes, CL_MEM_READ_WRITE);
     beats_buf_ = ocl_.alloc_buffer(beats_bytes, CL_MEM_READ_WRITE);
-    cmp_dump_buf_ = ocl_.alloc_buffer(cmp_dump_bytes, CL_MEM_READ_WRITE);
-    if (!digest_buf_ || !beats_buf_ || !cmp_dump_buf_) {
+    if (!beats_buf_) {
         return false;
     }
-    panel_digest_cap_ = panel_tile_count;
-    digest_host_.assign(static_cast<size_t>(panel_tile_count) * 8u, 0u);
+    panel_beats_cap_ = panel_tile_count;
     beats_host_.assign(static_cast<size_t>(panel_tile_count), 0u);
-    cmp_dump_host_.assign(static_cast<size_t>(panel_tile_count) * kJackpotCmpDumpWordsPerTile, 0u);
-    return true;
-}
-
-namespace {
-
-void fmt_blake3_msb_hex(const uint32_t digest[8], char *out, size_t out_cap) {
-    size_t pos = 0;
-    for (int w = 7; w >= 0 && pos + 8 < out_cap; --w) {
-        pos += static_cast<size_t>(std::snprintf(out + pos, out_cap - pos, "%08x", digest[w]));
-    }
-    if (pos < out_cap) {
-        out[pos] = '\0';
-    } else if (out_cap > 0) {
-        out[out_cap - 1] = '\0';
-    }
-}
-
-const char *unsigned_word_cmp(uint32_t d, uint32_t b) {
-    if (d < b) {
-        return "lt";
-    }
-    if (d > b) {
-        return "gt";
-    }
-    return "eq";
-}
-
-const char *compare_action(const char *cmp) {
-    if (std::strcmp(cmp, "lt") == 0) {
-        return "BEAT";
-    }
-    if (std::strcmp(cmp, "gt") == 0) {
-        return "lose";
-    }
-    return "next";
-}
-
-
-bool simulate_gpu_cmp_beat(const uint32_t gpu_cmp[8]) {
-    for (int w = 7; w >= 0; --w) {
-        const uint32_t code = gpu_cmp[w];
-        if (code == kGpuCmpUnevaluated) {
-            continue;
-        }
-        if (code == 1) {
-            return false;
-        }
-        if (code == 2) {
-            return true;
-        }
-        if (code == 3) {
-            continue;
-        }
-    }
-    return true;
-}
-
-const char *gpu_cmp_code_label(uint32_t code) {
-    switch (code) {
-    case 1:
-        return "gt";
-    case 2:
-        return "lt";
-    case 3:
-        return "eq";
-    default:
-        return "--";
-    }
-}
-
-const char *gpu_cmp_action_label(uint32_t code) {
-    switch (code) {
-    case 1:
-        return "lose";
-    case 2:
-        return "BEAT";
-    case 3:
-        return "next";
-    default:
-        return "----";
-    }
-}
-
-// GPU compare trace vs CPU digest_beats_target; see case5_gen12_jackpot_cmp.md.
-void dump_tile_gpu_cpu_word_compare(const char *label, const uint32_t digest[8],
-                                    const uint32_t cpu_bound[8],
-                                    const uint32_t gpu_digest_at_cmp[8],
-                                    const uint32_t gpu_bound[8], const uint32_t gpu_cmp[8],
-                                    const uint32_t gpu_f1_gt[8], const uint32_t gpu_f1_lt[8],
-                                    const uint32_t gpu_fall_gt[8], const uint32_t gpu_fall_lt[8],
-                                    const uint32_t gpu_fall_store[8], uint32_t gpu_reach_store) {
-    std::fprintf(stderr, "[onednn] %s per-word GPU vs CPU compare (MSB-first w=7..0):\n", label);
-    std::fprintf(stderr,
-                 "  w   gpu_dig     gpu_bound   f1_gt f1_lt !gt_j !lt_j !store gpu cmp gpu act  "
-                 "digest      cpu_bound   cpu cmp cpu act  dig_ok bound_ok cmp_ok\n");
-
-    int bound_mismatch = 0;
-    int digest_mismatch = 0;
-    int cmp_mismatch = 0;
-    for (int w = 7; w >= 0; --w) {
-        const uint32_t gd = gpu_digest_at_cmp[w];
-        const uint32_t gb = gpu_bound[w];
-        const uint32_t code = gpu_cmp[w];
-        const uint32_t f1_gt = gpu_f1_gt ? gpu_f1_gt[w] : kGpuCmpUnevaluated;
-        const uint32_t f1_lt = gpu_f1_lt ? gpu_f1_lt[w] : kGpuCmpUnevaluated;
-        const uint32_t fall_gt = gpu_fall_gt ? gpu_fall_gt[w] : kGpuCmpUnevaluated;
-        const uint32_t fall_lt = gpu_fall_lt ? gpu_fall_lt[w] : kGpuCmpUnevaluated;
-        const uint32_t fall_store = gpu_fall_store ? gpu_fall_store[w] : kGpuCmpUnevaluated;
-        const uint32_t d = digest[w];
-        const uint32_t cb = cpu_bound[w];
-        const char *cpu_cmp = unsigned_word_cmp(d, cb);
-        const char *gpu_cmp_str = gpu_cmp_code_label(code);
-        const bool evaluated = code != kGpuCmpUnevaluated;
-        const bool dig_ok = !evaluated || (gd == d);
-        const bool bound_ok = !evaluated || (gb == cb);
-        bool cmp_ok = true;
-        if (evaluated) {
-            const char *gpu_op_cmp = unsigned_word_cmp(gd, gb);
-            if (std::strcmp(gpu_cmp_str, gpu_op_cmp) != 0) {
-                cmp_ok = false;
-            }
-            if (std::strcmp(gpu_cmp_str, cpu_cmp) != 0) {
-                cmp_ok = false;
-            }
-        }
-        if (!dig_ok) {
-            ++digest_mismatch;
-        }
-        if (!bound_ok) {
-            ++bound_mismatch;
-        }
-        if (evaluated && !cmp_ok) {
-            ++cmp_mismatch;
-        }
-        std::fprintf(stderr,
-                     "  %d  %08x  %08x  %4s  %4s  %4s  %4s  %5s  %3s   %-5s  %08x  %08x  %3s   "
-                     "%-5s  %3s    %3s      %3s\n",
-                     w, gd, gb,
-                     f1_gt == kGpuCmpUnevaluated ? "--"
-                                                 : (f1_gt ? "1" : "0"),
-                     f1_lt == kGpuCmpUnevaluated ? "--"
-                                                 : (f1_lt ? "1" : "0"),
-                     fall_gt == kGpuCmpUnevaluated ? "--" : (fall_gt ? "YES" : "no"),
-                     fall_lt == kGpuCmpUnevaluated ? "--" : (fall_lt ? "YES" : "no"),
-                     fall_store == kGpuCmpUnevaluated ? "--" : (fall_store ? "YES" : "no"),
-                     gpu_cmp_str, gpu_cmp_action_label(code), d, cb, cpu_cmp,
-                     compare_action(cpu_cmp), dig_ok ? (evaluated ? "yes" : "--") : "NO",
-                     bound_ok ? (evaluated ? "yes" : "--") : "NO",
-                     !evaluated ? "--" : (cmp_ok ? "yes" : "NO"));
-    }
-
-    const bool cpu_beat = cp_jackpot::digest_beats_target(digest, cpu_bound);
-    const bool gpu_trace_beat = simulate_gpu_cmp_beat(gpu_cmp);
-    std::fprintf(stderr,
-                 "[onednn] %s overall: cpu_beat=%d gpu_trace_beat=%d reach_store_beat=%s "
-                 "digest_mismatch_words=%d bound_mismatch_words=%d cmp_mismatch_words=%d\n",
-                 label, cpu_beat ? 1 : 0, gpu_trace_beat ? 1 : 0,
-                 gpu_reach_store == kGpuCmpUnevaluated
-                         ? "--"
-                         : (gpu_reach_store ? "YES" : "no"),
-                 digest_mismatch, bound_mismatch, cmp_mismatch);
-    std::fflush(stderr);
-}
-
-} // namespace
-
-bool Case33GemmOnednn::read_tile_jackpot_(int spat, uint32_t digest[8], uint32_t *gpu_beat_raw,
-                                          uint32_t gpu_digest_at_cmp[8], uint32_t gpu_bound[8],
-                                          uint32_t gpu_cmp[8], uint32_t gpu_f1_gt[8],
-                                          uint32_t gpu_f1_lt[8], uint32_t gpu_fall_gt[8],
-                                          uint32_t gpu_fall_lt[8], uint32_t gpu_fall_store[8],
-                                          uint32_t *gpu_reach_store) const {
-    if (!digest_buf_ || !beats_buf_ || spat < 0 || !digest || !gpu_beat_raw) {
-        return false;
-    }
-    const size_t dig_off = static_cast<size_t>(spat) * 8u * sizeof(uint32_t);
-    const size_t beat_off = static_cast<size_t>(spat) * sizeof(uint32_t);
-    const size_t cmp_base = static_cast<size_t>(spat) * kJackpotCmpDumpWordsPerTile;
-    const size_t cmp_digest_off = (cmp_base + kJackpotCmpDumpDigestOff) * sizeof(uint32_t);
-    const size_t cmp_bound_off = (cmp_base + kJackpotCmpDumpBoundOff) * sizeof(uint32_t);
-    const size_t cmp_code_off = (cmp_base + kJackpotCmpDumpCodeOff) * sizeof(uint32_t);
-    const size_t cmp_f1_gt_off = (cmp_base + kJackpotCmpDumpFlagGtOff) * sizeof(uint32_t);
-    const size_t cmp_f1_lt_off = (cmp_base + kJackpotCmpDumpFlagLtOff) * sizeof(uint32_t);
-    const size_t cmp_fall_gt_off = (cmp_base + kJackpotCmpDumpFallGtOff) * sizeof(uint32_t);
-    const size_t cmp_fall_lt_off = (cmp_base + kJackpotCmpDumpFallLtOff) * sizeof(uint32_t);
-    const size_t cmp_fall_store_off = (cmp_base + kJackpotCmpDumpFallStoreOff) * sizeof(uint32_t);
-    const size_t cmp_reach_store_off =
-            (cmp_base + kJackpotCmpDumpReachStoreBeatOff) * sizeof(uint32_t);
-    if (!ocl_.read_buffer(digest_buf_, digest, 8u * sizeof(uint32_t), dig_off) ||
-        !ocl_.read_buffer(beats_buf_, gpu_beat_raw, sizeof(uint32_t), beat_off)) {
-        return false;
-    }
-    if (gpu_digest_at_cmp && gpu_bound && gpu_cmp && cmp_dump_buf_) {
-        if (!ocl_.read_buffer(cmp_dump_buf_, gpu_digest_at_cmp, 8u * sizeof(uint32_t),
-                              cmp_digest_off) ||
-            !ocl_.read_buffer(cmp_dump_buf_, gpu_bound, 8u * sizeof(uint32_t), cmp_bound_off) ||
-            !ocl_.read_buffer(cmp_dump_buf_, gpu_cmp, 8u * sizeof(uint32_t), cmp_code_off)) {
-            return false;
-        }
-        if (gpu_f1_gt) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_f1_gt, 8u * sizeof(uint32_t), cmp_f1_gt_off)) {
-                return false;
-            }
-        }
-        if (gpu_f1_lt) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_f1_lt, 8u * sizeof(uint32_t), cmp_f1_lt_off)) {
-                return false;
-            }
-        }
-        if (gpu_fall_gt) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_fall_gt, 8u * sizeof(uint32_t),
-                                  cmp_fall_gt_off)) {
-                return false;
-            }
-        }
-        if (gpu_fall_lt) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_fall_lt, 8u * sizeof(uint32_t),
-                                  cmp_fall_lt_off)) {
-                return false;
-            }
-        }
-        if (gpu_fall_store) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_fall_store, 8u * sizeof(uint32_t),
-                                  cmp_fall_store_off)) {
-                return false;
-            }
-        }
-        if (gpu_reach_store) {
-            if (!ocl_.read_buffer(cmp_dump_buf_, gpu_reach_store, sizeof(uint32_t),
-                                  cmp_reach_store_off)) {
-                return false;
-            }
-        }
-        return true;
-    }
     return true;
 }
 
 bool Case33GemmOnednn::find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols,
                                              int tr_base, int tc_base, int *out_t_rows,
-                                             int *out_t_cols, int *out_spat) {
-    if (!digest_buf_ || !beats_buf_ || panel_tile_count <= 0) {
+                                             int *out_t_cols, const uint32_t hit_digest[8]) {
+    (void)hit_digest;
+    if (!beats_buf_ || panel_tile_count <= 0) {
         return false;
     }
     const int hash_mr = info_.xorSubM;
@@ -1159,30 +857,16 @@ bool Case33GemmOnednn::find_fused_panel_hit_(int panel_tile_count, int panel_til
     if (hash_mr <= 0 || hash_nr <= 0) {
         return false;
     }
-
-    const size_t digest_words = static_cast<size_t>(panel_tile_count) * 8u;
-    const size_t beats_words = static_cast<size_t>(panel_tile_count);
-    if (digest_host_.size() < digest_words) {
-        digest_host_.resize(digest_words);
+    if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
+        beats_host_.resize(static_cast<size_t>(panel_tile_count));
     }
-    if (beats_host_.size() < beats_words) {
-        beats_host_.resize(beats_words);
-    }
-    if (!ocl_.read_buffer(digest_buf_, digest_host_.data(), digest_words * sizeof(uint32_t)) ||
-        !ocl_.read_buffer(beats_buf_, beats_host_.data(), beats_words * sizeof(uint32_t))) {
+    if (!ocl_.read_buffer(beats_buf_, beats_host_.data(),
+                          static_cast<size_t>(panel_tile_count) * sizeof(uint32_t))) {
         return false;
     }
 
     for (int spat = 0; spat < panel_tile_count; ++spat) {
-        const uint32_t graw = beats_host_[static_cast<size_t>(spat)];
-        if (graw == 0u || graw == 0xFFFFFFFFu) {
-            continue;
-        }
-        uint32_t digest[8];
-        for (int w = 0; w < 8; ++w) {
-            digest[w] = digest_host_[static_cast<size_t>(spat) * 8u + static_cast<size_t>(w)];
-        }
-        if (!cp_jackpot::digest_beats_target(digest, scan_jackpot_bound_)) {
+        if (beats_host_[static_cast<size_t>(spat)] == 0u) {
             continue;
         }
         const int tr = spat / panel_tile_cols;
@@ -1195,258 +879,9 @@ bool Case33GemmOnednn::find_fused_panel_hit_(int panel_tile_count, int panel_til
         if (out_t_cols) {
             *out_t_cols = lc * hash_nr;
         }
-        if (out_spat) {
-            *out_spat = spat;
-        }
         return true;
     }
     return false;
-}
-
-bool Case33GemmOnednn::log_tile_jackpot_compare_(int spat, int t_rows, int t_cols,
-                                                const char *tag) {
-    uint32_t digest[8] = {};
-    uint32_t gpu_digest_at_cmp[8] = {};
-    uint32_t gpu_bound[8] = {};
-    uint32_t gpu_cmp[8] = {};
-    uint32_t gpu_f1_gt[8] = {};
-    uint32_t gpu_f1_lt[8] = {};
-    uint32_t gpu_fall_gt[8] = {};
-    uint32_t gpu_fall_lt[8] = {};
-    uint32_t gpu_fall_store[8] = {};
-    uint32_t gpu_reach_store = kGpuCmpUnevaluated;
-    uint32_t gpu_beat_raw = 0xFFFFFFFFu;
-    if (!read_tile_jackpot_(spat, digest, &gpu_beat_raw, gpu_digest_at_cmp, gpu_bound, gpu_cmp,
-                            gpu_f1_gt, gpu_f1_lt, gpu_fall_gt, gpu_fall_lt, gpu_fall_store,
-                            &gpu_reach_store)) {
-        std::fprintf(stderr, "[onednn] %s t_rows=%d t_cols=%d spat=%d: failed to read GPU digest/beats\n",
-                     tag ? tag : "jackpot compare", t_rows, t_cols, spat);
-        std::fflush(stderr);
-        return false;
-    }
-
-    const bool gpu = gpu_beat_raw != 0u && gpu_beat_raw != 0xFFFFFFFFu;
-    const bool cpu = cp_jackpot::digest_beats_target(digest, scan_jackpot_bound_);
-    const bool gpu_trace = simulate_gpu_cmp_beat(gpu_cmp);
-    char blake_hex[65];
-    fmt_blake3_msb_hex(digest, blake_hex, sizeof(blake_hex));
-
-    std::fprintf(stderr,
-                 "[onednn] %s t_rows=%d t_cols=%d spat=%d gpu_beat=%d gpu_trace_beat=%d "
-                 "cpu_beat=%d gpu_beat_raw=0x%08x blake3=%s bound=",
-                 tag ? tag : "jackpot compare", t_rows, t_cols, spat, gpu ? 1 : 0,
-                 gpu_trace ? 1 : 0, cpu ? 1 : 0, gpu_beat_raw, blake_hex);
-    for (int w = 7; w >= 0; --w) {
-        std::fprintf(stderr, "%08x", scan_jackpot_bound_[w]);
-    }
-    std::fprintf(stderr, "\n");
-    std::fflush(stderr);
-
-    dump_tile_gpu_cpu_word_compare("gpu digest vs bound", digest, scan_jackpot_bound_,
-                                   gpu_digest_at_cmp, gpu_bound, gpu_cmp, gpu_f1_gt, gpu_f1_lt,
-                                   gpu_fall_gt, gpu_fall_lt, gpu_fall_store, gpu_reach_store);
-    if (gpu != gpu_trace) {
-        std::fprintf(stderr,
-                     "[onednn] WARNING: gpu_beat flag (%d) disagrees with GPU trace replay (%d)\n",
-                     gpu ? 1 : 0, gpu_trace ? 1 : 0);
-        std::fflush(stderr);
-    }
-
-    log_cpu_recompute_hit_(t_rows, t_cols, digest, gpu_digest_at_cmp, gpu_bound, gpu_cmp, gpu_f1_gt,
-                           gpu_f1_lt, gpu_fall_gt, gpu_fall_lt, gpu_fall_store, gpu_reach_store);
-    return cpu;
-}
-
-bool Case33GemmOnednn::read_device_ab_for_recompute_() {
-    if (!a_buf_ || !b_buf_ || M_ <= 0 || N_ <= 0 || K_ <= 0) {
-        return false;
-    }
-    const size_t a_bytes = static_cast<size_t>(M_) * static_cast<size_t>(lda_);
-    const size_t b_bytes = static_cast<size_t>(N_) * static_cast<size_t>(ldb_);
-    if (recompute_a_scratch_.size() < a_bytes) {
-        recompute_a_scratch_.resize(a_bytes);
-    }
-    if (recompute_b_scratch_.size() < b_bytes) {
-        recompute_b_scratch_.resize(b_bytes);
-    }
-    return ocl_.read_buffer(a_buf_, recompute_a_scratch_.data(), a_bytes) &&
-           ocl_.read_buffer(b_buf_, recompute_b_scratch_.data(), b_bytes);
-}
-
-void Case33GemmOnednn::log_cpu_recompute_hit_(int t_rows, int t_cols, const uint32_t gpu_digest[8],
-                                              const uint32_t gpu_digest_at_cmp[8],
-                                              const uint32_t gpu_bound[8],
-                                              const uint32_t gpu_cmp[8],
-                                              const uint32_t gpu_f1_gt[8],
-                                              const uint32_t gpu_f1_lt[8],
-                                              const uint32_t gpu_fall_gt[8],
-                                              const uint32_t gpu_fall_lt[8],
-                                              const uint32_t gpu_fall_store[8],
-                                              uint32_t gpu_reach_store) {
-    const int hash_mr = info_.xorSubM;
-    const int hash_nr = info_.xorSubN;
-    if (hash_mr <= 0 || hash_nr <= 0 || (t_rows % hash_mr) != 0 || (t_cols % hash_nr) != 0) {
-        std::fprintf(stderr,
-                     "[onednn] cpu recompute: t_rows=%d t_cols=%d not aligned to hash tile %dx%d\n",
-                     t_rows, t_cols, hash_mr, hash_nr);
-        std::fflush(stderr);
-        return;
-    }
-    const int lr = t_rows / hash_mr;
-    const int lc = t_cols / hash_nr;
-
-    std::fprintf(stderr,
-                 "[onednn] cpu recompute: lr=%d lc=%d - reading device A(%dx%d) B(%dx%d)...\n", lr,
-                 lc, M_, K_, N_, K_);
-    std::fflush(stderr);
-
-    if (!read_device_ab_for_recompute_()) {
-        std::fprintf(stderr, "[onednn] cpu recompute: failed to read A/B from GPU\n");
-        std::fflush(stderr);
-        return;
-    }
-
-    uint32_t milestones[64] = {};
-    uint32_t msg[cp_jackpot::kJackpotWords] = {};
-    uint32_t cpu_digest[8] = {};
-    case5_ngen::compute_single_hash_tile_jackpot(
-            recompute_a_scratch_.data(), lda_, recompute_b_scratch_.data(), ldb_, M_, N_, K_,
-            num_milestones_, milestone_k_, info_.unrollM, info_.unrollN, info_.xorSubM,
-            info_.xorSubN, info_.xorSubGridM, info_.xorSubGridN, lr, lc, scan_jackpot_key_,
-            milestones, msg, cpu_digest);
-
-    const bool cpu_beat = cp_jackpot::digest_beats_target(cpu_digest, scan_jackpot_bound_);
-    char gpu_hex[65];
-    char cpu_hex[65];
-    fmt_blake3_msb_hex(gpu_digest, gpu_hex, sizeof(gpu_hex));
-    fmt_blake3_msb_hex(cpu_digest, cpu_hex, sizeof(cpu_hex));
-
-    bool digest_match = true;
-    for (int w = 0; w < 8; ++w) {
-        if (gpu_digest[w] != cpu_digest[w]) {
-            digest_match = false;
-            break;
-        }
-    }
-
-    std::fprintf(stderr, "[onednn] cpu recompute digest gpu=%s\n", gpu_hex);
-    std::fprintf(stderr, "[onednn] cpu recompute digest cpu=%s digest_match=%s\n", cpu_hex,
-                 digest_match ? "yes" : "NO");
-    if (!digest_match) {
-        dump_tile_gpu_cpu_word_compare("cpu-recomputed digest vs bound", cpu_digest,
-                                       scan_jackpot_bound_, gpu_digest_at_cmp, gpu_bound, gpu_cmp,
-                                       gpu_f1_gt, gpu_f1_lt, gpu_fall_gt, gpu_fall_lt,
-                                       gpu_fall_store, gpu_reach_store);
-        dump_tile_gpu_cpu_word_compare("gpu digest vs bound (repeat)", gpu_digest,
-                                       scan_jackpot_bound_, gpu_digest_at_cmp, gpu_bound, gpu_cmp,
-                                       gpu_f1_gt, gpu_f1_lt, gpu_fall_gt, gpu_fall_lt,
-                                       gpu_fall_store, gpu_reach_store);
-    }
-    std::fprintf(stderr,
-                 "[onednn] cpu recompute beat cpu_beat=%d gpu_beat flag/gpu_trace from line above\n",
-                 cpu_beat ? 1 : 0);
-    std::fprintf(stderr, "[onednn] cpu recompute msg=");
-    for (int w = 0; w < cp_jackpot::kJackpotWords; ++w) {
-        std::fprintf(stderr, "%08x", msg[w]);
-    }
-    std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "[onednn] cpu recompute milestones (ms0..ms%d):", num_milestones_ - 1);
-    for (int ms = 0; ms < num_milestones_; ++ms) {
-        std::fprintf(stderr, " %08x", milestones[ms]);
-    }
-    std::fprintf(stderr, "\n");
-    std::fflush(stderr);
-}
-
-void Case33GemmOnednn::dump_compare_panel_(int panel_tile_count) {
-    if (!digest_buf_ || !beats_buf_ || panel_tile_count <= 0) {
-        return;
-    }
-    const size_t digest_words = static_cast<size_t>(panel_tile_count) * 8u;
-    const size_t beats_words = static_cast<size_t>(panel_tile_count);
-    if (digest_host_.size() < digest_words) {
-        digest_host_.resize(digest_words);
-    }
-    if (beats_host_.size() < beats_words) {
-        beats_host_.resize(beats_words);
-    }
-    if (!ocl_.read_buffer(digest_buf_, digest_host_.data(), digest_words * sizeof(uint32_t)) ||
-        !ocl_.read_buffer(beats_buf_, beats_host_.data(), beats_words * sizeof(uint32_t))) {
-        std::fprintf(stderr, "[onednn] compare dump: failed to read digest/beats buffers\n");
-        return;
-    }
-
-    int gpu_beats = 0;
-    int cpu_beats = 0;
-    int mismatch = 0;
-    int false_pos = 0; // GPU yes, CPU no
-    int false_neg = 0; // GPU no, CPU yes
-    int unwritten = 0;
-    int compared = 0;
-    constexpr int kPrintMax = 32;
-    int printed = 0;
-
-    std::fprintf(stderr, "[onednn] compare dump: tiles=%d bound MSB-first:", panel_tile_count);
-    for (int w = 7; w >= 0; --w) {
-        std::fprintf(stderr, " %08x", scan_jackpot_bound_[w]);
-    }
-    std::fprintf(stderr, "\n");
-
-    for (int s = 0; s < panel_tile_count; ++s) {
-        uint32_t digest[8];
-        for (int w = 0; w < 8; ++w) {
-            digest[w] = digest_host_[static_cast<size_t>(s) * 8u + static_cast<size_t>(w)];
-        }
-        const uint32_t graw = beats_host_[static_cast<size_t>(s)];
-        if (graw == 0xFFFFFFFFu) {
-            ++unwritten;
-            if (printed < kPrintMax && unwritten <= 8) {
-                std::fprintf(stderr,
-                             "[onednn] UNWRITTEN beat spatial=%d (early-exit or OOB thread)\n", s);
-                ++printed;
-            }
-            continue;
-        }
-        ++compared;
-        const bool cpu = cp_jackpot::digest_beats_target(digest, scan_jackpot_bound_);
-        const bool gpu = graw != 0;
-        if (gpu) {
-            ++gpu_beats;
-        }
-        if (cpu) {
-            ++cpu_beats;
-        }
-        if (gpu != cpu) {
-            ++mismatch;
-            if (gpu && !cpu) {
-                ++false_pos;
-            }
-            if (!gpu && cpu) {
-                ++false_neg;
-            }
-        }
-        if ((gpu || cpu || gpu != cpu) && printed < kPrintMax) {
-            char blake_hex[65];
-            fmt_blake3_msb_hex(digest, blake_hex, sizeof(blake_hex));
-            std::fprintf(stderr,
-                         "[onednn] compare tile spat=%d gpu_beat=%d cpu_beat=%d "
-                         "gpu_beat_raw=0x%08x blake3=%s\n",
-                         s, gpu ? 1 : 0, cpu ? 1 : 0, graw, blake_hex);
-            ++printed;
-        }
-    }
-
-    std::fprintf(stderr,
-                 "[onednn] compare summary: compared=%d unwritten=%d gpu_beats=%d cpu_beats=%d "
-                 "mismatch=%d (false_pos=%d false_neg=%d)\n",
-                 compared, unwritten, gpu_beats, cpu_beats, mismatch, false_pos, false_neg);
-    if (mismatch == 0 && compared > 0) {
-        std::fprintf(stderr, "[onednn] compare: GPU matches CPU digest_beats_target on written tiles\n");
-    } else if (mismatch > 0) {
-        std::fprintf(stderr,
-                     "[onednn] compare: GPU judge disagrees with CPU — difficulty compare is broken\n");
-    }
-    std::fflush(stderr);
 }
 
 bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
@@ -1568,7 +1003,6 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
         return false;
     }
-    compare_dump_done_ = false;
 
     const int row_periods = hash_tile_rows_;
     const int col_periods = hash_tile_cols_;
@@ -1610,7 +1044,7 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             compute_tile_grid_(m_panel, n_panel, panel_tile_rows, panel_tile_cols, panel_tile_count);
 
             if (fused_jackpot_) {
-                if (!ensure_panel_digest_bufs_(panel_tile_count) || !ensure_jackpot_bufs_()) {
+                if (!ensure_panel_beats_buf_(panel_tile_count) || !ensure_jackpot_bufs_()) {
                     return false;
                 }
             } else if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {

@@ -456,20 +456,16 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
     iface.newArgument("tile_cols", DataType::d);
     iface.newArgument("xor_period", DataType::d);
     if (problem.case5TileXorBlake3) {
-        iface.newArgument("blake3_out", ExternalArgumentType::GlobalPtr, GlobalAccessType::Stateless);
+        if (!problem.case5FuseJackpot) {
+            iface.newArgument("blake3_out", ExternalArgumentType::GlobalPtr, GlobalAccessType::Stateless);
+        }
         for (int i = 0; i < 8; i++) {
             iface.newArgument("blake3_k" + std::to_string(i), DataType::ud);
         }
         if (problem.case5FuseJackpot) {
             iface.newArgument("blake3_beats", ExternalArgumentType::GlobalPtr,
                               GlobalAccessType::Stateless);
-            iface.newArgument("blake3_cmp_dump", ExternalArgumentType::GlobalPtr,
-                              GlobalAccessType::Stateless);
             iface.newArgument("found_flag", ExternalArgumentType::GlobalPtr,
-                              GlobalAccessType::Stateless);
-            iface.newArgument("out_t_rows", ExternalArgumentType::GlobalPtr,
-                              GlobalAccessType::Stateless);
-            iface.newArgument("out_t_cols", ExternalArgumentType::GlobalPtr,
                               GlobalAccessType::Stateless);
             iface.newArgument("tr_base", DataType::ud);
             iface.newArgument("tc_base", DataType::ud);
@@ -637,16 +633,15 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_cols);
     err |= set_arg(kernel, arg, sizeof(int), &bufs.xor_period);
     if (problem.case5TileXorBlake3) {
-        err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_out);
+        if (!problem.case5FuseJackpot) {
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_out);
+        }
         for (int i = 0; i < 8; i++) {
             err |= set_arg(kernel, arg, sizeof(uint32_t), &bufs.blake3_key_words[i]);
         }
         if (problem.case5FuseJackpot) {
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_beats);
-            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_cmp_dump);
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.found_flag);
-            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_rows);
-            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_cols);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tr_base);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tc_base);
             for (int i = 0; i < 8; i++) {
