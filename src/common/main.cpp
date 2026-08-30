@@ -826,7 +826,7 @@ int main(int argc, char** argv)
             const double panel_tiles =
                     (double)row_period_batch * (double)period_batch;
             if(onednn_fused_jackpot){
-                printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3; CPU digests judge\n");
+                printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
                 printf("[mode] period batch: row=%d col=%d (~%.1f MiB digests/panel on GPU)\n",
                        row_period_batch, period_batch,
                        panel_tiles * 8.0 * (double)sizeof(uint32_t) / (1024.0 * 1024.0));

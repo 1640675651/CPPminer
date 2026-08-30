@@ -460,6 +460,19 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
         for (int i = 0; i < 8; i++) {
             iface.newArgument("blake3_k" + std::to_string(i), DataType::ud);
         }
+        if (problem.case5FuseJackpot) {
+            // Bound via global buffer: scalar blake3_b* args read as garbage on Intel UHD/OpenCL.
+            iface.newArgument("blake3_bound", ExternalArgumentType::GlobalPtr,
+                              GlobalAccessType::Stateless);
+            iface.newArgument("found_flag", ExternalArgumentType::GlobalPtr,
+                              GlobalAccessType::Stateless);
+            iface.newArgument("out_t_rows", ExternalArgumentType::GlobalPtr,
+                              GlobalAccessType::Stateless);
+            iface.newArgument("out_t_cols", ExternalArgumentType::GlobalPtr,
+                              GlobalAccessType::Stateless);
+            iface.newArgument("tr_base", DataType::ud);
+            iface.newArgument("tc_base", DataType::ud);
+        }
     }
 
     if (hw >= HW::XeHPG) {
@@ -623,6 +636,14 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
         err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_out);
         for (int i = 0; i < 8; i++) {
             err |= set_arg(kernel, arg, sizeof(uint32_t), &bufs.blake3_key_words[i]);
+        }
+        if (problem.case5FuseJackpot) {
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_bound);
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.found_flag);
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_rows);
+            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.out_t_cols);
+            err |= set_arg(kernel, arg, sizeof(int), &bufs.tr_base);
+            err |= set_arg(kernel, arg, sizeof(int), &bufs.tc_base);
         }
     }
 

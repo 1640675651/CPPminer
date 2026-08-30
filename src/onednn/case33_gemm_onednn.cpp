@@ -541,7 +541,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
     const char *scan_mode =
-            fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+cpuJudge" : "igemm+tileXOR+GPUjackpot";
+            fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+gpuJudge" : "igemm+tileXOR+GPUjackpot";
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s unroll %dx%d xor %dx%d wg %dx%d "
                   "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
@@ -677,7 +677,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
     if (fused_jackpot_) {
-        if (!digest_buf_) {
+        if (!digest_buf_ || !found_buf_ || !out_rows_buf_ || !out_cols_buf_ || !bound_buf_) {
             return false;
         }
     } else if (!tile_xor_buf_) {
@@ -704,6 +704,12 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     if (fused_jackpot_) {
         bufs.blake3_out = digest_buf_;
         std::memcpy(bufs.blake3_key_words, scan_jackpot_key_, sizeof(bufs.blake3_key_words));
+        bufs.blake3_bound = bound_buf_;
+        bufs.found_flag = found_buf_;
+        bufs.out_t_rows = out_rows_buf_;
+        bufs.out_t_cols = out_cols_buf_;
+        bufs.tr_base = tr_base;
+        bufs.tc_base = tc_base;
     }
 
     gemmstone::GEMMProblem problem;
@@ -872,15 +878,107 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
                                                int panel_tile_cols, int tr_base, int tc_base,
                                                int *out_found, int *out_t_rows, int *out_t_cols) {
     if (!run_gemm_panel_(m_panel, n_panel, offset_a_rows, offset_b_cols, panel_tile_count,
-                         panel_tile_cols, tr_base, tc_base, fused_jackpot_, nullptr)) {
+                         panel_tile_cols, tr_base, tc_base, /*finish_queue=*/true, nullptr)) {
         return false;
     }
     if (fused_jackpot_) {
-        const int panel_tile_rows =
-                panel_tile_cols > 0 ? panel_tile_count / panel_tile_cols : panel_tile_count;
-        return scan_digest_panel_host_(scan_jackpot_key_, scan_jackpot_bound_, panel_tile_rows,
-                                       panel_tile_cols, panel_tile_count, tr_base, tc_base,
-                                       out_found, out_t_rows, out_t_cols, nullptr, {}, {});
+        int found = 0;
+        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found))) {
+            return false;
+        }
+        if (out_found) {
+            *out_found = found ? 1 : 0;
+        }
+        if (found) {
+            int t_rows = -1;
+            int t_cols = -1;
+            if (!ocl_.read_buffer(out_rows_buf_, &t_rows, sizeof(t_rows)) ||
+                !ocl_.read_buffer(out_cols_buf_, &t_cols, sizeof(t_cols))) {
+                return false;
+            }
+
+            // Capture GPU digest at the winning spatial for debug dump / host sanity.
+            const int hash_mr = info_.xorSubM;
+            const int hash_nr = info_.xorSubN;
+            hit_gpu_valid_ = false;
+            if (digest_buf_ && hash_mr > 0 && hash_nr > 0 && (t_rows % hash_mr) == 0 &&
+                (t_cols % hash_nr) == 0 && panel_tile_cols > 0) {
+                const int lr = t_rows / hash_mr;
+                const int lc = t_cols / hash_nr;
+                const int tr = lr - tr_base;
+                const int tc = lc - tc_base;
+                if (tr >= 0 && tc >= 0) {
+                    const size_t spatial =
+                            static_cast<size_t>(tr) * static_cast<size_t>(panel_tile_cols) +
+                            static_cast<size_t>(tc);
+                    const size_t digest_words =
+                            static_cast<size_t>(8) * static_cast<size_t>(panel_tile_count);
+                    if (digest_host_.size() < digest_words) {
+                        digest_host_.resize(digest_words);
+                    }
+                    if (ocl_.read_buffer(digest_buf_, digest_host_.data(),
+                                         digest_words * sizeof(uint32_t))) {
+                        for (int w = 0; w < 8; ++w) {
+                            hit_gpu_digest_[w] =
+                                    digest_host_[spatial * 8 + static_cast<size_t>(w)];
+                        }
+                        hit_gpu_valid_ = true;
+                    }
+                }
+            }
+
+            // Host sanity + recover systematic +1 hash-row claim (spatialId alloc_sub clobber).
+            if (hit_gpu_valid_ &&
+                !cp_jackpot::digest_beats_target(hit_gpu_digest_, scan_jackpot_bound_)) {
+                bool adjusted = false;
+                if (panel_tile_cols > 0) {
+                    const int lr = t_rows / hash_mr;
+                    const int lc = t_cols / hash_nr;
+                    const int tr = lr - tr_base;
+                    const int tc = lc - tc_base;
+                    if (tr > 0) {
+                        const size_t adj_spatial =
+                                static_cast<size_t>(tr - 1) * static_cast<size_t>(panel_tile_cols) +
+                                static_cast<size_t>(tc);
+                        if (adj_spatial * 8 + 8 <= digest_host_.size()) {
+                            uint32_t adj_digest[8];
+                            for (int w = 0; w < 8; ++w) {
+                                adj_digest[w] =
+                                        digest_host_[adj_spatial * 8 + static_cast<size_t>(w)];
+                            }
+                            if (cp_jackpot::digest_beats_target(adj_digest, scan_jackpot_bound_)) {
+                                t_rows = (tr_base + tr - 1) * hash_mr;
+                                std::memcpy(hit_gpu_digest_, adj_digest, sizeof(hit_gpu_digest_));
+                                adjusted = true;
+                            }
+                        }
+                    }
+                }
+                if (!adjusted) {
+                    std::fprintf(stderr,
+                                 "[onednn] ignoring GPU found at t_rows=%d t_cols=%d "
+                                 "(digest does not beat bound)\n",
+                                 t_rows, t_cols);
+                    const int zero = 0;
+                    if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero))) {
+                        return false;
+                    }
+                    if (out_found) {
+                        *out_found = 0;
+                    }
+                    hit_gpu_valid_ = false;
+                    return true;
+                }
+            }
+
+            if (out_t_rows) {
+                *out_t_rows = t_rows;
+            }
+            if (out_t_cols) {
+                *out_t_cols = t_cols;
+            }
+        }
+        return true;
     }
     if (!run_gpu_jackpot_panel_(panel_tile_count, panel_tile_cols, tr_base, tc_base, out_found,
                                 true)) {

@@ -37,6 +37,12 @@ struct LaunchBuffers {
     int xor_period = 1;
     cl_mem blake3_out = nullptr;
     uint32_t blake3_key_words[8] = {};
+    cl_mem blake3_bound = nullptr; // 8 u32 target; scalar bounds are unreliable on Intel OpenCL
+    cl_mem found_flag = nullptr;
+    cl_mem out_t_rows = nullptr;
+    cl_mem out_t_cols = nullptr;
+    int tr_base = 0;
+    int tc_base = 0;
 };
 
 struct LaunchDims {
