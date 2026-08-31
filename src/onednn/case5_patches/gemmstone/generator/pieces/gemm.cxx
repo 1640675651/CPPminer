@@ -15,8 +15,10 @@
 *******************************************************************************/
 
 
+#include "alloc_utils.hpp"
 #include "atomic_fusions.hpp"
 #include "cooperative_split.hpp"
+#include <cstdlib>
 #include "gemmstone/generator.hpp"
 #include "gemmstone/problem.hpp"
 #include "gemmstone/strategy.hpp"
@@ -413,6 +415,11 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
     if (strategy.kParallel && !strategy.kInterleave)
         add(1 | gt | state.flagAP, idK, idK, state.lidK);
 
+    if (problem.case5TileXor) {
+        gemmCase5TileXorAlloc(problem, strategy, state);
+        case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
+    }
+
     mulConstant(1, state.i0, idM, strategy.unroll[LoopM]);
     mulConstant(1, state.j0, idN, strategy.unroll[LoopN] * strategy.cInterleaveChunk(problem.Tc_ext));
 
@@ -576,8 +583,8 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
         if (checkB) emov(1 | f1[1], state.offsetB, 0, strategy, state);
     }
 
+    gemmCase5TileXorIterationInit(problem, strategy, state);
     gemmSetupABC(problem, strategy, state);
-    gemmCase5TileXorSetup(problem, strategy, state);
     gemmSubkernel(problem, strategy, state);
 
     mark(lKernelDone);
@@ -1008,6 +1015,16 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
         if (!gemmFusedPostOpsFinalize(labelLateExit, problem, strategy, state)) return false;
     }
 
+    // Case5 SLM-staged tile_xor: flush before any registerOutput marshaling.
+    if (problem.case5TileXor && problem.case5TileXorSlm)
+        gemmCase5TileXorFlushFromSlm(problem, strategy, state);
+    else if (problem.case5TileXor && problem.case5TileXorBlake3) {
+        // Fold stays in wrap-GRF; BLAKE3 consumes it in-register. Only digests hit global.
+        gemmCase5TileXorBlake3FromGrf(problem, strategy, state);
+    } else if (problem.case5TileXor && problem.case5TileXorWrapGrf
+             && problem.case5TileXorWrapGrfStoreMode == 2)
+        gemmCase5TileXorFlushFromGrf(problem, strategy, state);
+
     if (strategy.registerOutput()) {
         // Marshal C into output registers. The main path defines the output registers.
         if (outputCRange.empty()) {
@@ -1017,8 +1034,8 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
             // FIXME: check that layouts are compatible, and rearrange if not.
             overlappedCopy(state.C_regs[0], outputCRange, state);
         }
-    } else if (problem.case5TileXor) {
-        // Case5: C stays in GRFs for tile XOR only — no global C writeback.
+    } else if (problem.case5TileXor && !problem.case5TileXorSlm) {
+        // Case5 / 5.4 wrap / 5.5 wrapGrf: tile_xor written in K-loop or GRF epilogue flush.
     } else {
         // Regular C update into memory.
         if (!gemmUpdateCDispatch(problem, strategy, state)) return false;

@@ -1079,6 +1079,26 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
             if (hb0 % kb_sum == 0)
                 accumulateSum(true, regsB, layoutB, state.Bs_regs, state.Bs_layout, strategy, state, hb0, hb0 + kb_sum);
         }
+
+        // Case5.2: fold XOR chunks right after the last outer product of each panel.
+        if (problem.case5TileXorIncremental && !problem.case5TileXorNop) {
+            if ((h + minOPCount) % unrollK == 0) {
+                const int xorPeriod = (problem.case5XorPeriod > 0) ? problem.case5XorPeriod : 1;
+                Label lSkipFold;
+                if (xorPeriod > 1) {
+                    auto tmp = state.ra.alloc_sub<uint32_t>();
+                    add(1, tmp, state.tileXorPanel, uint16_t(1));
+                    and_(1, tmp, tmp, uint16_t(xorPeriod - 1));
+                    cmp(1 | nz | state.flagCase5Xor, tmp, 0);
+                    jmpi(1 | state.flagCase5Xor, lSkipFold);
+                    state.ra.safeRelease(tmp);
+                }
+                const int numChunks = (problem.case5XorFoldChunks > 0) ? problem.case5XorFoldChunks : 8;
+                for (int c = 0; c < numChunks; c++)
+                    gemmCase5TileXorFoldChunk(problem, strategy, state, c, numChunks);
+                mark(lSkipFold);
+            }
+        }
     });
 
     // Case5 milestoned tile XOR after each unrollK panel (runtime xorPeriod gate).

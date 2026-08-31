@@ -2801,6 +2801,26 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
         state.inputs.tileCount = interface.getArgumentIfExists("tile_count");
         state.inputs.tileCols = interface.getArgumentIfExists("tile_cols");
         state.inputs.xorPeriod = interface.getArgumentIfExists("xor_period");
+        if (problem.case5TileXorBlake3) {
+            state.inputs.blake3Out = interface.getArgumentIfExists("blake3_out");
+            for (int i = 0; i < 8; i++) {
+                state.inputs.blake3KeyWords[i] =
+                        interface.getArgumentIfExists("blake3_k" + std::to_string(i));
+            }
+            if (problem.case5FuseJackpot) {
+                state.inputs.blake3Beats = interface.getArgumentIfExists("blake3_beats");
+                state.inputs.blake3CmpDump = interface.getArgumentIfExists("blake3_cmp_dump");
+                state.inputs.foundFlag = interface.getArgumentIfExists("found_flag");
+                state.inputs.outTRows = interface.getArgumentIfExists("out_t_rows");
+                state.inputs.outTCols = interface.getArgumentIfExists("out_t_cols");
+                state.inputs.trBase = interface.getArgumentIfExists("tr_base");
+                state.inputs.tcBase = interface.getArgumentIfExists("tc_base");
+                for (int i = 0; i < 8; i++) {
+                    state.inputs.blake3BoundWords[i] =
+                            interface.getArgumentIfExists("blake3_b" + std::to_string(i));
+                }
+            }
+        }
     }
 
     size_t poCount = problem.postOps.len();
@@ -3095,6 +3115,36 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
             state.ra.claim(state.inputs.tileCols);
         if (state.inputs.xorPeriod.isValid())
             state.ra.claim(state.inputs.xorPeriod);
+        if (problem.case5TileXorBlake3) {
+            if (state.inputs.blake3Out.isValid())
+                state.ra.claim(state.inputs.blake3Out);
+            if (state.inputs.blake3Beats.isValid())
+                state.ra.claim(state.inputs.blake3Beats);
+            if (state.inputs.blake3CmpDump.isValid())
+                state.ra.claim(state.inputs.blake3CmpDump);
+            for (int i = 0; i < 8; i++) {
+                if (state.inputs.blake3KeyWords[i].isValid())
+                    state.ra.claim(state.inputs.blake3KeyWords[i]);
+            }
+            if (problem.case5FuseJackpot) {
+                for (int i = 0; i < 8; i++) {
+                    if (state.inputs.blake3BoundWords[i].isValid())
+                        state.ra.claim(state.inputs.blake3BoundWords[i]);
+                }
+                if (state.inputs.blake3BoundBuf.isValid())
+                    state.ra.claim(state.inputs.blake3BoundBuf);
+                if (state.inputs.foundFlag.isValid())
+                    state.ra.claim(state.inputs.foundFlag);
+                if (state.inputs.outTRows.isValid())
+                    state.ra.claim(state.inputs.outTRows);
+                if (state.inputs.outTCols.isValid())
+                    state.ra.claim(state.inputs.outTCols);
+                if (state.inputs.trBase.isValid())
+                    state.ra.claim(state.inputs.trBase);
+                if (state.inputs.tcBase.isValid())
+                    state.ra.claim(state.inputs.tcBase);
+            }
+        }
     }
 
     // Binary-related arguments are not claimed here, but instead

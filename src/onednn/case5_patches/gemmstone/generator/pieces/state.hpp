@@ -229,6 +229,24 @@ struct GEMMState : public CommonState {
         ngen::Subregister tileCount;                        // d  (# spatial tiles)
         ngen::Subregister tileCols;                         // d  (# tiles in N direction)
         ngen::Subregister xorPeriod;                        // d  (panels between XOR; 1 = every unrollK)
+        ngen::Subregister blake3Out;                        // q global digest out (8 u32 / tile)
+        ngen::Subregister blake3Beats;                      // q global u32[tile]: 1 if GPU compare beats
+        ngen::Subregister blake3CmpDump;                    // q per-tile u32[65]: dig, bound, cmp, f1_gt/lt, jmpi fall, reach_store
+        ngen::Subregister blake3KeyWords[8];                // ud keyed hash key (8 u32)
+        ngen::Subregister blake3BoundWords[8];              // ud target digest (8 u32)
+        ngen::Subregister blake3BoundBuf;                    // q global target digest (legacy)
+        ngen::Subregister jackpotKeyWords[8];               // ud (BLAKE3 key)
+        ngen::Subregister jackpotBoundWords[8];             // ud (unused; bound via jackpotBoundBuf)
+        ngen::Subregister jackpotBoundBuf;                    // q  (global target digest, 8 dwords)
+        ngen::Subregister jackpotDigestBuf;                 // q  (panel digest out: w*tile_count+spatial)
+        ngen::Subregister jackpotMsgBuf;                    // q  (panel folded msg out: w*tile_count+spatial)
+        ngen::Subregister foundFlag;                        // q  (found flag)
+        ngen::Subregister outTRows;                         // q
+        ngen::Subregister outTCols;                         // q
+        ngen::Subregister trBase;                           // d
+        ngen::Subregister tcBase;                           // d
+        ngen::Subregister hashMr;                           // d
+        ngen::Subregister hashNr;                           // d
         uint8_t surfaceA, surfaceAO, surfaceAScale;         // BTS indices
         uint8_t surfaceB, surfaceBO, surfaceBScale;         // BTS indices
         uint8_t surfaceAg, surfaceBg;                       // BTS
@@ -317,7 +335,14 @@ struct GEMMState : public CommonState {
     ngen::Subregister tileXorMs;                             // ud milestone index
     ngen::Subregister tileXorPanel;                          // ud panel counter (1 after first panel)
     ngen::Subregister spatialId;                            // ud
+    ngen::Subregister tileXorLocalId;                       // ud (idM%wgM) + (idN%wgN)*wgM at prologue
+    ngen::Subregister tileXorRow;                           // ud thread tile row (split path)
+    ngen::Subregister tileXorCol;                           // ud thread tile col (split path)
     ngen::GRF tileXorFold;                                  // optional scratch if preallocated
+    std::vector<ngen::GRF> tileXorFolds;                    // one fold GRF per logical sub-tile (split path)
+    std::vector<ngen::GRF> tileXorWrapGrf;                  // Case5.5: 2 GRF per fold (8 u32 each)
+    RegisterLayout tileXorSlmLayout;                        // 1x1 u32 scattered SLM (storeMatrix path)
+    std::vector<ngen::GRFRange> tileXorSlmAddrs;
     ngen::FlagRegister flagCase5Xor;                        // KR-period gate (not flagAP)
     ngen::Subregister remainders[3];                        // d (todo: w)
     ngen::Subregister remaindersFused[2];                   // w

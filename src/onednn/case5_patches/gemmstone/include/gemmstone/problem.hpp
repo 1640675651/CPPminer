@@ -199,7 +199,23 @@ struct GEMMProblem : public CommonProblem {
     ngen::Product product;
     bool case5TileXor = false;                      // Case5: emit milestoned tile XOR of C_regs
     bool case5TileXorNop = false;                   // Case5.1: same gate/store schedule, no C fold
+    bool case5TileXorIncremental = false;           // Case5.2: spread fold XOR across panel tail; store reduces
+    bool case5TileXorTree = false;                  // Case5.3: tree-reduce SIMD XOR fold (8 partial GRFs)
+    bool case5TileXorWrap = false;                  // Case5.4: 32 K milestones, 16 output slots (ms^ms+16)
+    bool case5TileXorWrapGrf = false;               // Case5.5: wrap with 2 GRF/tile staging (no global reload)
+    int case5TileXorWrapGrfStoreMode = 2;           // 0=off 1=in-loop ms>=N 2=epilogue (CASE5_XOR_WRAP_GRF_FLUSH)
+    bool case5TileXorWrapGrfStageUnified = true;    // false=hybrid mov/xor (CASE5_XOR_WRAP_GRF_STAGE=hybrid)
+    bool case5TileXorSlm = false;                   // Stage milestone XOR in SLM; flush to global at epilogue
+    bool case5TileXorBlake3 = false;                // Case5.6: b3_compress64 on 16 wrap-GRF slots per tile
+    bool case5FuseJackpot = false;                  // wrap-GRF fold uses rotl(slot,13)^x (cp_jackpot)
+    int case5XorFoldChunks = 8;                     // Case5.2: column/GRF chunks per milestone panel
+    int case5XorMaxMilestones = 1;                  // K / milestone_k (K-loop milestone count)
+    int case5XorOutputMilestones = 0;               // Case5.4: global tile_xor rows (0 → max/2 when wrap)
     int case5XorPeriod = 1;                         // Store every N unrollK panels (KR=128 -> 4 when k32)
+    int case5XorSubM = 0;                           // Logical sub-tile height (<= unrollM)
+    int case5XorSubN = 0;                           // Logical sub-tile width (<= unrollN)
+    int case5XorSubGridM = 1;                       // Sub-tiles per thread along M
+    int case5XorSubGridN = 1;                       // Sub-tiles per thread along N
 
     // The following data is derived from the postOps and does not need
     //   to be considered for equality/hashing purposes.

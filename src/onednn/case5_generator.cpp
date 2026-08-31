@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Case 5 gemmstone generator TU: all generator pieces + explicit HW instancing.
- * Lives in-repo (not third_party) so Gen12LP + XeHPG symbols always link even
- * when prepare_case5_deps skips re-applying patches to vendored gemmstone.
+ * Patched gemmstone pieces live in case5_patches/ and are copied into
+ * third_party/gemmstone by prepare_onednn_deps.bat (also invoked from CMake).
  ******************************************************************************/
 
 #include <array>

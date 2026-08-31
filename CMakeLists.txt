@@ -275,12 +275,36 @@ endif()
 if(CP_ENABLE_ONEDNN)
     set(_ONEDNN_DIR "${CMAKE_SOURCE_DIR}/src/onednn")
     set(_GEMMSTONE_ROOT "${_ONEDNN_DIR}/third_party/gemmstone")
-    set(_ONEDNN_SRC "${_ONEDNN_DIR}/third_party/onednn-src")
+    set(_ONEDNN_SRC "${CMAKE_SOURCE_DIR}/third_party/onednn-src")
     set(_ONEDNN_GEMM_JIT "${_ONEDNN_SRC}/src/gpu/intel/gemm/jit")
     set(_ONEDNN_KERNEL_DB "${_ONEDNN_GEMM_JIT}/selector/db/kernel.db")
+    set(_ONEDNN_PREP_BAT "${_ONEDNN_DIR}/prepare_onednn_deps.bat")
+    if(NOT EXISTS "${_ONEDNN_KERNEL_DB}" OR NOT EXISTS "${_GEMMSTONE_ROOT}/include/gemmstone/generator.hpp")
+        if(WIN32 AND EXISTS "${_ONEDNN_PREP_BAT}")
+            message(STATUS "CP_ENABLE_ONEDNN: running prepare_onednn_deps.bat (fetch + patch gemmstone)")
+            execute_process(
+                COMMAND cmd /c "${_ONEDNN_PREP_BAT}"
+                WORKING_DIRECTORY "${_ONEDNN_DIR}"
+                RESULT_VARIABLE _ONEDNN_PREP_RC)
+            if(NOT _ONEDNN_PREP_RC EQUAL 0)
+                message(FATAL_ERROR "prepare_onednn_deps.bat failed (exit ${_ONEDNN_PREP_RC})")
+            endif()
+        endif()
+    else()
+        if(WIN32 AND EXISTS "${_ONEDNN_PREP_BAT}")
+            message(STATUS "CP_ENABLE_ONEDNN: re-applying case5_patches to vendored gemmstone")
+            execute_process(
+                COMMAND cmd /c "${_ONEDNN_PREP_BAT}"
+                WORKING_DIRECTORY "${_ONEDNN_DIR}"
+                RESULT_VARIABLE _ONEDNN_PATCH_RC)
+            if(NOT _ONEDNN_PATCH_RC EQUAL 0)
+                message(FATAL_ERROR "prepare_onednn_deps.bat patch overlay failed (exit ${_ONEDNN_PATCH_RC})")
+            endif()
+        endif()
+    endif()
     if(NOT EXISTS "${_ONEDNN_KERNEL_DB}")
         message(FATAL_ERROR
-            "CP_ENABLE_ONEDNN requires oneDNN sources at src/onednn/third_party/onednn-src "
+            "CP_ENABLE_ONEDNN requires oneDNN sources at third_party/onednn-src "
             "(missing ${_ONEDNN_KERNEL_DB}). Run src/onednn/prepare_onednn_deps.bat")
     endif()
     file(GLOB _GEMMSTONE_PIECE_SOURCES CONFIGURE_DEPENDS

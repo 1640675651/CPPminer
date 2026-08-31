@@ -1,4 +1,4 @@
-// oneDNN kernel.db from third_party/onednn-src (see prepare_case5_deps.bat).
+// oneDNN kernel.db from third_party/onednn-src (see prepare_onednn_deps.bat).
 
 #include "gemmstone/kernel_catalog.hpp"
 

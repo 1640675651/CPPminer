@@ -68,10 +68,10 @@ private:
                                    int *out_t_cols, uint64_t *out_tiles_scanned,
                                    const std::function<bool()> &should_cancel,
                                    const std::function<void(uint64_t)> &on_progress);
+
     bool ensure_panel_beats_buf_(int panel_tile_count);
     bool find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols, int tr_base,
-                               int tc_base, int *out_t_rows, int *out_t_cols,
-                               const uint32_t hit_digest[8]);
+                               int tc_base, int *out_t_rows, int *out_t_cols);
 
     bool context_ready_ = false;
     bool available_ = false;

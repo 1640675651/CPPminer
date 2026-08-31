@@ -19,10 +19,7 @@
 namespace {
 
 constexpr size_t kJackpotFoundFlagOff = 8u * sizeof(uint32_t);
-constexpr size_t kJackpotHitDigestOff = kJackpotFoundFlagOff + sizeof(uint32_t);
-constexpr size_t kJackpotHitRowsOff = kJackpotHitDigestOff + 8u * sizeof(uint32_t);
-constexpr size_t kJackpotHitColsOff = kJackpotHitRowsOff + sizeof(uint32_t);
-constexpr size_t kJackpotFoundBufBytes = kJackpotHitColsOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundBufBytes = kJackpotFoundFlagOff + sizeof(uint32_t);
 
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -378,10 +375,10 @@ bool Case33GemmOnednn::ensure_jackpot_bufs_() {
         found_buf_ = ocl_.alloc_buffer(kJackpotFoundBufBytes, CL_MEM_READ_WRITE);
     }
     if (!out_rows_buf_) {
-        out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+        out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
     }
     if (!out_cols_buf_) {
-        out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+        out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
     }
     return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
 }
@@ -779,21 +776,10 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
             *out_found = found ? 1 : 0;
         }
         if (found) {
-            uint32_t digest[8] = {};
-            if (!ocl_.read_buffer(found_buf_, digest, 8u * sizeof(uint32_t), kJackpotHitDigestOff)) {
-                return false;
-            }
-            if (!cp_jackpot::digest_beats_target(digest, scan_jackpot_bound_)) {
-                found = 0;
-                if (out_found) {
-                    *out_found = 0;
-                }
-                return true;
-            }
             int t_rows = -1;
             int t_cols = -1;
             if (!find_fused_panel_hit_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
-                                       &t_rows, &t_cols, digest)) {
+                                       &t_rows, &t_cols)) {
                 found = 0;
                 if (out_found) {
                     *out_found = 0;
@@ -808,9 +794,8 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
             }
         }
         return true;
-    }
-    if (!run_gpu_jackpot_panel_(panel_tile_count, panel_tile_cols, tr_base, tc_base, out_found,
-                                true)) {
+    } else if (!run_gpu_jackpot_panel_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
+                                       out_found, true)) {
         return false;
     }
     if (out_found && *out_found) {
@@ -847,8 +832,7 @@ bool Case33GemmOnednn::ensure_panel_beats_buf_(int panel_tile_count) {
 
 bool Case33GemmOnednn::find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols,
                                              int tr_base, int tc_base, int *out_t_rows,
-                                             int *out_t_cols, const uint32_t hit_digest[8]) {
-    (void)hit_digest;
+                                             int *out_t_cols) {
     if (!beats_buf_ || panel_tile_count <= 0) {
         return false;
     }

@@ -135,7 +135,7 @@ ensure_blake3() {
 
 ensure_onednn_deps() {
     local onednn_dir="${PROJECT_ROOT}/src/onednn"
-    local kernel_db="${onednn_dir}/third_party/onednn-src/src/gpu/intel/gemm/jit/selector/db/kernel.db"
+    local kernel_db="${PROJECT_ROOT}/third_party/onednn-src/src/gpu/intel/gemm/jit/selector/db/kernel.db"
     if [[ -f "${kernel_db}" ]]; then
         log "oneDNN/gemmstone deps already present"
         return

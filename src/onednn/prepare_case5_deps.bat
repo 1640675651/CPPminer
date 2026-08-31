@@ -3,13 +3,13 @@ setlocal EnableDelayedExpansion
 
 cd /d "%~dp0"
 
-REM oneDNN source: ONEDNN_SRC if set, else clone into third_party\onednn-src.
+REM oneDNN source: ONEDNN_SRC if set, else clone into project third_party\onednn-src.
 if not defined ONEDNN_TAG set "ONEDNN_TAG=v3.13.2"
-set "ONEDNN_FETCH_DIR=third_party\onednn-src"
+set "ONEDNN_FETCH_DIR=..\..\third_party\onednn-src"
 set "NGEN_DEST=third_party\ngen"
 set "GEMMSTONE_DEST=third_party\gemmstone"
 set "PATCHES=case5_patches"
-set "TAG_STAMP=third_party\.case5_onednn_tag"
+set "TAG_STAMP=..\..\third_party\.case5_onednn_tag"
 set "REFRESH=0"
 
 if /I "%~1"=="refresh" set "REFRESH=1"
@@ -19,12 +19,14 @@ if "!REFRESH!"=="0" (
         if exist "!TAG_STAMP!" (
             set /p VENDORED_TAG=<"!TAG_STAMP!"
             if /I "!VENDORED_TAG!"=="!ONEDNN_TAG!" (
-                echo Case5 deps already vendored ^(!ONEDNN_TAG!^): !NGEN_DEST! and !GEMMSTONE_DEST!
+                echo Case5 deps already vendored ^(!ONEDNN_TAG!^); re-applying patches...
+                call :apply_patches
+                if errorlevel 1 exit /b 1
                 exit /b 0
             )
             echo Case5 deps vendored for !VENDORED_TAG! but ONEDNN_TAG=!ONEDNN_TAG!; re-vendoring...
         ) else (
-            echo Case5 deps present but tag stamp missing; re-vendoring for !ONEDNN_TAG!...
+            echo Case5 deps present but tag stamp missing; re-vendor for !ONEDNN_TAG!...
         )
         set "REFRESH=1"
     )
@@ -71,20 +73,24 @@ if errorlevel 1 exit /b 1
 call :robocopy_tree "!ONEDNN_ROOT!\src\gpu\intel\gemm\jit\generator" "!GEMMSTONE_DEST!\generator"
 if errorlevel 1 exit /b 1
 
-if not exist "!PATCHES!\gemmstone\gemmstone_config.hpp" (
-    echo Missing Case5 patch overlay: !PATCHES!\gemmstone\gemmstone_config.hpp
-    exit /b 1
-)
-
-echo Applying Case5 patches from !PATCHES! ...
-call :robocopy_tree "!PATCHES!\ngen" "!NGEN_DEST!"
-if errorlevel 1 exit /b 1
-call :robocopy_tree "!PATCHES!\gemmstone" "!GEMMSTONE_DEST!"
+call :apply_patches
 if errorlevel 1 exit /b 1
 
 echo !ONEDNN_TAG!> "!TAG_STAMP!"
 
 echo Case5 deps ready: !NGEN_DEST! and !GEMMSTONE_DEST! ^(oneDNN !ONEDNN_TAG!^)
+exit /b 0
+
+:apply_patches
+if not exist "!PATCHES!\gemmstone\gemmstone_config.hpp" (
+    echo Missing Case5 patch overlay: !PATCHES!\gemmstone\gemmstone_config.hpp
+    exit /b 1
+)
+echo Applying Case5 patches from !PATCHES! ...
+call :robocopy_tree "!PATCHES!\ngen" "!NGEN_DEST!"
+if errorlevel 1 exit /b 1
+call :robocopy_tree "!PATCHES!\gemmstone" "!GEMMSTONE_DEST!"
+if errorlevel 1 exit /b 1
 exit /b 0
 
 :validate_onednn_root
@@ -105,7 +111,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "third_party" mkdir "third_party"
+for %%D in ("!ONEDNN_FETCH_DIR!") do if not exist "%%~dpD" mkdir "%%~dpD"
 
 if exist "!ONEDNN_FETCH_DIR!" (
     echo Removing incomplete or outdated oneDNN tree at !ONEDNN_FETCH_DIR! ...

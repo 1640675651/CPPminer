@@ -156,7 +156,7 @@ CPU, real share found and verified — no spurious `ignoring GPU jackpot claim`.
 
 | File | Role |
 |------|------|
-| `third_party/gemmstone/generator/pieces/case5_blake3.cxx` | Fused BLAKE3 epilogue + compare loop |
+| `case5_patches/gemmstone/generator/pieces/case5_blake3.cxx` | Fused BLAKE3 epilogue + compare loop (patched into vendored gemmstone) |
 | `case33_gemm_onednn.cpp` | Host dump, CPU recompute, safety gate |
 | `case5_gemm_launch.cpp` | Kernel args (`blake3_cmp_dump`, `blake3_b0..b7`, …) |
 | `src/cpu/cp_jackpot.hpp` | Reference `digest_beats_target()` |

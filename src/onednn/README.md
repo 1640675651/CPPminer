@@ -15,7 +15,7 @@ cd src\onednn
 prepare_onednn_deps.bat
 ```
 
-Fetches oneDNN into `third_party/onednn-src` and vendors nGEN/gemmstone (+ `case5_patches/`).
+Fetches oneDNN into project `third_party/onednn-src` and vendors nGEN/gemmstone under `src/onednn/third_party/` (+ `case5_patches/` overlay).
 
 ## Build
 
@@ -55,7 +55,8 @@ src/onednn/
   case5_kernel_select.*       catalog selection + pearl tile filters
   case5_generator.cpp         gemmstone TU (patched pieces)
   case5_catalog.cpp           embedded kernel.db
-  case5_patches/              gemmstone/ngen overlays (tile XOR hooks)
+  case5_patches/              gemmstone/ngen overlays (source of truth; applied by prepare script)
   prepare_onednn_deps.bat
-  third_party/                ngen, gemmstone, onednn-src (after prepare)
+  third_party/                ngen, gemmstone (vendored after prepare)
+../../third_party/onednn-src   oneDNN checkout (after prepare)
 ```

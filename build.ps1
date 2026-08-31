@@ -257,7 +257,7 @@ function Copy-OpenClKernels {
 
 function Ensure-OneDnnDeps {
     $onednnDir = Join-Path $Root "src\onednn"
-    $kernelDb = Join-Path $onednnDir "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
+    $kernelDb = Join-Path $Root "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
     if (Test-Path $kernelDb) { return }
     Write-Host "=== Fetching oneDNN/gemmstone deps for Intel GPU backend ==="
     $prep = Join-Path $onednnDir "prepare_onednn_deps.bat"
