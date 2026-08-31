@@ -18,9 +18,16 @@
 
 namespace {
 
-constexpr size_t kJackpotFoundFlagOff = 8u * sizeof(uint32_t);
-constexpr size_t kJackpotFoundCoordsOff = (kJackpotFoundFlagOff + sizeof(uint32_t) + 7u) & ~size_t(7u);
+constexpr size_t kJackpotFoundFlagOffFused = 8u * sizeof(uint32_t);
+constexpr size_t kJackpotFoundCoordsOff =
+        (kJackpotFoundFlagOffFused + sizeof(uint32_t) + 7u) & ~size_t(7u);
 constexpr size_t kJackpotFoundBufBytes = kJackpotFoundCoordsOff + sizeof(uint64_t);
+
+// Fused gemmstone kernel packs bound[+0] found[+32] coords[+40] in one buffer.
+// Non-fused cp_onednn_jackpot_scan uses found_flag at buffer base (offset 0).
+constexpr size_t jackpot_found_flag_off(bool fused) {
+    return fused ? kJackpotFoundFlagOffFused : 0u;
+}
 
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -601,7 +608,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
             return false;
         }
         const int zero = 0;
-        if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
+        if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero),
+                               jackpot_found_flag_off(/*fused=*/true))) {
             return false;
         }
         const uint64_t zero_coords = 0;
@@ -740,7 +748,8 @@ bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_ti
         }
 
         int found = 0;
-        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found), kJackpotFoundFlagOff)) {
+        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found),
+                               jackpot_found_flag_off(/*fused=*/false))) {
             return false;
         }
         if (out_found) {
@@ -761,7 +770,8 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
     }
     if (fused_jackpot_) {
         int found = 0;
-        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found), kJackpotFoundFlagOff)) {
+        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found),
+                               jackpot_found_flag_off(/*fused=*/true))) {
             return false;
         }
         if (out_found) {
@@ -910,12 +920,17 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     std::memcpy(scan_jackpot_bound_, bound, sizeof(scan_jackpot_bound_));
 
     if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t)) ||
-        !ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t)) ||
-        !ocl_.write_buffer(found_buf_, bound, 8 * sizeof(uint32_t), 0)) {
+        !ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
         return false;
     }
+    if (fused_jackpot_) {
+        if (!ocl_.write_buffer(found_buf_, bound, 8 * sizeof(uint32_t), 0)) {
+            return false;
+        }
+    }
     const int zero = 0;
-    if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
+    if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero),
+                           jackpot_found_flag_off(fused_jackpot_))) {
         return false;
     }
 
