@@ -230,7 +230,6 @@ struct GEMMState : public CommonState {
         ngen::Subregister tileCols;                         // d  (# tiles in N direction)
         ngen::Subregister xorPeriod;                        // d  (panels between XOR; 1 = every unrollK)
         ngen::Subregister blake3Out;                        // q global digest out (8 u32 / tile)
-        ngen::Subregister blake3Beats;                      // q global u32[tile]: 1 if GPU compare beats
         ngen::Subregister blake3CmpDump;                    // q per-tile u32[65]: dig, bound, cmp, f1_gt/lt, jmpi fall, reach_store
         ngen::Subregister blake3KeyWords[8];                // ud keyed hash key (8 u32)
         ngen::Subregister blake3BoundWords[8];              // ud target digest (8 u32)

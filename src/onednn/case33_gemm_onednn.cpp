@@ -19,9 +19,8 @@
 namespace {
 
 constexpr size_t kJackpotFoundFlagOff = 8u * sizeof(uint32_t);
-constexpr size_t kJackpotFoundTRowsOff = kJackpotFoundFlagOff + sizeof(uint32_t);
-constexpr size_t kJackpotFoundTColsOff = kJackpotFoundTRowsOff + sizeof(uint32_t);
-constexpr size_t kJackpotFoundBufBytes = kJackpotFoundTColsOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundCoordsOff = (kJackpotFoundFlagOff + sizeof(uint32_t) + 7u) & ~size_t(7u);
+constexpr size_t kJackpotFoundBufBytes = kJackpotFoundCoordsOff + sizeof(uint64_t);
 
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -119,10 +118,6 @@ Case33GemmOnednn::~Case33GemmOnednn() {
     if (out_cols_buf_) {
         clReleaseMemObject(out_cols_buf_);
         out_cols_buf_ = nullptr;
-    }
-    if (beats_buf_) {
-        clReleaseMemObject(beats_buf_);
-        beats_buf_ = nullptr;
     }
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -599,7 +594,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
     if (fused_jackpot_) {
-        if (!found_buf_ || !beats_buf_ || !bound_buf_) {
+        if (!found_buf_ || !bound_buf_) {
             return false;
         }
         if (!ocl_.write_buffer(found_buf_, scan_jackpot_bound_, 8u * sizeof(uint32_t), 0)) {
@@ -609,17 +604,9 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
             return false;
         }
-        if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundTRowsOff) ||
-            !ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundTColsOff)) {
-            return false;
-        }
-        if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
-            beats_host_.assign(static_cast<size_t>(panel_tile_count), 0u);
-        } else {
-            std::fill(beats_host_.begin(), beats_host_.begin() + panel_tile_count, 0u);
-        }
-        if (!ocl_.write_buffer(beats_buf_, beats_host_.data(),
-                               static_cast<size_t>(panel_tile_count) * sizeof(uint32_t))) {
+        const uint64_t zero_coords = 0;
+        if (!ocl_.write_buffer(found_buf_, &zero_coords, sizeof(zero_coords),
+                                    kJackpotFoundCoordsOff)) {
             return false;
         }
     } else if (!tile_xor_buf_) {
@@ -647,7 +634,6 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         std::memcpy(bufs.blake3_key_words, scan_jackpot_key_, sizeof(bufs.blake3_key_words));
         std::memcpy(bufs.blake3_bound_words, scan_jackpot_bound_, sizeof(bufs.blake3_bound_words));
         bufs.found_flag = found_buf_;
-        bufs.blake3_beats = beats_buf_;
         bufs.tr_base = tr_base;
         bufs.tc_base = tc_base;
     }
@@ -782,22 +768,14 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
             *out_found = found ? 1 : 0;
         }
         if (found) {
-            int t_rows = -1;
-            int t_cols = -1;
-            if (!ocl_.read_buffer(found_buf_, &t_rows, sizeof(int), kJackpotFoundTRowsOff) ||
-                !ocl_.read_buffer(found_buf_, &t_cols, sizeof(int), kJackpotFoundTColsOff)) {
+            uint64_t packed_coords = 0;
+            if (!ocl_.read_buffer(found_buf_, &packed_coords, sizeof(packed_coords),
+                                   kJackpotFoundCoordsOff)) {
                 return false;
             }
-            if (t_rows < 0 || t_cols < 0) {
-                if (!find_fused_panel_hit_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
-                                           &t_rows, &t_cols)) {
-                    found = 0;
-                    if (out_found) {
-                        *out_found = 0;
-                    }
-                    return true;
-                }
-            }
+            const int t_rows = static_cast<int>(static_cast<uint32_t>(packed_coords));
+            const int t_cols =
+                    static_cast<int>(static_cast<uint32_t>(packed_coords >> 32));
             if (out_t_rows) {
                 *out_t_rows = t_rows;
             }
@@ -819,65 +797,6 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
         }
     }
     return true;
-}
-
-bool Case33GemmOnednn::ensure_panel_beats_buf_(int panel_tile_count) {
-    if (panel_tile_count <= 0) {
-        return false;
-    }
-    if (panel_beats_cap_ >= panel_tile_count && beats_buf_) {
-        return true;
-    }
-    if (beats_buf_) {
-        clReleaseMemObject(beats_buf_);
-        beats_buf_ = nullptr;
-    }
-    const size_t beats_bytes = static_cast<size_t>(panel_tile_count) * sizeof(uint32_t);
-    beats_buf_ = ocl_.alloc_buffer(beats_bytes, CL_MEM_READ_WRITE);
-    if (!beats_buf_) {
-        return false;
-    }
-    panel_beats_cap_ = panel_tile_count;
-    beats_host_.assign(static_cast<size_t>(panel_tile_count), 0u);
-    return true;
-}
-
-bool Case33GemmOnednn::find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols,
-                                             int tr_base, int tc_base, int *out_t_rows,
-                                             int *out_t_cols) {
-    if (!beats_buf_ || panel_tile_count <= 0) {
-        return false;
-    }
-    const int hash_mr = info_.xorSubM;
-    const int hash_nr = info_.xorSubN;
-    if (hash_mr <= 0 || hash_nr <= 0) {
-        return false;
-    }
-    if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
-        beats_host_.resize(static_cast<size_t>(panel_tile_count));
-    }
-    if (!ocl_.read_buffer(beats_buf_, beats_host_.data(),
-                          static_cast<size_t>(panel_tile_count) * sizeof(uint32_t))) {
-        return false;
-    }
-
-    for (int spat = 0; spat < panel_tile_count; ++spat) {
-        if (beats_host_[static_cast<size_t>(spat)] == 0u) {
-            continue;
-        }
-        const int tr = spat / panel_tile_cols;
-        const int tc = spat % panel_tile_cols;
-        const int lr = tr_base + tr;
-        const int lc = tc_base + tc;
-        if (out_t_rows) {
-            *out_t_rows = lr * hash_mr;
-        }
-        if (out_t_cols) {
-            *out_t_cols = lc * hash_nr;
-        }
-        return true;
-    }
-    return false;
 }
 
 bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
@@ -1040,7 +959,7 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             compute_tile_grid_(m_panel, n_panel, panel_tile_rows, panel_tile_cols, panel_tile_count);
 
             if (fused_jackpot_) {
-                if (!ensure_panel_beats_buf_(panel_tile_count) || !ensure_jackpot_bufs_()) {
+                if (!ensure_jackpot_bufs_()) {
                     return false;
                 }
             } else if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {

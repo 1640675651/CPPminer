@@ -465,8 +465,6 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
         if (problem.case5FuseJackpot) {
             iface.newArgument("found_flag", ExternalArgumentType::GlobalPtr,
                               GlobalAccessType::Stateless);
-            iface.newArgument("blake3_beats", ExternalArgumentType::GlobalPtr,
-                              GlobalAccessType::Stateless);
             iface.newArgument("tr_base", DataType::ud);
             iface.newArgument("tc_base", DataType::ud);
             for (int i = 0; i < 8; i++) {
@@ -641,7 +639,6 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
         }
         if (problem.case5FuseJackpot) {
             err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.found_flag);
-            err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.blake3_beats);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tr_base);
             err |= set_arg(kernel, arg, sizeof(int), &bufs.tc_base);
             for (int i = 0; i < 8; i++) {

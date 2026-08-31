@@ -36,7 +36,7 @@ struct LaunchBuffers {
     int tile_cols = 0;
     int xor_period = 1;
     cl_mem blake3_out = nullptr;   // digest[spatial*8+w] (non-fused blake3 dump only)
-    cl_mem blake3_beats = nullptr; // u32[spatial]: per-tile beat flag (fused jackpot coords)
+    cl_mem blake3_beats = nullptr; // unused (legacy LaunchBuffers field)
     uint32_t blake3_key_words[8] = {};
     uint32_t blake3_bound_words[8] = {};
     cl_mem blake3_bound = nullptr; // optional legacy global bound buffer (unused by kernel)

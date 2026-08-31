@@ -2808,7 +2808,6 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
                         interface.getArgumentIfExists("blake3_k" + std::to_string(i));
             }
             if (problem.case5FuseJackpot) {
-                state.inputs.blake3Beats = interface.getArgumentIfExists("blake3_beats");
                 state.inputs.blake3CmpDump = interface.getArgumentIfExists("blake3_cmp_dump");
                 state.inputs.foundFlag = interface.getArgumentIfExists("found_flag");
                 state.inputs.trBase = interface.getArgumentIfExists("tr_base");
@@ -3116,8 +3115,6 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
         if (problem.case5TileXorBlake3) {
             if (state.inputs.blake3Out.isValid())
                 state.ra.claim(state.inputs.blake3Out);
-            if (state.inputs.blake3Beats.isValid())
-                state.ra.claim(state.inputs.blake3Beats);
             if (state.inputs.blake3CmpDump.isValid())
                 state.ra.claim(state.inputs.blake3CmpDump);
             for (int i = 0; i < 8; i++) {

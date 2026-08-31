@@ -37,8 +37,8 @@ constexpr int kBlake3DigestWords = 8;
 constexpr uint32_t kJackpotFoundBoundBytes = kBlake3DigestWords * uint32_t(sizeof(uint32_t));
 
 constexpr uint32_t kJackpotFoundFlagOff = kJackpotFoundBoundBytes;
-constexpr uint32_t kJackpotFoundTRowsOff = kJackpotFoundFlagOff + uint32_t(sizeof(uint32_t));
-constexpr uint32_t kJackpotFoundTColsOff = kJackpotFoundTRowsOff + uint32_t(sizeof(uint32_t));
+constexpr uint32_t kJackpotFoundCoordsOff =
+        (kJackpotFoundFlagOff + uint32_t(sizeof(uint32_t)) + 7u) & ~7u;
 
 
 
@@ -318,9 +318,9 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
     const int hashNr = (problem.case5XorSubN > 0) ? problem.case5XorSubN : strategy.unroll[LoopN];
 
-    const bool gpuJudge = problem.case5FuseJackpot && state.inputs.blake3Beats.isValid()
+    const bool gpuJudge = problem.case5FuseJackpot && state.inputs.foundFlag.isValid()
 
-            && state.inputs.foundFlag.isValid() && state.inputs.trBase.isValid()
+            && state.inputs.trBase.isValid()
 
             && state.inputs.tcBase.isValid();
 
@@ -398,33 +398,7 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
 
 
-    // Bound in found_flag[0:7]; found int at byte offset kJackpotFoundFlagOff (32).
-
-
-
-    auto storeBeatAtSpatial = [&](const Subregister &spat, const Subregister &beat) {
-
-        auto hdr = state.ra.alloc_range(1);
-
-        auto byteOff = state.ra.alloc_sub<uint32_t>();
-
-        GRF word = state.ra.alloc();
-
-        shl(1, byteOff, spat, uint16_t(2));
-
-        eadd(1, hdr[0].uq(0), state.inputs.blake3Beats, byteOff, strategy, state);
-
-        mov(1, word.ud(0), beat);
-
-        store(1, scattered_dword(), A64, hdr[0], word);
-
-        state.ra.safeRelease(word);
-
-        state.ra.safeRelease(byteOff);
-
-        state.ra.safeRelease(hdr);
-
-    };
+    // Bound in found_flag[0:7]; found int at +32; packed (t_rows,t_cols) qword at +40.
 
 
 
@@ -456,6 +430,8 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
         GRF tColsGrf = state.ra.alloc();
 
+        GRF coordsGrf = state.ra.alloc();
+
         mov(1, lrG.ud(0), logicalRow);
 
         mov(1, lcG.ud(0), logicalCol);
@@ -482,31 +458,27 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
 
 
-        {
+        mov(1, coordsGrf.ud(0), tRowsGrf.ud(0));
 
-            auto rowHdr = state.ra.alloc_range(1);
-
-            eadd(1, rowHdr[0].uq(0), state.inputs.foundFlag, kJackpotFoundTRowsOff, strategy, state);
-
-            atomic(AtomicOp::mov, 1 | f0[0], scattered_dword(), A64, rowHdr[0], tRowsGrf);
-
-            state.ra.safeRelease(rowHdr);
-
-        }
+        mov(1, coordsGrf.ud(1), tColsGrf.ud(0));
 
         {
 
-            auto colHdr = state.ra.alloc_range(1);
+            auto coordHdr = state.ra.alloc_range(1);
 
-            eadd(1, colHdr[0].uq(0), state.inputs.foundFlag, kJackpotFoundTColsOff, strategy, state);
+            eadd(1, coordHdr[0].uq(0), state.inputs.foundFlag, kJackpotFoundCoordsOff, strategy,
 
-            atomic(AtomicOp::mov, 1 | f0[0], scattered_dword(), A64, colHdr[0], tColsGrf);
+                 state);
 
-            state.ra.safeRelease(colHdr);
+            atomic(AtomicOp::mov, 1 | f0[0], scattered_qword(), A64, coordHdr[0], coordsGrf);
+
+            state.ra.safeRelease(coordHdr);
 
         }
 
 
+
+        state.ra.safeRelease(coordsGrf);
 
         state.ra.safeRelease(tColsGrf);
 
@@ -699,8 +671,6 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             and_(1, tmp, tmp, uint32_t(1));
 
             or_(1, beatVal, beatVal, tmp);
-
-            storeBeatAtSpatial(spatKeepGrf.ud(0), beatVal);
 
             claimFound(beatVal, lrKeepGrf.ud(0), lcKeepGrf.ud(0));
 

@@ -69,10 +69,6 @@ private:
                                    const std::function<bool()> &should_cancel,
                                    const std::function<void(uint64_t)> &on_progress);
 
-    bool ensure_panel_beats_buf_(int panel_tile_count);
-    bool find_fused_panel_hit_(int panel_tile_count, int panel_tile_cols, int tr_base,
-                               int tc_base, int *out_t_rows, int *out_t_cols);
-
     bool context_ready_ = false;
     bool available_ = false;
     bool prep_ready_ = false;
@@ -115,16 +111,13 @@ private:
     cl_mem found_buf_ = nullptr;
     cl_mem out_rows_buf_ = nullptr;
     cl_mem out_cols_buf_ = nullptr;
-    cl_mem beats_buf_ = nullptr;
 
     size_t a_buf_bytes_ = 0;
     size_t b_buf_bytes_ = 0;
     int panel_tile_xor_cap_ = 0;
-    int panel_beats_cap_ = 0;
     bool jackpot_ready_ = false;
 
     std::vector<uint32_t> tile_xor_host_;
-    std::vector<uint32_t> beats_host_;
     std::vector<int8_t> a_host_;
     std::vector<int8_t> b_host_;
     std::vector<int8_t> pack_scratch_;
