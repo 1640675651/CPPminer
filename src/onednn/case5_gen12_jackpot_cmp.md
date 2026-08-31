@@ -147,6 +147,29 @@ Claim gating: `atomic add beatVal` (0 or 1) instead of unconditional `atomic add
 
 Mock run (`--mock --mock-diff 50 --max-nonce 1`): `cmp_ok=yes`, `gpu_trace_beat` matches
 CPU, real share found and verified — no spurious `ignoring GPU jackpot claim`.
+
+## Coord delivery (Gen12LP, 2026-08-30)
+
+**Working:** per-tile `blake3_beats[spatial]` unconditional stores + host scan for first
+beat (`find_fused_panel_hit_`). Mock PASS with tile-aligned coords (e.g. `t_rows=32 t_cols=28384`).
+
+**Not working in fused epilogue:**
+
+| Approach | Result |
+|----------|--------|
+| Branchless blend to `out_t_rows`/`out_t_cols` | Wrong coords (`1,1` then `0,0`); used wrong constant (`case5XorSubGridM` vs `case5XorSubM` for hash multiply) |
+| Branchless blend with correct `case5XorSubM/N` | Still wrong (`0,0`) |
+| Single winner spatial in `found_flag[+36]` + host derive | Wrong coords (`0,16`); branchless atomic claim unreliable on Gen12LP (see `gen12_cmp_isolate`) |
+| `jmpi` after win → unconditional coord store | Coords never written |
+| `atomic_cmpxchg` claim | GPU hang |
+
+**Root cause class:** Gen12LP flag/atomic claim hazard — first-hit branchless blend and `jmpi`
+coord stores are unreliable inside the fused GEMM epilogue (GRF budget + execution order).
+Unconditional per-tile beat stores work; host scan picks minimum spatial beat (not first atomic).
+
+**Path to `(found, row, col)` only:** separate lightweight OpenCL jackpot kernel post-GEMM
+(like `cp_onednn_jackpot.cl`), or fix claim in `gen12_cmp_isolate` then port branchless blend.
+
    (e.g. `cmp` into GRF + `cmp.ne` on mask, or `sel` into GRF then integer branch).
 3. Use separate flag registers for gt vs lt (e.g. `f0` vs `f1`) with documented clobber rules
    after BLAKE3 (BLAKE3 may clobber `f0[0]` — compare loop already uses `f1[0]` for that reason).

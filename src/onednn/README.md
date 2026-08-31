@@ -55,8 +55,8 @@ src/onednn/
   case5_kernel_select.*       catalog selection + pearl tile filters
   case5_generator.cpp         gemmstone TU (patched pieces)
   case5_catalog.cpp           embedded kernel.db
-  case5_patches/              gemmstone/ngen overlays (source of truth; applied by prepare script)
+  case5_patches/              gemmstone/ngen overlays (edit here only; applied by prepare script)
   prepare_onednn_deps.bat
-  third_party/                ngen, gemmstone (vendored after prepare)
+  third_party/                ngen, gemmstone (generated — do not edit)
 ../../third_party/onednn-src   oneDNN checkout (after prepare)
 ```

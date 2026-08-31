@@ -36,13 +36,13 @@ struct LaunchBuffers {
     int tile_cols = 0;
     int xor_period = 1;
     cl_mem blake3_out = nullptr;   // digest[spatial*8+w] (non-fused blake3 dump only)
-    cl_mem blake3_beats = nullptr; // u32[spatial]: in-kernel beat flag per tile (fused jackpot)
+    cl_mem blake3_beats = nullptr; // u32[spatial]: per-tile beat flag (fused jackpot coords)
     uint32_t blake3_key_words[8] = {};
     uint32_t blake3_bound_words[8] = {};
     cl_mem blake3_bound = nullptr; // optional legacy global bound buffer (unused by kernel)
     cl_mem found_flag = nullptr;
-    cl_mem out_t_rows = nullptr;
-    cl_mem out_t_cols = nullptr;
+    cl_mem out_t_rows = nullptr;   // fused jackpot: global t_rows (branchless blend)
+    cl_mem out_t_cols = nullptr;   // fused jackpot: global t_cols (branchless blend)
     int tr_base = 0;
     int tc_base = 0;
 };

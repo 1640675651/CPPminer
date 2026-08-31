@@ -19,7 +19,9 @@
 namespace {
 
 constexpr size_t kJackpotFoundFlagOff = 8u * sizeof(uint32_t);
-constexpr size_t kJackpotFoundBufBytes = kJackpotFoundFlagOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundTRowsOff = kJackpotFoundFlagOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundTColsOff = kJackpotFoundTRowsOff + sizeof(uint32_t);
+constexpr size_t kJackpotFoundBufBytes = kJackpotFoundTColsOff + sizeof(uint32_t);
 
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -607,6 +609,10 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundFlagOff)) {
             return false;
         }
+        if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundTRowsOff) ||
+            !ocl_.write_buffer(found_buf_, &zero, sizeof(zero), kJackpotFoundTColsOff)) {
+            return false;
+        }
         if (beats_host_.size() < static_cast<size_t>(panel_tile_count)) {
             beats_host_.assign(static_cast<size_t>(panel_tile_count), 0u);
         } else {
@@ -778,13 +784,19 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
         if (found) {
             int t_rows = -1;
             int t_cols = -1;
-            if (!find_fused_panel_hit_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
-                                       &t_rows, &t_cols)) {
-                found = 0;
-                if (out_found) {
-                    *out_found = 0;
+            if (!ocl_.read_buffer(found_buf_, &t_rows, sizeof(int), kJackpotFoundTRowsOff) ||
+                !ocl_.read_buffer(found_buf_, &t_cols, sizeof(int), kJackpotFoundTColsOff)) {
+                return false;
+            }
+            if (t_rows < 0 || t_cols < 0) {
+                if (!find_fused_panel_hit_(panel_tile_count, panel_tile_cols, tr_base, tc_base,
+                                           &t_rows, &t_cols)) {
+                    found = 0;
+                    if (out_found) {
+                        *out_found = 0;
+                    }
+                    return true;
                 }
-                return true;
             }
             if (out_t_rows) {
                 *out_t_rows = t_rows;

@@ -240,9 +240,7 @@ struct GEMMState : public CommonState {
         ngen::Subregister jackpotBoundBuf;                    // q  (global target digest, 8 dwords)
         ngen::Subregister jackpotDigestBuf;                 // q  (panel digest out: w*tile_count+spatial)
         ngen::Subregister jackpotMsgBuf;                    // q  (panel folded msg out: w*tile_count+spatial)
-        ngen::Subregister foundFlag;                        // q  (found flag)
-        ngen::Subregister outTRows;                         // q
-        ngen::Subregister outTCols;                         // q
+        ngen::Subregister foundFlag;                        // q  (found flag + coord slots)
         ngen::Subregister trBase;                           // d
         ngen::Subregister tcBase;                           // d
         ngen::Subregister hashMr;                           // d

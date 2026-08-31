@@ -2811,8 +2811,6 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
                 state.inputs.blake3Beats = interface.getArgumentIfExists("blake3_beats");
                 state.inputs.blake3CmpDump = interface.getArgumentIfExists("blake3_cmp_dump");
                 state.inputs.foundFlag = interface.getArgumentIfExists("found_flag");
-                state.inputs.outTRows = interface.getArgumentIfExists("out_t_rows");
-                state.inputs.outTCols = interface.getArgumentIfExists("out_t_cols");
                 state.inputs.trBase = interface.getArgumentIfExists("tr_base");
                 state.inputs.tcBase = interface.getArgumentIfExists("tc_base");
                 for (int i = 0; i < 8; i++) {
@@ -3135,10 +3133,6 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
                     state.ra.claim(state.inputs.blake3BoundBuf);
                 if (state.inputs.foundFlag.isValid())
                     state.ra.claim(state.inputs.foundFlag);
-                if (state.inputs.outTRows.isValid())
-                    state.ra.claim(state.inputs.outTRows);
-                if (state.inputs.outTCols.isValid())
-                    state.ra.claim(state.inputs.outTCols);
                 if (state.inputs.trBase.isValid())
                     state.ra.claim(state.inputs.trBase);
                 if (state.inputs.tcBase.isValid())
