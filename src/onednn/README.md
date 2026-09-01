@@ -17,6 +17,15 @@ prepare_onednn_deps.bat
 
 Fetches oneDNN into project `third_party/onednn-src` and vendors nGEN/gemmstone under `src/onednn/third_party/` (+ `case5_patches/` overlay).
 
+**Important:** `third_party/gemmstone` is generated locally (gitignored). The build applies `case5_patches/` on every configure. If you see errors like `case5TileXorWrap is not a member of gemmstone::GEMMProblem`, patches were not applied:
+
+```bat
+cd src\onednn
+prepare_onednn_deps.bat refresh
+```
+
+Then re-run CMake configure (`build.ps1 -Backend OneDnn` or delete `build/win/cmake` and configure again).
+
 ## Build
 
 ```powershell

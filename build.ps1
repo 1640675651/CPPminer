@@ -257,11 +257,19 @@ function Copy-OpenClKernels {
 
 function Ensure-OneDnnDeps {
     $onednnDir = Join-Path $Root "src\onednn"
-    $kernelDb = Join-Path $Root "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
-    if (Test-Path $kernelDb) { return }
-    Write-Host "=== Fetching oneDNN/gemmstone deps for Intel GPU backend ==="
     $prep = Join-Path $onednnDir "prepare_onednn_deps.bat"
     if (-not (Test-Path $prep)) { throw "Missing $prep" }
+    $problemHpp = Join-Path $onednnDir "third_party\gemmstone\include\gemmstone\problem.hpp"
+    $kernelDb = Join-Path $Root "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
+    $needsPrep = -not (Test-Path $kernelDb)
+    if (-not $needsPrep -and (Test-Path $problemHpp)) {
+        $needsPrep = -not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)
+    }
+    if (-not $needsPrep) {
+        Write-Host "=== OneDNN/gemmstone deps OK; re-applying case5_patches ==="
+    } else {
+        Write-Host "=== Fetching oneDNN/gemmstone deps for Intel GPU backend ==="
+    }
     Push-Location $onednnDir
     try {
         cmd /c "prepare_onednn_deps.bat"
@@ -271,6 +279,9 @@ function Ensure-OneDnnDeps {
     }
     if (-not (Test-Path $kernelDb)) {
         throw "OneDNN deps missing after prepare_onednn_deps.bat ($kernelDb)"
+    }
+    if (-not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)) {
+        throw "Case5 patches missing in $problemHpp — run: cd src\onednn && prepare_onednn_deps.bat refresh"
     }
 }
 

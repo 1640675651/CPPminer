@@ -19,7 +19,9 @@
 #endif
 #define NGEN_NEO_INTERFACE
 #define NGEN_WINDOWS_COMPAT
+#ifndef NGEN_NO_OP_NAMES
 #define NGEN_NO_OP_NAMES
+#endif
 
 namespace NGEN_NAMESPACE {
 
