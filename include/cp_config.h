@@ -43,6 +43,9 @@
 #define CP_ROW_PERIOD_BATCH_DEFAULT 32
 #define CP_ROW_PERIOD_BATCH_MAX   1024 /* 131072 rows / 128 rows per period */
 
+/* oneDNN: hash-tile row/col batch per panel (see Case33GemmOnednn scan). */
+#define CP_ONEDNN_PERIOD_BATCH_DEFAULT 256
+
 /* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
 #define CP_MACRO_BATCH_DEFAULT 1024 // one full row of 131072 cols
 #define CP_MACRO_BATCH_MAX     1048576

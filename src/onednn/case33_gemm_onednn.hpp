@@ -99,8 +99,8 @@ private:
     uint32_t scan_jackpot_key_[8] = {};
     uint32_t scan_jackpot_bound_[8] = {};
     int xor_period_ = 1;
-    int row_period_batch_ = CP_ROW_PERIOD_BATCH_DEFAULT;
-    int col_period_batch_ = CP_PERIOD_BATCH_DEFAULT;
+    int row_period_batch_ = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+    int col_period_batch_ = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
     int hash_tile_rows_ = 0;
     int hash_tile_cols_ = 0;
 

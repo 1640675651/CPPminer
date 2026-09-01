@@ -743,6 +743,16 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+        if(period_batch == CP_PERIOD_BATCH_DEFAULT){
+            period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+        }
+        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
+            row_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+        }
+    }
+#endif
     cp_worker_set_period_batch(period_batch);
     cp_worker_set_row_period_batch(row_period_batch);
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN

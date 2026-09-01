@@ -199,10 +199,10 @@ Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logica
 
 | Flag | Role | Default |
 |------|------|---------|
-| `--row-period-batch` | Hash-tile rows per panel | 32 |
-| `--period-batch` / `--col-period-batch` | Hash-tile cols per panel | 1024 |
+| `--row-period-batch` | Hash-tile rows per panel | 256 |
+| `--period-batch` / `--col-period-batch` | Hash-tile cols per panel | 256 |
 
-At defaults with 16×16 hash tiles and production dims, one panel covers 32×1024 = 32768 tiles (~0.05% of the matrix) before host sync. `--row-period-batch` is ignored on OpenCL.
+At defaults with 16×16 hash tiles and production dims, one panel covers 256×256 = 65536 hash tiles before host sync. `--row-period-batch` is ignored on OpenCL.
 
 ## Performance
 
