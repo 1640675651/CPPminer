@@ -53,7 +53,8 @@ cppminer.exe --backend onednn --onednn-layout NT --mock --mock-diff 50
 | Kernel | oneDNN `kernel.db` `select()` + pearl 8×16 tile filter + fallbacks |
 | XOR | Milestone K=128 → `xor_period = 128/unrollK`; gemmstone `case5_tile_xor` hook |
 | Layout | Host A/B (Pearl) → device gemmstone layouts via GPU/CPU prep. Default **TN** (A row, B col). Also `TT`, `NT`, `NN` via `--onednn-layout` or `CASE5_GEMM_LAYOUT`. |
-| Jackpot | Host `cp_jackpot` scan after GEMM (`tile_xor` readback) or fused in-kernel (`--fused-jackpot`) |
+| Jackpot | GPU `cp_onednn_jackpot_scan` after GEMM (`tile_xor` buffer) or fused in-kernel (`--fused-jackpot`) |
+| Debug | `CASE5_DEBUG_TILE_XOR_ZEROS=1` — before jackpot, read back `tile_xor` and warn on panels with many all-zero tiles (GEMM coverage). Optional `CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT=1.0`, `CASE5_DEBUG_TILE_XOR_ZERO_MAX_LOG=16`. See also `CASE5_DUMP_TILE_XOR=1`. |
 | HW | Gen12LP or XeHPG only (`case5_ngen::is_supported_device`) |
 
 ## Layout

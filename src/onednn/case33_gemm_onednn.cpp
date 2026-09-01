@@ -763,6 +763,39 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     return true;
 }
 
+bool Case33GemmOnednn::debug_audit_tile_xor_panel_(int panel_tile_count, int panel_tile_cols,
+                                                   int panel_tile_rows, int tr_base, int tc_base,
+                                                   int row_batch, int col_batch) {
+    if (!case5_ngen::case5_debug_tile_xor_zeros_enabled() || fused_jackpot_ || !tile_xor_buf_ ||
+        panel_tile_count <= 0 || num_milestones_ <= 0) {
+        return true;
+    }
+
+    static bool announced = false;
+    if (!announced) {
+        std::fprintf(stderr,
+                     "[onednn] CASE5_DEBUG_TILE_XOR_ZEROS: auditing tile_xor before jackpot "
+                     "(warn >= %.2f%% all-zero tiles per panel)\n",
+                     case5_ngen::case5_debug_tile_xor_zero_warn_pct());
+        std::fflush(stderr);
+        announced = true;
+    }
+
+    const size_t words =
+            static_cast<size_t>(num_milestones_) * static_cast<size_t>(panel_tile_count);
+    tile_xor_host_.resize(words);
+    if (!ocl_.read_buffer(tile_xor_buf_, tile_xor_host_.data(), words * sizeof(uint32_t))) {
+        std::fprintf(stderr, "[onednn] tile_xor zero audit: GPU readback failed\n");
+        return false;
+    }
+
+    const case5_ngen::Case5TileXorZeroAudit audit = case5_ngen::audit_case5_tile_xor_zeros(
+            tile_xor_host_.data(), tile_xor_host_.size(), num_milestones_, panel_tile_count);
+    case5_ngen::report_case5_tile_xor_zero_audit(audit, tr_base, tc_base, panel_tile_rows,
+                                                 panel_tile_cols, row_batch, col_batch);
+    return true;
+}
+
 bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_tile_cols,
                                               int tr_base, int tc_base, int *out_found,
                                               bool finish_queue) {
@@ -840,6 +873,18 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
     if (!run_gemm_panel_(m_panel, n_panel, offset_a_rows, offset_b_cols, panel_tile_count,
                          panel_tile_cols, tr_base, tc_base, /*finish_queue=*/true, nullptr)) {
         return false;
+    }
+    if (!fused_jackpot_) {
+        const int panel_tile_rows =
+                panel_tile_cols > 0 ? panel_tile_count / panel_tile_cols : 0;
+        const int row_batch =
+                info_.xorSubM > 0 ? m_panel / info_.xorSubM : 0;
+        const int col_batch =
+                info_.xorSubN > 0 ? n_panel / info_.xorSubN : 0;
+        if (!debug_audit_tile_xor_panel_(panel_tile_count, panel_tile_cols, panel_tile_rows,
+                                         tr_base, tc_base, row_batch, col_batch)) {
+            return false;
+        }
     }
     if (fused_jackpot_) {
         int found = 0;

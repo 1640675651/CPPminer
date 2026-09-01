@@ -376,6 +376,149 @@ inline void dump_case5_tile_xor(const std::vector<uint32_t> &got, int num_ms, in
     std::fflush(stderr);
 }
 
+// CASE5_DEBUG_TILE_XOR_ZEROS=1: after GEMM, read back tile_xor before jackpot and flag panels
+// with many all-zero tiles (unwritten GEMM slots). Optional:
+//   CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT=1.0  — warn if empty-tile % >= this (default 1.0)
+//   CASE5_DEBUG_TILE_XOR_ZERO_MAX_LOG=16     — cap SUSPICIOUS lines (0 = unlimited)
+struct Case5TileXorZeroAudit {
+    int tile_count = 0;
+    int num_milestones = 0;
+    uint64_t total_words = 0;
+    uint64_t zero_words = 0;
+    int empty_tiles = 0;
+    int worst_ms = -1;
+    int worst_ms_zero_sids = 0;
+};
+
+inline bool case5_debug_tile_xor_zeros_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CASE5_DEBUG_TILE_XOR_ZEROS");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+
+inline double case5_debug_tile_xor_zero_warn_pct() {
+    static const double pct = [] {
+        const char *v = std::getenv("CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT");
+        if (!v || v[0] == '\0') {
+            return 1.0;
+        }
+        const double x = std::atof(v);
+        return x < 0.0 ? 0.0 : x;
+    }();
+    return pct;
+}
+
+inline int case5_debug_tile_xor_zero_max_log() {
+    static const int n = [] {
+        const char *v = std::getenv("CASE5_DEBUG_TILE_XOR_ZERO_MAX_LOG");
+        if (!v || v[0] == '\0') {
+            return 16;
+        }
+        return std::atoi(v);
+    }();
+    return n;
+}
+
+inline Case5TileXorZeroAudit audit_case5_tile_xor_zeros(const uint32_t *data, size_t word_count,
+                                                       int num_ms, int tile_count) {
+    Case5TileXorZeroAudit out;
+    out.tile_count = tile_count;
+    out.num_milestones = num_ms;
+    if (!data || num_ms <= 0 || tile_count <= 0) {
+        return out;
+    }
+
+    const size_t expect =
+            static_cast<size_t>(num_ms) * static_cast<size_t>(tile_count);
+    out.total_words = expect < word_count ? expect : word_count;
+
+    for (size_t i = 0; i < out.total_words; ++i) {
+        if (data[i] == 0u) {
+            ++out.zero_words;
+        }
+    }
+
+    for (int sid = 0; sid < tile_count; ++sid) {
+        bool any_nonzero = false;
+        for (int ms = 0; ms < num_ms; ++ms) {
+            const size_t idx =
+                    static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
+                    static_cast<size_t>(sid);
+            if (idx < out.total_words && data[idx] != 0u) {
+                any_nonzero = true;
+                break;
+            }
+        }
+        if (!any_nonzero) {
+            ++out.empty_tiles;
+        }
+    }
+
+    for (int ms = 0; ms < num_ms; ++ms) {
+        int zero_sids = 0;
+        for (int sid = 0; sid < tile_count; ++sid) {
+            const size_t idx =
+                    static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
+                    static_cast<size_t>(sid);
+            if (idx >= out.total_words || data[idx] == 0u) {
+                ++zero_sids;
+            }
+        }
+        if (zero_sids > out.worst_ms_zero_sids) {
+            out.worst_ms_zero_sids = zero_sids;
+            out.worst_ms = ms;
+        }
+    }
+    return out;
+}
+
+inline void report_case5_tile_xor_zero_audit(const Case5TileXorZeroAudit &audit, int tr_base,
+                                             int tc_base, int panel_tile_rows,
+                                             int panel_tile_cols, int row_batch, int col_batch) {
+    if (!case5_debug_tile_xor_zeros_enabled() || audit.tile_count <= 0) {
+        return;
+    }
+
+    static int suspicious_logged = 0;
+    const int max_log = case5_debug_tile_xor_zero_max_log();
+
+    const double empty_pct = 100.0 * static_cast<double>(audit.empty_tiles) /
+                             static_cast<double>(audit.tile_count);
+    const double zero_word_pct =
+            audit.total_words > 0
+                    ? 100.0 * static_cast<double>(audit.zero_words) /
+                              static_cast<double>(audit.total_words)
+                    : 0.0;
+    const double warn_pct = case5_debug_tile_xor_zero_warn_pct();
+    const bool suspicious = empty_pct >= warn_pct;
+
+    if (!suspicious) {
+        return;
+    }
+    if (max_log > 0 && suspicious_logged >= max_log) {
+        return;
+    }
+
+    std::fprintf(stderr,
+                 "[onednn] tile_xor zero audit panel hash_base=(%d,%d) grid=%dx%d "
+                 "batch=%dx%d: tiles=%d milestones=%d empty=%d (%.2f%%) zero_words=%.2f%%",
+                 tr_base, tc_base, panel_tile_rows, panel_tile_cols, row_batch, col_batch,
+                 audit.tile_count, audit.num_milestones, audit.empty_tiles, empty_pct,
+                 zero_word_pct);
+    if (audit.worst_ms >= 0) {
+        std::fprintf(stderr, " worst_ms=%d (%d/%d sids zero)", audit.worst_ms,
+                     audit.worst_ms_zero_sids, audit.tile_count);
+    }
+    if (suspicious) {
+        std::fprintf(stderr, " SUSPICIOUS (>=%.2f%% empty tiles)", warn_pct);
+    }
+    std::fprintf(stderr, "\n");
+    ++suspicious_logged;
+    std::fflush(stderr);
+}
+
 inline bool verify_case5_tile_xor(const std::vector<uint32_t> &got, const int8_t *a,
                                   const int8_t *b, int M, int N, int K, int num_ms,
                                   int milestone_k, int unroll_m, int unroll_n, int /*wg_m*/,

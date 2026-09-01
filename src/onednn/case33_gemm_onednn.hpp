@@ -65,6 +65,8 @@ private:
                                  int64_t offset_b_cols, int panel_tile_count, int panel_tile_cols,
                                  int tr_base, int tc_base, int *out_found, int *out_t_rows = nullptr,
                                  int *out_t_cols = nullptr);
+    bool debug_audit_tile_xor_panel_(int panel_tile_count, int panel_tile_cols, int panel_tile_rows,
+                                     int tr_base, int tc_base, int row_batch, int col_batch);
     bool scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
                                    int panel_tile_rows, int panel_tile_cols, int panel_tile_count,
                                    int tr_base, int tc_base, int *out_found, int *out_t_rows,
