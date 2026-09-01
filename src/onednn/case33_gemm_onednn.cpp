@@ -281,19 +281,12 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
 
 void Case33GemmOnednn::compute_tile_grid_(int m, int n, int &out_tile_rows, int &out_tile_cols,
                                             int &out_tile_count) const {
+    // Active unroll panels only (panels are exact multiples of unroll). Do not rnd_up to WG
+    // here — launch padding does not produce tile_xor stores inside the panel bounds.
     int threads_m = div_up(m, info_.unrollM);
     int threads_n = div_up(n, info_.unrollN);
     if (info_.isNMK) {
         std::swap(threads_m, threads_n);
-    }
-    if (info_.fusedEUs && threads_m > 1) {
-        threads_m = rnd_up(threads_m, 2);
-    }
-    if (info_.fixedWG || threads_m > info_.wgM) {
-        threads_m = rnd_up(threads_m, info_.wgM);
-    }
-    if (info_.fixedWG || threads_n > info_.wgN) {
-        threads_n = rnd_up(threads_n, info_.wgN);
     }
     threads_n *= info_.wgExpand > 0 ? info_.wgExpand : 1;
     if (info_.isNMK) {
@@ -736,12 +729,12 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
 
     case5_ngen::LaunchDims dims =
             case5_ngen::compute_case5_launch_dims(info_, m_panel, n_panel);
-    case5_ngen::apply_linear_order_launch_dims(info_, dims, m_panel, n_panel, K_);
     cl_int err = case5_ngen::bind_case5_kernel_args(kernel_, info_, problem, bufs, dims);
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[onednn] clSetKernelArg failed (%d)\n", err);
         return false;
     }
+    case5_ngen::apply_linear_order_launch_dims(info_, dims, m_panel, n_panel, K_);
 
     const size_t gws[2] = {dims.gws[0], dims.gws[1]};
     const size_t lws[2] = {dims.lws[0], dims.lws[1]};
