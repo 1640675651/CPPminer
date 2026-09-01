@@ -296,8 +296,8 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
         printf("[onednn] matrix prep: CPU random A + noise (%s)\n",
                case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major));
     }
-    printf("[onednn] period batch: row=%d col=%d (%d hash rows x %d hash cols/panel at defaults)\n",
-           g_row_period_batch, g_col_period_batch,
+    printf("[onednn] period batch: row=%d col=%d (%dx%d hash tiles/panel, %dx%d GEMM m×n)\n",
+           g_row_period_batch, g_col_period_batch, g_row_period_batch, g_col_period_batch,
            g_row_period_batch * di.xorSubM, g_col_period_batch * di.xorSubN);
     fflush(stdout);
 }
@@ -391,6 +391,10 @@ extern "C" int cp_onednn_worker_mine_attempt(
 
     printf("[onednn] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n", row_parts,
            col_parts, (unsigned long long)cp_jackpot_scale_factor());
+    const auto &di = g_gemm.driver_info();
+    printf("[onednn] period batch: row=%d col=%d (%dx%d hash tiles/panel, %dx%d GEMM mxn)\n",
+           g_row_period_batch, g_col_period_batch, g_row_period_batch, g_col_period_batch,
+           g_row_period_batch * di.xorSubM, g_col_period_batch * di.xorSubN);
     printf("[onednn] GEMM %s\n", g_gemm.backend());
     fflush(stdout);
 

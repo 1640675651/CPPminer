@@ -522,12 +522,11 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
-                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
+                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d",
                   info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, fused_jackpot_ ? folded_msg_words_ : 0,
-                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, row_period_batch_,
-                  col_period_batch_);
+                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {

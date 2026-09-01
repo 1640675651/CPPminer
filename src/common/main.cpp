@@ -743,8 +743,11 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
+    cp_worker_set_period_batch(period_batch);
+    cp_worker_set_row_period_batch(row_period_batch);
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
-    /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone. */
+    /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
+     * Period batch must be set before init (backend banner + scan loop read batch at init). */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
         cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
         if(onednn_layout){
@@ -754,8 +757,6 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
-    cp_worker_set_period_batch(period_batch);
-    cp_worker_set_row_period_batch(row_period_batch);
     cp_worker_set_step_major_ap(step_major_ap);
     cp_worker_set_cutlass_fused(cutlass_fused);
     pearl_set_cutlass_fused(cutlass_fused);
