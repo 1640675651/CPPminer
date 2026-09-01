@@ -734,8 +734,9 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     problem.B.layout = b_row_major_ ? gemmstone::MatrixLayout::T : gemmstone::MatrixLayout::N;
     problem.C.layout = gemmstone::MatrixLayout::N;
 
-    const case5_ngen::LaunchDims dims =
+    case5_ngen::LaunchDims dims =
             case5_ngen::compute_case5_launch_dims(info_, m_panel, n_panel);
+    case5_ngen::apply_linear_order_launch_dims(info_, dims, m_panel, n_panel, K_);
     cl_int err = case5_ngen::bind_case5_kernel_args(kernel_, info_, problem, bufs, dims);
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[onednn] clSetKernelArg failed (%d)\n", err);
