@@ -9,7 +9,7 @@ Pool / job logistics live under `src/common/`. Each compute backend is a separat
 | CPU | `src/cpu/` | Fused GEMM+XOR (contiguous 8×16) |
 | CUDA | `src/cuda/` | Pascal CUTLASS Fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
-| OneDNN | `src/onednn/` | Intel GPU gemmstone GEMM + tile XOR + host jackpot |
+| OneDNN | `src/onednn/` | Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 
 ## Requirements
 
@@ -85,8 +85,12 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
-# OneDNN (Intel GPU gemmstone + host jackpot)
+# OneDNN (Intel GPU gemmstone + GPU jackpot)
 .\cppminer.exe --backend onednn --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
+  --wallet prl1... --worker worker_name
+
+# OneDNN fused path (single kernel: IGEMM + fold + BLAKE3 + in-kernel jackpot)
+.\cppminer.exe --backend onednn --fused-jackpot --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
 # Offline mock: first share + zk-pow verify (no pool)
@@ -136,6 +140,34 @@ This scipt pulls third-party dependencies and execute cmake.
 
 `--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-issue` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** is float **B-scalar broadcast**.
 
+### OneDNN options
+
+Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build time; see [`src/onednn/README.md`](src/onednn/README.md) for gemmstone deps.
+
+| Flag | Description |
+|------|-------------|
+| `--fused-jackpot` | **Fused path:** one gemmstone kernel (IGEMM + wrap-GRF fold + BLAKE3 + in-kernel jackpot compare). No `tile_xor` global readback. |
+| `--onednn-layout NAME` | Device A/B layout: `TN` (default), `TT`, `NT`, `NN`. `T`/`N` = row/column major; C is always N. Env: `CASE5_GEMM_LAYOUT`. Legacy `TNN`/`TTN`/… (3 chars) still accepted. |
+
+**Scan paths**
+
+- **Default (`--no-fused-jackpot`):** Case 5 IGEMM + milestone `tile_xor` flush → separate device jackpot kernel. Higher VRAM traffic (`tile_xor` panel buffer) but simpler judge (OpenCL reference in `kernels/cp_onednn_jackpot.cl`).
+- **`--fused-jackpot`:** Case 5.6 fused kernel — fold, BLAKE3, and target compare in-register; host readback is `found_flag` + packed `(t_rows, t_cols)` only. Lower panel I/O; recommended for production Intel GPU mining.
+
+**Batching:** `--row-period-batch` and `--period-batch` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
+
+```powershell
+# List Intel GPUs, then mine with fused jackpot
+.\cppminer.exe --backend onednn --list-devices
+.\cppminer.exe --backend onednn --fused-jackpot --devices 0 --mock --mock-diff 50
+
+# Default two-kernel path, smaller panels (less VRAM per launch)
+.\cppminer.exe --backend onednn --row-period-batch 16 --period-batch 512 --mock
+
+# Alternate device layouts (GPU prep fuses transpose + noise)
+.\cppminer.exe --backend onednn --onednn-layout TT --mock --mock-diff 50
+```
+
 ### Scan batching (`--period-batch`)
 
 Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
@@ -160,6 +192,17 @@ Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLAS
 | `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
 
 CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C window.
+
+**OneDNN — 2D hash-tile panels**
+
+Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logical unroll grid, e.g. 16×16 → 8192×8192 tiles at `m=n=131072`). Each panel = one gemmstone GEMM launch (+ separate jackpot kernel unless `--fused-jackpot`).
+
+| Flag | Role | Default |
+|------|------|---------|
+| `--row-period-batch` | Hash-tile rows per panel | 32 |
+| `--period-batch` / `--col-period-batch` | Hash-tile cols per panel | 1024 |
+
+At defaults with 16×16 hash tiles and production dims, one panel covers 32×1024 = 32768 tiles (~0.05% of the matrix) before host sync. `--row-period-batch` is ignored on OpenCL.
 
 ## Performance
 
@@ -247,8 +290,9 @@ scripts/          plain_proof_host.py (optional verify)
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
 - **cp_fee** — Same-pool 1% tile-debt developer fee (reconnect + authorize)
 - **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
-- **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl`)
+- **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl` / `onednn`)
 - **cp_cpu** — Fused GEMM+XOR + host BLAKE3 jackpot
 - **cp_gpu** — CUDA plain_proof path (under `src/cuda/`)
 - **cp_opencl** — OpenCL plain_proof path (under `src/opencl/`)
+- **cp_onednn** — Intel GPU oneDNN/gemmstone path (under `src/onednn/`)
 - **cp_noise** — Matrix generation and pearl noise

@@ -34,6 +34,14 @@ struct Case33OclPrep {
     bool prepare_job_b_colmajor(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K,
                                 int ldb);
 
+    /* Layout-dispatching GPU prep for gemmstone device buffers. */
+    bool prepare_job_b_gpu(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K, int ldb,
+                           bool b_row_major);
+    bool prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
+                               const uint8_t job_key[32], const uint8_t b_noise_seed[32], int m,
+                               int K, int lda, bool a_row_major, int salted,
+                               uint8_t a_key_out[32]);
+
     /* Noise perm pairs + fused coalesced A prepack (d_noise_seed_ and d_A_sig_ must be set). */
     bool fused_prepack_a(cl_mem a_buf, int m, int K, int blocks_k, int macro_rows);
 
@@ -66,7 +74,11 @@ private:
     bool build_perm_pairs_(int is_b, int K);
     bool noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, int K, int out_lda, int is_b,
                                 int has_signal);
+    bool noisy_matrix_a_colmajor_(cl_mem out, cl_mem signal, int rows, int K, int lda);
     bool noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb, int is_b);
+    bool noisy_matrix_b_rowmajor_(cl_mem out, int K, int N, int ldb);
+    bool pad_rowmajor_row_tails_(cl_mem out, int rows, int valid_cols, int ldb);
+    bool pad_colmajor_col_tails_(cl_mem out, int cols, int valid_rows, int lda);
 
     OpenClContext *ocl_ = nullptr;
     cl_program program_ = nullptr;
@@ -85,7 +97,11 @@ private:
     cl_kernel k_fused_prepack_a_ = nullptr;
     cl_kernel k_fused_prepack_b_ = nullptr;
     cl_kernel k_noisy_rowmajor_ = nullptr;
+    cl_kernel k_noisy_a_colmajor_ = nullptr;
     cl_kernel k_noisy_colmajor_ = nullptr;
+    cl_kernel k_noisy_b_rowmajor_ = nullptr;
+    cl_kernel k_pad_row_tails_ = nullptr;
+    cl_kernel k_pad_col_tails_ = nullptr;
     cl_kernel k_test_random_hash_ = nullptr;
 
     cl_mem d_A_sig_ = nullptr;

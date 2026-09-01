@@ -143,7 +143,8 @@ void fill_xor_subtile_driver_info(DriverInfo &out, const XorSubtileDims &xsd) {
     out.xorOwnedN = xsd.ownedN;
 }
 
-GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot) {
+GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot,
+                        bool a_row_major, bool b_row_major) {
     GEMMProblem problem;
     problem.Ta = problem.Ta_ext = Type::s8;
     problem.Tb = problem.Tb_ext = Type::s8;
@@ -151,8 +152,8 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot
     problem.Ts = Type::f32;
     problem.alpha = 1;
     problem.beta = 0;
-    problem.A.layout = MatrixLayout::T;
-    problem.B.layout = MatrixLayout::N;
+    problem.A.layout = a_row_major ? MatrixLayout::T : MatrixLayout::N;
+    problem.B.layout = b_row_major ? MatrixLayout::T : MatrixLayout::N;
     problem.C.layout = MatrixLayout::N;
     problem.A.crosspack = problem.B.crosspack = problem.C.crosspack = 1;
     problem.A.packSize = problem.B.packSize = problem.C.packSize = 0;
@@ -246,7 +247,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                                   bool xor_nop, bool fused_jackpot) {
     set_binary_packaging(hw, device);
 
-    auto problem = makeProblem(product, xor_nop, fused_jackpot);
+    auto problem = makeProblem(product, xor_nop, fused_jackpot, dims.a_row_major, dims.b_row_major);
     const auto selection = select_case5_candidates(hw, product, device, problem, dims);
     product.stepping = selection.stepping;
 
@@ -350,11 +351,13 @@ bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) 
 
 cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildParams *dims,
                              DriverInfo *info, std::string *err, bool xor_nop,
-                             bool fused_jackpot) {
+                             bool fused_jackpot, bool a_row_major, bool b_row_major) {
     BuildParams build_dims;
     if (dims) {
         build_dims = *dims;
     }
+    build_dims.a_row_major = a_row_major;
+    build_dims.b_row_major = b_row_major;
     try {
         const Product product = detect_product(ctx, device);
         if (!is_supported_product(product)) {

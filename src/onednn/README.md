@@ -32,7 +32,10 @@ CMake flag: `-DCP_ENABLE_ONEDNN=ON`
 ```bat
 cppminer.exe --backend onednn --list-devices
 cppminer.exe --backend onednn --wallet prl1... --worker rig01 --mock
+cppminer.exe --backend onednn --onednn-layout NT --mock --mock-diff 50
 ```
+
+**Layout names** (C always column-major N): two letters for A then B — `TN` (default), `TT`, `NT`, `NN`. Override with `--onednn-layout` or env `CASE5_GEMM_LAYOUT=TN|TT|NT|NN` (legacy three-letter forms like `TNN` still work). Also `CASE5_A_LAYOUT` / `CASE5_B_LAYOUT`: `row`/`col`.
 
 ## Design
 
@@ -40,8 +43,8 @@ cppminer.exe --backend onednn --wallet prl1... --worker rig01 --mock
 |------|--------|
 | Kernel | oneDNN `kernel.db` `select()` + pearl 8×16 tile filter + fallbacks |
 | XOR | Milestone K=128 → `xor_period = 128/unrollK`; gemmstone `case5_tile_xor` hook |
-| Layout | Host row-major → device column-major NNN (gemmstone contract) |
-| Jackpot | Host `cp_jackpot` scan after GEMM (`tile_xor` readback) |
+| Layout | Host A/B (Pearl) → device gemmstone layouts via GPU/CPU prep. Default **TN** (A row, B col). Also `TT`, `NT`, `NN` via `--onednn-layout` or `CASE5_GEMM_LAYOUT`. |
+| Jackpot | Host `cp_jackpot` scan after GEMM (`tile_xor` readback) or fused in-kernel (`--fused-jackpot`) |
 | HW | Gen12LP or XeHPG only (`case5_ngen::is_supported_device`) |
 
 ## Layout

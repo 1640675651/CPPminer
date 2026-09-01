@@ -78,6 +78,8 @@ struct BuildParams {
     int lda = 0;
     int ldb = 0;
     int ldc = 0;
+    bool a_row_major = true;
+    bool b_row_major = false;
 };
 
 // Build OpenCL kernel via gemmstone. Caller owns with clReleaseKernel.
@@ -85,6 +87,7 @@ struct BuildParams {
 // fused_jackpot: Case 5.6 fused GEMM+XOR+BLAKE3+jackpot in one kernel (no tile_xor global I/O).
 cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildParams *dims,
                              DriverInfo *info, std::string *err = nullptr, bool xor_nop = false,
-                             bool fused_jackpot = false);
+                             bool fused_jackpot = false, bool a_row_major = true,
+                             bool b_row_major = false);
 
 } // namespace case5_ngen

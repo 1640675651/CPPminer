@@ -40,6 +40,9 @@ static int g_context_ready = 0;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_fused_jackpot = 0;
+static bool g_a_row_major = true;
+static bool g_b_row_major = false;
+static int g_gemm_layout_cli = 0;
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n, int gpu_prep) {
     return g_zero_b.ready && g_zero_b.m == m && g_zero_b.n == n &&
@@ -211,6 +214,37 @@ extern "C" void cp_onednn_worker_set_fused_jackpot(int on) {
     g_fused_jackpot = on ? 1 : 0;
 }
 
+extern "C" void cp_onednn_worker_set_gemm_layout(const char *name) {
+    if (g_context_ready) {
+        fprintf(stderr, "[onednn] set_gemm_layout ignored after init\n");
+        return;
+    }
+    if (!name || name[0] == '\0') {
+        return;
+    }
+    bool a_row = g_a_row_major;
+    bool b_row = g_b_row_major;
+    if (!case5_ngen::case5_parse_gemm_layout_name(name, a_row, b_row)) {
+        fprintf(stderr, "[onednn] invalid --onednn-layout %s (use TN, TT, NT, or NN)\n", name);
+        return;
+    }
+    g_a_row_major = a_row;
+    g_b_row_major = b_row;
+    g_gemm_layout_cli = 1;
+}
+
+static void resolve_gemm_layout(void) {
+    if (!g_gemm_layout_cli) {
+        bool a_row = g_a_row_major;
+        bool b_row = g_b_row_major;
+        if (case5_ngen::case5_parse_gemm_layout_env(a_row, b_row)) {
+            g_a_row_major = a_row;
+            g_b_row_major = b_row;
+        }
+    }
+    g_gemm.set_gemm_layout(g_a_row_major, g_b_row_major);
+}
+
 extern "C" void cp_onednn_worker_set_platform(int platform_index) {
     g_platform_filter = platform_index;
 }
@@ -240,6 +274,7 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     g_gemm.set_row_period_batch(g_row_period_batch);
     g_gemm.set_col_period_batch(g_col_period_batch);
     g_gemm.set_fused_jackpot(g_fused_jackpot != 0);
+    resolve_gemm_layout();
     if (!g_gemm.init_context(g_device_index, g_platform_filter)) {
         fprintf(stderr, "[onednn] init failed (device=%d)\n", g_device_index);
         g_context_ready = 0;
@@ -255,9 +290,11 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     printf("[onednn] hash tile: %dx%d logical (unroll %dx%d, split=%s)\n", di.xorSubM, di.xorSubN,
            di.unrollM, di.unrollN, case5_ngen::case5_xor_subtile_split_mode_name());
     if (g_gemm.gpu_prep_ready()) {
-        printf("[onednn] matrix prep: GPU-only A/B prep (TNN, no matrix D2H on scan path)\n");
+        printf("[onednn] matrix prep: GPU-only A/B prep (%s, no matrix D2H on scan path)\n",
+               case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major));
     } else {
-        printf("[onednn] matrix prep: CPU random A + noise (TNN: row-major A, column-major B)\n");
+        printf("[onednn] matrix prep: CPU random A + noise (%s)\n",
+               case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major));
     }
     printf("[onednn] period batch: row=%d col=%d (%d hash rows x %d hash cols/panel at defaults)\n",
            g_row_period_batch, g_col_period_batch,
@@ -280,9 +317,12 @@ extern "C" void cp_onednn_worker_begin_job(const uint8_t job_key[32], int m, int
     g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     if (zero_b_prepare_job(job_key, m, n) == 0) {
         if (g_zero_b.use_gpu_prep) {
-            printf("[onednn] zero-B: GPU noisy B on device (salted=%d)\n", g_zero_b.salted);
+            printf("[onednn] zero-B: GPU noisy B on device layout=%s (salted=%d)\n",
+                   case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
+                   g_zero_b.salted);
         } else {
-            printf("[onednn] zero-B: host noise + column-major B on device (salted=%d)\n",
+            printf("[onednn] zero-B: host noise + device B upload layout=%s (salted=%d)\n",
+                   case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
                    g_zero_b.salted);
         }
         fflush(stdout);

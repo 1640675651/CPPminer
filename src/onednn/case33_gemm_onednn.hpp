@@ -18,6 +18,7 @@ struct Case33GemmOnednn {
     void set_row_period_batch(int batch);
     void set_col_period_batch(int batch);
     void set_fused_jackpot(bool fused);
+    void set_gemm_layout(bool a_row_major, bool b_row_major);
     int row_period_batch() const { return row_period_batch_; }
     int col_period_batch() const { return col_period_batch_; }
 
@@ -51,8 +52,10 @@ private:
     bool ensure_panel_tile_xor_buf_(int panel_tile_count);
     bool build_jackpot_kernel_();
     bool ensure_jackpot_bufs_();
-    bool upload_a_rowmajor_(const int8_t *a_rowmajor);
-    bool upload_b_colmajor_(const int8_t *b_rowmajor);
+    bool upload_a_(const int8_t *a_rowmajor);
+    bool upload_b_(const int8_t *b_bt_rowmajor);
+    int64_t panel_offset_a_(int64_t row_offset) const;
+    int64_t panel_offset_b_(int64_t col_offset) const;
     bool run_gemm_panel_(int m_panel, int n_panel, int64_t offset_a_rows, int64_t offset_b_cols,
                          int panel_tile_count, int panel_tile_cols, int tr_base, int tc_base,
                          bool finish_queue, int *out_found = nullptr);
@@ -89,6 +92,8 @@ private:
     int folded_msg_words_ = 0;
     int milestone_k_ = 128;
     bool fused_jackpot_ = false;
+    bool a_row_major_ = true;
+    bool b_row_major_ = false;
     uint32_t scan_jackpot_key_[8] = {};
     uint32_t scan_jackpot_bound_[8] = {};
     int xor_period_ = 1;

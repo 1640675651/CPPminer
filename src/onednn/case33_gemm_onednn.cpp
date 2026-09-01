@@ -55,6 +55,36 @@ void pack_b_colmajor(const int8_t *b_bt_rm, int K, int N, int ldb, int8_t *out) 
     }
 }
 
+// Row-major K×N with leading dimension ldb (>= N); host B^T is N×K row-major.
+void pack_b_rowmajor_from_bt(const int8_t *b_bt_rm, int K, int N, int ldb, int8_t *out) {
+    const size_t row_bytes = static_cast<size_t>(ldb);
+    std::memset(out, 0, row_bytes * static_cast<size_t>(K));
+    for (int k = 0; k < K; ++k) {
+        int8_t *row = out + static_cast<size_t>(k) * row_bytes;
+        for (int n = 0; n < N; ++n) {
+            row[n] = b_bt_rm[static_cast<size_t>(n) * K + k];
+        }
+        if (ldb > N) {
+            std::memset(row + N, 0, static_cast<size_t>(ldb - N));
+        }
+    }
+}
+
+// Column-major K×M with leading dimension lda (>= M); host A is row-major M×K.
+void pack_a_colmajor(const int8_t *a_rm, int M, int K, int lda, int8_t *out) {
+    const size_t col_stride = static_cast<size_t>(lda);
+    std::memset(out, 0, col_stride * static_cast<size_t>(K));
+    for (int k = 0; k < K; ++k) {
+        int8_t *col = out + static_cast<size_t>(k) * col_stride;
+        for (int i = 0; i < M; ++i) {
+            col[i] = a_rm[static_cast<size_t>(i) * static_cast<size_t>(K) + static_cast<size_t>(k)];
+        }
+        if (lda > M) {
+            std::memset(col + M, 0, static_cast<size_t>(lda - M));
+        }
+    }
+}
+
 int clamp_row_period_batch(int batch) {
     if (batch < 1) {
         batch = 1;
@@ -91,6 +121,23 @@ void Case33GemmOnednn::set_fused_jackpot(bool fused) {
         return;
     }
     fused_jackpot_ = fused;
+}
+
+void Case33GemmOnednn::set_gemm_layout(bool a_row_major, bool b_row_major) {
+    if (context_ready_) {
+        std::fprintf(stderr, "[onednn] set_gemm_layout ignored after init_context\n");
+        return;
+    }
+    a_row_major_ = a_row_major;
+    b_row_major_ = b_row_major;
+}
+
+int64_t Case33GemmOnednn::panel_offset_a_(int64_t row_offset) const {
+    return a_row_major_ ? row_offset * static_cast<int64_t>(lda_) : row_offset;
+}
+
+int64_t Case33GemmOnednn::panel_offset_b_(int64_t col_offset) const {
+    return b_row_major_ ? col_offset : col_offset * static_cast<int64_t>(ldb_);
 }
 
 Case33GemmOnednn::~Case33GemmOnednn() {
@@ -152,9 +199,8 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
     M_ = M;
     N_ = N;
     K_ = K;
-    // A row-major (lda>=K); B column-major (ldb>=K). ldc kept for ABI only.
-    lda_ = case5_ngen::pad_ld_int8(K_);
-    ldb_ = case5_ngen::pad_ld_int8(K_);
+    lda_ = a_row_major_ ? case5_ngen::pad_ld_int8(K_) : case5_ngen::pad_ld_int8(M_);
+    ldb_ = b_row_major_ ? case5_ngen::pad_ld_int8(N_) : case5_ngen::pad_ld_int8(K_);
     ldc_ = case5_ngen::pad_ld_int8(M_);
 
     constexpr int milestone_k = 128;
@@ -263,8 +309,10 @@ void Case33GemmOnednn::compute_tile_grid_(int m, int n, int &out_tile_rows, int 
 }
 
 bool Case33GemmOnednn::ensure_matrix_bufs_() {
-    const size_t a_bytes = static_cast<size_t>(lda_) * static_cast<size_t>(M_);
-    const size_t b_bytes = static_cast<size_t>(ldb_) * static_cast<size_t>(N_);
+    const size_t a_bytes = static_cast<size_t>(lda_) *
+                           static_cast<size_t>(a_row_major_ ? M_ : K_);
+    const size_t b_bytes = static_cast<size_t>(ldb_) *
+                           static_cast<size_t>(b_row_major_ ? K_ : N_);
 
     if (a_buf_ && a_buf_bytes_ != a_bytes) {
         clReleaseMemObject(a_buf_);
@@ -430,14 +478,18 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
      * OpenCL kernel is size-independent. Production M/N only affect host tile grids. */
     constexpr int kKernelSelectM = 256;
     constexpr int kKernelSelectN = 256;
-    case5_ngen::BuildParams build_dims{kKernelSelectM, kKernelSelectN, K_DIM, 0, 0, 0};
-    build_dims.lda = case5_ngen::pad_ld_int8(build_dims.k);
-    build_dims.ldb = case5_ngen::pad_ld_int8(build_dims.k);
+    case5_ngen::BuildParams build_dims{kKernelSelectM, kKernelSelectN, K_DIM, 0, 0, 0,
+                                       a_row_major_, b_row_major_};
+    build_dims.lda = a_row_major_ ? case5_ngen::pad_ld_int8(build_dims.k)
+                                  : case5_ngen::pad_ld_int8(build_dims.m);
+    build_dims.ldb = b_row_major_ ? case5_ngen::pad_ld_int8(build_dims.n)
+                                  : case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldc = case5_ngen::pad_ld_int8(build_dims.m);
 
     std::string ngen_err;
     kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,
-                                             &ngen_err, false, fused_jackpot_);
+                                             &ngen_err, false, fused_jackpot_, a_row_major_,
+                                             b_row_major_);
     if (!kernel_) {
         std::fprintf(stderr, "[onednn] gemmstone kernel build failed: %s\n", ngen_err.c_str());
         std::snprintf(backend_, sizeof(backend_), "gemmstone build failed: %s", ngen_err.c_str());
@@ -466,13 +518,16 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     device_flat_index_ = ocl_.device_flat_index;
     const char *scan_mode =
             fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+gpuJudge" : "igemm+tileXOR+GPUjackpot";
+    char layout_name[8] = {};
+    case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
-                  "oneDNN gemmstone %s/%s %s unroll %dx%d xor %dx%d wg %dx%d "
+                  "oneDNN gemmstone %s/%s %s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
                   "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d row_batch=%d col_batch=%d",
-                  info_.hwName, info_.strategyName, scan_mode, info_.unrollM, info_.unrollN,
-                  info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN, info_.subgroupSize,
-                  num_milestones_, fused_jackpot_ ? folded_msg_words_ : 0, tile_rows_, tile_cols_,
-                  hash_tile_rows_, hash_tile_cols_, row_period_batch_, col_period_batch_);
+                  info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
+                  info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
+                  info_.subgroupSize, num_milestones_, fused_jackpot_ ? folded_msg_words_ : 0,
+                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, row_period_batch_,
+                  col_period_batch_);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
@@ -486,28 +541,38 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     return true;
 }
 
-bool Case33GemmOnednn::upload_a_rowmajor_(const int8_t *a_rowmajor) {
+bool Case33GemmOnednn::upload_a_(const int8_t *a_rowmajor) {
     if (!a_rowmajor) {
         return false;
     }
     const size_t raw_bytes = static_cast<size_t>(M_) * static_cast<size_t>(K_);
-    const size_t bytes = static_cast<size_t>(lda_) * static_cast<size_t>(M_);
-    if (lda_ == K_) {
+    const size_t bytes = static_cast<size_t>(lda_) *
+                         static_cast<size_t>(a_row_major_ ? M_ : K_);
+    if (a_row_major_ && lda_ == K_) {
         a_host_.assign(a_rowmajor, a_rowmajor + raw_bytes);
         return ocl_.write_buffer(a_buf_, a_rowmajor, bytes);
     }
     a_host_.resize(bytes);
-    pack_a_rowmajor(a_rowmajor, M_, K_, lda_, a_host_.data());
+    if (a_row_major_) {
+        pack_a_rowmajor(a_rowmajor, M_, K_, lda_, a_host_.data());
+    } else {
+        pack_a_colmajor(a_rowmajor, M_, K_, lda_, a_host_.data());
+    }
     return ocl_.write_buffer(a_buf_, a_host_.data(), bytes);
 }
 
-bool Case33GemmOnednn::upload_b_colmajor_(const int8_t *b_rowmajor) {
-    if (!b_rowmajor) {
+bool Case33GemmOnednn::upload_b_(const int8_t *b_bt_rowmajor) {
+    if (!b_bt_rowmajor) {
         return false;
     }
-    const size_t bytes = static_cast<size_t>(ldb_) * static_cast<size_t>(N_);
+    const size_t bytes = static_cast<size_t>(ldb_) *
+                         static_cast<size_t>(b_row_major_ ? K_ : N_);
     b_host_.resize(bytes);
-    pack_b_colmajor(b_rowmajor, K_, N_, ldb_, b_host_.data());
+    if (b_row_major_) {
+        pack_b_rowmajor_from_bt(b_bt_rowmajor, K_, N_, ldb_, b_host_.data());
+    } else {
+        pack_b_colmajor(b_bt_rowmajor, K_, N_, ldb_, b_host_.data());
+    }
     return ocl_.write_buffer(b_buf_, b_host_.data(), bytes);
 }
 
@@ -522,7 +587,7 @@ bool Case33GemmOnednn::prepare_job(int M, int N, int K, const int8_t *b_rowmajor
     if (!ensure_matrix_bufs_()) {
         return false;
     }
-    if (!upload_b_colmajor_(b_rowmajor)) {
+    if (!upload_b_(b_rowmajor)) {
         return false;
     }
     available_ = true;
@@ -540,7 +605,7 @@ bool Case33GemmOnednn::prepare_job_gpu(int M, int N, int K, const uint8_t b_nois
     if (!ensure_matrix_bufs_()) {
         return false;
     }
-    if (!prep_.prepare_job_b_colmajor(b_buf_, b_noise_seed, N_, K_, ldb_)) {
+    if (!prep_.prepare_job_b_gpu(b_buf_, b_noise_seed, N_, K_, ldb_, b_row_major_)) {
         return false;
     }
     available_ = true;
@@ -551,7 +616,7 @@ bool Case33GemmOnednn::prepare_attempt_a(const int8_t *a_rowmajor) {
     if (!available_ || !a_rowmajor) {
         return false;
     }
-    return upload_a_rowmajor_(a_rowmajor);
+    return upload_a_(a_rowmajor);
 }
 
 bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
@@ -564,8 +629,8 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
     if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
         return false;
     }
-    return prep_.prepare_attempt_a_rowmajor(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed,
-                                            M_, K_, lda_, salted, a_key_out);
+    return prep_.prepare_attempt_a_gpu(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
+                                       lda_, a_row_major_, salted, a_key_out);
 }
 
 bool Case33GemmOnednn::read_A_sig(int8_t *h_A_sig) {
@@ -582,13 +647,22 @@ bool Case33GemmOnednn::read_A_sig(int8_t *h_A_sig) {
     if (a_host_.size() < need) {
         return false;
     }
-    if (lda_ == K_) {
+    if (lda_ == K_ && a_row_major_) {
         std::memcpy(h_A_sig, a_host_.data(), need);
         return true;
     }
-    for (int i = 0; i < M_; ++i) {
-        std::memcpy(h_A_sig + static_cast<size_t>(i) * K_, a_host_.data() + static_cast<size_t>(i) * lda_,
-                    K_);
+    if (a_row_major_) {
+        for (int i = 0; i < M_; ++i) {
+            std::memcpy(h_A_sig + static_cast<size_t>(i) * K_,
+                        a_host_.data() + static_cast<size_t>(i) * lda_, K_);
+        }
+        return true;
+    }
+    for (int k = 0; k < K_; ++k) {
+        for (int i = 0; i < M_; ++i) {
+            h_A_sig[static_cast<size_t>(i) * K_ + k] =
+                    a_host_[static_cast<size_t>(k) * lda_ + i];
+        }
     }
     return true;
 }
@@ -626,8 +700,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     bufs.b = b_buf_;
     bufs.c = c_buf_;
     bufs.tile_xor = fused_jackpot_ ? nullptr : tile_xor_buf_;
-    bufs.offset_a = offset_a_rows * static_cast<int64_t>(lda_);
-    bufs.offset_b = offset_b_cols;
+    bufs.offset_a = panel_offset_a_(offset_a_rows);
+    bufs.offset_b = panel_offset_b_(offset_b_cols);
     bufs.offset_c = 0;
     bufs.lda = lda_;
     bufs.ldb = ldb_;
@@ -657,8 +731,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     problem.case5TileXorNop = false;
     problem.case5FuseJackpot = fused_jackpot_;
     problem.case5TileXorBlake3 = fused_jackpot_;
-    problem.A.layout = gemmstone::MatrixLayout::T;
-    problem.B.layout = gemmstone::MatrixLayout::N;
+    problem.A.layout = a_row_major_ ? gemmstone::MatrixLayout::T : gemmstone::MatrixLayout::N;
+    problem.B.layout = b_row_major_ ? gemmstone::MatrixLayout::T : gemmstone::MatrixLayout::N;
     problem.C.layout = gemmstone::MatrixLayout::N;
 
     const case5_ngen::LaunchDims dims =
@@ -965,8 +1039,7 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             const int m_panel = row_batch * hash_mr;
             const int n_panel = col_batch * hash_nr;
             const int64_t offset_a_rows = static_cast<int64_t>(rpi0) * hash_mr;
-            const int64_t offset_b_cols =
-                    static_cast<int64_t>(cpi0) * hash_nr * static_cast<int64_t>(ldb_);
+            const int64_t offset_b_cols = static_cast<int64_t>(cpi0) * hash_nr;
 
             int panel_tile_rows = 0;
             int panel_tile_cols = 0;

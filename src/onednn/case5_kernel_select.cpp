@@ -200,9 +200,9 @@ OnednnSelectInput onednn_select_input_from_dims(const BuildParams &dims) {
     in.batch = 0;
     in.alpha = 1.0f;
     in.beta = 0.0f;
-    // Row-major A: lda>=K. Column-major B: ldb>=K.
-    in.lda = dims.lda > 0 ? dims.lda : dims.k;
-    in.ldb = dims.ldb > 0 ? dims.ldb : dims.k;
+    // Row-major A: lda>=K. Column-major A: lda>=M. Column-major B: ldb>=K. Row-major B: ldb>=N.
+    in.lda = dims.lda > 0 ? dims.lda : (dims.a_row_major ? dims.k : dims.m);
+    in.ldb = dims.ldb > 0 ? dims.ldb : (dims.b_row_major ? dims.n : dims.k);
     in.ldc = dims.ldc > 0 ? dims.ldc : dims.m;
     return in;
 }

@@ -2,6 +2,7 @@
 
 #include "cp_jackpot.hpp"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,99 @@ inline const char *case5_xor_subtile_split_mode_name() {
         case XorSubtileSplitMode::Vertical: return "vertical";
     }
     return "both";
+}
+
+// Device matrix layouts (C always column-major N). Names: TN, TT, NT, NN (A then B).
+// Host A is M×K row-major; host B^T is N×K row-major. Device packing converts layout.
+inline bool case5_rowmajor_from_env(const char *env_name, bool default_row) {
+    const char *v = std::getenv(env_name);
+    if (!v || v[0] == '\0') {
+        return default_row;
+    }
+    if (std::strcmp(v, "col") == 0 || std::strcmp(v, "column") == 0 || std::strcmp(v, "N") == 0
+            || std::strcmp(v, "n") == 0) {
+        return false;
+    }
+    return true;
+}
+
+inline bool case5_resolve_rowmajor(int cli_layout, const char *env_name, bool default_row) {
+    if (cli_layout < 0) {
+        return case5_rowmajor_from_env(env_name, default_row);
+    }
+    return cli_layout == 0;
+}
+
+inline const char *case5_layout_trans_name(bool row_major) {
+    return row_major ? "T" : "N";
+}
+
+inline void case5_gemm_layout_name(bool a_row_major, bool b_row_major, char *out, size_t out_sz) {
+    std::snprintf(out, out_sz, "%s%s", case5_layout_trans_name(a_row_major),
+                  case5_layout_trans_name(b_row_major));
+}
+
+inline const char *case5_device_layout_name(bool a_row_major, bool b_row_major) {
+    static thread_local char buf[8];
+    case5_gemm_layout_name(a_row_major, b_row_major, buf, sizeof(buf));
+    return buf;
+}
+
+inline bool case5_parse_gemm_layout_env(bool &a_row_major, bool &b_row_major) {
+    const char *v = std::getenv("CASE5_GEMM_LAYOUT");
+    if (!v || v[0] == '\0') {
+        return false;
+    }
+    char a = '\0';
+    char b = '\0';
+    if (std::strlen(v) >= 3 && (v[2] == 'N' || v[2] == 'n')) {
+        a = static_cast<char>(std::toupper(static_cast<unsigned char>(v[0])));
+        b = static_cast<char>(std::toupper(static_cast<unsigned char>(v[1])));
+    } else if (std::strlen(v) == 2) {
+        a = static_cast<char>(std::toupper(static_cast<unsigned char>(v[0])));
+        b = static_cast<char>(std::toupper(static_cast<unsigned char>(v[1])));
+    } else {
+        return false;
+    }
+    if ((a != 'T' && a != 'N') || (b != 'T' && b != 'N')) {
+        return false;
+    }
+    a_row_major = (a == 'T');
+    b_row_major = (b == 'T');
+    return true;
+}
+
+inline bool case5_parse_gemm_layout_name(const char *name, bool &a_row_major, bool &b_row_major) {
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+    char a = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
+    char b = static_cast<char>(std::toupper(static_cast<unsigned char>(name[1])));
+    if ((a != 'T' && a != 'N') || (b != 'T' && b != 'N')) {
+        return false;
+    }
+    if (name[2] != '\0' && name[2] != 'N' && name[2] != 'n') {
+        return false;
+    }
+    a_row_major = (a == 'T');
+    b_row_major = (b == 'T');
+    return true;
+}
+
+inline void case5_resolve_gemm_layouts(int cli_a_layout, int cli_b_layout, bool &a_row_major,
+                                       bool &b_row_major) {
+    a_row_major = case5_resolve_rowmajor(cli_a_layout, "CASE5_A_LAYOUT", true);
+    b_row_major = case5_resolve_rowmajor(cli_b_layout, "CASE5_B_LAYOUT", false);
+    bool env_a = a_row_major;
+    bool env_b = b_row_major;
+    if (case5_parse_gemm_layout_env(env_a, env_b)) {
+        if (cli_a_layout < 0) {
+            a_row_major = env_a;
+        }
+        if (cli_b_layout < 0) {
+            b_row_major = env_b;
+        }
+    }
 }
 
 // One XOR word per thread over the full unrollM x unrollN panel (no sub-tiling).

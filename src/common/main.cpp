@@ -104,6 +104,8 @@ static void print_usage(void)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     printf("  --fused-jackpot       oneDNN in-reg fold + flush + GPU jackpot (found flag only)\n");
     printf("  --no-fused-jackpot    oneDNN GEMM + separate device fold/BLAKE jackpot (default)\n");
+    printf("  --onednn-layout NAME  device A/B layout: TN (default), TT, NT, NN (C always N)\n");
+    printf("                       (CASE5_GEMM_LAYOUT env when flag unset)\n");
 #endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
@@ -228,6 +230,7 @@ int main(int argc, char** argv)
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
     int onednn_fused_jackpot = 0;
+    const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
     int simd_env_invalid = 0;
@@ -408,6 +411,12 @@ int main(int argc, char** argv)
             onednn_fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
             onednn_fused_jackpot = 0;
+        } else if(!strcmp(argv[i], "--onednn-layout")){
+            if(i + 1 >= argc){
+                fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
+                return 1;
+            }
+            onednn_layout = argv[++i];
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
@@ -738,6 +747,9 @@ int main(int argc, char** argv)
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone. */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
         cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
+        if(onednn_layout){
+            cp_onednn_worker_set_gemm_layout(onednn_layout);
+        }
         cp_onednn_worker_init(devs, ndev);
         cp_worker_apply_backend_defaults();
     }
@@ -836,8 +848,15 @@ int main(int argc, char** argv)
                        panel_tiles * (double)tile_xor_words * (double)sizeof(uint32_t)
                                / (1024.0 * 1024.0));
             }
-            printf("[mode] host signal ~%.0f MiB; TNN buffers (row-major A, column-major B) on Intel GPU\n",
-                   host_mib);
+            {
+                const char *layout_msg = onednn_layout;
+                if(!layout_msg){
+                    const char *env_layout = getenv("CASE5_GEMM_LAYOUT");
+                    layout_msg = (env_layout && env_layout[0]) ? env_layout : "TN";
+                }
+                printf("[mode] host signal ~%.0f MiB; device layout %s on Intel GPU\n",
+                       host_mib, layout_msg);
+            }
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
