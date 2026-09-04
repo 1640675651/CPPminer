@@ -108,12 +108,10 @@ typedef float4 cpm_vec;
 #define CASE32_CPM_SPLAT(b) ((float4)(b))
 #define CASE32_CPM_MAD(aval, bsc, c) mad((aval), CASE32_CPM_SPLAT(bsc), (c))
 #endif
-#ifndef LDS_KWG
-#define LDS_KWG 16
+/* How many coalesce kg-strips to stage in LDS at once (Case 3.4; keep SLM modest). */
+#ifndef KG_LDS_CHUNK
+#define KG_LDS_CHUNK 8
 #endif
-#define LDS_KGROUPS (LDS_KWG / RANK)
-#define LDS_A_STRIDE (MICRO_M * KG_BYTES_A)
-#define LDS_B_STRIDE (MICRO_N * KG_SLICE_B)
 
 #define PP_JACKPOT_WORDS 16
 #define PP_LROT 13
@@ -329,6 +327,22 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
 #endif
 }
 
+#if CASE32_USE_LDS
+/* Case 3.4: all WIs cooperatively copy A/B kg-strips into SLM (coalesced 16B). */
+inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int nbytes,
+                              int lid, int lsz) {
+    for (int off = lid * 16; off + 15 < nbytes; off += lsz * 16) {
+        vstore4(vload4(0, src + off), 0, dst + off);
+        vstore4(vload4(0, src + off + 4), 0, dst + off + 4);
+        vstore4(vload4(0, src + off + 8), 0, dst + off + 8);
+        vstore4(vload4(0, src + off + 12), 0, dst + off + 12);
+    }
+    for (int off = (nbytes & ~15) + lid; off < nbytes; off += lsz) {
+        dst[off] = src[off];
+    }
+}
+#endif
+
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -338,6 +352,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                                     __global int *out_t_rows, __global int *out_t_cols,
                                     int fuse_jackpot, int micro_m_begin, int micro_m_count) {
     const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
 #if !CASE32_USE_LDS
     if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
         return;
@@ -378,8 +393,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         msg[i] = 0u;
     }
 #if CASE32_USE_LDS && defined(CASE32_COALESCE)
-    __local char lds_a[MICRO_M * LDS_KGROUPS * KG_BYTES_A];
-    __local char lds_b[MICRO_N * LDS_KGROUPS * KG_SLICE_B];
+    /* Case 3.4: stage full macro kg-strips; every WI participates in the copy. */
+    __local uchar lds_a[KG_LDS_CHUNK * MACRO_KG_STRIP_A];
+    __local uchar lds_b[KG_LDS_CHUNK * MACRO_KG_STRIP_B];
     const int active = (tr_in_slice < micro_m_count);
 #endif
     for (int reg_half = 0; reg_half < HASH_REG_TILES_N; ++reg_half) {
@@ -406,47 +422,28 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 (size_t)kb * (size_t)MACRO_KB_BLOCK_B;
 
 #if CASE32_USE_LDS
-        /* CLBlast-style: stage KWG of A (all macro rows) and B (all macro cols) in
-           __local, then every WI reuses the same panels for its MR×NR C tile. */
-        for (int kg0 = 0; kg0 < KGROUPS; kg0 += LDS_KGROUPS) {
-            const int n_kg = ((kg0 + LDS_KGROUPS) <= KGROUPS) ? LDS_KGROUPS
-                                                             : (KGROUPS - kg0);
-            if (active) {
-                if (hash_tc == 0) {
-                    for (int kg_l = 0; kg_l < n_kg; ++kg_l) {
-                        __global const char *src =
-                                a_pre + a_kb_base +
-                                (size_t)(kg0 + kg_l) * (size_t)MACRO_KG_STRIP_A +
-                                (size_t)tr * (size_t)KG_BYTES_A;
-                        __local char *dst = lds_a + (size_t)kg_l * (size_t)LDS_A_STRIDE +
-                                            (size_t)tr * (size_t)KG_BYTES_A;
-                        for (int i = 0; i < KG_BYTES_A; i += RANK) {
-                            *((__local int *)(dst + i)) = as_int(vload4(0, src + i));
-                        }
-                    }
-                }
-                if (tr_in_slice == 0) {
-                    for (int kg_l = 0; kg_l < n_kg; ++kg_l) {
-                        __global const char *src =
-                                b_pre + b_kb_base +
-                                (size_t)(kg0 + kg_l) * (size_t)MACRO_KG_STRIP_B +
-                                (size_t)tc * (size_t)KG_SLICE_B;
-                        __local char *dst = lds_b + (size_t)kg_l * (size_t)LDS_B_STRIDE +
-                                            (size_t)tc * (size_t)KG_SLICE_B;
-                        for (int i = 0; i < KG_SLICE_B; i += RANK) {
-                            *((__local int *)(dst + i)) = as_int(vload4(0, src + i));
-                        }
-                    }
-                }
-            }
+        /* Case 3.4 cooperative LDS: all WIs copy A/B strips, then reuse from SLM. */
+        for (int kg0 = 0; kg0 < KGROUPS; kg0 += KG_LDS_CHUNK) {
+            const int nkg = min(KG_LDS_CHUNK, KGROUPS - kg0);
+            const int a_bytes = nkg * MACRO_KG_STRIP_A;
+            const int b_bytes = nkg * MACRO_KG_STRIP_B;
+
+            case32_copy_bytes((__global const uchar *)(a_pre + a_kb_base +
+                                                       (size_t)kg0 * (size_t)MACRO_KG_STRIP_A),
+                              lds_a, a_bytes, lid, lsz);
+            case32_copy_bytes((__global const uchar *)(b_pre + b_kb_base +
+                                                       (size_t)kg0 * (size_t)MACRO_KG_STRIP_B),
+                              lds_b, b_bytes, lid, lsz);
             barrier(CLK_LOCAL_MEM_FENCE);
 
             if (active) {
-                for (int kg_l = 0; kg_l < n_kg; ++kg_l) {
-                    __local const char *a_kg = lds_a + (size_t)kg_l * (size_t)LDS_A_STRIDE +
-                                               (size_t)tr * (size_t)KG_BYTES_A;
-                    __local const char *b_kg = lds_b + (size_t)kg_l * (size_t)LDS_B_STRIDE +
-                                               (size_t)tc * (size_t)KG_SLICE_B;
+                for (int kgi = 0; kgi < nkg; ++kgi) {
+                    __local const uchar *a_kg =
+                            lds_a + (size_t)kgi * (size_t)MACRO_KG_STRIP_A +
+                            (size_t)tr * (size_t)KG_BYTES_A;
+                    __local const uchar *b_kg =
+                            lds_b + (size_t)kgi * (size_t)MACRO_KG_STRIP_B +
+                            (size_t)tc * (size_t)KG_SLICE_B;
                     int a_pack[MR];
                     int b_pack[NR];
                     #pragma unroll
