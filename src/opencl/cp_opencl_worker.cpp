@@ -38,6 +38,8 @@ static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
 static int g_tile_mr = 0;
 static int g_tile_nr = 0;
+static int g_macro_m = 0;
+static int g_macro_n = 0;
 static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
@@ -237,6 +239,16 @@ extern "C" void cp_opencl_worker_set_tile(int mr, int nr) {
     g_tile_nr = nr;
 }
 
+extern "C" void cp_opencl_worker_set_macro(int macro_m, int macro_n) {
+    if (macro_m <= 0 || macro_n <= 0) {
+        g_macro_m = 0;
+        g_macro_n = 0;
+        return;
+    }
+    g_macro_m = macro_m;
+    g_macro_n = macro_n;
+}
+
 extern "C" void cp_opencl_worker_set_issue_mode(int mode) {
     if (mode < 0) {
         mode = 0;
@@ -263,15 +275,18 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     int tile_mr = 4;
     int tile_nr = 8;
     const char *source = "default 4x8";
+    const int macro_m = g_macro_m;
+    const int macro_n = g_macro_n;
 
     if (g_tile_mr > 0 && g_tile_nr > 0) {
-        if (!case32::configure(g_tile_mr, g_tile_nr)) {
-            fprintf(stderr, "[ocl] --ocl-tile %dx%d invalid; using 4x8\n", g_tile_mr,
-                    g_tile_nr);
+        if (!case32::configure(g_tile_mr, g_tile_nr, macro_m, macro_n)) {
+            fprintf(stderr, "[ocl] --ocl-tile %dx%d / macro %dx%d invalid; using 4x8\n",
+                    g_tile_mr, g_tile_nr, macro_m > 0 ? macro_m : 0,
+                    macro_n > 0 ? macro_n : 0);
             tile_mr = 4;
             tile_nr = 8;
             source = "invalid CLI, using 4x8";
-            case32::configure(tile_mr, tile_nr);
+            case32::configure(tile_mr, tile_nr, 0, 0);
         } else {
             tile_mr = g_tile_mr;
             tile_nr = g_tile_nr;
@@ -288,8 +303,8 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
                 source = "AMD GPU auto 8x16";
             }
         }
-        if (!case32::configure(tile_mr, tile_nr)) {
-            fprintf(stderr, "[ocl] hash tile configure failed\n");
+        if (!case32::configure(tile_mr, tile_nr, macro_m, macro_n)) {
+            fprintf(stderr, "[ocl] hash tile / macro configure failed\n");
             return;
         }
     }

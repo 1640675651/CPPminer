@@ -192,6 +192,16 @@ extern "C" void cp_worker_set_ocl_tile(int mr, int nr)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_macro(int macro_m, int macro_n)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_macro(macro_m, macro_n);
+#else
+    (void)macro_m;
+    (void)macro_n;
+#endif
+}
+
 extern "C" void cp_worker_set_ocl_issue_mode(int mode)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL

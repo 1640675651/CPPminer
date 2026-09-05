@@ -39,6 +39,8 @@ void cp_worker_set_ocl_platform(int platform_index);
 void cp_worker_set_onednn_platform(int platform_index);
 /* OpenCL-only: register tile MR x NR (4x4, 4x8, 8x8, or 8x16). mr<=0 restores auto (4x8; 8x16 on AMD). */
 void cp_worker_set_ocl_tile(int mr, int nr);
+/* OpenCL-only: macro block 64x64 or 128x128. <=0 restores default 128x128. */
+void cp_worker_set_ocl_macro(int macro_m, int macro_n);
 /* OpenCL-only: GEMM issue. 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
 void cp_worker_set_ocl_issue_mode(int mode);
 /* Legacy: on → broadcast, off → auto. */

@@ -73,7 +73,9 @@ static void print_usage(void)
 #endif
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-    printf("  --ocl-tile MxN     OpenCL register tile: 4x8 (default; 64x64 macro), 4x4, 8x8, or 8x16 (auto on AMD)\n");
+    printf("  --ocl-tile MxN[/MmMm]  OpenCL register tile: 4x4, 4x8 (default), 8x8, 8x16 (auto on AMD);\n");
+    printf("                         optional /64x64 or /128x128 macro (same as --ocl-macro)\n");
+    printf("  --ocl-macro MxN    OpenCL macro block: 64x64 or 128x128 (default 128x128)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
@@ -262,6 +264,8 @@ int main(int argc, char** argv)
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
     int ocl_tile_nr = 0;
+    int ocl_macro_m = 0;
+    int ocl_macro_n = 0;
     int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
@@ -313,14 +317,52 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-tile requires MxN (e.g. 4x4, 4x8, 8x8, or 8x16)\n");
+                fprintf(stderr, "--ocl-tile requires MxN or MxN/MACROMxMACRON "
+                                "(e.g. 4x8, 4x8/64x64)\n");
                 return 1;
             }
-            if(sscanf(v, "%dx%d", &ocl_tile_mr, &ocl_tile_nr) != 2 ||
-               !((ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
+            int tile_macro_m = 0, tile_macro_n = 0;
+            const int nfields = sscanf(v, "%dx%d/%dx%d", &ocl_tile_mr, &ocl_tile_nr,
+                                       &tile_macro_m, &tile_macro_n);
+            if(nfields == 2){
+                /* tile only */
+            } else if(nfields == 4){
+                ocl_macro_m = tile_macro_m;
+                ocl_macro_n = tile_macro_n;
+            } else {
+                fprintf(stderr,
+                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
+                        "or MxN/64x64|128x128)\n",
+                        v);
+                return 1;
+            }
+            if(!((ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
                  (ocl_tile_mr == 8 && (ocl_tile_nr == 8 || ocl_tile_nr == 16)))){
                 fprintf(stderr,
                         "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
+                return 1;
+            }
+            if(nfields == 4 &&
+               !((ocl_macro_m == 64 && ocl_macro_n == 64) ||
+                 (ocl_macro_m == 128 && ocl_macro_n == 128))){
+                fprintf(stderr,
+                        "invalid --ocl-tile macro in %s (expected 64x64 or 128x128)\n",
+                        v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-macro", 11)){
+            const char* v = argv[i] + 11;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-macro requires MxN (64x64 or 128x128)\n");
+                return 1;
+            }
+            if(sscanf(v, "%dx%d", &ocl_macro_m, &ocl_macro_n) != 2 ||
+               !((ocl_macro_m == 64 && ocl_macro_n == 64) ||
+                 (ocl_macro_m == 128 && ocl_macro_n == 128))){
+                fprintf(stderr,
+                        "invalid --ocl-macro %s (expected 64x64 or 128x128)\n", v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-issue", 11)){
@@ -571,6 +613,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_platform(ocl_platform);
     if(ocl_tile_mr > 0)
         cp_worker_set_ocl_tile(ocl_tile_mr, ocl_tile_nr);
+    if(ocl_macro_m > 0)
+        cp_worker_set_ocl_macro(ocl_macro_m, ocl_macro_n);
     if(ocl_issue_mode != 0)
         cp_worker_set_ocl_issue_mode(ocl_issue_mode);
     if(ocl_cpm_int)

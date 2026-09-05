@@ -61,29 +61,38 @@ bool is_supported_tile(int mr, int nr) {
     return false;
 }
 
-/* Case 3.4: 4x8/64x64 → 128 WI/WG. 8x* keeps 128×128. */
-void select_macro_for_tile(int mr, int /*nr*/, int *macro_m, int *macro_n) {
-    if (mr == 4) {
-        *macro_m = kMacroSmall;
-        *macro_n = kMacroSmall;
-    } else {
-        *macro_m = kMacroLarge;
-        *macro_n = kMacroLarge;
+bool is_supported_macro(int macro_m, int macro_n) {
+    if (macro_m == kMacroSmall && macro_n == kMacroSmall) {
+        return true;
     }
+    if (macro_m == kMacroLarge && macro_n == kMacroLarge) {
+        return true;
+    }
+    return false;
+}
+
+/* Soft default when --ocl-macro omitted: always 128×128. */
+void default_macro(int *macro_m, int *macro_n) {
+    *macro_m = kMacroLarge;
+    *macro_n = kMacroLarge;
 }
 
 } // namespace
 
-bool configure(int mr, int nr) {
+bool configure(int mr, int nr, int macro_m, int macro_n) {
     if (!is_supported_tile(mr, nr)) {
         std::fprintf(stderr, "[ocl] register tile must be 4x4, 4x8, 8x8, or 8x16 (got %dx%d)\n",
                      mr, nr);
         return false;
     }
 
-    int macro_m = kMacroLarge;
-    int macro_n = kMacroLarge;
-    select_macro_for_tile(mr, nr, &macro_m, &macro_n);
+    if (macro_m <= 0 || macro_n <= 0) {
+        default_macro(&macro_m, &macro_n);
+    } else if (!is_supported_macro(macro_m, macro_n)) {
+        std::fprintf(stderr,
+                     "[ocl] macro must be 64x64 or 128x128 (got %dx%d)\n", macro_m, macro_n);
+        return false;
+    }
 
     if (macro_m % mr != 0 || macro_n % nr != 0) {
         std::fprintf(stderr,
@@ -99,8 +108,8 @@ bool configure(int mr, int nr) {
     const int work_items = (macro_m / mr) * (macro_n / hash_nr);
     if (work_items > kMacroWorkItemsMax) {
         std::fprintf(stderr,
-                     "[ocl] tile %dx%d needs %d work-items per macro block (max %d)\n", mr, nr,
-                     work_items, kMacroWorkItemsMax);
+                     "[ocl] tile %dx%d / macro %dx%d needs %d work-items per macro (max %d)\n",
+                     mr, nr, macro_m, macro_n, work_items, kMacroWorkItemsMax);
         return false;
     }
     kMR = mr;
