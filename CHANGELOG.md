@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5 (tentative)
+- Experimental OneDNN backend for intel GPU (DONE)
+- Fix OpenCL dot product extension on some GPU (DONE)
+- Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group (DONE) 
+- Configurable matrix size (TODO)
+
 ## v0.4
 - ARM CPU + NEON support.
 - AVX-VNNI support.

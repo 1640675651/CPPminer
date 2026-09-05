@@ -13,14 +13,21 @@
 #define R_RANK 128
 #endif
 
+#ifndef MACRO_M
+#define MACRO_M 128
+#endif
+#ifndef MACRO_N
+#define MACRO_N 128
+#endif
+
 #define CP_RANGE_MASK 63
 #define CP_ZERO_PT 16
 #define CP_B3_LINES 8
 #define K_GROUPS (KR / 4)
 #define KG_BYTES_A (MR * 4)
 #define KG_SLICE_B (NR * 4)
-#define MICRO_M (128 / MR)
-#define MICRO_N (128 / NR)
+#define MICRO_M (MACRO_M / MR)
+#define MICRO_N (MACRO_N / NR)
 #define MACRO_KG_STRIP_A (MICRO_M * KG_BYTES_A)
 #define MACRO_KG_STRIP_B (MICRO_N * KG_SLICE_B)
 #define MACRO_KB_BLOCK_A (K_GROUPS * MACRO_KG_STRIP_A)

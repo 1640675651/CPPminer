@@ -118,6 +118,8 @@ bool Case33OclPrep::build_program_(const std::string &kernel_dir) {
     opts += " -DMR=" + std::to_string(case32::kMR);
     opts += " -DNR=" + std::to_string(case32::kNR);
     opts += " -DKR=" + std::to_string(case32::kKR);
+    opts += " -DMACRO_M=" + std::to_string(case32::kMacroM);
+    opts += " -DMACRO_N=" + std::to_string(case32::kMacroN);
     opts += " -DR_RANK=" + std::to_string(R_RANK);
 
     cl_int err = CL_SUCCESS;

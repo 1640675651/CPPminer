@@ -155,6 +155,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DNR=" + std::to_string(case32::kNR);
         build_opts += " -DHASH_NR=" + std::to_string(case32::hash_tile_nr());
         build_opts += " -DKR=" + std::to_string(case32::kKR);
+        build_opts += " -DMACRO_M=" + std::to_string(case32::kMacroM);
+        build_opts += " -DMACRO_N=" + std::to_string(case32::kMacroN);
         build_opts += " -DR_RANK=" + std::to_string(R_RANK);
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
@@ -216,6 +218,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) + " -DKR=" +
                         std::to_string(case32::kKR) +
+                        " -DMACRO_M=" + std::to_string(case32::kMacroM) +
+                        " -DMACRO_N=" + std::to_string(case32::kMacroN) +
                         " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=" +
                         std::to_string(case32::wi_row_major() ? 1 : 0) +
