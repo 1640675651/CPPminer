@@ -60,10 +60,11 @@ struct OpenClContext {
     bool build_program_from_source(const char *source, const char *build_options = "",
                                    bool quiet = false);
 
-    /* Probe clBuildProgram in a child process first. Drivers that abort() inside
-       the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill only the child;
-       the parent returns false and can fall back to another build. Does not
-       modify this->program. */
+    /* Probe clBuildProgram in a child process first (Linux only). Drivers that
+       abort() inside the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill
+       only the child; the parent returns false and can fall back to another
+       build. Windows/Apple skip the probe (no fork / OpenCL not fork-safe).
+       Does not modify this->program. */
     bool probe_build(const char *source, const char *build_options = "");
 
     /* probe_build() then build_program_from_source/file if the probe survives. */

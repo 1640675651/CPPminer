@@ -382,7 +382,7 @@ bool OpenClContext::build_program_from_file(const char *cl_path, const char *bui
     return build_program_from_source(source.c_str(), build_options, quiet);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 bool OpenClContext::probe_build(const char *source, const char *build_options) {
     if (!context || !device || source == nullptr) {
         return false;
@@ -435,7 +435,8 @@ bool OpenClContext::probe_build(const char *source, const char *build_options) {
 }
 #else
 bool OpenClContext::probe_build(const char * /*source*/, const char * /*build_options*/) {
-    /* No fork on Windows; rely on normal clBuildProgram error returns. */
+    /* Windows: no fork. Apple: OpenCL is not fork-safe after context init.
+       Rely on normal clBuildProgram error returns in both cases. */
     return true;
 }
 #endif
