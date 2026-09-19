@@ -250,17 +250,27 @@ function Ensure-CargoOnPath {
 }
 
 function Copy-OpenClKernels {
-    $kernelSrcDir = Join-Path $Root "src\opencl\kernels"
     $kernelDstDir = Join-Path $Root "kernels"
     New-Item -ItemType Directory -Force -Path $kernelDstDir | Out-Null
-    foreach ($name in @(
-        "case33_gemm_xor.cl",
-        "cp_ocl_blake3.cl",
-        "cp_ocl_merkle.cl",
-        "cp_ocl_prep.cl",
-        "cp_onednn_jackpot.cl"
-    )) {
-        Copy-Item (Join-Path $kernelSrcDir $name) (Join-Path $kernelDstDir $name) -Force
+    $pairs = @(
+        @{ Src = (Join-Path $Root "src\opencl\kernels"); Names = @(
+            "case33_gemm_xor.cl",
+            "cp_ocl_blake3.cl",
+            "cp_ocl_merkle.cl",
+            "cp_ocl_prep.cl",
+            "cp_onednn_jackpot.cl"
+        )},
+        @{ Src = (Join-Path $Root "src\qpow\opencl\kernels"); Names = @(
+            "qpow_mining.cl"
+        )}
+    )
+    foreach ($group in $pairs) {
+        foreach ($name in $group.Names) {
+            $src = Join-Path $group.Src $name
+            if (Test-Path $src) {
+                Copy-Item $src (Join-Path $kernelDstDir $name) -Force
+            }
+        }
     }
 }
 

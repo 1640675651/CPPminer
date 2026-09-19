@@ -5,9 +5,9 @@ Cross-platform multi-algo miner written in C++. Select the algorithm at runtime 
 | Algo | Backends | PoW |
 |------|----------|-----|
 | `pearl` | `cpu` / `cuda` / `opencl` / `onednn` | GEMM+XOR jackpot + `plain_proof` |
-| `quantus` | `cpu` / `wgpu` | Poseidon2 QPoW (`qpow-poseidon2`) |
+| `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
-Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus CPU mining uses `src/qpow/`; Quantus wgpu uses `rust/cp-wgpu-ffi` + `src/wgpu/` (wraps quantus-miner `engine-gpu`):
+Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
@@ -15,8 +15,9 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | CUDA | `src/cuda/` | Pearl: Pascal CUTLASS fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
-| Quantus CPU | `src/qpow/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
-| wgpu | `src/wgpu/` + `rust/cp-wgpu-ffi` | Quantus only (Pearl not supported yet) |
+| Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
+| Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-wgpu-ffi` | GpuEngine FFI |
+| Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
 
 ## Requirements
 
@@ -54,7 +55,7 @@ Enable multiple backends in one binary; select at runtime with `--backend`. Both
 | | cpu | cuda | opencl | onednn | wgpu |
 |--|-----|------|--------|--------|------|
 | pearl | ✓ | ✓ | ✓ | ✓ | ✗ |
-| quantus | ✓ | ✗ | ✗ | ✗ | ✓ |
+| quantus | ✓ | ✗ | ✓ | ✗ | ✓ |
 
 ## Build (Windows)
 
@@ -98,6 +99,11 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --algo quantus --backend wgpu --devices 0 `
   --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 # Omit --devices to use all mining adapters (discrete preferred).
+
+# Quantus OpenCL (requires -Backend OpenCl / CP_ENABLE_OPENCL)
+.\cppminer.exe --backend opencl --list-devices
+.\cppminer.exe --algo quantus --backend opencl --devices 0 `
+  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 ```
 
 ```powershell
@@ -132,7 +138,7 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` or `wgpu`; Pearl: not `wgpu`. `--pool` required for Quantus (no default host) |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: not `wgpu`. `--pool` required for Quantus (no default host) |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus`) |
 | `--wallet` | Wallet address (required unless `--mock`) |

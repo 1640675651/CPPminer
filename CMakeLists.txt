@@ -50,7 +50,7 @@ set(CP_COMMON_SOURCES
     src/common/cp_state.cpp
     src/common/cp_worker.cpp
     src/common/cp_noise.c
-    src/qpow/miner.cpp
+    src/qpow/cpu/miner.cpp
 )
 
 set(CP_INCLUDE_DIRS
@@ -60,12 +60,13 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/cuda
     ${CMAKE_SOURCE_DIR}/src/opencl
     ${CMAKE_SOURCE_DIR}/src/onednn
-    ${CMAKE_SOURCE_DIR}/src/wgpu
+    ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
+    ${CMAKE_SOURCE_DIR}/src/qpow/opencl
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
 
 # Quantus Poseidon2 AVX2 TU (separate compile unit for /arch:AVX2).
-add_library(cp_qpow_avx2 OBJECT src/qpow/simd_avx2.cpp)
+add_library(cp_qpow_avx2 OBJECT src/qpow/cpu/simd_avx2.cpp)
 target_include_directories(cp_qpow_avx2 PRIVATE
     ${CMAKE_SOURCE_DIR}/src/qpow/include
     ${CMAKE_SOURCE_DIR}/include)
@@ -280,6 +281,7 @@ if(CP_ENABLE_OPENCL OR CP_ENABLE_ONEDNN)
             src/opencl/case32_prepack.cpp
             src/opencl/case32_layout.cpp
             src/opencl/opencl_context.cpp
+            src/qpow/opencl/cp_qpow_opencl_worker.cpp
         )
         add_compile_definitions(CP_ENABLE_OPENCL=1)
     else()
@@ -374,7 +376,7 @@ else()
 endif()
 
 if(CP_ENABLE_WGPU)
-    list(APPEND CP_SOURCES src/wgpu/cp_wgpu_worker.cpp)
+    list(APPEND CP_SOURCES src/qpow/wgpu/cp_wgpu_worker.cpp)
     add_compile_definitions(CP_ENABLE_WGPU=1)
 else()
     add_compile_definitions(CP_ENABLE_WGPU=0)
@@ -406,6 +408,9 @@ if(CP_ENABLE_OPENCL)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
             "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/qpow/opencl/kernels/qpow_mining.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/qpow_mining.cl"
         COMMENT "Copy OpenCL kernels next to cppminer")
 elseif(CP_ENABLE_ONEDNN)
     target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
@@ -586,7 +591,7 @@ if(CP_ENABLE_WGPU)
         else()
             message(WARNING "cp-wgpu-ffi unavailable; wgpu stub")
         endif()
-        target_sources(cppminer PRIVATE src/wgpu/cp_wgpu_stub.cpp)
+        target_sources(cppminer PRIVATE src/qpow/wgpu/cp_wgpu_stub.cpp)
     endif()
 
     if(_cp_link_wgpu_ffi AND NOT _cp_wgpu_use_stub)

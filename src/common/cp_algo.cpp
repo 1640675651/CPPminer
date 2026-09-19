@@ -33,8 +33,11 @@ int cp_algo_supports(CpAlgoId algo, CpBackendId backend)
     /* wgpu is Quantus-only (Pearl not supported yet). */
     if(backend == CP_BACKEND_WGPU)
         return algo == CP_ALGO_QUANTUS && cp_worker_has_wgpu();
-    if(algo == CP_ALGO_QUANTUS)
-        return backend == CP_BACKEND_CPU && cp_worker_has_cpu();
+    if(algo == CP_ALGO_QUANTUS){
+        if(backend == CP_BACKEND_CPU) return cp_worker_has_cpu();
+        if(backend == CP_BACKEND_OPENCL) return cp_worker_has_opencl();
+        return 0;
+    }
     /* Pearl: any built Pearl backend (not wgpu). */
     switch(backend){
     case CP_BACKEND_CPU:    return cp_worker_has_cpu();

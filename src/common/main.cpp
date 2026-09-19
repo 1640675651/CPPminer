@@ -15,6 +15,9 @@
 #include "cp_state.h"
 #include "cp_util.h"
 #include "cp_worker.h"
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+#include "cp_qpow_opencl_worker.h"
+#endif
 
 #include "qpow/poseidon2.hpp"
 
@@ -1071,9 +1074,22 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+            if(!ndev){ devs[0] = 0; ndev = 1; }
+            if(cp_qpow_opencl_worker_init(devs, ndev) != 0){
+                fprintf(stderr, "quantus opencl backend init failed\n");
+                return 1;
+            }
+        }
+#endif
         const int qrc = run_quantus_pool(pool_host, pool_port);
         if(cp_worker_backend_id() == CP_BACKEND_WGPU)
             cp_worker_shutdown();
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        else if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+            cp_qpow_opencl_worker_shutdown();
+#endif
         return qrc;
     }
 
