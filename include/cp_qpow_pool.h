@@ -34,7 +34,7 @@ void cp_qpow_pool_clear(void);
 void cp_qpow_pool_set_session_id(const char* id);
 const char* cp_qpow_pool_session_id(void);
 
-int cp_qpow_pool_send_login(int msg_id, const char* login, const char* pass,
+int cp_qpow_pool_send_login(int msg_id, const char* login, const char* worker,
                             const char* agent);
 
 int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
