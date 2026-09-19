@@ -258,23 +258,30 @@ detect_cuda_arch() {
 ensure_quantus_miner() {
     local qm_dir="${PROJECT_ROOT}/third_party/quantus-miner"
     local engine_gpu="${qm_dir}/crates/engine-gpu/Cargo.toml"
+    local engine_gpu_lib="${qm_dir}/crates/engine-gpu/src/lib.rs"
+    local device_patch="${PROJECT_ROOT}/src/qpow/wgpu/quantus-miner-v4.2.0-device-select.patch"
     if [[ -f "${engine_gpu}" ]]; then
         log "quantus-miner already present at ${qm_dir}"
-        return
+    else
+        log "Fetching Quantus-Network/quantus-miner (v4.2.0)"
+        if ! command -v git &>/dev/null; then
+            fail "git required to fetch quantus-miner"
+        fi
+
+        rm -rf "${qm_dir}"
+        mkdir -p "${PROJECT_ROOT}/third_party"
+        git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 \
+            https://github.com/Quantus-Network/quantus-miner.git "${qm_dir}" \
+            || fail "quantus-miner clone failed"
+
+        [[ -f "${engine_gpu}" ]] || fail "quantus-miner missing after clone"
     fi
-
-    log "Fetching Quantus-Network/quantus-miner (v4.2.0)"
-    if ! command -v git &>/dev/null; then
-        fail "git required to fetch quantus-miner"
+    if [[ -f "${device_patch}" && -f "${engine_gpu_lib}" ]] &&
+       ! grep -q "fn list_mining_adapters" "${engine_gpu_lib}"; then
+        log "Applying quantus-miner device-select patch"
+        git -C "${qm_dir}" apply --whitespace=nowarn "${device_patch}" \
+            || fail "quantus-miner device-select patch failed"
     fi
-
-    rm -rf "${qm_dir}"
-    mkdir -p "${PROJECT_ROOT}/third_party"
-    git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 \
-        https://github.com/Quantus-Network/quantus-miner.git "${qm_dir}" \
-        || fail "quantus-miner clone failed"
-
-    [[ -f "${engine_gpu}" ]] || fail "quantus-miner missing after clone"
 }
 
 # ── Find cmake ────────────────────────────────────────────────────────────────

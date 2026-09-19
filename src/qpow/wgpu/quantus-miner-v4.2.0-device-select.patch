@@ -1,0 +1,170 @@
+diff --git a/crates/engine-gpu/src/lib.rs b/crates/engine-gpu/src/lib.rs
+index 016fa37..c81e474 100644
+--- a/crates/engine-gpu/src/lib.rs
++++ b/crates/engine-gpu/src/lib.rs
+@@ -184,6 +184,51 @@ fn backend_rank(backend: wgpu::Backend) -> u8 {
+     }
+ }
+ 
++fn device_type_label(dt: wgpu::DeviceType) -> &'static str {
++    match dt {
++        wgpu::DeviceType::DiscreteGpu => "DiscreteGpu",
++        wgpu::DeviceType::IntegratedGpu => "IntegratedGpu",
++        wgpu::DeviceType::VirtualGpu => "VirtualGpu",
++        wgpu::DeviceType::Cpu => "Cpu",
++        _ => "Other",
++    }
++}
++
++/// One mining-usable adapter as shown by `--list-devices` / `list_mining_adapters`.
++/// `index` is the selection index accepted by `try_new_with_devices`.
++#[derive(Debug, Clone)]
++pub struct ListedAdapter {
++    pub index: usize,
++    pub name: String,
++    pub device_type: &'static str,
++    pub backend: String,
++}
++
++/// Enumerate adapters that would be considered for mining (same filter as init:
++/// drop CPU emulators, keep best backend only, discrete-first order).
++pub fn list_mining_adapters() -> Vec<ListedAdapter> {
++    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
++        backends: wgpu::Backends::PRIMARY,
++        ..Default::default()
++    });
++    let adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY);
++    let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(|a| a.get_info()).collect();
++    let selected = select_adapters(&infos);
++    selected
++        .into_iter()
++        .enumerate()
++        .map(|(i, raw)| {
++            let info = &infos[raw];
++            ListedAdapter {
++                index: i,
++                name: info.name.clone(),
++                device_type: device_type_label(info.device_type),
++                backend: format!("{:?}", info.backend),
++            }
++        })
++        .collect()
++}
++
+ /// Select which adapters to mine on, returning indices into `infos` ordered
+ /// discrete-first.
+ ///
+@@ -292,23 +337,52 @@ impl GpuEngine {
+         batch_size: u32,
+         throttle_ms: u64,
+         allow_integrated: bool,
++    ) -> Result<Self, Box<dyn std::error::Error>> {
++        Self::try_new_with_devices(batch_size, throttle_ms, allow_integrated, None)
++    }
++
++    /// Like [`Self::try_new`], but optionally restrict to mining-adapter indices
++    /// from [`list_mining_adapters`].
++    ///
++    /// `device_indices`: `None` or empty -> auto (all mining adapters, subject to
++    /// `allow_integrated`). Non-empty -> only those indices; integrated filtering
++    /// is skipped so an explicitly chosen iGPU is kept.
++    pub fn try_new_with_devices(
++        batch_size: u32,
++        throttle_ms: u64,
++        allow_integrated: bool,
++        device_indices: Option<&[usize]>,
+     ) -> Result<Self, Box<dyn std::error::Error>> {
+         if batch_size == 0 {
+             return Err("batch_size must be non-zero".into());
+         }
+ 
++        let indices_owned: Option<Vec<usize>> = device_indices
++            .filter(|s| !s.is_empty())
++            .map(|s| s.to_vec());
++
+         // Handle both cases: called from within a tokio runtime or from outside
+         match tokio::runtime::Handle::try_current() {
+             Ok(handle) => {
+                 // We're inside a tokio runtime - use block_in_place to allow blocking
+                 tokio::task::block_in_place(|| {
+-                    handle.block_on(Self::init(batch_size, throttle_ms, allow_integrated))
++                    handle.block_on(Self::init(
++                        batch_size,
++                        throttle_ms,
++                        allow_integrated,
++                        indices_owned.as_deref(),
++                    ))
+                 })
+             }
+             Err(_) => {
+                 // No runtime exists - create a temporary one
+                 let rt = tokio::runtime::Runtime::new()?;
+-                rt.block_on(Self::init(batch_size, throttle_ms, allow_integrated))
++                rt.block_on(Self::init(
++                    batch_size,
++                    throttle_ms,
++                    allow_integrated,
++                    indices_owned.as_deref(),
++                ))
+             }
+         }
+     }
+@@ -317,6 +391,7 @@ impl GpuEngine {
+         batch_size: u32,
+         throttle_ms: u64,
+         allow_integrated: bool,
++        device_indices: Option<&[usize]>,
+     ) -> Result<Self, Box<dyn std::error::Error>> {
+         log::info!(target: "gpu_engine", "Initializing WGPU...");
+         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+@@ -327,8 +402,8 @@ impl GpuEngine {
+         let adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY);
+         let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(|a| a.get_info()).collect();
+ 
+-        let selected = select_adapters(&infos);
+-        if selected.is_empty() {
++        let selected_all = select_adapters(&infos);
++        if selected_all.is_empty() {
+             log::error!(
+                 target: "gpu_engine",
+                 "No usable GPU adapters found ({} enumerated). Use --gpu-devices 0 to disable GPU mining.",
+@@ -337,6 +412,27 @@ impl GpuEngine {
+             return Err("No usable GPU adapters found".into());
+         }
+ 
++        let explicit = device_indices.is_some_and(|s| !s.is_empty());
++        let selected: Vec<usize> = if let Some(want) = device_indices.filter(|s| !s.is_empty()) {
++            let mut out = Vec::with_capacity(want.len());
++            let mut seen = std::collections::HashSet::new();
++            for &wi in want {
++                if wi >= selected_all.len() {
++                    return Err(format!(
++                        "GPU device index {wi} out of range (0..{})",
++                        selected_all.len()
++                    )
++                    .into());
++                }
++                if seen.insert(wi) {
++                    out.push(selected_all[wi]);
++                }
++            }
++            out
++        } else {
++            selected_all
++        };
++
+         let mut adapters: Vec<Option<wgpu::Adapter>> = adapters.into_iter().map(Some).collect();
+ 
+         // Track successfully initialized contexts with their device type
+@@ -466,8 +562,10 @@ impl GpuEngine {
+         }
+ 
+         // Filter integrated GPUs if discrete GPUs successfully initialized
++        // (skipped when the caller picked devices explicitly).
+         let device_types: Vec<_> = initialized.iter().map(|g| g.device_type).collect();
+-        let keep_indices = filter_initialized_gpus(&device_types, allow_integrated);
++        let keep_allow_integrated = allow_integrated || explicit;
++        let keep_indices = filter_initialized_gpus(&device_types, keep_allow_integrated);
+ 
+         let contexts: Vec<Arc<GpuContext>> = initialized
+             .into_iter()

@@ -222,6 +222,8 @@ function Find-OpenClLib {
 function Ensure-QuantusMiner {
     $qmRoot = Join-Path $Root "third_party\quantus-miner"
     $engineGpu = Join-Path $qmRoot "crates\engine-gpu\Cargo.toml"
+    $engineGpuLib = Join-Path $qmRoot "crates\engine-gpu\src\lib.rs"
+    $devicePatch = Join-Path $Root "src\qpow\wgpu\quantus-miner-v4.2.0-device-select.patch"
     if (-not (Test-Path $engineGpu)) {
         Write-Host "=== Fetching Quantus-Network/quantus-miner (v4.2.0) ==="
         if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -237,6 +239,13 @@ function Ensure-QuantusMiner {
     }
     if (-not (Test-Path $engineGpu)) {
         throw "quantus-miner missing at $engineGpu"
+    }
+    if ((Test-Path $devicePatch) -and (Test-Path $engineGpuLib) -and
+        -not (Select-String -Path $engineGpuLib -Pattern "fn list_mining_adapters" -Quiet)) {
+        Write-Host "=== Applying quantus-miner device-select patch ==="
+        Invoke-External -Command {
+            git -C $qmRoot apply --whitespace=nowarn $devicePatch
+        } -FailureMessage "quantus-miner device-select patch failed"
     }
     return $qmRoot
 }
