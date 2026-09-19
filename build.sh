@@ -254,6 +254,29 @@ detect_cuda_arch() {
     echo "75"  # conservative default
 }
 
+# ── Ensure-Quantus-Miner ──────────────────────────────────────────────────────
+ensure_quantus_miner() {
+    local qm_dir="${PROJECT_ROOT}/third_party/quantus-miner"
+    local engine_gpu="${qm_dir}/crates/engine-gpu/Cargo.toml"
+    if [[ -f "${engine_gpu}" ]]; then
+        log "quantus-miner already present at ${qm_dir}"
+        return
+    fi
+
+    log "Fetching Quantus-Network/quantus-miner (v4.2.0)"
+    if ! command -v git &>/dev/null; then
+        fail "git required to fetch quantus-miner"
+    fi
+
+    rm -rf "${qm_dir}"
+    mkdir -p "${PROJECT_ROOT}/third_party"
+    git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 \
+        https://github.com/Quantus-Network/quantus-miner.git "${qm_dir}" \
+        || fail "quantus-miner clone failed"
+
+    [[ -f "${engine_gpu}" ]] || fail "quantus-miner missing after clone"
+}
+
 # ── Find cmake ────────────────────────────────────────────────────────────────
 find_cmake() {
     if command -v cmake &>/dev/null; then
@@ -269,9 +292,7 @@ log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} One
 ensure_blake3
 
 if (( ENABLE_WGPU )); then
-    if [[ ! -f "${PROJECT_ROOT}/../quantus-miner/crates/engine-gpu/Cargo.toml" ]]; then
-        fail "Wgpu backend requires sibling quantus-miner (../quantus-miner/crates/engine-gpu)"
-    fi
+    ensure_quantus_miner
     if ! command -v cargo &>/dev/null; then
         fail "Wgpu backend requires cargo on PATH"
     fi

@@ -219,6 +219,28 @@ function Find-OpenClLib {
     throw "Vendored OpenCL.lib missing at $vendored (see third_party/opencl/README.md)"
 }
 
+function Ensure-QuantusMiner {
+    $qmRoot = Join-Path $Root "third_party\quantus-miner"
+    $engineGpu = Join-Path $qmRoot "crates\engine-gpu\Cargo.toml"
+    if (-not (Test-Path $engineGpu)) {
+        Write-Host "=== Fetching Quantus-Network/quantus-miner (v4.2.0) ==="
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "git required to fetch quantus-miner into third_party/quantus-miner"
+        }
+        if (Test-Path $qmRoot) { Remove-Item $qmRoot -Recurse -Force }
+        $tp = Join-Path $Root "third_party"
+        New-Item -ItemType Directory -Force -Path $tp | Out-Null
+        Invoke-External -Command {
+            git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 `
+                https://github.com/Quantus-Network/quantus-miner.git $qmRoot
+        } -FailureMessage "quantus-miner clone failed"
+    }
+    if (-not (Test-Path $engineGpu)) {
+        throw "quantus-miner missing at $engineGpu"
+    }
+    return $qmRoot
+}
+
 function Ensure-CargoOnPath {
     $cmd = Get-Command cargo -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) {
@@ -385,10 +407,7 @@ try {
         Write-Host "=== CUDA arch: $CudaArch ==="
     }
     if ($EnableWgpu) {
-        $engineGpu = Join-Path (Split-Path $Root -Parent) "quantus-miner\crates\engine-gpu\Cargo.toml"
-        if (-not (Test-Path $engineGpu)) {
-            throw "Wgpu backend requires sibling quantus-miner at $engineGpu"
-        }
+        $null = Ensure-QuantusMiner
         if (-not (Ensure-CargoOnPath)) {
             throw "Wgpu backend requires cargo on PATH"
         }

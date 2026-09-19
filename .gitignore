@@ -2,6 +2,7 @@
 /rust/cp-proof-ffi/target/
 /rust/cp-wgpu-ffi/target/
 /third_party/blake3/
+/third_party/quantus-miner/
 /third_party/onednn-src/
 /third_party/.case5_onednn_tag
 /src/onednn/third_party/gemmstone/

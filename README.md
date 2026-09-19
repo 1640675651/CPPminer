@@ -27,7 +27,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
-- **wgpu build:** Rust toolchain + sibling [`quantus-miner`](../quantus-miner) (`engine-gpu`). Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Quantus only.
+- **wgpu build:** Rust toolchain; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` (`engine-gpu`). Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Quantus only.
 
 ## Build options (CMake)
 
@@ -46,7 +46,7 @@ cmake --build build --config Release
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
-| `CP_ENABLE_WGPU` | OFF | Quantus wgpu GpuEngine (Rust FFI; needs sibling quantus-miner) |
+| `CP_ENABLE_WGPU` | OFF | Quantus wgpu GpuEngine (Rust FFI; fetches `third_party/quantus-miner`) |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 

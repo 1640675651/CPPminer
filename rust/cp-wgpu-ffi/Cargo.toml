@@ -10,9 +10,9 @@ name = "cp_wgpu_ffi"
 crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]
-engine-gpu = { path = "../../../quantus-miner/crates/engine-gpu" }
-engine-cpu = { path = "../../../quantus-miner/crates/engine-cpu" }
-pow-core = { path = "../../../quantus-miner/crates/pow-core" }
+engine-gpu = { path = "../../third_party/quantus-miner/crates/engine-gpu" }
+engine-cpu = { path = "../../third_party/quantus-miner/crates/engine-cpu" }
+pow-core = { path = "../../third_party/quantus-miner/crates/pow-core" }
 primitive-types = { version = "0.13.1", default-features = false }
 parking_lot = "0.12"
 log = "0.4"
