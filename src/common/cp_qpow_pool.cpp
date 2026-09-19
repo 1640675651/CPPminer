@@ -66,7 +66,7 @@ int cp_qpow_pool_send_login(int msg_id, const char* login, const char* pass,
              "\"login\":\"%s\",\"pass\":\"%s\",\"agent\":\"%s\"}}",
              msg_id, login ? login : "", pass ? pass : "x",
              agent ? agent : "cppminer/1.0");
-    printf("[net] Quantus login (login/pass/agent)\n");
+    printf("[net] Quantus login (login/pass=worker/agent)\n");
     fflush(stdout);
     return cp_send_json(cp_pool_socket(), msg);
 }

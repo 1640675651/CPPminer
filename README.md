@@ -80,7 +80,7 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --algo pearl --backend cpu --wallet prl1... --worker worker_name
 
 # Quantus CPU (LuckyPool / compatible stratum; --pool required, no default host)
-.\cppminer.exe --algo quantus --backend cpu `
+.\cppminer.exe --algo quantus --backend cpu --threads 8 `
   --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 
 # CUDA (CUTLASS fused GEMM+jackpot)
@@ -119,6 +119,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
+| `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
 | `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--dev` | Use 8192×8192 matrices for testing |

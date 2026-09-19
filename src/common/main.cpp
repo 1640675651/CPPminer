@@ -146,6 +146,7 @@ static void print_usage(void)
     printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
     printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
+    printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -302,7 +303,7 @@ reconnect:
         cp_sleep(5);
     }
 
-    if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), "x", agent_global))
+    if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
 
     char login_line[65536];
@@ -725,6 +726,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
+        } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
+            g_qpow_threads = atoi(argv[++i]);
+            if(g_qpow_threads < 0) g_qpow_threads = 0;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             const char* login =
                 "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"

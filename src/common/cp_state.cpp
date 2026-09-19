@@ -22,6 +22,7 @@ uint32_t g_cert_version = 3;
 int g_cert_version_forced = 0;
 int g_cpu_matrix_gen = 0;
 int g_max_nonce = 0;
+int g_qpow_threads = 0;
 
 uint32_t cp_resolve_cert_version(uint32_t notify_cert_version)
 {

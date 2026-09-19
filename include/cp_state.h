@@ -32,6 +32,8 @@ extern uint32_t g_cert_version;
 extern int g_cert_version_forced;
 extern int g_cpu_matrix_gen;
 extern int g_max_nonce;
+/* Quantus OpenMP thread count; <=0 means omp_get_max_threads(). */
+extern int g_qpow_threads;
 
 /* Resolve cert version: forced CLI, else notify (1..3), else g_cert_version. */
 uint32_t cp_resolve_cert_version(uint32_t notify_cert_version);
