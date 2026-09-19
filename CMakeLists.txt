@@ -5,6 +5,7 @@ option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
 option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
+option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -20,8 +21,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU")
 endif()
 
 set(_cp_langs CXX C)
@@ -59,6 +60,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/cuda
     ${CMAKE_SOURCE_DIR}/src/opencl
     ${CMAKE_SOURCE_DIR}/src/onednn
+    ${CMAKE_SOURCE_DIR}/src/wgpu
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
 
@@ -371,6 +373,13 @@ else()
     add_compile_definitions(CP_ENABLE_ONEDNN=0)
 endif()
 
+if(CP_ENABLE_WGPU)
+    list(APPEND CP_SOURCES src/wgpu/cp_wgpu_worker.cpp)
+    add_compile_definitions(CP_ENABLE_WGPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_WGPU=0)
+endif()
+
 add_executable(cppminer ${CP_SOURCES} $<TARGET_OBJECTS:cp_qpow_avx2>)
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
@@ -513,6 +522,121 @@ if(_cp_link_proof_ffi)
     endif()
 endif()
 
+# Quantus wgpu GpuEngine FFI (cdylib preferred: bundles wgpu/DX12/Vulkan deps).
+if(CP_ENABLE_WGPU)
+    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-wgpu-ffi)
+    set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
+    set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/../quantus-miner/crates/engine-gpu/Cargo.toml)
+    if(WIN32)
+        set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.lib)
+    else()
+        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.so)
+        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dylib)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.a)
+    endif()
+
+    set(_cp_link_wgpu_ffi FALSE)
+    set(_cp_wgpu_use_stub FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_WGPU_FFI_MANIFEST} AND EXISTS ${_cp_engine_gpu})
+        file(GLOB _cp_wgpu_rs CONFIGURE_DEPENDS ${CP_WGPU_FFI_DIR}/src/*.rs)
+        if(WIN32)
+            set(_cp_wgpu_build_out ${_cp_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_wgpu_build_out ${_cp_wgpu_dylib})
+        else()
+            set(_cp_wgpu_build_out ${_cp_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_WGPU_FFI_MANIFEST}
+                ${CP_WGPU_FFI_DIR}/Cargo.lock
+                ${_cp_wgpu_rs}
+                ${_cp_engine_gpu}
+            COMMENT "Building cp-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
+        add_dependencies(cppminer cp_wgpu_ffi_build)
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_wgpu_implib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_wgpu_dylib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_wgpu_so})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
+    else()
+        set(_cp_wgpu_use_stub TRUE)
+        if(NOT CARGO_EXECUTABLE)
+            message(WARNING "cargo not found; wgpu stub (init will fail)")
+        elseif(NOT EXISTS ${_cp_engine_gpu})
+            message(WARNING "quantus-miner/crates/engine-gpu missing; wgpu stub")
+        else()
+            message(WARNING "cp-wgpu-ffi unavailable; wgpu stub")
+        endif()
+        target_sources(cppminer PRIVATE src/wgpu/cp_wgpu_stub.cpp)
+    endif()
+
+    if(_cp_link_wgpu_ffi AND NOT _cp_wgpu_use_stub)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_wgpu_ffi.dll"
+                COMMENT "Copy cp_wgpu_ffi.dll next to cppminer")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+            endif()
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_dylib})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE
+                    pthread dl m
+                    "-framework Security"
+                    "-framework CoreFoundation"
+                    "-framework SystemConfiguration"
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            else()
+                target_link_libraries(cppminer PRIVATE
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_so})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "\$ORIGIN")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE pthread dl m)
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.so"
+                COMMENT "Copy libcp_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+endif()
+
 if(MSVC)
     target_compile_options(cppminer PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
@@ -639,4 +763,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} CUBLAS=${CP_ENABLE_CUBLAS}")

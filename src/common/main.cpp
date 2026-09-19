@@ -65,6 +65,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     printf("|onednn");
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    printf("|wgpu");
+#endif
     printf(" (built: ");
     {
         int first = 1;
@@ -72,10 +75,12 @@ static void print_usage(void)
         if(cp_worker_has_cuda()){ printf("%scuda", first ? "" : ","); first = 0; }
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
         if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
+        if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
-    printf("  --devices N[,M]    device index(es): CUDA ids, or OpenCL flat index\n");
+    printf("  --devices N[,M]    device index(es): CUDA ids, OpenCL flat index,\n");
+    printf("                     or wgpu mining-adapter indices (--list-devices)\n");
     printf("                     (default: 0; OpenCL prefers discrete GPU first)\n");
     printf("  --list-devices     list devices for the selected backend and exit\n");
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
@@ -283,7 +288,7 @@ static int run_quantus_pool(const char* pool_host, int pool_port)
     int msg_id = 1;
 
     cp_qpow_pool_set_active(1);
-    printf("[mode] algo=quantus backend=cpu\n");
+    printf("[mode] algo=quantus backend=%s\n", cp_worker_backend_name());
     if(cp_fee_enabled())
         printf("[mode] dev fee: 1%%\n");
     fflush(stdout);
@@ -388,6 +393,7 @@ int main(int argc, char** argv)
     CpAlgoId algo_sel = CP_ALGO_PEARL;
     int devs[MAX_GPUS] = {0};
     int ndev = 0;
+    int devices_specified = 0;
     int align_test = 0;
     int align_test_prod = 0;
     int no_period_gemm = 0;
@@ -468,6 +474,7 @@ int main(int argc, char** argv)
             else if(!strcmp(b, "cuda")) backend_sel = CP_BACKEND_CUDA;
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
             else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
+            else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -478,6 +485,7 @@ int main(int argc, char** argv)
             strncpy(tmp, s, 255); tmp[255] = 0;
             char* tok = strtok(tmp, ",");
             while(tok && ndev < MAX_GPUS){ devs[ndev++] = atoi(tok); tok = strtok(NULL, ","); }
+            devices_specified = 1;
         } else if(!strcmp(argv[i], "--list-devices")){
             list_devices = 1;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -801,19 +809,25 @@ int main(int argc, char** argv)
         if(backend_sel == CP_BACKEND_NONE)
             backend_sel = CP_BACKEND_CPU;
         if(!cp_algo_supports(algo_sel, backend_sel)){
+            char qb[64];
+            cp_algo_format_backends(CP_ALGO_QUANTUS, qb, (int)sizeof(qb));
             fprintf(stderr,
-                    "--algo quantus supports cpu only (got backend that is unavailable "
-                    "or unsupported)\n");
+                    "--algo quantus does not support this --backend "
+                    "(supported in this build: %s)\n", qb);
             return 1;
         }
-        if(!pool_specified && !g_mock){
+        if(!pool_specified && !g_mock && !list_devices){
             fprintf(stderr, "--pool required for --algo quantus (no default host)\n");
             return 1;
         }
-    } else if(backend_sel != CP_BACKEND_NONE &&
+    } else if(!list_devices && backend_sel != CP_BACKEND_NONE &&
               !cp_algo_supports(algo_sel, backend_sel)){
-        fprintf(stderr, "--backend not available for --algo %s\n",
-                cp_algo_name(algo_sel));
+        char pb[64];
+        cp_algo_format_backends(algo_sel, pb, (int)sizeof(pb));
+        fprintf(stderr,
+                "--backend not available for --algo %s "
+                "(supported: %s; note: wgpu is quantus-only)\n",
+                cp_algo_name(algo_sel), pb);
         return 1;
     }
 
@@ -842,8 +856,14 @@ int main(int argc, char** argv)
                 n += cp_worker_list_devices();
             }
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+            if(cp_worker_has_wgpu()){
+                if(cp_worker_select(CP_BACKEND_WGPU) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
             if(n <= 0){
-                printf("[list-devices] no CUDA/OpenCL/OneDNN backends in this build\n");
+                printf("[list-devices] no CUDA/OpenCL/OneDNN/wgpu backends in this build\n");
                 return 1;
             }
             return 0;
@@ -1040,7 +1060,21 @@ int main(int argc, char** argv)
         }
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
         fflush(stdout);
-        return run_quantus_pool(pool_host, pool_port);
+        if(cp_worker_backend_id() == CP_BACKEND_WGPU){
+            /* No --devices → auto (all mining adapters). Explicit → those indices. */
+            if(devices_specified)
+                cp_worker_init(devs, ndev);
+            else
+                cp_worker_init(NULL, 0);
+            if(!cp_worker_is_ready()){
+                fprintf(stderr, "wgpu backend init failed\n");
+                return 1;
+            }
+        }
+        const int qrc = run_quantus_pool(pool_host, pool_port);
+        if(cp_worker_backend_id() == CP_BACKEND_WGPU)
+            cp_worker_shutdown();
+        return qrc;
     }
 
     cp_worker_apply_backend_defaults();

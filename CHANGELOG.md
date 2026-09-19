@@ -5,6 +5,7 @@
 - Fix OpenCL dot product extension on some GPU (DONE)
 - Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group (DONE) 
 - Introduce quantus algorithm (DONE)
+- Quantus wgpu backend via quantus-miner GpuEngine FFI (DONE)
 - Configurable matrix size (TODO)
 
 ## v0.4

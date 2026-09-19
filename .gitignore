@@ -1,5 +1,6 @@
 /build/
 /rust/cp-proof-ffi/target/
+/rust/cp-wgpu-ffi/target/
 /third_party/blake3/
 /third_party/onednn-src/
 /third_party/.case5_onednn_tag

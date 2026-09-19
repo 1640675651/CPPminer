@@ -30,9 +30,12 @@ const char* cp_algo_name(CpAlgoId algo)
 int cp_algo_supports(CpAlgoId algo, CpBackendId backend)
 {
     if(backend == CP_BACKEND_NONE) return 0;
+    /* wgpu is Quantus-only (Pearl not supported yet). */
+    if(backend == CP_BACKEND_WGPU)
+        return algo == CP_ALGO_QUANTUS && cp_worker_has_wgpu();
     if(algo == CP_ALGO_QUANTUS)
         return backend == CP_BACKEND_CPU && cp_worker_has_cpu();
-    /* Pearl: any built backend. */
+    /* Pearl: any built Pearl backend (not wgpu). */
     switch(backend){
     case CP_BACKEND_CPU:    return cp_worker_has_cpu();
     case CP_BACKEND_CUDA:   return cp_worker_has_cuda();
@@ -48,10 +51,11 @@ void cp_algo_format_backends(CpAlgoId algo, char* buf, int buf_len)
     buf[0] = 0;
     int first = 1;
     const CpBackendId ids[] = {
-        CP_BACKEND_CPU, CP_BACKEND_CUDA, CP_BACKEND_OPENCL, CP_BACKEND_ONEDNN
+        CP_BACKEND_CPU, CP_BACKEND_CUDA, CP_BACKEND_OPENCL, CP_BACKEND_ONEDNN,
+        CP_BACKEND_WGPU
     };
-    const char* names[] = { "cpu", "cuda", "opencl", "onednn" };
-    for(int i = 0; i < 4; i++){
+    const char* names[] = { "cpu", "cuda", "opencl", "onednn", "wgpu" };
+    for(int i = 0; i < 5; i++){
         if(!cp_algo_supports(algo, ids[i])) continue;
         int n = (int)strlen(buf);
         snprintf(buf + n, (size_t)(buf_len - n), "%s%s", first ? "" : "|", names[i]);

@@ -6,14 +6,14 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OneDnn
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Wgpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl,OneDnn -CudaArch 75
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
 #
-# Requires: MSVC, CMake, and (for proofs) cargo. OpenCL headers/CUTLASS are
+# Requires: MSVC, CMake, and (for proofs / wgpu) cargo. OpenCL headers/CUTLASS are
 # fetched as needed. The script snapshots and restores your shell environment.
 
 param(
-    [ValidateSet("Cpu", "Cuda", "OpenCl", "OneDnn")]
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = "",
@@ -27,7 +27,13 @@ $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
 $OutExe = Join-Path $Root "cppminer.exe"
 
-$BackendList = @($Backend | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Unique)
+$BackendList = @(
+    $Backend |
+        ForEach-Object { "$_".Split(',') } |
+        ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
 if ($BackendList.Count -eq 0) {
     $BackendList = @("Cpu")
 }
@@ -37,14 +43,17 @@ foreach ($i in 0..($BackendList.Count - 1)) {
         '^(?i)opencl$' { $BackendList[$i] = 'OpenCl' }
         '^(?i)cuda$'   { $BackendList[$i] = 'Cuda' }
         '^(?i)cpu$'    { $BackendList[$i] = 'Cpu' }
+        '^(?i)wgpu$'   { $BackendList[$i] = 'Wgpu' }
+        default { throw "Unknown backend '$($BackendList[$i])' (valid: Cpu,Cuda,OpenCl,OneDnn,Wgpu)" }
     }
 }
 $EnableCpu = $BackendList -contains "Cpu"
 $EnableCuda = $BackendList -contains "Cuda"
 $EnableOpenCl = $BackendList -contains "OpenCl"
 $EnableOneDnn = $BackendList -contains "OneDnn"
-if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn)) {
-    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn"
+$EnableWgpu = $BackendList -contains "Wgpu"
+if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $EnableWgpu)) {
+    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn,Wgpu"
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
@@ -349,7 +358,7 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn CUBLAS=$EnableCublas) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn WGPU=$EnableWgpu CUBLAS=$EnableCublas) ==="
 
     if ($EnableOpenCl -or $EnableOneDnn) {
         $null = Ensure-OpenClHeaders
@@ -365,6 +374,15 @@ try {
         if (-not $CudaArch) { $CudaArch = Get-GpuArch }
         Write-Host "=== CUDA arch: $CudaArch ==="
     }
+    if ($EnableWgpu) {
+        $engineGpu = Join-Path (Split-Path $Root -Parent) "quantus-miner\crates\engine-gpu\Cargo.toml"
+        if (-not (Test-Path $engineGpu)) {
+            throw "Wgpu backend requires sibling quantus-miner at $engineGpu"
+        }
+        if (-not (Ensure-CargoOnPath)) {
+            throw "Wgpu backend requires cargo on PATH"
+        }
+    }
 
     $CmakeBuild = Join-Path $BuildDir "cmake"
     New-Item -ItemType Directory -Force -Path $CmakeBuild | Out-Null
@@ -376,6 +394,7 @@ try {
         "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_WGPU=$(if ($EnableWgpu) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {
@@ -395,6 +414,17 @@ try {
     Copy-Item $built $OutExe -Force
     if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
+    }
+    if ($EnableWgpu) {
+        $wgpuDll = @(
+            (Join-Path $CmakeBuild "Release\cp_wgpu_ffi.dll"),
+            (Join-Path $CmakeBuild "cp_wgpu_ffi.dll"),
+            (Join-Path $Root "rust\cp-wgpu-ffi\target\release\cp_wgpu_ffi.dll")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($wgpuDll) {
+            Copy-Item $wgpuDll (Join-Path $Root "cp_wgpu_ffi.dll") -Force
+            Write-Host "=== Copied cp_wgpu_ffi.dll ==="
+        }
     }
 
     Write-Host "=== Done: $OutExe ==="

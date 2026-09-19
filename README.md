@@ -2,12 +2,12 @@
 
 Cross-platform multi-algo miner written in C++. Select the algorithm at runtime with `--algo` (default `pearl`).
 
-| Algo | Backends (v1) | PoW |
-|------|---------------|-----|
+| Algo | Backends | PoW |
+|------|----------|-----|
 | `pearl` | `cpu` / `cuda` / `opencl` / `onednn` | GEMM+XOR jackpot + `plain_proof` |
-| `quantus` | `cpu` only | Poseidon2 QPoW (`qpow-poseidon2`) |
+| `quantus` | `cpu` / `wgpu` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
-Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus CPU mining uses `src/qpow/`:
+Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus CPU mining uses `src/qpow/`; Quantus wgpu uses `rust/cp-wgpu-ffi` + `src/wgpu/` (wraps quantus-miner `engine-gpu`):
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
@@ -16,6 +16,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | Quantus CPU | `src/qpow/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
+| wgpu | `src/wgpu/` + `rust/cp-wgpu-ffi` | Quantus only (Pearl not supported yet) |
 
 ## Requirements
 
@@ -25,6 +26,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
+- **wgpu build:** Rust toolchain + sibling [`quantus-miner`](../quantus-miner) (`engine-gpu`). Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Quantus only.
 
 ## Build options (CMake)
 
@@ -43,10 +45,16 @@ cmake --build build --config Release
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
+| `CP_ENABLE_WGPU` | OFF | Quantus wgpu GpuEngine (Rust FFI; needs sibling quantus-miner) |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
-Enable multiple Pearl backends in one binary; select at runtime with `--backend`. Both algos are always compiled in; use `--algo pearl|quantus` (Quantus accepts `--backend cpu` only).
+Enable multiple backends in one binary; select at runtime with `--backend`. Both algos are always compiled in; use `--algo pearl|quantus`. Runtime and compile-time **algo×backend matrix**:
+
+| | cpu | cuda | opencl | onednn | wgpu |
+|--|-----|------|--------|--------|------|
+| pearl | ✓ | ✓ | ✓ | ✓ | ✗ |
+| quantus | ✓ | ✗ | ✗ | ✗ | ✓ |
 
 ## Build (Windows)
 
@@ -61,16 +69,18 @@ CUDA, OpenCL, or combinations (comma-separated list):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl,OneDnn
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Wgpu
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 # Optional debug: link cuBLAS (large DLLs; not needed for production CUTLASS path)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
-Produces `cppminer.exe` in the repo root.
+Produces `cppminer.exe` in the repo root (plus `cp_wgpu_ffi.dll` when wgpu is enabled).
 
 ## Build (*nix)
 ```bash
 ./build.sh --backend cpu,opencl,onednn,cuda
+./build.sh --backend cpu,wgpu
 ```
 This scipt pulls third-party dependencies and execute cmake.
 ## Run
@@ -83,6 +93,14 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --algo quantus --backend cpu --threads 8 `
   --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 
+# Quantus wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU build)
+.\cppminer.exe --backend wgpu --list-devices
+.\cppminer.exe --algo quantus --backend wgpu --devices 0 `
+  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
+# Omit --devices to use all mining adapters (discrete preferred).
+```
+
+```powershell
 # CUDA (CUTLASS fused GEMM+jackpot)
 .\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
   --wallet prl1... --worker worker_name --devices 0
@@ -114,13 +132,13 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus supports `--backend cpu` only; `--pool` is required (no default host) |
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` (must be compiled in; must be valid for `--algo`) |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` or `wgpu`; Pearl: not `wgpu`. `--pool` required for Quantus (no default host) |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
-| `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |
+| `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--dev` | Use 8192×8192 matrices for testing |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |

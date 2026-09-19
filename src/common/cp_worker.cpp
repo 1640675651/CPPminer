@@ -18,6 +18,9 @@
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
 #include "cp_onednn_worker.h"
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+#include "cp_wgpu_worker.h"
+#endif
 
 static CpBackendId g_backend = CP_BACKEND_NONE;
 
@@ -57,6 +60,15 @@ extern "C" int cp_worker_has_onednn(void)
 #endif
 }
 
+extern "C" int cp_worker_has_wgpu(void)
+{
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static CpBackendId default_backend(void)
 {
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -67,6 +79,8 @@ static CpBackendId default_backend(void)
     return CP_BACKEND_CPU;
 #elif defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     return CP_BACKEND_OPENCL;
+#elif defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    return CP_BACKEND_WGPU;
 #else
     return CP_BACKEND_NONE;
 #endif
@@ -96,6 +110,11 @@ extern "C" int cp_worker_select(CpBackendId id)
         g_backend = CP_BACKEND_ONEDNN;
         return 0;
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        g_backend = CP_BACKEND_WGPU;
+        return 0;
+#endif
     default:
         fprintf(stderr, "[worker] backend %d not built into this binary\n", (int)id);
         return -1;
@@ -116,6 +135,7 @@ extern "C" const char* cp_worker_backend_name(void)
     case CP_BACKEND_CUDA: return "cuda";
     case CP_BACKEND_OPENCL: return "opencl";
     case CP_BACKEND_ONEDNN: return "onednn";
+    case CP_BACKEND_WGPU: return "wgpu";
     default: return "none";
     }
 }
@@ -146,6 +166,11 @@ extern "C" void cp_worker_init(int* devices, int ndev)
         cp_onednn_worker_init(devices, ndev);
         return;
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        cp_wgpu_worker_init(devices, ndev);
+        return;
+#endif
     default:
         fprintf(stderr, "[worker] no backend available\n");
         break;
@@ -158,6 +183,10 @@ extern "C" int cp_worker_is_ready(void)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     case CP_BACKEND_ONEDNN:
         return cp_onednn_worker_is_ready();
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        return cp_wgpu_worker_is_ready();
 #endif
     default:
         return 1;
@@ -264,6 +293,10 @@ extern "C" int cp_worker_list_devices(void)
     case CP_BACKEND_CUDA:
         return cp_gpu_list_devices();
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        return cp_wgpu_worker_list_devices();
+#endif
     case CP_BACKEND_CPU:
         printf("[cpu] host CPU backend (no device list)\n");
         return 0;
@@ -287,6 +320,9 @@ extern "C" void cp_worker_shutdown(void)
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     case CP_BACKEND_ONEDNN: cp_onednn_worker_shutdown(); break;
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU: cp_wgpu_worker_shutdown(); break;
 #endif
     default: break;
     }

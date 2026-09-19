@@ -7,6 +7,7 @@
 #   ./build.sh --backend cpu
 #   ./build.sh --backend cuda --cuda-arch 61
 #   ./build.sh --backend cpu,opencl
+#   ./build.sh --backend cpu,wgpu
 #   ./build.sh --backend cpu,cuda,opencl --cuda-arch 75
 #   ./build.sh --backend cuda --enable-cublas
 #
@@ -52,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --backend CPU[,CUDA[,OpenCl]]  Backends to build (default: cpu)"
+            echo "  --backend CPU[,CUDA[,OpenCl[,OneDnn[,wgpu]]]]  Backends to build (default: cpu)"
             echo "  --cuda-arch ARCH               CUDA compute arch e.g. 75, 86 (default: auto)"
             echo "  --enable-cublas                Link cuBLAS (requires CUDA)"
             echo "  --help, -h                     Show this help"
@@ -69,14 +70,16 @@ ENABLE_CPU=0
 ENABLE_CUDA=0
 ENABLE_OPENCL=0
 ENABLE_ONEDNN=0
+ENABLE_WGPU=0
 for b in "${BACKENDS[@]}"; do
     case "$b" in
         cpu)    ENABLE_CPU=1 ;;
         cuda)   ENABLE_CUDA=1 ;;
         opencl) ENABLE_OPENCL=1 ;;
         onednn) ENABLE_ONEDNN=1 ;;
+        wgpu)   ENABLE_WGPU=1 ;;
         *)
-            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn)" >&2
+            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn, wgpu)" >&2
             exit 1
             ;;
     esac
@@ -88,8 +91,8 @@ fi
 if (( ENABLE_CUBLAS && ENABLE_CUDA == 0 )); then
     echo "--enable-cublas requires --backend cuda" >&2; exit 1
 fi
-if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 )); then
-    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn" >&2; exit 1
+if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 && ENABLE_WGPU == 0 )); then
+    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn,wgpu" >&2; exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -261,9 +264,18 @@ find_cmake() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} CUBLAS=${ENABLE_CUBLAS}"
+log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} WGPU=${ENABLE_WGPU} CUBLAS=${ENABLE_CUBLAS}"
 
 ensure_blake3
+
+if (( ENABLE_WGPU )); then
+    if [[ ! -f "${PROJECT_ROOT}/../quantus-miner/crates/engine-gpu/Cargo.toml" ]]; then
+        fail "Wgpu backend requires sibling quantus-miner (../quantus-miner/crates/engine-gpu)"
+    fi
+    if ! command -v cargo &>/dev/null; then
+        fail "Wgpu backend requires cargo on PATH"
+    fi
+fi
 
 if (( ENABLE_CUDA )); then
     CUDA_ROOT=$(find_cuda_root) || fail "CUDA Toolkit not found (needed for --backend cuda). Set --cuda-arch or install CUDA."
@@ -301,6 +313,7 @@ if [[ -n "$CMAKE_EXE" ]]; then
         -DCP_ENABLE_CUDA=$(( ENABLE_CUDA ? 1 : 0 ))
         -DCP_ENABLE_OPENCL=$(( ENABLE_OPENCL ? 1 : 0 ))
         -DCP_ENABLE_ONEDNN=$(( ENABLE_ONEDNN ? 1 : 0 ))
+        -DCP_ENABLE_WGPU=$(( ENABLE_WGPU ? 1 : 0 ))
         -DCP_ENABLE_CUBLAS=$(( ENABLE_CUBLAS ? 1 : 0 ))
     )
 

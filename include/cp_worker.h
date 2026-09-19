@@ -12,7 +12,8 @@ typedef enum {
     CP_BACKEND_CPU    = 1,
     CP_BACKEND_CUDA   = 2,
     CP_BACKEND_OPENCL = 3,
-    CP_BACKEND_ONEDNN = 4
+    CP_BACKEND_ONEDNN = 4,
+    CP_BACKEND_WGPU   = 5
 } CpBackendId;
 
 /* Compile-time availability (1 if linked). */
@@ -20,6 +21,7 @@ int cp_worker_has_cpu(void);
 int cp_worker_has_cuda(void);
 int cp_worker_has_opencl(void);
 int cp_worker_has_onednn(void);
+int cp_worker_has_wgpu(void);
 
 const char* cp_worker_backend_name(void);
 CpBackendId cp_worker_backend_id(void);
