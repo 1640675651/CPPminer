@@ -60,14 +60,19 @@ const char* cp_qpow_pool_session_id(void)
 int cp_qpow_pool_send_login(int msg_id, const char* login, const char* worker,
                             const char* agent)
 {
+    const char* w = (worker && worker[0]) ? worker : "";
+    char ident[384];
+    if(w[0])
+        snprintf(ident, sizeof(ident), "%s.%s", login ? login : "", w);
+    else
+        snprintf(ident, sizeof(ident), "%s", login ? login : "");
     char msg[768];
     snprintf(msg, sizeof(msg),
              "{\"id\":%d,\"method\":\"login\",\"params\":{"
-             "\"login\":\"%s\",\"pass\":\"x\",\"worker\":\"%s\",\"agent\":\"%s\"}}",
-             msg_id, login ? login : "",
-             worker ? worker : "rig01",
+             "\"login\":\"%s\",\"pass\":\"%s\",\"agent\":\"%s\"}}",
+             msg_id, ident, w[0] ? w : "x",
              agent ? agent : "cppminer/1.0");
-    printf("[net] Quantus login (login/worker/agent, pass=x)\n");
+    printf("[net] Quantus login (login=wallet.worker, pass=worker)\n");
     fflush(stdout);
     return cp_send_json(cp_pool_socket(), msg);
 }
