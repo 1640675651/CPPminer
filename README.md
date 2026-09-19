@@ -1,15 +1,21 @@
 # CPPminer
 
-Cross-Platform Pearl miner written in C++.
+Cross-platform multi-algo miner written in C++. Select the algorithm at runtime with `--algo` (default `pearl`).
 
-Pool / job logistics live under `src/common/`. Each compute backend is a separate worker directory:
+| Algo | Backends (v1) | PoW |
+|------|---------------|-----|
+| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` | GEMM+XOR jackpot + `plain_proof` |
+| `quantus` | `cpu` only | Poseidon2 QPoW (`qpow-poseidon2`) |
+
+Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus CPU mining uses `src/qpow/`:
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
-| CPU | `src/cpu/` | Fused GEMM+XOR (contiguous 8×16) |
-| CUDA | `src/cuda/` | Pascal CUTLASS Fused GEMM+XOR+jackpot |
-| OpenCL | `src/opencl/` | Fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
-| OneDNN | `src/onednn/` | Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
+| CPU | `src/cpu/` | Pearl: fused GEMM+XOR (contiguous 8×16) |
+| CUDA | `src/cuda/` | Pearl: Pascal CUTLASS fused GEMM+XOR+jackpot |
+| OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
+| OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
+| Quantus CPU | `src/qpow/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 
 ## Requirements
 
@@ -40,7 +46,7 @@ cmake --build build --config Release
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
-Enable multiple backends in one binary; select at runtime with `--backend cpu|cuda|opencl|onednn`.
+Enable multiple Pearl backends in one binary; select at runtime with `--backend`. Both algos are always compiled in; use `--algo pearl|quantus` (Quantus accepts `--backend cpu` only).
 
 ## Build (Windows)
 
@@ -70,8 +76,12 @@ This scipt pulls third-party dependencies and execute cmake.
 ## Run
 
 ```powershell
-# CPU
-.\cppminer.exe --backend cpu --wallet prl1... --worker worker_name
+# Pearl CPU (default --algo pearl)
+.\cppminer.exe --algo pearl --backend cpu --wallet prl1... --worker worker_name
+
+# Quantus CPU (LuckyPool / compatible stratum; --pool required, no default host)
+.\cppminer.exe --algo quantus --backend cpu `
+  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 
 # CUDA (CUTLASS fused GEMM+jackpot)
 .\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
@@ -93,7 +103,7 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend onednn --fused-jackpot --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
-# Offline mock: first share + zk-pow verify (no pool)
+# Offline mock: first share + zk-pow verify (no pool; Pearl only)
 .\cppminer.exe --backend onednn --mock
 .\cppminer.exe --backend cuda --mock
 .\cppminer.exe --backend opencl --mock
@@ -104,8 +114,9 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` (must be compiled in) |
-| `--pool` | `stratum+tcp://host:port` |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus supports `--backend cpu` only; `--pool` is required (no default host) |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` (must be compiled in; must be valid for `--algo`) |
+| `--pool` | `stratum+tcp://host:port` (required for `--algo quantus`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--devices` | CUDA device ids, or OpenCL flat index (`--list-devices`) |

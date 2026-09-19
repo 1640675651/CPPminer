@@ -2,16 +2,21 @@
  * CPminer — cross-platform LuckyPool plain_proof miner (CPU / CUDA / …).
  */
 #include "cp_config.h"
+#include "cp_algo.h"
 #include "cp_fee.h"
 #include "cp_mine.h"
 #include "cp_noise.h"
 #include "cp_pool.h"
 #include "cp_platform.h"
 #include "cp_proof.h"
+#include "cp_qpow_mine.h"
+#include "cp_qpow_pool.h"
 #include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
 #include "cp_worker.h"
+
+#include "qpow/poseidon2.hpp"
 
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "gemm/case33_gemm_xor.hpp"
@@ -37,8 +42,16 @@
 
 static void print_usage(void)
 {
-    printf("CPminer — LuckyPool plain_proof miner\n");
-    printf("  --pool URI         stratum+tcp://host:port\n");
+    printf("CPminer — multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("  --algo NAME        pearl (default) or quantus\n");
+    {
+        char pb[64], qb[64];
+        cp_algo_format_backends(CP_ALGO_PEARL, pb, (int)sizeof(pb));
+        cp_algo_format_backends(CP_ALGO_QUANTUS, qb, (int)sizeof(qb));
+        printf("                     pearl backends: %s\n", pb);
+        printf("                     quantus backends: %s\n", qb);
+    }
+    printf("  --pool URI         stratum+tcp://host:port (required for quantus)\n");
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
     printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
@@ -216,11 +229,162 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     return rc;
 }
 
+static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char* cur_job_key)
+{
+    if(!job || !job->job_id[0]) return CP_JOB_NONE;
+    if(!strcmp(job->job_key, cur_job_key)){
+        printf("[pool] duplicate quantus job ignored id=%s\n", job->job_id);
+        fflush(stdout);
+        return CP_JOB_NONE;
+    }
+    strncpy(cur_job_key, job->job_key, 319);
+    cur_job_key[319] = 0;
+
+    printf("[qpow] job id=%s mining_hash=%.16s... diff=%.0f\n", job->job_id,
+           job->job_key + (int)strlen(job->job_id) + 1, job->difficulty);
+    fflush(stdout);
+
+    int rc = cp_qpow_mine_job(job, cp_pool_socket(), msg_id, worker_global);
+    if(rc == CP_JOB_FEE_SWITCH){
+        printf("[fee] pausing quantus job for wallet switch\n");
+        fflush(stdout);
+        return rc;
+    }
+    if(rc == CP_JOB_CANCELLED){
+        printf("[qpow] job ended (new job or disconnect)\n");
+        fflush(stdout);
+    }
+
+    CpQpowJob pj;
+    while(rc == CP_JOB_CANCELLED && cp_qpow_pool_take_pending(&pj)){
+        strncpy(cur_job_key, pj.job_key, 319);
+        cur_job_key[319] = 0;
+        printf("[qpow] mining queued job=%s%s...\n", pj.job_id,
+               cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+        fflush(stdout);
+        rc = cp_qpow_mine_job(&pj, cp_pool_socket(), msg_id, worker_global);
+        if(rc == CP_JOB_FEE_SWITCH){
+            printf("[fee] pausing quantus job for wallet switch\n");
+            fflush(stdout);
+            return rc;
+        }
+        if(rc == CP_JOB_CANCELLED){
+            printf("[qpow] job ended (new job or disconnect)\n");
+            fflush(stdout);
+        }
+    }
+    return rc;
+}
+
+static int run_quantus_pool(const char* pool_host, int pool_port)
+{
+    char cur_job_key[160] = {0};
+    int msg_id = 1;
+
+    cp_qpow_pool_set_active(1);
+    printf("[mode] algo=quantus backend=cpu\n");
+    if(cp_fee_enabled())
+        printf("[mode] dev fee: 1%%\n");
+    fflush(stdout);
+
+reconnect:
+    cp_pool_reader_stop();
+    cp_pool_disconnect();
+    cp_pool_inbox_clear();
+    cp_qpow_pool_clear();
+    cur_job_key[0] = 0;
+
+    printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
+    while(1){
+        if(cp_pool_connect(pool_host, pool_port)) break;
+        printf("[main] Reconnecting in 5 sec...\n");
+        fflush(stdout);
+        cp_sleep(5);
+    }
+
+    if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), "x", agent_global))
+        goto reconnect;
+
+    char login_line[65536];
+    int got = cp_pool_recv_one(login_line, sizeof(login_line), 30000);
+    if(got <= 0){
+        printf("[net] login response missing, reconnecting...\n");
+        fflush(stdout);
+        goto reconnect;
+    }
+    printf("[pool-raw] %s\n", login_line);
+    fflush(stdout);
+
+    char session[80] = {0};
+    CpQpowJob first_job;
+    memset(&first_job, 0, sizeof(first_job));
+    if(!cp_qpow_pool_parse_login_result(login_line, session, (int)sizeof(session),
+                                        &first_job)){
+        printf("[net] login parse failed: %s\n", login_line);
+        fflush(stdout);
+        cp_sleep(3);
+        goto reconnect;
+    }
+    cp_qpow_pool_set_session_id(session);
+    cp_fee_on_authorized();
+    if(cp_fee_enabled()){
+        printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
+               cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
+               (unsigned long long)cp_fee_debt(),
+               (unsigned long long)cp_fee_threshold());
+        fflush(stdout);
+    }
+    printf("[net] session=%s first_job=%s\n", session, first_job.job_id);
+    fflush(stdout);
+
+    cp_pool_reader_start();
+
+    {
+        int rc = handle_qpow_job(&first_job, &msg_id, cur_job_key);
+        if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
+    }
+
+    while(1){
+        char line_buf[65536];
+        int wr = cp_pool_wait_line(line_buf, sizeof(line_buf), -1);
+        if(wr < 0){
+            printf("[net] Connection lost, reconnecting...\n");
+            fflush(stdout);
+            goto reconnect;
+        }
+        if(wr == 0) continue;
+
+        if(strstr(line_buf, "\"method\":\"job\"") ||
+           strstr(line_buf, "\"method\": \"job\"")){
+            CpQpowJob job;
+            if(!cp_qpow_pool_parse_job(line_buf, &job)){
+                printf("[pool] quantus job parse failed\n");
+                fflush(stdout);
+                continue;
+            }
+            int rc = handle_qpow_job(&job, &msg_id, cur_job_key);
+            if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
+            continue;
+        }
+
+        if(strstr(line_buf, "result") || strstr(line_buf, "error")){
+            printf("[pool] jsonrpc: %s\n", line_buf);
+            fflush(stdout);
+            continue;
+        }
+
+        printf("[pool] (unhandled) %s\n", line_buf);
+        fflush(stdout);
+    }
+}
+
 int main(int argc, char** argv)
 {
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
+    int pool_specified = 0;
     const char* wallet = NULL;
+    CpAlgoId algo_sel = CP_ALGO_PEARL;
     int devs[MAX_GPUS] = {0};
     int ndev = 0;
     int align_test = 0;
@@ -287,7 +451,13 @@ int main(int argc, char** argv)
                     strncpy(hbuf, h, hlen); hbuf[hlen] = 0;
                     pool_host = hbuf;
                     pool_port = atoi(colon + 1);
+                    pool_specified = 1;
                 }
+            }
+        } else if(!strcmp(argv[i], "--algo") && i + 1 < argc){
+            if(cp_algo_parse(argv[++i], &algo_sel) != 0){
+                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", argv[i]);
+                return 1;
             }
         } else if(!strcmp(argv[i], "--wallet") && i + 1 < argc){
             wallet = argv[++i];
@@ -555,7 +725,92 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
+        } else if(!strcmp(argv[i], "--qpow-selftest")){
+            const char* login =
+                "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"
+                "\"id\":\"d5adbda4-fd6c-4f33-8924-b3c1ae35dcbc\","
+                "\"job\":{\"algo\":\"qpow-poseidon2\",\"difficulty\":10000000000,"
+                "\"extranonce\":\"00131609\",\"job_id\":\"70655-10000000000\","
+                "\"mining_hash\":\"1925e1ae2f620d7162e637fae74fa790ca9526e878e01b52c43c1a762354c961\","
+                "\"seq\":70655,"
+                "\"target\":\"000000006df37f675ef6eadf5ab9a2072d44268d97df837e6748956e5c6c2117501e68855669e4b8356cf292464d9e16cc8d4655f8fb96f429b149fc87d74da4\"},"
+                "\"status\":\"OK\"}}";
+            const char* jobline =
+                "{\"jsonrpc\":\"2.0\",\"method\":\"job\",\"params\":{\"clean_jobs\":true,"
+                "\"job\":{\"algo\":\"qpow-poseidon2\",\"difficulty\":10000000000,"
+                "\"extranonce\":\"0012e986\",\"job_id\":\"70257-10000000000\","
+                "\"mining_hash\":\"93e8f5baa1b97f5945c69ec8736cda957f920aeae7e659af14679235a4ff7a51\","
+                "\"seq\":70257,"
+                "\"target\":\"000000006df37f675ef6eadf5ab9a2072d44268d97df837e6748956e5c6c2117501e68855669e4b8356cf292464d9e16cc8d4655f8fb96f429b149fc87d74da4\"}}}";
+            char session[80];
+            CpQpowJob j0, j1;
+            int fail = 0;
+            if(!cp_qpow_pool_parse_login_result(login, session, (int)sizeof(session), &j0)){
+                fprintf(stderr, "FAIL login parse\n");
+                fail++;
+            } else if(strcmp(session, "d5adbda4-fd6c-4f33-8924-b3c1ae35dcbc") != 0){
+                fprintf(stderr, "FAIL session id\n");
+                fail++;
+            } else if(j0.extranonce_len != 4 || j0.extranonce[0] != 0x00 ||
+                      j0.extranonce[1] != 0x13){
+                fprintf(stderr, "FAIL login extranonce\n");
+                fail++;
+            }
+            if(!cp_qpow_pool_parse_job(jobline, &j1)){
+                fprintf(stderr, "FAIL job parse\n");
+                fail++;
+            } else if(strcmp(j1.job_id, "70257-10000000000") != 0 || !j1.clean_jobs){
+                fprintf(stderr, "FAIL job fields\n");
+                fail++;
+            }
+            /* One Poseidon2 hash against known midstate/header path. */
+            {
+                uint8_t header[32], nonce[64], hash[64];
+                memset(nonce, 0, 64);
+                if(cp_hex_to_bytes(
+                       "0000000000000000000000000000000000000000000000000000000000000000",
+                       header, 32) != 32)
+                    fail++;
+                else {
+                    qpow::get_nonce_hash(header, nonce, hash);
+                    char hx[129];
+                    cp_bin_to_hex(hash, 64, hx);
+                    static const char* want =
+                        "8e64e3d8e0f38f882e8501f9e525df0a95d2e91e9cfc32c9248d756fb07780e2"
+                        "f8fdca2c5a54441e6fcd8d774a5f6aae72f36d1c76bc19f691a0d4f6c607e8cc";
+                    if(strcmp(hx, want) != 0){
+                        fprintf(stderr, "FAIL golden hash\n  got %s\n", hx);
+                        fail++;
+                    }
+                }
+            }
+            if(fail){
+                printf("%d qpow selftest failure(s)\n", fail);
+                return 1;
+            }
+            printf("qpow selftest passed\n");
+            return 0;
         }
+    }
+
+    if(algo_sel == CP_ALGO_QUANTUS){
+        if(backend_sel == CP_BACKEND_NONE)
+            backend_sel = CP_BACKEND_CPU;
+        if(!cp_algo_supports(algo_sel, backend_sel)){
+            fprintf(stderr,
+                    "--algo quantus supports cpu only (got backend that is unavailable "
+                    "or unsupported)\n");
+            return 1;
+        }
+        if(!pool_specified && !g_mock){
+            fprintf(stderr, "--pool required for --algo quantus (no default host)\n");
+            return 1;
+        }
+    } else if(backend_sel != CP_BACKEND_NONE &&
+              !cp_algo_supports(algo_sel, backend_sel)){
+        fprintf(stderr, "--backend not available for --algo %s\n",
+                cp_algo_name(algo_sel));
+        return 1;
     }
 
     if(list_devices){
@@ -772,7 +1027,17 @@ int main(int argc, char** argv)
     wallet_global[sizeof(wallet_global) - 1] = 0;
 
     /* Offline mock skips the pool; no fee reconnects. */
-    cp_fee_init(wallet_global, g_mock ? 0 : 1);
+    cp_fee_init(wallet_global, g_mock ? 0 : 1, algo_sel);
+
+    if(algo_sel == CP_ALGO_QUANTUS){
+        if(g_mock){
+            fprintf(stderr, "--mock is not supported with --algo quantus yet\n");
+            return 1;
+        }
+        printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
+        fflush(stdout);
+        return run_quantus_pool(pool_host, pool_port);
+    }
 
     cp_worker_apply_backend_defaults();
     cp_worker_set_period_gemm(!no_period_gemm);

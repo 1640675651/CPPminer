@@ -42,10 +42,14 @@ set(CP_COMMON_SOURCES
     src/common/cp_job_ctrl.cpp
     src/common/cp_mine.cpp
     src/common/cp_fee.cpp
+    src/common/cp_algo.cpp
+    src/common/cp_qpow_pool.cpp
+    src/common/cp_qpow_mine.cpp
     src/common/cp_share_queue.cpp
     src/common/cp_state.cpp
     src/common/cp_worker.cpp
     src/common/cp_noise.c
+    src/qpow/miner.cpp
 )
 
 set(CP_INCLUDE_DIRS
@@ -55,7 +59,19 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/cuda
     ${CMAKE_SOURCE_DIR}/src/opencl
     ${CMAKE_SOURCE_DIR}/src/onednn
+    ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
+
+# Quantus Poseidon2 AVX2 TU (separate compile unit for /arch:AVX2).
+add_library(cp_qpow_avx2 OBJECT src/qpow/simd_avx2.cpp)
+target_include_directories(cp_qpow_avx2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/qpow/include
+    ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(cp_qpow_avx2 PRIVATE /O2 /arch:AVX2)
+else()
+    target_compile_options(cp_qpow_avx2 PRIVATE -O3 -mavx2)
+endif()
 
 # BLAKE3
 set(B3_DIR ${CMAKE_SOURCE_DIR}/third_party/blake3)
@@ -355,7 +371,7 @@ else()
     add_compile_definitions(CP_ENABLE_ONEDNN=0)
 endif()
 
-add_executable(cppminer ${CP_SOURCES})
+add_executable(cppminer ${CP_SOURCES} $<TARGET_OBJECTS:cp_qpow_avx2>)
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)
