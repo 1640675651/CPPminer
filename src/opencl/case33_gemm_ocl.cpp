@@ -136,8 +136,8 @@ Case33GemmOcl::~Case33GemmOcl() {
 
 bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     auto try_build = [&](bool use_dot, bool force_ext, bool use_asm, bool use_builtin,
-                         const char *label) -> bool {
-        const bool scalar = !use_dot && !use_asm && !use_builtin;
+                         const char *label, bool use_sudot = false) -> bool {
+        const bool scalar = !use_dot && !use_asm && !use_builtin && !use_sudot;
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
         build_opts += " -DNR=" + std::to_string(case32::kNR);
@@ -161,7 +161,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         } else if (issue_mode_ == 2) {
             build_opts += " -DCASE32_FORCE_PACKED=1";
         }
-        if (use_asm) {
+        if (use_sudot) {
+            build_opts += " -DCASE32_USE_BUILTIN_SUDOT4=1";
+        } else if (use_asm) {
             build_opts += " -DCASE32_USE_ASM_DOT=1";
         } else if (use_builtin) {
             build_opts += " -DCASE32_USE_BUILTIN_SDOT4=1";
@@ -216,9 +218,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: kernel create FAILED", label);
             return false;
         }
-        using_integer_dot_ = use_dot && !use_asm && !use_builtin;
+        using_integer_dot_ = use_dot && !use_asm && !use_builtin && !use_sudot;
         using_asm_dot_ = use_asm;
-        using_builtin_dot_ = use_builtin;
+        using_builtin_dot_ = use_builtin || use_sudot;
         using_cpm_ = scalar && issue_mode_ != 2;
         std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", label);
         return true;
@@ -271,8 +273,28 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             built = try_build(false, false, false, false, "cpm (asm failed)");
         }
     } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
-        /* Default cascade: AMD builtin → KHR → scalar cpm. */
-        built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
+        /* Default cascade: sudot4 -> asm v_dot4c -> sdot4 -> KHR -> scalar cpm.
+         *
+         * sudot4 goes first because on RDNA3 every other accelerated path fails
+         * to compile, leaving the scalar 4x int32 MAC nest:
+         *   __builtin_amdgcn_sdot4 -> "needs target feature dot1-insts"
+         *   v_dot4c_i32_i8 (asm)   -> "instruction not supported on this GPU"
+         *   dot_acc_sat            -> cl_khr_integer_dot_product not exposed
+         * All three are GFX9/RDNA2 spellings; gfx11 has V_DOT4_I32_IU8 instead.
+         * try_build() already falls back on a build failure, so ordering the
+         * most specific form first costs nothing where it is unsupported.
+         *
+         * The asm form is also kept reachable here: dpi_mode_ defaults to
+         * Builtin and nothing calls set_dpi_mode(), so Case32OclDpiMode::Asm
+         * was otherwise dead code. */
+        built = try_build(false, false, false, false,
+                          "builtin __builtin_amdgcn_sudot4 (gfx11)", true);
+        if (!built) {
+            built = try_build(false, false, true, false, "asm v_dot4c_i32_i8");
+        }
+        if (!built) {
+            built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
+        }
         if (!built) {
             built = try_build(true, false, false, false, "KHR dot_acc_sat");
         }

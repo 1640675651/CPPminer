@@ -200,6 +200,7 @@ inline bool digest_beats_target(const uint digest[8], __global const uint *bound
 }
 
 #if defined(CASE32_USE_ASM_DOT) || defined(CASE32_USE_BUILTIN_SDOT4) || \
+        defined(CASE32_USE_BUILTIN_SUDOT4) || \
         defined(CASE32_USE_DOT) || defined(CASE32_INT_DOT) || \
         defined(CASE32_FORCE_PACKED)
 #define CASE32_PACKED_DOT 1
@@ -211,6 +212,12 @@ inline int case32_dot4(int acc, int a_pack, int b_pack) {
 #if defined(CASE32_USE_ASM_DOT)
     __asm volatile("v_dot4c_i32_i8 %0, %1, %2" : "+v"(acc) : "v"(a_pack), "v"(b_pack));
     return acc;
+#elif defined(CASE32_USE_BUILTIN_SUDOT4)
+    /* RDNA3 (gfx11) spells the int8 dot product V_DOT4_I32_IU8, reached via
+     * sudot4 with both operands marked signed. The older sdot4 and v_dot4c
+     * forms need dot1-insts, which gfx11 does not have, so on a Radeon 780M
+     * the accelerated path fell through to the scalar 4x MAC nest. */
+    return __builtin_amdgcn_sudot4(true, a_pack, true, b_pack, acc, false);
 #elif defined(CASE32_USE_BUILTIN_SDOT4)
     return __builtin_amdgcn_sdot4(a_pack, b_pack, acc, false);
 #elif defined(CASE32_USE_DOT)
