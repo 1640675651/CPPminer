@@ -15,7 +15,12 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+/* MinGW's UCRT headers already define ssize_t as __int64 via corecrt.h, so
+ * redefining it here as int is a hard error there (and would be wrong on
+ * 64-bit anyway). Only MSVC needs the shim. */
+#if !defined(__MINGW32__) && !defined(__MINGW64__)
 typedef int ssize_t;
+#endif
 
 #define CP_SOCK_CLOSE(s) closesocket((SOCKET)(s))
 #define CP_INVALID_SOCK INVALID_SOCKET

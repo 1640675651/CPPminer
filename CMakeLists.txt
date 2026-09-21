@@ -325,7 +325,10 @@ else()
     set(_cp_cargo_args build --release)
     set(_cp_cargo_profile release)
 endif()
-if(WIN32)
+# The name depends on the toolchain, not the OS: an MSVC-targeting cargo emits
+# cp_proof_ffi.lib, while a MinGW-targeting one emits libcp_proof_ffi.a. Keying
+# this off WIN32 broke the MinGW/MSYS2 build, which is still Windows.
+if(MSVC)
     set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/cp_proof_ffi.lib)
 else()
     set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/libcp_proof_ffi.a)
