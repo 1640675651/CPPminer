@@ -7,12 +7,15 @@
 extern "C" {
 #endif
 
+/* Nonces per GpuEngine launch; 0 → 1e6. Call before init. */
+void cp_wgpu_worker_set_batch_size(uint32_t batch);
+uint32_t cp_wgpu_worker_batch_size(void);
+
 int cp_wgpu_worker_init(int* devices, int ndev);
 void cp_wgpu_worker_shutdown(void);
 int cp_wgpu_worker_is_ready(void);
 int cp_wgpu_worker_list_devices(void);
 
-/* Search helper used by Quantus mine loop. Returns CP_WGPU_* codes. */
 int cp_wgpu_worker_search(
     const uint8_t header[32],
     uint64_t difficulty_u64,

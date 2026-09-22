@@ -44,7 +44,7 @@ cppminer.exe --backend onednn --wallet prl1... --worker rig01 --mock
 cppminer.exe --backend onednn --onednn-layout NT --mock --mock-diff 50
 ```
 
-Default panel batching: `--row-period-batch 256 --period-batch 256` (256×256 hash tiles per GEMM panel). Override with CLI flags.
+Default panel batching: `--row-period-batch 256 --batch-size 256` (256×256 hash tiles per GEMM panel). Override with CLI flags.
 
 **Layout names** (C always column-major N): two letters for A then B — `TN` (default), `TT`, `NT`, `NN`. Override with `--onednn-layout` or env `CASE5_GEMM_LAYOUT=TN|TT|NT|NN` (legacy three-letter forms like `TNN` still work). Also `CASE5_A_LAYOUT` / `CASE5_B_LAYOUT`: `row`/`col`.
 

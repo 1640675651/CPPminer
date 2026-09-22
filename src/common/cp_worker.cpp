@@ -15,6 +15,7 @@
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_opencl_worker.h"
+#include "cp_qpow_opencl_worker.h"
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
 #include "cp_onednn_worker.h"
@@ -410,16 +411,24 @@ extern "C" void cp_worker_set_period_batch(int batch)
         cp_cuda_worker_set_period_batch(batch);
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
-        cp_opencl_worker_set_macro_batch(batch);
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+        if(g_algo == 1)
+            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 1 ? 1 : batch));
+        else
+            cp_opencl_worker_set_macro_batch(batch);
+    }
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         cp_onednn_worker_set_col_period_batch(batch);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
-    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
-        cp_pearl_wgpu_worker_set_macro_batch(batch);
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU){
+        if(g_algo == 1)
+            cp_wgpu_worker_set_batch_size((uint32_t)(batch < 1 ? 1 : batch));
+        else
+            cp_pearl_wgpu_worker_set_macro_batch(batch);
+    }
 #endif
     (void)batch;
 }
@@ -444,8 +453,12 @@ extern "C" void cp_worker_set_col_period_batch(int batch)
         cp_cuda_worker_set_col_period_batch(batch);
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
-        cp_opencl_worker_set_macro_batch(batch);
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+        if(g_algo == 1)
+            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 1 ? 1 : batch));
+        else
+            cp_opencl_worker_set_macro_batch(batch);
+    }
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)

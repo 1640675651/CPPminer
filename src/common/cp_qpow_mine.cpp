@@ -31,7 +31,25 @@
 /* Fee reconnect quantum: ~40s at 0.25 MH/s per thread. */
 static const uint64_t k_qpow_fee_hashes_per_unit = 10000000ull;
 static const uint64_t k_search_chunk = 8192ull;
-static const uint64_t k_gpu_search_chunk = 1000000ull;
+static const uint64_t k_gpu_search_chunk_default = 1000000ull;
+
+static uint64_t qpow_gpu_search_chunk(void)
+{
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU){
+        uint32_t b = cp_wgpu_worker_batch_size();
+        return b ? (uint64_t)b : k_gpu_search_chunk_default;
+    }
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+        uint32_t b = cp_qpow_opencl_worker_batch_size();
+        return b ? (uint64_t)b : k_gpu_search_chunk_default;
+    }
+#endif
+    return k_gpu_search_chunk_default;
+}
+
 static std::atomic<int> g_qpow_mock_outcome{CP_SHARE_OUTCOME_NONE};
 
 /* (hi:lo) / d → quotient; remainder via rem_out. Assumes d != 0. */
@@ -224,8 +242,10 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
     build_start_nonce(job, worker_name, cur);
     /* Single GPU stream: stamp tid=0 for nonce salt consistency with CPU path. */
     stamp_thread_id(cur, job->extranonce_len, 0);
-    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=wgpu%s\n",
+    const uint64_t search_chunk = qpow_gpu_search_chunk();
+    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=wgpu batch=%llu%s\n",
            job->job_id, job->difficulty, job->extranonce_len,
+           (unsigned long long)search_chunk,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     cp_job_mine_begin(job->job_key);
@@ -242,7 +262,7 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
         uint8_t out_hash[CP_QPOW_TARGET_BYTES];
         uint64_t hashes = 0;
         const int st = cp_wgpu_worker_search(
-            job->mining_hash, diff, job->target, cur, k_gpu_search_chunk,
+            job->mining_hash, diff, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
         cp_fee_note_tiles(hashes);
@@ -259,7 +279,7 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
             memcpy(cur, out_nonce, CP_QPOW_NONCE_BYTES);
             qpow::inc_be(cur);
         } else if(st == CP_WGPU_OK_EXHAUSTED){
-            add_be_u64(cur, hashes > 0 ? hashes : k_gpu_search_chunk);
+            add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_WGPU_DEVICE_LOST){
             fprintf(stderr, "[qpow] wgpu device lost\n");
             stop_rc = CP_JOB_CANCELLED;
@@ -300,8 +320,10 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
     uint8_t cur[CP_QPOW_NONCE_BYTES];
     build_start_nonce(job, worker_name, cur);
     stamp_thread_id(cur, job->extranonce_len, 0);
-    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=opencl%s\n",
+    const uint64_t search_chunk = qpow_gpu_search_chunk();
+    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=opencl batch=%llu%s\n",
            job->job_id, job->difficulty, job->extranonce_len,
+           (unsigned long long)search_chunk,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     cp_job_mine_begin(job->job_key);
@@ -318,7 +340,7 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
         uint8_t out_hash[CP_QPOW_TARGET_BYTES];
         uint64_t hashes = 0;
         const int st = cp_qpow_opencl_worker_search(
-            job->mining_hash, job->target, cur, k_gpu_search_chunk,
+            job->mining_hash, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
         cp_fee_note_tiles(hashes);
@@ -335,7 +357,7 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
             memcpy(cur, out_nonce, CP_QPOW_NONCE_BYTES);
             qpow::inc_be(cur);
         } else if(st == CP_QPOW_OCL_OK_EXHAUSTED){
-            add_be_u64(cur, hashes > 0 ? hashes : k_gpu_search_chunk);
+            add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_QPOW_OCL_CANCELLED){
             stop_rc = CP_JOB_CANCELLED;
             break;

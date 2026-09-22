@@ -63,9 +63,9 @@ void cp_worker_configure_ocl_tile(int device_index);
 void cp_worker_apply_backend_defaults(void);
 int cp_worker_uses_contiguous_tiles(void);
 void cp_worker_set_period_gemm(int on);
-void cp_worker_set_period_batch(int batch);
+void cp_worker_set_period_batch(int batch); /* also --batch-size for Quantus nonces/launch */
 void cp_worker_set_row_period_batch(int batch);
-void cp_worker_set_col_period_batch(int batch);
+void cp_worker_set_col_period_batch(int batch); /* alias of set_period_batch on OpenCL/Pearl */
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
 void cp_worker_set_onednn_fused_jackpot(int on);

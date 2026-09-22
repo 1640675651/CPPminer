@@ -1,4 +1,4 @@
-# OpenCL GEMM issue shape
+﻿# OpenCL GEMM issue shape
 
 Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `--ocl-issue`.
 
@@ -35,12 +35,12 @@ Separate from issue shape. `build_kernel_` builds an ordered candidate list and 
 
 | Mode | Flag | Candidates |
 |------|------|------------|
-| **auto** (default) | `--ocl-dot auto` | AMD: sudot4 → sdot4 → KHR (if advertised) → scalar; others: KHR (if advertised) → scalar |
-| **sudot** | `--ocl-dot sudot` | sudot4 → scalar |
-| **sdot4** | `--ocl-dot sdot4` | sdot4 → scalar |
-| **khr** | `--ocl-dot khr` | KHR (if advertised) → scalar |
-| **force-khr** | `--ocl-dot force-khr` | forced KHR → scalar |
-| **asm** | `--ocl-dot asm` | experimental `v_dot4c` → scalar |
+| **auto** (default) | `--ocl-dot auto` | AMD: sudot4 鈫?sdot4 鈫?KHR (if advertised) 鈫?scalar; others: KHR (if advertised) 鈫?scalar |
+| **sudot** | `--ocl-dot sudot` | sudot4 鈫?scalar |
+| **sdot4** | `--ocl-dot sdot4` | sdot4 鈫?scalar |
+| **khr** | `--ocl-dot khr` | KHR (if advertised) 鈫?scalar |
+| **force-khr** | `--ocl-dot force-khr` | forced KHR 鈫?scalar |
+| **asm** | `--ocl-dot asm` | experimental `v_dot4c` 鈫?scalar |
 | **off** | `--ocl-dot off` | scalar only |
 
 Asm is opt-in only; it is not part of `auto`.
@@ -50,7 +50,7 @@ Asm is opt-in only; it is not part of `auto`.
 | Type | Flag | Acc tile |
 |------|------|----------|
 | **float** (default) | `--ocl-cpm-type float` | `float4 mad`, flush to int32 each KR |
-| **int** | `--ocl-cpm-type int` | int8→int32 lanes, `int4` mul+add |
+| **int** | `--ocl-cpm-type int` | int8鈫抜nt32 lanes, `int4` mul+add |
 
 Only applies on the cpm nest (auto scalar fallback or `--ocl-issue broadcast`).
 
@@ -58,7 +58,7 @@ Only applies on the cpm nest (auto scalar fallback or `--ocl-issue broadcast`).
 
 Optional `__local` A/B panel staging with work-group barriers (`CASE32_USE_LDS`). Default **off**.
 
-On most GPUs this **regressed** scan throughput: barrier + global→local copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
+On most GPUs this **regressed** scan throughput: barrier + global鈫抣ocal copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
 
 ## packed
 
@@ -83,18 +83,18 @@ cvec += avec * bscalar    // mad(float4, float, float4)
 ## Compare
 
 ```bash
-# default auto (on Intel without DPI → cpm float)
-./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32
+# default auto (on Intel without DPI 鈫?cpm float)
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --batch-size 32
 
 # force cpm (same nest as beignet-fix scalar)
-./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32 \
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --batch-size 32 \
   --ocl-issue broadcast
 
 # force packed dots
-./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --period-batch 32 \
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --dev --batch-size 32 \
   --ocl-issue packed
 ```
 
-Wait for `[ocl] attempt timing: … GMAC/s`. Look for `clblast cpm float` in the backend line and `private=… B/WI` from the kernel mem print.
+Wait for `[ocl] attempt timing: 鈥?GMAC/s`. Look for `clblast cpm float` in the backend line and `private=鈥?B/WI` from the kernel mem print.
 
 Broadcast+float issue may improve performance on GPUs that are weak in int but strong in float. UHD 630 (no DPI) is fastest with broadcast+float (~115 GH/s vs ~100 GH/s packed scalar). AMD/NVIDIA with hardware DPI typically see a large gain from `dot_acc_sat` / packed issue.

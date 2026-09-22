@@ -154,8 +154,9 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
-| `--period-batch N` | Batch size for scan launches (default 1024; see below) |
-| `--col-period-batch N` | Alias for `--period-batch` |
+| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus wgpu/OpenCL: **nonces per launch** (default 1000000). Aliases: `--period-batch`, `--col-period-batch` |
+| `--period-batch N` | Alias for `--batch-size` |
+| `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
@@ -195,7 +196,7 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 - **Default (`--no-fused-jackpot`):** Case 5 IGEMM + milestone `tile_xor` flush → separate device jackpot kernel. Higher VRAM traffic (`tile_xor` panel buffer) but simpler judge (OpenCL reference in `kernels/cp_onednn_jackpot.cl`).
 - **`--fused-jackpot`:** Case 5.6 fused kernel — fold, BLAKE3, and target compare in-register; host readback is `found_flag` + packed `(t_rows, t_cols)` only. Lower panel I/O; recommended for production Intel GPU mining.
 
-**Batching:** `--row-period-batch` and `--period-batch` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
+**Batching:** `--row-period-batch` and `--batch-size` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
 
 ```powershell
 # List Intel GPUs, then mine with fused jackpot
@@ -203,19 +204,19 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 .\cppminer.exe --backend onednn --fused-jackpot --devices 0 --mock --mock-diff 50
 
 # Default two-kernel path, smaller panels (less VRAM per launch)
-.\cppminer.exe --backend onednn --row-period-batch 16 --period-batch 512 --mock
+.\cppminer.exe --backend onednn --row-period-batch 16 --batch-size 512 --mock
 
 # Alternate device layouts (GPU prep fuses transpose + noise)
 .\cppminer.exe --backend onednn --onednn-layout TT --mock --mock-diff 50
 ```
 
-### Scan batching (`--period-batch`)
+### Scan batching (`--batch-size`)
 
 Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
 
 **OpenCL — 1D macro slicing**
 
-Each macro block defaults to 128×128 (`--ocl-macro 64x64` for the smaller size). Macros are a 2D grid (`macro_rows × macro_cols`), walked as a flat index `mb`. `--period-batch N` is how many **macro blocks** each kernel launch covers (`CP_MACRO_BATCH_*` in `include/cp_config.h`). Tile / issue flags: [OpenCL options](#opencl-options).
+Each macro block defaults to 128×128 (`--ocl-macro 64x64` for the smaller size). Macros are a 2D grid (`macro_rows × macro_cols`), walked as a flat index `mb`. `--batch-size N` is how many **macro blocks** each kernel launch covers (`CP_MACRO_BATCH_*` in `include/cp_config.h`). Tile / issue flags: [OpenCL options](#opencl-options).
 
 - Default: `1024` (one full macro-row at production `m=n=131072` with 128×128 macros)
 - Max: `1048576` (full matrix: `1024×1024` macros at 128×128; more macros when using 64×64)
@@ -223,14 +224,14 @@ Each macro block defaults to 128×128 (`--ocl-macro 64x64` for the smaller size)
 
 **CUDA — 2D launch window**
 
-Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLASS_CTA_M/N`). `--row-period-batch` / `--period-batch` count how many of those CTAs to launch per step (clipped to remaining).
+Default **CUTLASS fused** path tiles the matrix in **128×128 CTAs** (`CP_CUTLASS_CTA_M/N`). `--row-period-batch` / `--batch-size` count how many of those CTAs to launch per step (clipped to remaining).
 
 `--cublas-period` (debug) uses BzMiner **periods** instead: `PP_ROW_PERIOD=128` × `PP_COL_PERIOD=256` (not the same as the 128×128 CTA).
 
 | Flag | Role | Default | Max |
 |------|------|---------|-----|
 | `--row-period-batch` | Row CTAs (or row periods) per launch | 32 | 1024 |
-| `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
+| `--batch-size` / `--period-batch` / `--col-period-batch` | Col CTAs (or col periods) per launch | 1024 | 1024 |
 
 CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C window.
 
@@ -241,7 +242,7 @@ Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logica
 | Flag | Role | Default |
 |------|------|---------|
 | `--row-period-batch` | Hash-tile rows per panel | 256 |
-| `--period-batch` / `--col-period-batch` | Hash-tile cols per panel | 256 |
+| `--batch-size` / `--period-batch` / `--col-period-batch` | Hash-tile cols per panel | 256 |
 
 At defaults with 16×16 hash tiles and production dims, one panel covers 256×256 = 65536 hash tiles before host sync. `--row-period-batch` is ignored on OpenCL.
 

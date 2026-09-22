@@ -7,6 +7,17 @@
 #include <stdio.h>
 
 static int g_wgpu_ready = 0;
+static uint32_t g_batch_size = 1000000u;
+
+extern "C" void cp_wgpu_worker_set_batch_size(uint32_t batch)
+{
+    g_batch_size = batch == 0 ? 1000000u : batch;
+}
+
+extern "C" uint32_t cp_wgpu_worker_batch_size(void)
+{
+    return g_batch_size;
+}
 
 static int wgpu_cancel_check(void)
 {
@@ -15,21 +26,20 @@ static int wgpu_cancel_check(void)
 
 extern "C" int cp_wgpu_worker_init(int* devices, int ndev)
 {
-    /* Default batch 1M nonces; prefer discrete (allow_integrated=0) unless
-     * --devices explicitly picks adapters. */
-    if(cp_wgpu_init(1000000u, 0, devices, ndev) != 0){
+    /* Prefer discrete (allow_integrated=0) unless --devices picks adapters. */
+    if(cp_wgpu_init(g_batch_size, 0, devices, ndev) != 0){
         fprintf(stderr, "[wgpu] worker init failed\n");
         g_wgpu_ready = 0;
         return -1;
     }
     g_wgpu_ready = 1;
     if(devices && ndev > 0){
-        printf("[wgpu] GpuEngine ready (batch=1000000, devices=");
+        printf("[wgpu] GpuEngine ready (batch=%u, devices=", g_batch_size);
         for(int i = 0; i < ndev; i++)
             printf("%s%d", i ? "," : "", devices[i]);
         printf(")\n");
     } else {
-        printf("[wgpu] GpuEngine ready (batch=1000000, devices=auto)\n");
+        printf("[wgpu] GpuEngine ready (batch=%u, devices=auto)\n", g_batch_size);
     }
     fflush(stdout);
     return 0;

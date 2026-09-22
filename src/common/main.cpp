@@ -1,5 +1,5 @@
-/*
- * CPminer — cross-platform LuckyPool plain_proof miner (CPU / CUDA / …).
+﻿/*
+ * CPminer 鈥?cross-platform LuckyPool plain_proof miner (CPU / CUDA / 鈥?.
  */
 #include "cp_config.h"
 #include "cp_algo.h"
@@ -45,7 +45,7 @@
 
 static void print_usage(void)
 {
-    printf("CPminer — multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("CPminer 鈥?multi-algo LuckyPool miner (pearl / quantus)\n");
     printf("  --algo NAME        pearl (default) or quantus\n");
     {
         char pb[64], qb[64];
@@ -106,9 +106,11 @@ static void print_usage(void)
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (CUDA debug)\n");
-    printf("  --period-batch N     col-period batch (CUDA) / macro-block batch (OpenCL, default %d)\n",
+    printf("  --batch-size N       launch batch: Pearl col/macro panel (default %d);\n",
            CP_PERIOD_BATCH_DEFAULT);
-    printf("  --col-period-batch N alias for --period-batch\n");
+    printf("                       Quantus wgpu/OpenCL nonces per launch (default 1000000)\n");
+    printf("  --period-batch N     alias for --batch-size\n");
+    printf("  --col-period-batch N alias for --batch-size\n");
     printf("  --row-period-batch N row-period batch size (default %d, max %d)\n",
            CP_ROW_PERIOD_BATCH_DEFAULT, CP_ROW_PERIOD_BATCH_MAX);
     printf("  --row-major-ap       row-major Ap/BpT (lda=%d; CUTLASS default)\n",
@@ -406,7 +408,8 @@ int main(int argc, char** argv)
     int align_test = 0;
     int align_test_prod = 0;
     int no_period_gemm = 0;
-    int period_batch = CP_PERIOD_BATCH_DEFAULT;
+    int batch_size = CP_PERIOD_BATCH_DEFAULT;
+    int batch_size_set = 0;
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
@@ -637,14 +640,21 @@ int main(int argc, char** argv)
             g_dev_dims = 1;
         } else if(!strcmp(argv[i], "--no-period-gemm")){
             no_period_gemm = 1;
+        } else if(!strncmp(argv[i], "--batch-size", 12)){
+            const char* v = argv[i] + 12;
+            if(*v == '=') batch_size = atoi(v + 1);
+            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+            batch_size_set = 1;
         } else if(!strncmp(argv[i], "--period-batch", 14)){
             const char* v = argv[i] + 14;
-            if(*v == '=') period_batch = atoi(v + 1);
-            else if(i + 1 < argc) period_batch = atoi(argv[++i]);
+            if(*v == '=') batch_size = atoi(v + 1);
+            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+            batch_size_set = 1;
         } else if(!strncmp(argv[i], "--col-period-batch", 18)){
             const char* v = argv[i] + 18;
-            if(*v == '=') period_batch = atoi(v + 1);
-            else if(i + 1 < argc) period_batch = atoi(argv[++i]);
+            if(*v == '=') batch_size = atoi(v + 1);
+            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+            batch_size_set = 1;
         } else if(!strncmp(argv[i], "--row-period-batch", 18)){
             const char* v = argv[i] + 18;
             if(*v == '=') row_period_batch = atoi(v + 1);
@@ -973,7 +983,7 @@ int main(int argc, char** argv)
         if(!ndev){ devs[0] = 0; ndev = 1; }
         cp_worker_apply_backend_defaults();
         cp_worker_set_period_gemm(!no_period_gemm);
-        cp_worker_set_period_batch(period_batch);
+        cp_worker_set_period_batch(batch_size);
         cp_worker_set_row_period_batch(row_period_batch);
         cp_worker_set_step_major_ap(step_major_ap);
         cp_worker_set_cutlass_fused(cutlass_fused);
@@ -1014,7 +1024,7 @@ int main(int argc, char** argv)
         }
         cp_worker_apply_backend_defaults();
         cp_worker_set_period_gemm(1);
-        cp_worker_set_period_batch(period_batch);
+        cp_worker_set_period_batch(batch_size);
         cp_worker_set_row_period_batch(row_period_batch);
         cp_worker_set_step_major_ap(step_major_ap);
         cp_worker_set_cutlass_fused(cutlass_fused);
@@ -1098,6 +1108,17 @@ int main(int argc, char** argv)
     if(algo_sel == CP_ALGO_QUANTUS){
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
         fflush(stdout);
+        /* Quantus launch batch: --batch-size, else 1e6 nonces. */
+        {
+            uint32_t qbatch = 1000000u;
+            if(batch_size_set){
+                if(batch_size < 1) batch_size = 1;
+                qbatch = (uint32_t)batch_size;
+            }
+            cp_worker_set_period_batch((int)qbatch);
+            printf("[mode] batch-size: %u nonces/launch\n", qbatch);
+            fflush(stdout);
+        }
         if(cp_worker_backend_id() == CP_BACKEND_WGPU){
             /* No --devices → auto (all mining adapters). Explicit → those indices. */
             if(devices_specified)
@@ -1137,8 +1158,8 @@ int main(int argc, char** argv)
     cp_worker_set_period_gemm(!no_period_gemm);
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL
-       && period_batch == CP_PERIOD_BATCH_DEFAULT){
-        period_batch = CP_MACRO_BATCH_DEFAULT;
+       && batch_size == CP_PERIOD_BATCH_DEFAULT){
+        batch_size = CP_MACRO_BATCH_DEFAULT;
     }
     /* Resolve tile (incl. broadcast auto 4x8) before mode banner / fee tile counts. */
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
@@ -1149,21 +1170,21 @@ int main(int argc, char** argv)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(cp_worker_backend_id() == CP_BACKEND_WGPU
        && cp_worker_algo() == 0
-       && period_batch == CP_PERIOD_BATCH_DEFAULT){
-        period_batch = CP_MACRO_BATCH_DEFAULT;
+       && batch_size == CP_PERIOD_BATCH_DEFAULT){
+        batch_size = CP_MACRO_BATCH_DEFAULT;
     }
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-        if(period_batch == CP_PERIOD_BATCH_DEFAULT){
-            period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+        if(batch_size == CP_PERIOD_BATCH_DEFAULT){
+            batch_size = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
         }
         if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
             row_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
         }
     }
 #endif
-    cp_worker_set_period_batch(period_batch);
+    cp_worker_set_period_batch(batch_size);
     cp_worker_set_row_period_batch(row_period_batch);
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
@@ -1251,26 +1272,26 @@ int main(int argc, char** argv)
                 : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? (128 / 8) * (128 / 8)
                 : (128 / 8) * (128 / 16);
             printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
-            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
-                   period_batch, period_batch * tiles_per_macro);
+            printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
+                   batch_size, batch_size * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
             printf("[mode] scan: wgpu fused GEMM + XOR + device jackpot (8x8)\n");
-            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
-                   period_batch, period_batch * 256);
+            printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
+                   batch_size, batch_size * 256);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
             const double panel_tiles =
-                    (double)row_period_batch * (double)period_batch;
+                    (double)row_period_batch * (double)batch_size;
             if(onednn_fused_jackpot){
                 printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
-                printf("[mode] period batch: row=%d col=%d\n", row_period_batch, period_batch);
+                printf("[mode] period batch: row=%d col=%d\n", row_period_batch, batch_size);
             } else {
                 const int tile_xor_words = K_DIM / R_RANK;
                 printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");
                 printf("[mode] period batch: row=%d col=%d (~%.1f MiB tile_xor/panel on GPU)\n",
-                       row_period_batch, period_batch,
+                       row_period_batch, batch_size,
                        panel_tiles * (double)tile_xor_words * (double)sizeof(uint32_t)
                                / (1024.0 * 1024.0));
             }
@@ -1314,12 +1335,12 @@ int main(int argc, char** argv)
             if(cutlass_fused){
                 printf("[mode] jackpot: fused in GEMM kernel (no tile_xor / C_hist)\n");
                 printf("[mode] period batch: row=%d col=%d\n",
-                       row_period_batch, period_batch);
+                       row_period_batch, batch_size);
             } else {
                 printf("[mode] jackpot: separate XOR kernel (period GEMM)\n");
                 printf("[mode] period batch: row=%d col=%d (~%.0f MiB C_hist/GPU)\n",
-                       row_period_batch, period_batch,
-                       (double)row_period_batch * (double)period_batch
+                       row_period_batch, batch_size,
+                       (double)row_period_batch * (double)batch_size
                        * (double)(K_DIM / R_RANK)
                        * (double)PP_ROW_PERIOD * (double)PP_COL_PERIOD
                        * (double)sizeof(int32_t) / (1024.0 * 1024.0));

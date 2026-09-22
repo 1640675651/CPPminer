@@ -136,6 +136,16 @@ int cancelled()
 
 } // namespace
 
+extern "C" void cp_qpow_opencl_worker_set_batch_size(uint32_t batch)
+{
+    g_batch_size = batch == 0 ? 1000000u : batch;
+}
+
+extern "C" uint32_t cp_qpow_opencl_worker_batch_size(void)
+{
+    return g_batch_size;
+}
+
 extern "C" int cp_qpow_opencl_worker_list_devices(void)
 {
     return OpenClContext::list_devices(g_platform_filter);

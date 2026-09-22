@@ -18,6 +18,10 @@ void cp_qpow_opencl_worker_shutdown(void);
 int cp_qpow_opencl_worker_is_ready(void);
 int cp_qpow_opencl_worker_list_devices(void);
 
+/* Nonces per launch; 0 → 1e6. Call before init. */
+void cp_qpow_opencl_worker_set_batch_size(uint32_t batch);
+uint32_t cp_qpow_opencl_worker_batch_size(void);
+
 /* Search [start_be, start_be+count). Writes BE nonce/hash on found. */
 int cp_qpow_opencl_worker_search(
     const uint8_t header[32],
