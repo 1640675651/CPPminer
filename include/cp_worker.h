@@ -11,13 +11,17 @@ typedef enum {
     CP_BACKEND_NONE   = 0,
     CP_BACKEND_CPU    = 1,
     CP_BACKEND_CUDA   = 2,
-    CP_BACKEND_OPENCL = 3
+    CP_BACKEND_OPENCL = 3,
+    CP_BACKEND_ONEDNN = 4,
+    CP_BACKEND_WGPU   = 5
 } CpBackendId;
 
 /* Compile-time availability (1 if linked). */
 int cp_worker_has_cpu(void);
 int cp_worker_has_cuda(void);
 int cp_worker_has_opencl(void);
+int cp_worker_has_onednn(void);
+int cp_worker_has_wgpu(void);
 
 const char* cp_worker_backend_name(void);
 CpBackendId cp_worker_backend_id(void);
@@ -25,19 +29,30 @@ CpBackendId cp_worker_backend_id(void);
 /* Select backend before init when several are compiled. Returns 0 on ok. */
 int cp_worker_select(CpBackendId id);
 
+/* Algo for backends shared by pearl/quantus (wgpu). Call before init/list. */
+void cp_worker_set_algo(int algo_id); /* CpAlgoId without including cp_algo.h */
+int cp_worker_algo(void);
+
 void cp_worker_init(int* devices, int ndev);
+int cp_worker_is_ready(void);
 void cp_worker_shutdown(void);
 
 /* Print devices for the selected backend (OpenCL/CUDA). Returns count, or 0. */
 int cp_worker_list_devices(void);
 /* OpenCL-only: restrict device enumeration to platform index (-1 = all). */
 void cp_worker_set_ocl_platform(int platform_index);
+/* OneDNN-only: same as --ocl-platform (shared OpenCL enumeration). */
+void cp_worker_set_onednn_platform(int platform_index);
 /* OpenCL-only: register tile MR x NR (4x4, 4x8, 8x8, or 8x16). mr<=0 restores auto (4x8; 8x16 on AMD). */
 void cp_worker_set_ocl_tile(int mr, int nr);
+/* OpenCL-only: macro block 64x64 or 128x128. <=0 restores default 128x128. */
+void cp_worker_set_ocl_macro(int macro_m, int macro_n);
 /* OpenCL-only: GEMM issue. 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
 void cp_worker_set_ocl_issue_mode(int mode);
 /* Legacy: on → broadcast, off → auto. */
 void cp_worker_set_ocl_issue_broadcast(int on);
+/* OpenCL-only: dot backend. 0=auto, 1=force-khr, 2=off, 3=sudot, 4=sdot4, 5=asm, 6=khr. */
+void cp_worker_set_ocl_dot_policy(int policy);
 /* OpenCL-only: broadcast cpm type. 0 = float (default), 1 = int32. */
 void cp_worker_set_ocl_cpm_int(int on);
 /* OpenCL-only: stage A/B panels in local memory (0 = off default, 1 = on). */
@@ -53,6 +68,7 @@ void cp_worker_set_row_period_batch(int batch);
 void cp_worker_set_col_period_batch(int batch);
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
+void cp_worker_set_onednn_fused_jackpot(int on);
 
 typedef enum {
     CP_PREPACK_SEPARATE = 0, /* row-major noisy + persistent a_pre_/b_pre_ */

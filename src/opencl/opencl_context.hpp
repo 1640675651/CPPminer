@@ -24,6 +24,7 @@ struct OclDeviceInfo {
     std::string vendor_name;
     bool discrete = false; /* GPU with CL_DEVICE_HOST_UNIFIED_MEMORY == false */
     bool integer_dot_product = false;
+    bool integer_dot_product_hw = false;
 };
 
 struct OpenClContext {
@@ -39,6 +40,7 @@ struct OpenClContext {
     int device_flat_index = -1;
     bool discrete_gpu = false;
     bool has_integer_dot_product = false;
+    bool has_integer_dot_product_hw = false;
     size_t max_work_group_size = 256;
 
     ~OpenClContext();
@@ -51,13 +53,18 @@ struct OpenClContext {
 
     /* Select by flat index from enumerate_devices(). Fails if out of range. */
     bool init(int device_index = 0, int platform_filter = -1);
-    bool build_program_from_file(const char *cl_path, const char *build_options = "");
-    bool build_program_from_source(const char *source, const char *build_options = "");
+    /* Bind an already-enumerated device (e.g. Intel-only list for oneDNN). */
+    bool init(const OclDeviceInfo &pick);
+    bool build_program_from_file(const char *cl_path, const char *build_options = "",
+                                 bool quiet = false);
+    bool build_program_from_source(const char *source, const char *build_options = "",
+                                   bool quiet = false);
 
-    /* Probe clBuildProgram in a child process first. Drivers that abort() inside
-       the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill only the child;
-       the parent returns false and can fall back to another build. Does not
-       modify this->program. */
+    /* Probe clBuildProgram in a child process first (Linux only). Drivers that
+       abort() inside the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill
+       only the child; the parent returns false and can fall back to another
+       build. Windows/Apple skip the probe (no fork / OpenCL not fork-safe).
+       Does not modify this->program. */
     bool probe_build(const char *source, const char *build_options = "");
 
     /* probe_build() then build_program_from_source/file if the probe survives. */
@@ -66,8 +73,8 @@ struct OpenClContext {
 
     cl_kernel create_kernel(const char *name) const;
 
-    bool write_buffer(cl_mem buf, const void *host, size_t bytes) const;
-    bool read_buffer(cl_mem buf, void *host, size_t bytes) const;
+    bool write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset = 0) const;
+    bool read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset = 0) const;
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);

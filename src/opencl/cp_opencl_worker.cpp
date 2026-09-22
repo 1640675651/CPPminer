@@ -38,9 +38,12 @@ static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
 static int g_tile_mr = 0;
 static int g_tile_nr = 0;
+static int g_macro_m = 0;
+static int g_macro_n = 0;
 static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
+static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
 static int g_cpm_int = 0;
 static int g_use_lds = 0;
 
@@ -237,6 +240,16 @@ extern "C" void cp_opencl_worker_set_tile(int mr, int nr) {
     g_tile_nr = nr;
 }
 
+extern "C" void cp_opencl_worker_set_macro(int macro_m, int macro_n) {
+    if (macro_m <= 0 || macro_n <= 0) {
+        g_macro_m = 0;
+        g_macro_n = 0;
+        return;
+    }
+    g_macro_m = macro_m;
+    g_macro_n = macro_n;
+}
+
 extern "C" void cp_opencl_worker_set_issue_mode(int mode) {
     if (mode < 0) {
         mode = 0;
@@ -251,6 +264,16 @@ extern "C" void cp_opencl_worker_set_issue_broadcast(int on) {
     g_issue_mode = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
+    if (policy < 0) {
+        policy = 0;
+    }
+    if (policy > 6) {
+        policy = 0;
+    }
+    g_dot_policy = policy;
+}
+
 extern "C" void cp_opencl_worker_set_cpm_int(int on) {
     g_cpm_int = on ? 1 : 0;
 }
@@ -263,15 +286,18 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     int tile_mr = 4;
     int tile_nr = 8;
     const char *source = "default 4x8";
+    const int macro_m = g_macro_m;
+    const int macro_n = g_macro_n;
 
     if (g_tile_mr > 0 && g_tile_nr > 0) {
-        if (!case32::configure(g_tile_mr, g_tile_nr)) {
-            fprintf(stderr, "[ocl] --ocl-tile %dx%d invalid; using 4x8\n", g_tile_mr,
-                    g_tile_nr);
+        if (!case32::configure(g_tile_mr, g_tile_nr, macro_m, macro_n)) {
+            fprintf(stderr, "[ocl] --ocl-tile %dx%d / macro %dx%d invalid; using 4x8\n",
+                    g_tile_mr, g_tile_nr, macro_m > 0 ? macro_m : 0,
+                    macro_n > 0 ? macro_n : 0);
             tile_mr = 4;
             tile_nr = 8;
             source = "invalid CLI, using 4x8";
-            case32::configure(tile_mr, tile_nr);
+            case32::configure(tile_mr, tile_nr, 0, 0);
         } else {
             tile_mr = g_tile_mr;
             tile_nr = g_tile_nr;
@@ -288,8 +314,8 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
                 source = "AMD GPU auto 8x16";
             }
         }
-        if (!case32::configure(tile_mr, tile_nr)) {
-            fprintf(stderr, "[ocl] hash tile configure failed\n");
+        if (!case32::configure(tile_mr, tile_nr, macro_m, macro_n)) {
+            fprintf(stderr, "[ocl] hash tile / macro configure failed\n");
             return;
         }
     }
@@ -299,9 +325,11 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     cp_pp_set_hash_tile(g_hash_tile_mr, g_hash_tile_w);
     pearl_set_contiguous_tile_shape(g_hash_tile_mr, g_hash_tile_w);
 
-    printf("[ocl] OpenCL register tile: %dx%d, hash tile: %dx%d, %s-major WI (%s, %d WI/macro)\n",
-           case32::kMR, case32::kNR, g_hash_tile_mr, g_hash_tile_w,
-           case32::wi_row_major() ? "row" : "column", source, case32::kMacroWorkItems);
+    printf("[ocl] OpenCL register tile: %dx%d, hash tile: %dx%d, macro %dx%d, %s-major WI "
+           "(%s, %d WI/macro)\n",
+           case32::kMR, case32::kNR, g_hash_tile_mr, g_hash_tile_w, case32::kMacroM,
+           case32::kMacroN, case32::wi_row_major() ? "row" : "column", source,
+           case32::kMacroWorkItems);
     fflush(stdout);
 }
 
@@ -331,6 +359,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
     g_gemm.set_issue_mode(g_issue_mode);
+    g_gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(g_dot_policy));
     g_gemm.set_cpm_int(g_cpm_int);
     g_gemm.set_use_lds(g_use_lds);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
@@ -348,6 +377,11 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] max work-group size: %zu\n", g_gemm.max_work_group_size());
     printf("[ocl] %s\n", g_gemm.backend());
     printf("[ocl] %s\n", g_gemm.dpi_status());
+    if (g_issue_mode == 0 && g_gemm.integer_dot_product_hw() == 0 &&
+        g_gemm.integer_dot_product()) {
+        printf("[ocl] note: DPI reports software path on this device; Intel OpenCL "
+               "dot_acc_sat may not beat cpm. Try --backend onednn for Intel GPU perf.\n");
+    }
     if (g_issue_mode == 1) {
         printf("[ocl] issue: broadcast/cpm %s (--ocl-issue broadcast%s)\n",
                g_cpm_int ? "int" : "float",

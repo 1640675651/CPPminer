@@ -17,10 +17,14 @@ int cp_opencl_hash_tile_mr(void);
 int cp_opencl_hash_tile_w(void);
 /* OpenCL register tile size. Pass mr<=0 to restore auto (4x8 default, 8x16 on AMD). */
 void cp_opencl_worker_set_tile(int mr, int nr);
+/* OpenCL macro block MxN (64x64 or 128x128). Pass <=0 to restore default 128x128. */
+void cp_opencl_worker_set_macro(int macro_m, int macro_n);
 /* OpenCL GEMM issue: 0 = auto (DPI then cpm), 1 = broadcast/cpm, 2 = packed. */
 void cp_opencl_worker_set_issue_mode(int mode);
 /* Legacy: on → broadcast (1), off → auto (0). */
 void cp_opencl_worker_set_issue_broadcast(int on);
+/* Dot backend policy: 0=auto, 1=force-khr, 2=off, 3=sudot, 4=sdot4, 5=asm, 6=khr. */
+void cp_opencl_worker_set_dot_policy(int policy);
 /* Broadcast cpm type: 0 = float (default), 1 = int32. Requires broadcast issue. */
 void cp_opencl_worker_set_cpm_int(int on);
 /* Stage A/B in __local (default off). */

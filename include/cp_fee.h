@@ -3,23 +3,25 @@
 
 #include <stdint.h>
 
+#include "cp_algo.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
  * Same-pool developer fee (tile-debt model):
- *   - T = hash tiles in one full matrix scan (backend/layout/dims; not matrix dim M)
+ *   - T = hash tiles in one full matrix scan (Pearl) or hash quantum (Quantus)
  *   - User scans: debt += tiles
- *   - When debt >= 100 * T, run fee matrices until debt is paid down
+ *   - When debt >= 100 * T, run fee work until debt is paid down
  *   - Fee scans: debt -= 100 * tiles (clamped at 0); leave fee mode when debt < 100*T
  *   - Seed debt = 50 * T so the first fee lands mid-period
- * Reconnect + re-authorize when the wanted wallet changes.
+ * Reconnect + re-authorize/login when the wanted wallet changes.
  */
 
 #define CP_FEE_PERIOD 100
 
-void cp_fee_init(const char* user_wallet, int enable);
+void cp_fee_init(const char* user_wallet, int enable, CpAlgoId algo);
 
 /* Full-matrix hash-tile count T for the active backend/layout/dims. Call after
  * backend + g_m_active/g_n_active are known (and again if they change). Seeds

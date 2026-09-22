@@ -2,6 +2,7 @@
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
 #include "cp_platform.h"
+#include "cp_qpow_pool.h"
 #include "cp_state.h"
 #include "cp_util.h"
 
@@ -149,6 +150,9 @@ static char* pop_json_message(int sock)
 
 static void pool_dispatch_line(const char* line)
 {
+    if(cp_qpow_pool_on_line(line))
+        return;
+
     if(strstr(line, "mining.set_difficulty")){
         double d = cp_json_num(line, "params");
         if(!d){
@@ -326,6 +330,33 @@ void cp_pool_inbox_clear(void)
 {
     std::lock_guard<std::mutex> lk(g_inbox_mx);
     g_pool_inbox.clear();
+}
+
+int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
+{
+    if(!out || out_cap == 0 || tcp_sock < 0) return -1;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeout_ms < 0 ? 60000 : timeout_ms);
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    while(1){
+        if(net_buf_has_complete_json()){
+            char* line = pop_json_message(tcp_sock);
+            if(!line) return -1;
+            strncpy(out, line, out_cap - 1);
+            out[out_cap - 1] = 0;
+            return 1;
+        }
+        int remain_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            deadline - std::chrono::steady_clock::now())
+                            .count();
+        if(remain_ms <= 0) return 0;
+        if(remain_ms > 200) remain_ms = 200;
+        if(!net_wait_readable(tcp_sock, remain_ms)) continue;
+        int n = recv(tcp_sock, net_buf + net_pos,
+                     (int)sizeof(net_buf) - net_pos - 1, 0);
+        if(n <= 0) return -1;
+        net_pos += n;
+    }
 }
 
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)

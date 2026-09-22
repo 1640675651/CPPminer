@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -65,6 +66,105 @@ int clamp_macro_batch(int batch) {
         batch = CP_MACRO_BATCH_MAX;
     }
     return batch;
+}
+
+const char *dot_backend_label(Case32OclDotBackend b, int issue_mode, bool cpm_int) {
+    switch (b) {
+    case Case32OclDotBackend::Sudot4:
+        return "builtin __builtin_amdgcn_sudot4 (gfx11)";
+    case Case32OclDotBackend::Sdot4:
+        return "builtin __builtin_amdgcn_sdot4";
+    case Case32OclDotBackend::AsmDot4c:
+        return "asm v_dot4c_i32_i8";
+    case Case32OclDotBackend::KhrDpi:
+        return "cl_khr_integer_dot_product";
+    case Case32OclDotBackend::KhrDpiForce:
+        return "force cl_khr_integer_dot_product";
+    case Case32OclDotBackend::Scalar:
+        if (issue_mode == 1) {
+            return cpm_int ? "broadcast int (cpm)" : "broadcast float (cpm)";
+        }
+        if (issue_mode == 2) {
+            return "packed scalar";
+        }
+        return cpm_int ? "cpm int" : "cpm float";
+    }
+    return "unknown";
+}
+
+const char *dot_kind_short(Case32OclDotBackend b, int issue_mode, bool cpm_int) {
+    switch (b) {
+    case Case32OclDotBackend::Sudot4:
+        return "builtin sudot4";
+    case Case32OclDotBackend::Sdot4:
+        return "builtin sdot4";
+    case Case32OclDotBackend::AsmDot4c:
+        return "asm v_dot4c";
+    case Case32OclDotBackend::KhrDpi:
+    case Case32OclDotBackend::KhrDpiForce:
+        return "dot_acc_sat";
+    case Case32OclDotBackend::Scalar:
+        if (issue_mode == 2) {
+            return "packed scalar";
+        }
+        return cpm_int ? "clblast cpm int" : "clblast cpm float";
+    }
+    return "clblast cpm";
+}
+
+/* Build ordered candidate list. issue_mode==1 (broadcast) is handled by caller. */
+std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, bool vendor_amd,
+                                                     bool has_khr) {
+    using B = Case32OclDotBackend;
+    std::vector<B> out;
+
+    auto push_unique = [&](B b) {
+        for (B x : out) {
+            if (x == b) {
+                return;
+            }
+        }
+        out.push_back(b);
+    };
+    auto finish_with_scalar = [&]() {
+        push_unique(B::Scalar);
+        return out;
+    };
+
+    switch (policy) {
+    case Case32OclDotPolicy::Off:
+        return finish_with_scalar();
+    case Case32OclDotPolicy::ForceKhr:
+        push_unique(B::KhrDpiForce);
+        return finish_with_scalar();
+    case Case32OclDotPolicy::PinSudot4:
+        push_unique(B::Sudot4);
+        return finish_with_scalar();
+    case Case32OclDotPolicy::PinSdot4:
+        push_unique(B::Sdot4);
+        return finish_with_scalar();
+    case Case32OclDotPolicy::PinAsm:
+        push_unique(B::AsmDot4c);
+        return finish_with_scalar();
+    case Case32OclDotPolicy::PinKhr:
+        if (has_khr) {
+            push_unique(B::KhrDpi);
+        }
+        return finish_with_scalar();
+    case Case32OclDotPolicy::Auto:
+    default:
+        /* AMD: sudot4 (RDNA3) → sdot4 (GFX9/RDNA2) → KHR if advertised → scalar.
+         * Intel/NVIDIA/other: KHR if advertised → scalar.
+         * Asm stays opt-in via PinAsm only. */
+        if (vendor_amd) {
+            push_unique(B::Sudot4);
+            push_unique(B::Sdot4);
+        }
+        if (has_khr) {
+            push_unique(B::KhrDpi);
+        }
+        return finish_with_scalar();
+    }
 }
 
 } // namespace
@@ -135,14 +235,35 @@ Case33GemmOcl::~Case33GemmOcl() {
 }
 
 bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
-    auto try_build = [&](bool use_dot, bool force_ext, bool use_asm, bool use_builtin,
-                         const char *label, bool use_sudot = false) -> bool {
-        const bool scalar = !use_dot && !use_asm && !use_builtin && !use_sudot;
+    auto with_cl_std = [](std::string opts, const char *ver) {
+        const std::string needle = "-cl-std=CL1.2";
+        const size_t pos = opts.find(needle);
+        const std::string repl = std::string("-cl-std=") + ver;
+        if (pos != std::string::npos) {
+            opts.replace(pos, needle.size(), repl);
+        } else {
+            opts = repl + " " + opts;
+        }
+        return opts;
+    };
+
+    auto try_build = [&](Case32OclDotBackend backend) -> bool {
+        const bool use_sudot = backend == Case32OclDotBackend::Sudot4;
+        const bool use_asm = backend == Case32OclDotBackend::AsmDot4c;
+        const bool use_builtin = backend == Case32OclDotBackend::Sdot4;
+        const bool use_dot = backend == Case32OclDotBackend::KhrDpi ||
+                             backend == Case32OclDotBackend::KhrDpiForce;
+        const bool force_ext = backend == Case32OclDotBackend::KhrDpiForce;
+        const bool scalar = backend == Case32OclDotBackend::Scalar;
+        const char *label = dot_backend_label(backend, issue_mode_, use_cpm_int_);
+
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
         build_opts += " -DNR=" + std::to_string(case32::kNR);
         build_opts += " -DHASH_NR=" + std::to_string(case32::hash_tile_nr());
         build_opts += " -DKR=" + std::to_string(case32::kKR);
+        build_opts += " -DMACRO_M=" + std::to_string(case32::kMacroM);
+        build_opts += " -DMACRO_N=" + std::to_string(case32::kMacroN);
         build_opts += " -DR_RANK=" + std::to_string(R_RANK);
         build_opts += " -DPP_MAX_MILESTONES=" + std::to_string(case32::kNumMilestones);
         build_opts += " -DCASE32_COALESCE=1";
@@ -174,14 +295,41 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 build_opts += " -Dcl_khr_integer_dot_product";
             }
         }
-        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
-            if (use_dot && force_ext && !use_asm && !use_builtin) {
+
+        auto adopt_kernel = [&](const char *status_label) -> bool {
+            if (kernel_) {
+                clReleaseKernel(kernel_);
+                kernel_ = nullptr;
+            }
+            kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
+            if (!kernel_) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: kernel create FAILED",
+                              label);
+                return false;
+            }
+            adopted_backend_ = backend;
+            using_integer_dot_ = use_dot;
+            using_asm_dot_ = use_asm;
+            using_builtin_dot_ = use_builtin || use_sudot;
+            using_cpm_ = scalar && issue_mode_ != 2;
+            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", status_label);
+            return true;
+        };
+
+        if (use_dot) {
+            /* Primary: CL1.2 + extension macro (NVIDIA, AMD, and other KHR DPI drivers). */
+            if (ocl_.build_program_from_file(kernel_cl_path, build_opts.c_str(), true)) {
+                return adopt_kernel(label);
+            }
+            if (force_ext) {
                 std::string build_opts2 =
                         "-cl-std=CL1.2 -cl-ext=+cl_khr_integer_dot_product "
                         "-DCASE32_FORCE_DPI=1 -DMR=" +
                         std::to_string(case32::kMR) + " -DNR=" +
                         std::to_string(case32::kNR) + " -DKR=" +
                         std::to_string(case32::kKR) +
+                        " -DMACRO_M=" + std::to_string(case32::kMacroM) +
+                        " -DMACRO_N=" + std::to_string(case32::kMacroN) +
                         " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=" +
                         std::to_string(case32::wi_row_major() ? 1 : 0) +
@@ -189,133 +337,50 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
-                if (ocl_.safe_build_program_from_file(kernel_cl_path, build_opts2.c_str())) {
-                    if (kernel_) {
-                        clReleaseKernel(kernel_);
-                        kernel_ = nullptr;
-                    }
-                    kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
-                    if (kernel_) {
-                        using_integer_dot_ = true;
-                        using_asm_dot_ = false;
-                        using_builtin_dot_ = false;
-                        using_cpm_ = false;
-                        std::snprintf(dpi_status_, sizeof(dpi_status_), "%s (-cl-ext): OK",
-                                      label);
-                        return true;
-                    }
+                if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
+                    return adopt_kernel(label);
+                }
+            }
+            /* Intel NEO: CL1.2 advertises KHR DPI but dot_acc_sat(char4) needs CL3.0.
+             * Kernel uses __opencl_c_integer_dot_product_input_4x8bit only (no packed API). */
+            if (ocl_.has_integer_dot_product &&
+                ocl_.vendor_name.find("Intel") != std::string::npos) {
+                const std::string cl30_opts =
+                        with_cl_std(build_opts, "CL3.0") + " -DCASE32_FORCE_DPI=1";
+                if (ocl_.build_program_from_file(kernel_cl_path, cl30_opts.c_str(), true)) {
+                    return adopt_kernel("Intel CL3.0 dot_acc_sat");
                 }
             }
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
         }
-        if (kernel_) {
-            clReleaseKernel(kernel_);
-            kernel_ = nullptr;
-        }
-        kernel_ = ocl_.create_kernel("case33_macro_gemm_xor");
-        if (!kernel_) {
-            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: kernel create FAILED", label);
+
+        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
+            std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
         }
-        using_integer_dot_ = use_dot && !use_asm && !use_builtin && !use_sudot;
-        using_asm_dot_ = use_asm;
-        using_builtin_dot_ = use_builtin || use_sudot;
-        using_cpm_ = scalar && issue_mode_ != 2;
-        std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", label);
-        return true;
+        return adopt_kernel(label);
     };
 
-    bool built = false;
-    /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
+    const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
+                               ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+
+    std::vector<Case32OclDotBackend> candidates;
     if (issue_mode_ == 1) {
-        built = try_build(false, false, false, false,
-                          use_cpm_int_ ? "broadcast int (cpm)" : "broadcast float (cpm)");
-    } else if (issue_mode_ == 2) {
-        /* --ocl-issue packed: DPI if possible, else scalar per-C dot4. */
-        if (dpi_mode_ == Case32OclDpiMode::Off) {
-            built = try_build(false, false, false, false, "packed scalar dot4");
-        } else if (dpi_mode_ == Case32OclDpiMode::Asm) {
-            built = try_build(false, false, true, false, "packed asm v_dot4c");
-            if (!built) {
-                built = try_build(false, false, false, false, "packed scalar (asm failed)");
-            }
-        } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
-            built = try_build(false, false, false, true, "packed builtin sdot4");
-            if (!built) {
-                built = try_build(true, false, false, false, "packed KHR dot_acc_sat");
-            }
-            if (!built) {
-                built = try_build(false, false, false, false, "packed scalar");
-            }
-        } else if (dpi_mode_ == Case32OclDpiMode::Force) {
-            built = try_build(true, true, false, false, "packed force DPI");
-            if (!built) {
-                built = try_build(false, false, false, false, "packed scalar (force failed)");
-            }
-        } else if (ocl_.has_integer_dot_product) {
-            built = try_build(true, false, false, false, "packed auto DPI");
-            if (!built) {
-                built = try_build(false, false, false, false, "packed scalar (auto DPI failed)");
-            }
-        } else {
-            built = try_build(false, false, false, true, "packed builtin sdot4");
-            if (!built) {
-                built = try_build(false, false, false, false, "packed scalar (no DPI)");
-            }
-        }
-    } else if (dpi_mode_ == Case32OclDpiMode::Off) {
-        built = try_build(false, false, false, false,
-                          use_cpm_int_ ? "cpm int (forced off)" : "cpm float (forced off)");
-    } else if (dpi_mode_ == Case32OclDpiMode::Asm) {
-        built = try_build(false, false, true, false, "asm v_dot4c_i32_i8");
-        if (!built) {
-            built = try_build(false, false, false, false, "cpm (asm failed)");
-        }
-    } else if (dpi_mode_ == Case32OclDpiMode::Builtin) {
-        /* Default cascade: sudot4 -> asm v_dot4c -> sdot4 -> KHR -> scalar cpm.
-         *
-         * sudot4 goes first because on RDNA3 every other accelerated path fails
-         * to compile, leaving the scalar 4x int32 MAC nest:
-         *   __builtin_amdgcn_sdot4 -> "needs target feature dot1-insts"
-         *   v_dot4c_i32_i8 (asm)   -> "instruction not supported on this GPU"
-         *   dot_acc_sat            -> cl_khr_integer_dot_product not exposed
-         * All three are GFX9/RDNA2 spellings; gfx11 has V_DOT4_I32_IU8 instead.
-         * try_build() already falls back on a build failure, so ordering the
-         * most specific form first costs nothing where it is unsupported.
-         *
-         * The asm form is also kept reachable here: dpi_mode_ defaults to
-         * Builtin and nothing calls set_dpi_mode(), so Case32OclDpiMode::Asm
-         * was otherwise dead code. */
-        built = try_build(false, false, false, false,
-                          "builtin __builtin_amdgcn_sudot4 (gfx11)", true);
-        if (!built) {
-            built = try_build(false, false, true, false, "asm v_dot4c_i32_i8");
-        }
-        if (!built) {
-            built = try_build(false, false, false, true, "builtin __builtin_amdgcn_sdot4");
-        }
-        if (!built) {
-            built = try_build(true, false, false, false, "KHR dot_acc_sat");
-        }
-        if (!built) {
-            built = try_build(false, false, false, false,
-                              use_cpm_int_ ? "cpm int" : "cpm float");
-        }
-    } else if (dpi_mode_ == Case32OclDpiMode::Force) {
-        built = try_build(true, true, false, false, "force CASE32_FORCE_DPI");
-        if (!built) {
-            built = try_build(false, false, false, false, "cpm (force failed)");
-        }
-    } else if (ocl_.has_integer_dot_product) {
-        built = try_build(true, false, false, false, "auto cl_khr_integer_dot_product");
-        if (!built) {
-            built = try_build(false, false, false, false, "cpm (auto DPI failed)");
-        }
+        /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
+        candidates = {Case32OclDotBackend::Scalar};
     } else {
-        built = try_build(false, false, false, false,
-                          use_cpm_int_ ? "cpm int (no DPI)" : "cpm float (no DPI)");
+        candidates = select_dot_backends(dot_policy_, vendor_is_amd, ocl_.has_integer_dot_product);
     }
+
+    bool built = false;
+    for (Case32OclDotBackend backend : candidates) {
+        if (try_build(backend)) {
+            built = true;
+            break;
+        }
+    }
+
     if (built && kernel_) {
         cl_ulong local_b = 0;
         cl_ulong priv_b = 0;
@@ -425,20 +490,7 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
 
-    const char *dot_kind = "clblast cpm";
-    if (using_asm_dot_) {
-        dot_kind = "asm v_dot4c";
-    } else if (using_builtin_dot_) {
-        dot_kind = "builtin sdot4";
-    } else if (using_integer_dot_) {
-        dot_kind = "dot_acc_sat";
-    } else if (issue_mode_ == 2) {
-        dot_kind = "packed scalar";
-    } else if (use_cpm_int_) {
-        dot_kind = "clblast cpm int";
-    } else if (using_cpm_) {
-        dot_kind = "clblast cpm float";
-    }
+    const char *dot_kind = dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
@@ -486,20 +538,7 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         return false;
     }
 
-    const char *dot_kind = "clblast cpm";
-    if (using_asm_dot_) {
-        dot_kind = "asm v_dot4c";
-    } else if (using_builtin_dot_) {
-        dot_kind = "builtin sdot4";
-    } else if (using_integer_dot_) {
-        dot_kind = "dot_acc_sat";
-    } else if (issue_mode_ == 2) {
-        dot_kind = "packed scalar";
-    } else if (use_cpm_int_) {
-        dot_kind = "clblast cpm int";
-    } else if (using_cpm_) {
-        dot_kind = "clblast cpm float";
-    }
+    const char *dot_kind = dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,

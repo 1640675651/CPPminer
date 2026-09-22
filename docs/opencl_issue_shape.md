@@ -23,11 +23,27 @@ loads are unchanged.
 
 | Mode | Flag | Inner loop |
 |------|------|------------|
-| **auto** (default) | `--ocl-issue auto` | DPI if available, else CLBlast **cpm** (beignet-fix) |
+| **auto** (default) | `--ocl-issue auto` | Same nest as accelerated/scalar path chosen by `--ocl-dot` |
 | **broadcast** | `--ocl-issue broadcast` | Force cpm: `cpm += aval * bscalar` (`CASE32_NO_DPI`) |
-| **packed** | `--ocl-issue packed` | Per-C `dot4` / DP4A into `acc[j,i]` |
+| **packed** | `--ocl-issue packed` | Per-C `dot4` / DP4A into `acc[j,i]` (still uses `--ocl-dot` cascade) |
 
-`broadcast` / scalar fallback pass `-DCASE32_NO_DPI=1` so Intel cannot auto-enable KHR DPI and silently switch to packed dots. AMD `sdot4` / `dot_acc_sat` stay on **packed** or **auto** when DPI builds.
+`broadcast` / scalar fallback pass `-DCASE32_NO_DPI=1` so Intel cannot auto-enable KHR DPI and silently switch to packed dots.
+
+### Dot backend (`--ocl-dot`)
+
+Separate from issue shape. `build_kernel_` builds an ordered candidate list and takes the first that compiles.
+
+| Mode | Flag | Candidates |
+|------|------|------------|
+| **auto** (default) | `--ocl-dot auto` | AMD: sudot4 → sdot4 → KHR (if advertised) → scalar; others: KHR (if advertised) → scalar |
+| **sudot** | `--ocl-dot sudot` | sudot4 → scalar |
+| **sdot4** | `--ocl-dot sdot4` | sdot4 → scalar |
+| **khr** | `--ocl-dot khr` | KHR (if advertised) → scalar |
+| **force-khr** | `--ocl-dot force-khr` | forced KHR → scalar |
+| **asm** | `--ocl-dot asm` | experimental `v_dot4c` → scalar |
+| **off** | `--ocl-dot off` | scalar only |
+
+Asm is opt-in only; it is not part of `auto`.
 
 ### cpm type (`--ocl-cpm-type`)
 
@@ -81,4 +97,4 @@ cvec += avec * bscalar    // mad(float4, float, float4)
 
 Wait for `[ocl] attempt timing: … GMAC/s`. Look for `clblast cpm float` in the backend line and `private=… B/WI` from the kernel mem print.
 
-Broadcast+float issue may improve performance since some GPUs are weak in int but strong in float. For example, on UHD 630, broadcast+float yields 115GH/s, packed+int yields 100GH/s, and broadcast+int yields 90GH/s.
+Broadcast+float issue may improve performance on GPUs that are weak in int but strong in float. UHD 630 (no DPI) is fastest with broadcast+float (~115 GH/s vs ~100 GH/s packed scalar). AMD/NVIDIA with hardware DPI typically see a large gain from `dot_acc_sat` / packed issue.

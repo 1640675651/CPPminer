@@ -11,7 +11,7 @@ int8_t* h_Ap_global = NULL;
 int8_t* h_BpT_global = NULL;
 char wallet_global[256] = {0};
 char worker_global[64] = "rig01";
-char agent_global[64] = "cppminer/0.3";
+char agent_global[64] = "cppminer/0.4";
 int g_dry_run = 0;
 int g_plain_verify = 0;
 int g_mock = 0;
@@ -22,6 +22,7 @@ uint32_t g_cert_version = 3;
 int g_cert_version_forced = 0;
 int g_cpu_matrix_gen = 0;
 int g_max_nonce = 0;
+int g_qpow_threads = 0;
 
 uint32_t cp_resolve_cert_version(uint32_t notify_cert_version)
 {

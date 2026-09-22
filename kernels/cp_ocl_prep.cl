@@ -13,14 +13,21 @@
 #define R_RANK 128
 #endif
 
+#ifndef MACRO_M
+#define MACRO_M 128
+#endif
+#ifndef MACRO_N
+#define MACRO_N 128
+#endif
+
 #define CP_RANGE_MASK 63
 #define CP_ZERO_PT 16
 #define CP_B3_LINES 8
 #define K_GROUPS (KR / 4)
 #define KG_BYTES_A (MR * 4)
 #define KG_SLICE_B (NR * 4)
-#define MICRO_M (128 / MR)
-#define MICRO_N (128 / NR)
+#define MICRO_M (MACRO_M / MR)
+#define MICRO_N (MACRO_N / NR)
 #define MACRO_KG_STRIP_A (MICRO_M * KG_BYTES_A)
 #define MACRO_KG_STRIP_B (MICRO_N * KG_SLICE_B)
 #define MACRO_KB_BLOCK_A (K_GROUPS * MACRO_KG_STRIP_A)
@@ -170,6 +177,115 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
                 }
             }
         }
+    }
+}
+
+/* Pearl noisy matrix in native row layout: A is M×K (row*K+k), B^T is N×K (col*K+k). */
+__kernel void ocl_noisy_matrix_rowmajor(__global char *out, __global const uchar *noise_seed,
+                                        __global const uint *pairs, int rows, int K, int rank,
+                                        int is_b, int has_signal,
+                                        __global const char *signal, int out_lda) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows) {
+        return;
+    }
+    if (out_lda < K) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(row, rank, noise_seed, is_b, el);
+    __global char *dst = out + (size_t)row * (size_t)out_lda;
+    for (int l = 0; l < K; ++l) {
+        const int pos = (int)(char)el[pairs[(size_t)l * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
+        int sig = 0;
+        if (has_signal) {
+            sig = (int)signal[(size_t)row * (size_t)K + (size_t)l];
+        }
+        dst[l] = (char)(sig + (pos - neg));
+    }
+    for (int l = K; l < out_lda; ++l) {
+        dst[l] = 0;
+    }
+}
+
+/* A column-major (gemmstone layout N): row-parallel like rowmajor; write out[k*lda+row]. */
+__kernel void ocl_noisy_matrix_a_colmajor(__global char *out, __global const uchar *noise_seed,
+                                         __global const uint *pairs, int rows, int K, int rank,
+                                         __global const char *signal, int out_lda) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows || out_lda < rows) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(row, rank, noise_seed, 0, el);
+    for (int k = 0; k < K; ++k) {
+        const int pos = (int)(char)el[pairs[(size_t)k * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)k * 2 + 1]];
+        const int sig = (int)signal[(size_t)row * (size_t)K + (size_t)k];
+        out[(size_t)k * (size_t)out_lda + (size_t)row] = (char)(sig + (pos - neg));
+    }
+}
+
+/* Zero column-major column tails when lda > valid_rows (one work item per column). */
+__kernel void ocl_pad_colmajor_col_tails(__global char *out, int cols, int valid_rows, int lda) {
+    const int col = (int)get_global_id(0);
+    if (col >= cols || lda <= valid_rows) {
+        return;
+    }
+    __global char *dst = out + (size_t)col * (size_t)lda;
+    for (int p = valid_rows; p < lda; ++p) {
+        dst[p] = 0;
+    }
+}
+
+/* gemmstone column-major B (zero signal): column j at out + j*ldb. */
+__kernel void ocl_noisy_matrix_colmajor(__global char *out, __global const uchar *noise_seed,
+                                        __global const uint *pairs, int cols, int K, int rank,
+                                        int is_b, int ldb) {
+    const int col = (int)get_global_id(0);
+    if (col >= cols || ldb < K) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(col, rank, noise_seed, is_b, el);
+    __global char *dst = out + (size_t)col * (size_t)ldb;
+    for (int k = 0; k < K; ++k) {
+        const int pos = (int)(char)el[pairs[(size_t)k * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)k * 2 + 1]];
+        dst[k] = (char)(pos - neg);
+    }
+    for (int k = K; k < ldb; ++k) {
+        dst[k] = 0;
+    }
+}
+
+/* gemmstone row-major B (K×N, zero signal): column-parallel; write out[k*ldb+n]. */
+__kernel void ocl_noisy_matrix_b_rowmajor(__global char *out, __global const uchar *noise_seed,
+                                          __global const uint *pairs, int K, int N, int rank,
+                                          int ldb) {
+    const int n = (int)get_global_id(0);
+    if (n >= N || ldb < N) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(n, rank, noise_seed, 1, el);
+    for (int k = 0; k < K; ++k) {
+        const int pos = (int)(char)el[pairs[(size_t)k * 2]];
+        const int neg = (int)(char)el[pairs[(size_t)k * 2 + 1]];
+        out[(size_t)k * (size_t)ldb + (size_t)n] = (char)(pos - neg);
+    }
+}
+
+/* Zero row-major matrix row tails when ldb > valid_cols (one work item per row). */
+__kernel void ocl_pad_rowmajor_row_tails(__global char *out, int rows, int valid_cols, int ldb) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows || ldb <= valid_cols) {
+        return;
+    }
+    __global char *dst = out + (size_t)row * (size_t)ldb;
+    for (int p = valid_cols; p < ldb; ++p) {
+        dst[p] = 0;
     }
 }
 

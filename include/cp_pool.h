@@ -23,6 +23,9 @@ void cp_pool_reader_start(void);
 void cp_pool_reader_stop(void);
 void cp_pool_inbox_clear(void);
 
+/* Blocking read of one JSON object (reader must be stopped). 1=ok, 0=timeout, -1=lost */
+int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms);
+
 /* 1 = line copied, 0 = timeout, -1 = connection lost */
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms);
 int cp_pool_conn_lost(void);

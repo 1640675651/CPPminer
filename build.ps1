@@ -5,15 +5,15 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -CudaArch 61
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl -CudaArch 75
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OneDnn
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Wgpu
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl,OneDnn -CudaArch 75
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
 #
-# Requires: MSVC, CMake, and (for proofs) cargo. OpenCL headers/CUTLASS are
+# Requires: MSVC, CMake, and (for proofs / wgpu) cargo. OpenCL headers/CUTLASS are
 # fetched as needed. The script snapshots and restores your shell environment.
 
 param(
-    [ValidateSet("Cpu", "Cuda", "OpenCl")]
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = "",
@@ -27,15 +27,33 @@ $BuildDir = Join-Path $Root "build\win"
 $B3Dir = Join-Path $BuildDir "b3"
 $OutExe = Join-Path $Root "cppminer.exe"
 
-$BackendList = @($Backend | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Unique)
+$BackendList = @(
+    $Backend |
+        ForEach-Object { "$_".Split(',') } |
+        ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
 if ($BackendList.Count -eq 0) {
     $BackendList = @("Cpu")
+}
+foreach ($i in 0..($BackendList.Count - 1)) {
+    switch -Regex ($BackendList[$i]) {
+        '^(?i)onednn$' { $BackendList[$i] = 'OneDnn' }
+        '^(?i)opencl$' { $BackendList[$i] = 'OpenCl' }
+        '^(?i)cuda$'   { $BackendList[$i] = 'Cuda' }
+        '^(?i)cpu$'    { $BackendList[$i] = 'Cpu' }
+        '^(?i)wgpu$'   { $BackendList[$i] = 'Wgpu' }
+        default { throw "Unknown backend '$($BackendList[$i])' (valid: Cpu,Cuda,OpenCl,OneDnn,Wgpu)" }
+    }
 }
 $EnableCpu = $BackendList -contains "Cpu"
 $EnableCuda = $BackendList -contains "Cuda"
 $EnableOpenCl = $BackendList -contains "OpenCl"
-if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl)) {
-    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl"
+$EnableOneDnn = $BackendList -contains "OneDnn"
+$EnableWgpu = $BackendList -contains "Wgpu"
+if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $EnableWgpu)) {
+    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn,Wgpu"
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
@@ -201,6 +219,37 @@ function Find-OpenClLib {
     throw "Vendored OpenCL.lib missing at $vendored (see third_party/opencl/README.md)"
 }
 
+function Ensure-QuantusMiner {
+    $qmRoot = Join-Path $Root "third_party\quantus-miner"
+    $engineGpu = Join-Path $qmRoot "crates\engine-gpu\Cargo.toml"
+    $engineGpuLib = Join-Path $qmRoot "crates\engine-gpu\src\lib.rs"
+    $devicePatch = Join-Path $Root "src\qpow\wgpu\quantus-miner-v4.2.0-device-select.patch"
+    if (-not (Test-Path $engineGpu)) {
+        Write-Host "=== Fetching Quantus-Network/quantus-miner (v4.2.0) ==="
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "git required to fetch quantus-miner into third_party/quantus-miner"
+        }
+        if (Test-Path $qmRoot) { Remove-Item $qmRoot -Recurse -Force }
+        $tp = Join-Path $Root "third_party"
+        New-Item -ItemType Directory -Force -Path $tp | Out-Null
+        Invoke-External -Command {
+            git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 `
+                https://github.com/Quantus-Network/quantus-miner.git $qmRoot
+        } -FailureMessage "quantus-miner clone failed"
+    }
+    if (-not (Test-Path $engineGpu)) {
+        throw "quantus-miner missing at $engineGpu"
+    }
+    if ((Test-Path $devicePatch) -and (Test-Path $engineGpuLib) -and
+        -not (Select-String -Path $engineGpuLib -Pattern "fn list_mining_adapters" -Quiet)) {
+        Write-Host "=== Applying quantus-miner device-select patch ==="
+        Invoke-External -Command {
+            git -C $qmRoot apply --whitespace=nowarn $devicePatch
+        } -FailureMessage "quantus-miner device-select patch failed"
+    }
+    return $qmRoot
+}
+
 function Ensure-CargoOnPath {
     $cmd = Get-Command cargo -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) {
@@ -232,16 +281,57 @@ function Ensure-CargoOnPath {
 }
 
 function Copy-OpenClKernels {
-    $kernelSrcDir = Join-Path $Root "src\opencl\kernels"
     $kernelDstDir = Join-Path $Root "kernels"
     New-Item -ItemType Directory -Force -Path $kernelDstDir | Out-Null
-    foreach ($name in @(
-        "case33_gemm_xor.cl",
-        "cp_ocl_blake3.cl",
-        "cp_ocl_merkle.cl",
-        "cp_ocl_prep.cl"
-    )) {
-        Copy-Item (Join-Path $kernelSrcDir $name) (Join-Path $kernelDstDir $name) -Force
+    $pairs = @(
+        @{ Src = (Join-Path $Root "src\opencl\kernels"); Names = @(
+            "case33_gemm_xor.cl",
+            "cp_ocl_blake3.cl",
+            "cp_ocl_merkle.cl",
+            "cp_ocl_prep.cl",
+            "cp_onednn_jackpot.cl"
+        )},
+        @{ Src = (Join-Path $Root "src\qpow\opencl\kernels"); Names = @(
+            "qpow_mining.cl"
+        )}
+    )
+    foreach ($group in $pairs) {
+        foreach ($name in $group.Names) {
+            $src = Join-Path $group.Src $name
+            if (Test-Path $src) {
+                Copy-Item $src (Join-Path $kernelDstDir $name) -Force
+            }
+        }
+    }
+}
+
+function Ensure-OneDnnDeps {
+    $onednnDir = Join-Path $Root "src\onednn"
+    $prep = Join-Path $onednnDir "prepare_onednn_deps.bat"
+    if (-not (Test-Path $prep)) { throw "Missing $prep" }
+    $problemHpp = Join-Path $onednnDir "third_party\gemmstone\include\gemmstone\problem.hpp"
+    $kernelDb = Join-Path $Root "third_party\onednn-src\src\gpu\intel\gemm\jit\selector\db\kernel.db"
+    $needsPrep = -not (Test-Path $kernelDb)
+    if (-not $needsPrep -and (Test-Path $problemHpp)) {
+        $needsPrep = -not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)
+    }
+    if (-not $needsPrep) {
+        Write-Host "=== OneDNN/gemmstone deps OK; re-applying case5_patches ==="
+    } else {
+        Write-Host "=== Fetching oneDNN/gemmstone deps for Intel GPU backend ==="
+    }
+    Push-Location $onednnDir
+    try {
+        cmd /c "prepare_onednn_deps.bat"
+        if ($LASTEXITCODE -ne 0) { throw "prepare_onednn_deps.bat failed" }
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path $kernelDb)) {
+        throw "OneDNN deps missing after prepare_onednn_deps.bat ($kernelDb)"
+    }
+    if (-not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)) {
+        throw "Case5 patches missing in $problemHpp — run: cd src\onednn && prepare_onednn_deps.bat refresh"
     }
 }
 
@@ -309,11 +399,14 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl CUBLAS=$EnableCublas) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn WGPU=$EnableWgpu CUBLAS=$EnableCublas) ==="
 
-    if ($EnableOpenCl) {
+    if ($EnableOpenCl -or $EnableOneDnn) {
         $null = Ensure-OpenClHeaders
         $null = Find-OpenClLib
+    }
+    if ($EnableOneDnn) {
+        Ensure-OneDnnDeps
     }
     if ($EnableCuda) {
         $null = Ensure-Cutlass
@@ -321,6 +414,12 @@ try {
         Write-Host "=== CUDA: $CudaRoot ==="
         if (-not $CudaArch) { $CudaArch = Get-GpuArch }
         Write-Host "=== CUDA arch: $CudaArch ==="
+    }
+    if ($EnableWgpu) {
+        $null = Ensure-QuantusMiner
+        if (-not (Ensure-CargoOnPath)) {
+            throw "Wgpu backend requires cargo on PATH"
+        }
     }
 
     $CmakeBuild = Join-Path $BuildDir "cmake"
@@ -332,6 +431,8 @@ try {
         "-DCP_ENABLE_CPU=$(if ($EnableCpu) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUDA=$(if ($EnableCuda) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_WGPU=$(if ($EnableWgpu) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {
@@ -349,8 +450,28 @@ try {
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
     Copy-Item $built $OutExe -Force
-    if ($EnableOpenCl) {
+    if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
+    }
+    if ($EnableWgpu) {
+        $wgpuDll = @(
+            (Join-Path $CmakeBuild "Release\cp_wgpu_ffi.dll"),
+            (Join-Path $CmakeBuild "cp_wgpu_ffi.dll"),
+            (Join-Path $Root "rust\cp-wgpu-ffi\target\release\cp_wgpu_ffi.dll")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($wgpuDll) {
+            Copy-Item $wgpuDll (Join-Path $Root "cp_wgpu_ffi.dll") -Force
+            Write-Host "=== Copied cp_wgpu_ffi.dll ==="
+        }
+        $pearlWgpuDll = @(
+            (Join-Path $CmakeBuild "Release\cp_pearl_wgpu_ffi.dll"),
+            (Join-Path $CmakeBuild "cp_pearl_wgpu_ffi.dll"),
+            (Join-Path $Root "rust\cp-pearl-wgpu-ffi\target\release\cp_pearl_wgpu_ffi.dll")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($pearlWgpuDll) {
+            Copy-Item $pearlWgpuDll (Join-Path $Root "cp_pearl_wgpu_ffi.dll") -Force
+            Write-Host "=== Copied cp_pearl_wgpu_ffi.dll ==="
+        }
     }
 
     Write-Host "=== Done: $OutExe ==="

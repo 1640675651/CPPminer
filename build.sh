@@ -7,6 +7,7 @@
 #   ./build.sh --backend cpu
 #   ./build.sh --backend cuda --cuda-arch 61
 #   ./build.sh --backend cpu,opencl
+#   ./build.sh --backend cpu,wgpu
 #   ./build.sh --backend cpu,cuda,opencl --cuda-arch 75
 #   ./build.sh --backend cuda --enable-cublas
 #
@@ -52,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --backend CPU[,CUDA[,OpenCl]]  Backends to build (default: cpu)"
+            echo "  --backend CPU[,CUDA[,OpenCl[,OneDnn[,wgpu]]]]  Backends to build (default: cpu)"
             echo "  --cuda-arch ARCH               CUDA compute arch e.g. 75, 86 (default: auto)"
             echo "  --enable-cublas                Link cuBLAS (requires CUDA)"
             echo "  --help, -h                     Show this help"
@@ -68,13 +69,17 @@ done
 ENABLE_CPU=0
 ENABLE_CUDA=0
 ENABLE_OPENCL=0
+ENABLE_ONEDNN=0
+ENABLE_WGPU=0
 for b in "${BACKENDS[@]}"; do
     case "$b" in
         cpu)    ENABLE_CPU=1 ;;
         cuda)   ENABLE_CUDA=1 ;;
         opencl) ENABLE_OPENCL=1 ;;
+        onednn) ENABLE_ONEDNN=1 ;;
+        wgpu)   ENABLE_WGPU=1 ;;
         *)
-            echo "Unknown backend: $b (valid: cpu, cuda, opencl)" >&2
+            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn, wgpu)" >&2
             exit 1
             ;;
     esac
@@ -86,8 +91,8 @@ fi
 if (( ENABLE_CUBLAS && ENABLE_CUDA == 0 )); then
     echo "--enable-cublas requires --backend cuda" >&2; exit 1
 fi
-if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 )); then
-    echo "Enable at least one backend: --backend cpu,cuda,OpenCl" >&2; exit 1
+if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 && ENABLE_WGPU == 0 )); then
+    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn,wgpu" >&2; exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -129,6 +134,23 @@ ensure_blake3() {
     # Copy to build staging
     mkdir -p "${B3_DIR}"
     cp "${src_dir}"/* "${B3_DIR}/"
+}
+
+ensure_onednn_deps() {
+    local onednn_dir="${PROJECT_ROOT}/src/onednn"
+    local kernel_db="${PROJECT_ROOT}/third_party/onednn-src/src/gpu/intel/gemm/jit/selector/db/kernel.db"
+    if [[ -f "${kernel_db}" ]]; then
+        log "oneDNN/gemmstone deps already present"
+        return
+    fi
+    log "Fetching oneDNN/gemmstone deps for Intel GPU backend"
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+        (cd "${onednn_dir}" && cmd /c prepare_onednn_deps.bat) \
+            || fail "prepare_onednn_deps.bat failed"
+    else
+        fail "OneDNN backend on Unix: vendor deps via src/onednn/prepare_onednn_deps.bat (Wine) or set ONEDNN_SRC"
+    fi
+    [[ -f "${kernel_db}" ]] || fail "OneDNN deps missing after prepare script"
 }
 
 # ── Ensure-OpenCL-Headers ─────────────────────────────────────────────────────
@@ -232,6 +254,36 @@ detect_cuda_arch() {
     echo "75"  # conservative default
 }
 
+# ── Ensure-Quantus-Miner ──────────────────────────────────────────────────────
+ensure_quantus_miner() {
+    local qm_dir="${PROJECT_ROOT}/third_party/quantus-miner"
+    local engine_gpu="${qm_dir}/crates/engine-gpu/Cargo.toml"
+    local engine_gpu_lib="${qm_dir}/crates/engine-gpu/src/lib.rs"
+    local device_patch="${PROJECT_ROOT}/src/qpow/wgpu/quantus-miner-v4.2.0-device-select.patch"
+    if [[ -f "${engine_gpu}" ]]; then
+        log "quantus-miner already present at ${qm_dir}"
+    else
+        log "Fetching Quantus-Network/quantus-miner (v4.2.0)"
+        if ! command -v git &>/dev/null; then
+            fail "git required to fetch quantus-miner"
+        fi
+
+        rm -rf "${qm_dir}"
+        mkdir -p "${PROJECT_ROOT}/third_party"
+        git -c advice.detachedHead=false clone --depth 1 --branch v4.2.0 \
+            https://github.com/Quantus-Network/quantus-miner.git "${qm_dir}" \
+            || fail "quantus-miner clone failed"
+
+        [[ -f "${engine_gpu}" ]] || fail "quantus-miner missing after clone"
+    fi
+    if [[ -f "${device_patch}" && -f "${engine_gpu_lib}" ]] &&
+       ! grep -q "fn list_mining_adapters" "${engine_gpu_lib}"; then
+        log "Applying quantus-miner device-select patch"
+        git -C "${qm_dir}" apply --whitespace=nowarn "${device_patch}" \
+            || fail "quantus-miner device-select patch failed"
+    fi
+}
+
 # ── Find cmake ────────────────────────────────────────────────────────────────
 find_cmake() {
     if command -v cmake &>/dev/null; then
@@ -242,9 +294,16 @@ find_cmake() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} CUBLAS=${ENABLE_CUBLAS}"
+log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} WGPU=${ENABLE_WGPU} CUBLAS=${ENABLE_CUBLAS}"
 
 ensure_blake3
+
+if (( ENABLE_WGPU )); then
+    ensure_quantus_miner
+    if ! command -v cargo &>/dev/null; then
+        fail "Wgpu backend requires cargo on PATH"
+    fi
+fi
 
 if (( ENABLE_CUDA )); then
     CUDA_ROOT=$(find_cuda_root) || fail "CUDA Toolkit not found (needed for --backend cuda). Set --cuda-arch or install CUDA."
@@ -254,8 +313,12 @@ if (( ENABLE_CUDA )); then
     ensure_cutlass
 fi
 
-if (( ENABLE_OPENCL )); then
+if (( ENABLE_OPENCL || ENABLE_ONEDNN )); then
     ensure_opencl_headers
+fi
+
+if (( ENABLE_ONEDNN )); then
+    ensure_onednn_deps
 fi
 
 # ── CMake build (if cmake available) ─────────────────────────────────────────
@@ -277,6 +340,8 @@ if [[ -n "$CMAKE_EXE" ]]; then
         -DCP_ENABLE_CPU=$(( ENABLE_CPU ? 1 : 0 ))
         -DCP_ENABLE_CUDA=$(( ENABLE_CUDA ? 1 : 0 ))
         -DCP_ENABLE_OPENCL=$(( ENABLE_OPENCL ? 1 : 0 ))
+        -DCP_ENABLE_ONEDNN=$(( ENABLE_ONEDNN ? 1 : 0 ))
+        -DCP_ENABLE_WGPU=$(( ENABLE_WGPU ? 1 : 0 ))
         -DCP_ENABLE_CUBLAS=$(( ENABLE_CUBLAS ? 1 : 0 ))
     )
 

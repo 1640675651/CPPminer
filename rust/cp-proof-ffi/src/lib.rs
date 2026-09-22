@@ -21,6 +21,8 @@ const SCATTERED_COLS: [usize; 16] = [
 const CUTLASS_ROWS: [usize; 8] = [0, 1, 2, 3, 16, 17, 18, 19];
 const CUTLASS_COLS: [usize; 8] = [0, 1, 2, 3, 32, 33, 34, 35];
 
+const CONTIGUOUS_16x16_ROWS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileLayout {
     Scattered = 0,
@@ -28,6 +30,7 @@ enum TileLayout {
     Cutlass = 2,
     Contiguous8x8 = 3,
     Contiguous4x8 = 4,
+    Contiguous16x16 = 5,
 }
 
 impl TileLayout {
@@ -38,7 +41,8 @@ impl TileLayout {
             2 => Ok(Self::Cutlass),
             3 => Ok(Self::Contiguous8x8),
             4 => Ok(Self::Contiguous4x8),
-            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, 3, or 4)")),
+            5 => Ok(Self::Contiguous16x16),
+            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, 3, 4, or 5)")),
         }
     }
 }
@@ -88,6 +92,10 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
         TileLayout::Contiguous4x8 => (
             &[0, 1, 2, 3],
             &[0, 1, 2, 3, 4, 5, 6, 7],
+        ),
+        TileLayout::Contiguous16x16 => (
+            &CONTIGUOUS_16x16_ROWS,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         ),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
     }

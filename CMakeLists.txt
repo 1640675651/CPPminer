@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.18)
 option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
 option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
+option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
+option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -19,8 +21,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU")
 endif()
 
 set(_cp_langs CXX C)
@@ -41,10 +43,14 @@ set(CP_COMMON_SOURCES
     src/common/cp_job_ctrl.cpp
     src/common/cp_mine.cpp
     src/common/cp_fee.cpp
+    src/common/cp_algo.cpp
+    src/common/cp_qpow_pool.cpp
+    src/common/cp_qpow_mine.cpp
     src/common/cp_share_queue.cpp
     src/common/cp_state.cpp
     src/common/cp_worker.cpp
     src/common/cp_noise.c
+    src/qpow/cpu/miner.cpp
 )
 
 set(CP_INCLUDE_DIRS
@@ -53,7 +59,23 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/cpu
     ${CMAKE_SOURCE_DIR}/src/cuda
     ${CMAKE_SOURCE_DIR}/src/opencl
+    ${CMAKE_SOURCE_DIR}/src/onednn
+    ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
+    ${CMAKE_SOURCE_DIR}/src/qpow/opencl
+    ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
+
+# Quantus Poseidon2 AVX2 TU (separate compile unit for /arch:AVX2).
+add_library(cp_qpow_avx2 OBJECT src/qpow/cpu/simd_avx2.cpp)
+target_include_directories(cp_qpow_avx2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/qpow/include
+    ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(cp_qpow_avx2 PRIVATE /O2 /arch:AVX2)
+else()
+    target_compile_options(cp_qpow_avx2 PRIVATE -O3 -mavx2)
+endif()
 
 # BLAKE3
 set(B3_DIR ${CMAKE_SOURCE_DIR}/third_party/blake3)
@@ -187,7 +209,7 @@ else()
     add_compile_definitions(CP_ENABLE_CUDA=0 CP_ENABLE_CUBLAS=0)
 endif()
 
-if(CP_ENABLE_OPENCL)
+if(CP_ENABLE_OPENCL OR CP_ENABLE_ONEDNN)
     # Prefer vendored Khronos headers + Windows x64 import lib (no vendor SDK).
     set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
     set(_OCL_LIB_WIN "${CMAKE_SOURCE_DIR}/third_party/opencl/lib/x64/OpenCL.lib")
@@ -250,22 +272,120 @@ if(CP_ENABLE_OPENCL)
         find_package(OpenCL REQUIRED)
     endif()
     unset(_cp_termux_ocl)
-    list(APPEND CP_SOURCES
-        src/opencl/cp_opencl_worker.cpp
-        src/opencl/case33_gemm_ocl.cpp
-        src/opencl/case33_ocl_prep.cpp
-        src/opencl/cp_ocl_align_test.cpp
-        src/opencl/cp_ocl_prep_profile.cpp
-        src/opencl/case32_prepack.cpp
-        src/opencl/case32_layout.cpp
-        src/opencl/opencl_context.cpp
-    )
-    add_compile_definitions(CP_ENABLE_OPENCL=1)
+    if(CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES
+            src/opencl/cp_opencl_worker.cpp
+            src/opencl/case33_gemm_ocl.cpp
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/cp_ocl_align_test.cpp
+            src/opencl/cp_ocl_prep_profile.cpp
+            src/opencl/case32_prepack.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp
+            src/qpow/opencl/cp_qpow_opencl_worker.cpp
+        )
+        add_compile_definitions(CP_ENABLE_OPENCL=1)
+    else()
+        add_compile_definitions(CP_ENABLE_OPENCL=0)
+    endif()
+    set(_CP_NEEDS_OPENCL_LINK TRUE)
 else()
     add_compile_definitions(CP_ENABLE_OPENCL=0)
 endif()
 
-add_executable(cppminer ${CP_SOURCES})
+if(CP_ENABLE_ONEDNN)
+    set(_ONEDNN_DIR "${CMAKE_SOURCE_DIR}/src/onednn")
+    set(_GEMMSTONE_ROOT "${_ONEDNN_DIR}/third_party/gemmstone")
+    set(_ONEDNN_SRC "${CMAKE_SOURCE_DIR}/third_party/onednn-src")
+    set(_ONEDNN_GEMM_JIT "${_ONEDNN_SRC}/src/gpu/intel/gemm/jit")
+    set(_ONEDNN_KERNEL_DB "${_ONEDNN_GEMM_JIT}/selector/db/kernel.db")
+    set(_ONEDNN_PREP_BAT "${_ONEDNN_DIR}/prepare_onednn_deps.bat")
+    set(_ONEDNN_PROBLEM_HPP "${_GEMMSTONE_ROOT}/include/gemmstone/problem.hpp")
+    if(WIN32 AND EXISTS "${_ONEDNN_PREP_BAT}")
+        if(NOT EXISTS "${_ONEDNN_KERNEL_DB}" OR NOT EXISTS "${_GEMMSTONE_ROOT}/include/gemmstone/generator.hpp")
+            message(STATUS "CP_ENABLE_ONEDNN: running prepare_onednn_deps.bat (fetch + patch gemmstone)")
+        else()
+            message(STATUS "CP_ENABLE_ONEDNN: re-applying case5_patches to vendored gemmstone")
+        endif()
+        execute_process(
+            COMMAND cmd /c "${_ONEDNN_PREP_BAT}"
+            WORKING_DIRECTORY "${_ONEDNN_DIR}"
+            RESULT_VARIABLE _ONEDNN_PREP_RC)
+        if(NOT _ONEDNN_PREP_RC EQUAL 0)
+            message(FATAL_ERROR "prepare_onednn_deps.bat failed (exit ${_ONEDNN_PREP_RC})")
+        endif()
+    endif()
+    if(NOT EXISTS "${_ONEDNN_KERNEL_DB}")
+        message(FATAL_ERROR
+            "CP_ENABLE_ONEDNN requires oneDNN sources at third_party/onednn-src "
+            "(missing ${_ONEDNN_KERNEL_DB}). Run src/onednn/prepare_onednn_deps.bat")
+    endif()
+    if(NOT EXISTS "${_ONEDNN_PROBLEM_HPP}")
+        message(FATAL_ERROR
+            "CP_ENABLE_ONEDNN requires vendored gemmstone at ${_GEMMSTONE_ROOT}. "
+            "Run src/onednn/prepare_onednn_deps.bat")
+    endif()
+    file(READ "${_ONEDNN_PROBLEM_HPP}" _ONEDNN_PROBLEM_HPP_CONTENT)
+    if(NOT _ONEDNN_PROBLEM_HPP_CONTENT MATCHES "case5TileXor")
+        message(FATAL_ERROR
+            "Case5 gemmstone patches not applied (case5TileXor missing in problem.hpp). "
+            "From repo root run: src/onednn/prepare_onednn_deps.bat refresh")
+    endif()
+    file(GLOB _GEMMSTONE_PIECE_SOURCES CONFIGURE_DEPENDS
+        "${_GEMMSTONE_ROOT}/generator/pieces/*.cpp")
+    set(_ONEDNN_GEMMSTONE_SOURCES
+        src/onednn/case5_generator.cpp
+        src/onednn/case5_catalog.cpp
+        src/onednn/case5_kernel_select.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_selector.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_evaluator.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy_parser.cpp
+        ${_GEMMSTONE_PIECE_SOURCES}
+        src/onednn/third_party/ngen/ngen_register_allocator.cpp)
+    list(APPEND CP_SOURCES
+        src/onednn/cp_onednn_worker.cpp
+        src/onednn/case33_gemm_onednn.cpp
+        src/onednn/case5_gemm_launch.cpp
+        src/onednn/case5_ngen_gemm.cpp
+        ${_ONEDNN_GEMMSTONE_SOURCES})
+    if(NOT CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp)
+    endif()
+    list(APPEND CP_INCLUDE_DIRS
+        ${_ONEDNN_DIR}
+        ${_GEMMSTONE_ROOT}
+        ${_GEMMSTONE_ROOT}/include
+        ${_GEMMSTONE_ROOT}/generator
+        ${_ONEDNN_GEMM_JIT}
+        ${_ONEDNN_DIR}/third_party/ngen)
+    add_compile_definitions(CP_ENABLE_ONEDNN=1
+        NGEN_SAFE
+        NGEN_SHORT_NAMES
+        NGEN_LINK_OPENCL
+        NGEN_NO_OP_NAMES
+        NGEN_NAMESPACE=ngen
+        NGEN_CONFIG
+        GEMMSTONE_CONFIG
+        GEMMSTONE_BUILD_12LP
+        _CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_definitions(CP_ENABLE_ONEDNN=0)
+endif()
+
+if(CP_ENABLE_WGPU)
+    list(APPEND CP_SOURCES
+        src/qpow/wgpu/cp_wgpu_worker.cpp
+        src/pearl/wgpu/cp_pearl_wgpu_worker.cpp)
+    add_compile_definitions(CP_ENABLE_WGPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_WGPU=0)
+endif()
+
+add_executable(cppminer ${CP_SOURCES} $<TARGET_OBJECTS:cp_qpow_avx2>)
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)
@@ -291,7 +411,27 @@ if(CP_ENABLE_OPENCL)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
             "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/qpow/opencl/kernels/qpow_mining.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/qpow_mining.cl"
         COMMENT "Copy OpenCL kernels next to cppminer")
+elseif(CP_ENABLE_ONEDNN)
+    target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_blake3.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_merkle.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_onednn_jackpot.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_onednn_jackpot.cl"
+        COMMENT "Copy OpenCL prep kernels next to cppminer")
 endif()
 
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
@@ -393,11 +533,210 @@ if(_cp_link_proof_ffi)
     endif()
 endif()
 
+# Quantus wgpu GpuEngine FFI (cdylib preferred: bundles wgpu/DX12/Vulkan deps).
+if(CP_ENABLE_WGPU)
+    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-wgpu-ffi)
+    set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
+    set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/third_party/quantus-miner/crates/engine-gpu/Cargo.toml)
+    if(WIN32)
+        set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.lib)
+    else()
+        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.so)
+        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dylib)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.a)
+    endif()
+
+    set(_cp_link_wgpu_ffi FALSE)
+    set(_cp_wgpu_use_stub FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_WGPU_FFI_MANIFEST} AND EXISTS ${_cp_engine_gpu})
+        file(GLOB _cp_wgpu_rs CONFIGURE_DEPENDS ${CP_WGPU_FFI_DIR}/src/*.rs)
+        if(WIN32)
+            set(_cp_wgpu_build_out ${_cp_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_wgpu_build_out ${_cp_wgpu_dylib})
+        else()
+            set(_cp_wgpu_build_out ${_cp_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_WGPU_FFI_MANIFEST}
+                ${CP_WGPU_FFI_DIR}/Cargo.lock
+                ${_cp_wgpu_rs}
+                ${_cp_engine_gpu}
+            COMMENT "Building cp-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
+        add_dependencies(cppminer cp_wgpu_ffi_build)
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_wgpu_implib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_wgpu_dylib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_wgpu_so})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
+    else()
+        set(_cp_wgpu_use_stub TRUE)
+        if(NOT CARGO_EXECUTABLE)
+            message(WARNING "cargo not found; wgpu stub (init will fail)")
+        elseif(NOT EXISTS ${_cp_engine_gpu})
+            message(WARNING "third_party/quantus-miner missing; wgpu stub (run build.ps1/build.sh -Backend Wgpu)")
+        else()
+            message(WARNING "cp-wgpu-ffi unavailable; wgpu stub")
+        endif()
+        target_sources(cppminer PRIVATE src/qpow/wgpu/cp_wgpu_stub.cpp)
+    endif()
+
+    if(_cp_link_wgpu_ffi AND NOT _cp_wgpu_use_stub)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_wgpu_ffi.dll"
+                COMMENT "Copy cp_wgpu_ffi.dll next to cppminer")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+            endif()
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_dylib})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE
+                    pthread dl m
+                    "-framework Security"
+                    "-framework CoreFoundation"
+                    "-framework SystemConfiguration"
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            else()
+                target_link_libraries(cppminer PRIVATE
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_so})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "\$ORIGIN")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE pthread dl m)
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.so"
+                COMMENT "Copy libcp_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+
+    # Pearl wgpu FFI (separate crate from Quantus).
+    set(CP_PEARL_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-pearl-wgpu-ffi)
+    set(CP_PEARL_WGPU_FFI_MANIFEST ${CP_PEARL_WGPU_FFI_DIR}/Cargo.toml)
+    if(WIN32)
+        set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll.lib)
+        set(_cp_pearl_wgpu_dll ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll)
+    else()
+        set(_cp_pearl_wgpu_so ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.so)
+        set(_cp_pearl_wgpu_dylib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.dylib)
+    endif()
+    set(_cp_link_pearl_wgpu_ffi FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_PEARL_WGPU_FFI_MANIFEST})
+        file(GLOB _cp_pearl_wgpu_rs CONFIGURE_DEPENDS ${CP_PEARL_WGPU_FFI_DIR}/src/*.rs)
+        file(GLOB _cp_pearl_wgpu_shaders CONFIGURE_DEPENDS
+            ${CMAKE_SOURCE_DIR}/src/pearl/wgpu/kernels/*.wgsl)
+        if(WIN32)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_dylib})
+        else()
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_pearl_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_PEARL_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_PEARL_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_PEARL_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_PEARL_WGPU_FFI_MANIFEST}
+                ${_cp_pearl_wgpu_rs}
+                ${_cp_pearl_wgpu_shaders}
+            COMMENT "Building cp-pearl-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_pearl_wgpu_ffi_build DEPENDS ${_cp_pearl_wgpu_build_out})
+        add_dependencies(cppminer cp_pearl_wgpu_ffi_build)
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: cargo will build ${_cp_pearl_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_pearl_wgpu_implib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_pearl_wgpu_dylib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_pearl_wgpu_so})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_so}")
+    else()
+        message(WARNING "cp-pearl-wgpu-ffi unavailable; pearl --backend wgpu will fail at init")
+    endif()
+
+    if(_cp_link_pearl_wgpu_ffi)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_pearl_wgpu_ffi.dll"
+                COMMENT "Copy cp_pearl_wgpu_ffi.dll next to cppminer")
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_dylib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_so})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.so"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+endif()
+
 if(MSVC)
     target_compile_options(cppminer PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp>
         $<$<COMPILE_LANGUAGE:C>:/openmp>
     )
+    if(CP_ENABLE_ONEDNN)
+        set_source_files_properties(
+            src/onednn/case5_generator.cpp
+            src/onednn/case5_ngen_gemm.cpp
+            src/onednn/case5_kernel_select.cpp
+            PROPERTIES COMPILE_OPTIONS "/bigobj;/Zm200")
+        target_link_options(cppminer PRIVATE /STACK:8388608)
+    endif()
     # AVX2 / AVX-VNNI only in dedicated x86 ukernel translation units.
     if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
@@ -511,4 +850,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} CUBLAS=${CP_ENABLE_CUBLAS}")

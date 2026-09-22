@@ -29,13 +29,14 @@ struct Case33GemmOcl {
 
 
 
-    void set_dpi_mode(Case32OclDpiMode mode) { dpi_mode_ = mode; }
+    void set_dot_policy(Case32OclDotPolicy mode) { dot_policy_ = mode; }
+    Case32OclDotPolicy dot_policy() const { return dot_policy_; }
 
     void set_macro_batch(int batch);
 
     int macro_batch() const { return macro_batch_; }
 
-    /* 0 = auto (DPI then cpm; beignet-fix), 1 = broadcast/cpm, 2 = packed per-C dot4. */
+    /* 0 = auto (DPI on AMD/NVIDIA; broadcast cpm on Intel), 1 = broadcast/cpm, 2 = packed per-C dot4. */
     void set_issue_mode(int mode);
     /* Legacy: on → broadcast (1), off → auto (0). */
     void set_issue_broadcast(int on);
@@ -88,6 +89,9 @@ struct Case33GemmOcl {
 
     const char *dpi_status() const { return dpi_status_; }
 
+    bool integer_dot_product() const { return ocl_.has_integer_dot_product; }
+    bool integer_dot_product_hw() const { return ocl_.has_integer_dot_product_hw; }
+
     size_t max_work_group_size() const { return ocl_.max_work_group_size; }
 
 
@@ -138,7 +142,7 @@ private:
 
     int macro_batch_ = CP_MACRO_BATCH_DEFAULT;
 
-    Case32OclDpiMode dpi_mode_ = Case32OclDpiMode::Builtin;
+    Case32OclDotPolicy dot_policy_ = Case32OclDotPolicy::Auto;
 
     int issue_mode_ = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 
@@ -146,7 +150,7 @@ private:
 
     bool use_lds_ = false;
 
-
+    Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
     bool using_integer_dot_ = false;
 

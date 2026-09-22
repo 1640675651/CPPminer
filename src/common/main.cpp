@@ -2,16 +2,24 @@
  * CPminer — cross-platform LuckyPool plain_proof miner (CPU / CUDA / …).
  */
 #include "cp_config.h"
+#include "cp_algo.h"
 #include "cp_fee.h"
 #include "cp_mine.h"
 #include "cp_noise.h"
 #include "cp_pool.h"
 #include "cp_platform.h"
 #include "cp_proof.h"
+#include "cp_qpow_mine.h"
+#include "cp_qpow_pool.h"
 #include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
 #include "cp_worker.h"
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+#include "cp_qpow_opencl_worker.h"
+#endif
+
+#include "qpow/poseidon2.hpp"
 
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "gemm/case33_gemm_xor.hpp"
@@ -27,14 +35,26 @@
 #include "cp_opencl_prep_profile.h"
 #endif
 
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+#include "cp_onednn_worker.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void print_usage(void)
 {
-    printf("CPminer — LuckyPool plain_proof miner\n");
-    printf("  --pool URI         stratum+tcp://host:port\n");
+    printf("CPminer — multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("  --algo NAME        pearl (default) or quantus\n");
+    {
+        char pb[64], qb[64];
+        cp_algo_format_backends(CP_ALGO_PEARL, pb, (int)sizeof(pb));
+        cp_algo_format_backends(CP_ALGO_QUANTUS, qb, (int)sizeof(qb));
+        printf("                     pearl backends: %s\n", pb);
+        printf("                     quantus backends: %s\n", qb);
+    }
+    printf("  --pool URI         stratum+tcp://host:port (required for quantus)\n");
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
     printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
@@ -45,22 +65,41 @@ static void print_usage(void)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("|opencl");
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("|onednn");
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    printf("|wgpu");
+#endif
     printf(" (built: ");
     {
         int first = 1;
         if(cp_worker_has_cpu()){ printf("%scpu", first ? "" : ","); first = 0; }
         if(cp_worker_has_cuda()){ printf("%scuda", first ? "" : ","); first = 0; }
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
+        if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
+        if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
-    printf("  --devices N[,M]    device index(es): CUDA ids, or OpenCL flat index\n");
+    printf("  --devices N[,M]    device index(es): CUDA ids, OpenCL flat index,\n");
+    printf("                     or wgpu mining-adapter indices (--list-devices)\n");
     printf("                     (default: 0; OpenCL prefers discrete GPU first)\n");
     printf("  --list-devices     list devices for the selected backend and exit\n");
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("  --ocl-platform P   OpenCL/OneDNN: only enumerate platform index P\n");
+#else
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
-    printf("  --ocl-tile MxN     OpenCL register tile: 4x8 (default), 4x4, 8x8, or 8x16 (auto on AMD)\n");
+#endif
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    printf("  --ocl-tile MxN[/MmMm]  OpenCL register tile: 4x4, 4x8 (default), 8x8, 8x16 (auto on AMD);\n");
+    printf("                         optional /64x64 or /128x128 macro (same as --ocl-macro)\n");
+    printf("  --ocl-macro MxN    OpenCL macro block: 64x64 or 128x128 (default 128x128)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
+    printf("  --ocl-dot MODE     OpenCL dot backend: auto (default), sudot, sdot4, khr,\n");
+    printf("                     force-khr, asm, or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
 #endif
@@ -87,6 +126,12 @@ static void print_usage(void)
            ""
 #endif
            );
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("  --fused-jackpot       oneDNN in-reg fold + flush + GPU jackpot (found flag only)\n");
+    printf("  --no-fused-jackpot    oneDNN GEMM + separate device fold/BLAKE jackpot (default)\n");
+    printf("  --onednn-layout NAME  device A/B layout: TN (default), TT, NT, NN (C always N)\n");
+    printf("                       (CASE5_GEMM_LAYOUT env when flag unset)\n");
+#endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
@@ -111,6 +156,7 @@ static void print_usage(void)
     printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
     printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
+    printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -194,13 +240,165 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     return rc;
 }
 
+static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char* cur_job_key)
+{
+    if(!job || !job->job_id[0]) return CP_JOB_NONE;
+    if(!strcmp(job->job_key, cur_job_key)){
+        printf("[pool] duplicate quantus job ignored id=%s\n", job->job_id);
+        fflush(stdout);
+        return CP_JOB_NONE;
+    }
+    strncpy(cur_job_key, job->job_key, 319);
+    cur_job_key[319] = 0;
+
+    printf("[qpow] job id=%s mining_hash=%.16s... diff=%.0f\n", job->job_id,
+           job->job_key + (int)strlen(job->job_id) + 1, job->difficulty);
+    fflush(stdout);
+
+    int rc = cp_qpow_mine_job(job, cp_pool_socket(), msg_id, worker_global);
+    if(rc == CP_JOB_FEE_SWITCH){
+        printf("[fee] pausing quantus job for wallet switch\n");
+        fflush(stdout);
+        return rc;
+    }
+    if(rc == CP_JOB_CANCELLED){
+        printf("[qpow] job ended (new job or disconnect)\n");
+        fflush(stdout);
+    }
+
+    CpQpowJob pj;
+    while(rc == CP_JOB_CANCELLED && cp_qpow_pool_take_pending(&pj)){
+        strncpy(cur_job_key, pj.job_key, 319);
+        cur_job_key[319] = 0;
+        printf("[qpow] mining queued job=%s%s...\n", pj.job_id,
+               cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+        fflush(stdout);
+        rc = cp_qpow_mine_job(&pj, cp_pool_socket(), msg_id, worker_global);
+        if(rc == CP_JOB_FEE_SWITCH){
+            printf("[fee] pausing quantus job for wallet switch\n");
+            fflush(stdout);
+            return rc;
+        }
+        if(rc == CP_JOB_CANCELLED){
+            printf("[qpow] job ended (new job or disconnect)\n");
+            fflush(stdout);
+        }
+    }
+    return rc;
+}
+
+static int run_quantus_pool(const char* pool_host, int pool_port)
+{
+    char cur_job_key[160] = {0};
+    int msg_id = 1;
+
+    cp_qpow_pool_set_active(1);
+    printf("[mode] algo=quantus backend=%s\n", cp_worker_backend_name());
+    if(cp_fee_enabled())
+        printf("[mode] dev fee: 1%%\n");
+    fflush(stdout);
+
+reconnect:
+    cp_pool_reader_stop();
+    cp_pool_disconnect();
+    cp_pool_inbox_clear();
+    cp_qpow_pool_clear();
+    cur_job_key[0] = 0;
+
+    printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
+    while(1){
+        if(cp_pool_connect(pool_host, pool_port)) break;
+        printf("[main] Reconnecting in 5 sec...\n");
+        fflush(stdout);
+        cp_sleep(5);
+    }
+
+    if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), worker_global, agent_global))
+        goto reconnect;
+
+    char login_line[65536];
+    int got = cp_pool_recv_one(login_line, sizeof(login_line), 30000);
+    if(got <= 0){
+        printf("[net] login response missing, reconnecting...\n");
+        fflush(stdout);
+        goto reconnect;
+    }
+    printf("[pool-raw] %s\n", login_line);
+    fflush(stdout);
+
+    char session[80] = {0};
+    CpQpowJob first_job;
+    memset(&first_job, 0, sizeof(first_job));
+    if(!cp_qpow_pool_parse_login_result(login_line, session, (int)sizeof(session),
+                                        &first_job)){
+        printf("[net] login parse failed: %s\n", login_line);
+        fflush(stdout);
+        cp_sleep(3);
+        goto reconnect;
+    }
+    cp_qpow_pool_set_session_id(session);
+    cp_fee_on_authorized();
+    if(cp_fee_enabled()){
+        printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
+               cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
+               (unsigned long long)cp_fee_debt(),
+               (unsigned long long)cp_fee_threshold());
+        fflush(stdout);
+    }
+    printf("[net] session=%s first_job=%s\n", session, first_job.job_id);
+    fflush(stdout);
+
+    cp_pool_reader_start();
+
+    {
+        int rc = handle_qpow_job(&first_job, &msg_id, cur_job_key);
+        if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
+    }
+
+    while(1){
+        char line_buf[65536];
+        int wr = cp_pool_wait_line(line_buf, sizeof(line_buf), -1);
+        if(wr < 0){
+            printf("[net] Connection lost, reconnecting...\n");
+            fflush(stdout);
+            goto reconnect;
+        }
+        if(wr == 0) continue;
+
+        if(strstr(line_buf, "\"method\":\"job\"") ||
+           strstr(line_buf, "\"method\": \"job\"")){
+            CpQpowJob job;
+            if(!cp_qpow_pool_parse_job(line_buf, &job)){
+                printf("[pool] quantus job parse failed\n");
+                fflush(stdout);
+                continue;
+            }
+            int rc = handle_qpow_job(&job, &msg_id, cur_job_key);
+            if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
+            continue;
+        }
+
+        if(strstr(line_buf, "result") || strstr(line_buf, "error")){
+            printf("[pool] jsonrpc: %s\n", line_buf);
+            fflush(stdout);
+            continue;
+        }
+
+        printf("[pool] (unhandled) %s\n", line_buf);
+        fflush(stdout);
+    }
+}
+
 int main(int argc, char** argv)
 {
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
+    int pool_specified = 0;
     const char* wallet = NULL;
+    CpAlgoId algo_sel = CP_ALGO_PEARL;
     int devs[MAX_GPUS] = {0};
     int ndev = 0;
+    int devices_specified = 0;
     int align_test = 0;
     int align_test_prod = 0;
     int no_period_gemm = 0;
@@ -209,6 +407,8 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
+    int onednn_fused_jackpot = 0;
+    const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
     int simd_env_invalid = 0;
@@ -240,7 +440,10 @@ int main(int argc, char** argv)
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
     int ocl_tile_nr = 0;
+    int ocl_macro_m = 0;
+    int ocl_macro_n = 0;
     int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
+    int ocl_dot_policy = 0; /* Case32OclDotPolicy */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
@@ -261,7 +464,13 @@ int main(int argc, char** argv)
                     strncpy(hbuf, h, hlen); hbuf[hlen] = 0;
                     pool_host = hbuf;
                     pool_port = atoi(colon + 1);
+                    pool_specified = 1;
                 }
+            }
+        } else if(!strcmp(argv[i], "--algo") && i + 1 < argc){
+            if(cp_algo_parse(argv[++i], &algo_sel) != 0){
+                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", argv[i]);
+                return 1;
             }
         } else if(!strcmp(argv[i], "--wallet") && i + 1 < argc){
             wallet = argv[++i];
@@ -270,6 +479,8 @@ int main(int argc, char** argv)
             if(!strcmp(b, "cpu")) backend_sel = CP_BACKEND_CPU;
             else if(!strcmp(b, "cuda")) backend_sel = CP_BACKEND_CUDA;
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
+            else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
+            else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -280,6 +491,7 @@ int main(int argc, char** argv)
             strncpy(tmp, s, 255); tmp[255] = 0;
             char* tok = strtok(tmp, ",");
             while(tok && ndev < MAX_GPUS){ devs[ndev++] = atoi(tok); tok = strtok(NULL, ","); }
+            devices_specified = 1;
         } else if(!strcmp(argv[i], "--list-devices")){
             list_devices = 1;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -290,14 +502,52 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-tile requires MxN (e.g. 4x4, 4x8, 8x8, or 8x16)\n");
+                fprintf(stderr, "--ocl-tile requires MxN or MxN/MACROMxMACRON "
+                                "(e.g. 4x8, 4x8/64x64)\n");
                 return 1;
             }
-            if(sscanf(v, "%dx%d", &ocl_tile_mr, &ocl_tile_nr) != 2 ||
-               !((ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
+            int tile_macro_m = 0, tile_macro_n = 0;
+            const int nfields = sscanf(v, "%dx%d/%dx%d", &ocl_tile_mr, &ocl_tile_nr,
+                                       &tile_macro_m, &tile_macro_n);
+            if(nfields == 2){
+                /* tile only */
+            } else if(nfields == 4){
+                ocl_macro_m = tile_macro_m;
+                ocl_macro_n = tile_macro_n;
+            } else {
+                fprintf(stderr,
+                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
+                        "or MxN/64x64|128x128)\n",
+                        v);
+                return 1;
+            }
+            if(!((ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
                  (ocl_tile_mr == 8 && (ocl_tile_nr == 8 || ocl_tile_nr == 16)))){
                 fprintf(stderr,
                         "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
+                return 1;
+            }
+            if(nfields == 4 &&
+               !((ocl_macro_m == 64 && ocl_macro_n == 64) ||
+                 (ocl_macro_m == 128 && ocl_macro_n == 128))){
+                fprintf(stderr,
+                        "invalid --ocl-tile macro in %s (expected 64x64 or 128x128)\n",
+                        v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-macro", 11)){
+            const char* v = argv[i] + 11;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-macro requires MxN (64x64 or 128x128)\n");
+                return 1;
+            }
+            if(sscanf(v, "%dx%d", &ocl_macro_m, &ocl_macro_n) != 2 ||
+               !((ocl_macro_m == 64 && ocl_macro_n == 64) ||
+                 (ocl_macro_m == 128 && ocl_macro_n == 128))){
+                fprintf(stderr,
+                        "invalid --ocl-macro %s (expected 64x64 or 128x128)\n", v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-issue", 11)){
@@ -316,6 +566,34 @@ int main(int argc, char** argv)
                 ocl_issue_mode = 2;
             } else {
                 fprintf(stderr, "invalid --ocl-issue %s (expected auto, broadcast, or packed)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-dot", 9)){
+            const char* v = argv[i] + 9;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-dot requires auto, sudot, sdot4, khr, force-khr, asm, or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "auto")){
+                ocl_dot_policy = 0;
+            } else if(!strcmp(v, "force-khr") || !strcmp(v, "force")){
+                ocl_dot_policy = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "scalar") || !strcmp(v, "cpm")){
+                ocl_dot_policy = 2;
+            } else if(!strcmp(v, "sudot") || !strcmp(v, "sudot4")){
+                ocl_dot_policy = 3;
+            } else if(!strcmp(v, "sdot4") || !strcmp(v, "sdot") || !strcmp(v, "builtin")){
+                ocl_dot_policy = 4;
+            } else if(!strcmp(v, "asm") || !strcmp(v, "v_dot4c")){
+                ocl_dot_policy = 5;
+            } else if(!strcmp(v, "khr") || !strcmp(v, "dpi")){
+                ocl_dot_policy = 6;
+            } else {
+                fprintf(stderr,
+                        "invalid --ocl-dot %s (expected auto, sudot, sdot4, khr, force-khr, asm, or off)\n",
+                        v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-cpm-type", 14)){
@@ -384,6 +662,16 @@ int main(int argc, char** argv)
 #endif
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
+        } else if(!strcmp(argv[i], "--fused-jackpot")){
+            onednn_fused_jackpot = 1;
+        } else if(!strcmp(argv[i], "--no-fused-jackpot")){
+            onednn_fused_jackpot = 0;
+        } else if(!strcmp(argv[i], "--onednn-layout")){
+            if(i + 1 >= argc){
+                fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
+                return 1;
+            }
+            onednn_layout = argv[++i];
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
@@ -480,8 +768,103 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
+        } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
+            g_qpow_threads = atoi(argv[++i]);
+            if(g_qpow_threads < 0) g_qpow_threads = 0;
+        } else if(!strcmp(argv[i], "--qpow-selftest")){
+            const char* login =
+                "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"
+                "\"id\":\"d5adbda4-fd6c-4f33-8924-b3c1ae35dcbc\","
+                "\"job\":{\"algo\":\"qpow-poseidon2\",\"difficulty\":10000000000,"
+                "\"extranonce\":\"00131609\",\"job_id\":\"70655-10000000000\","
+                "\"mining_hash\":\"1925e1ae2f620d7162e637fae74fa790ca9526e878e01b52c43c1a762354c961\","
+                "\"seq\":70655,"
+                "\"target\":\"000000006df37f675ef6eadf5ab9a2072d44268d97df837e6748956e5c6c2117501e68855669e4b8356cf292464d9e16cc8d4655f8fb96f429b149fc87d74da4\"},"
+                "\"status\":\"OK\"}}";
+            const char* jobline =
+                "{\"jsonrpc\":\"2.0\",\"method\":\"job\",\"params\":{\"clean_jobs\":true,"
+                "\"job\":{\"algo\":\"qpow-poseidon2\",\"difficulty\":10000000000,"
+                "\"extranonce\":\"0012e986\",\"job_id\":\"70257-10000000000\","
+                "\"mining_hash\":\"93e8f5baa1b97f5945c69ec8736cda957f920aeae7e659af14679235a4ff7a51\","
+                "\"seq\":70257,"
+                "\"target\":\"000000006df37f675ef6eadf5ab9a2072d44268d97df837e6748956e5c6c2117501e68855669e4b8356cf292464d9e16cc8d4655f8fb96f429b149fc87d74da4\"}}}";
+            char session[80];
+            CpQpowJob j0, j1;
+            int fail = 0;
+            if(!cp_qpow_pool_parse_login_result(login, session, (int)sizeof(session), &j0)){
+                fprintf(stderr, "FAIL login parse\n");
+                fail++;
+            } else if(strcmp(session, "d5adbda4-fd6c-4f33-8924-b3c1ae35dcbc") != 0){
+                fprintf(stderr, "FAIL session id\n");
+                fail++;
+            } else if(j0.extranonce_len != 4 || j0.extranonce[0] != 0x00 ||
+                      j0.extranonce[1] != 0x13){
+                fprintf(stderr, "FAIL login extranonce\n");
+                fail++;
+            }
+            if(!cp_qpow_pool_parse_job(jobline, &j1)){
+                fprintf(stderr, "FAIL job parse\n");
+                fail++;
+            } else if(strcmp(j1.job_id, "70257-10000000000") != 0 || !j1.clean_jobs){
+                fprintf(stderr, "FAIL job fields\n");
+                fail++;
+            }
+            /* One Poseidon2 hash against known midstate/header path. */
+            {
+                uint8_t header[32], nonce[64], hash[64];
+                memset(nonce, 0, 64);
+                if(cp_hex_to_bytes(
+                       "0000000000000000000000000000000000000000000000000000000000000000",
+                       header, 32) != 32)
+                    fail++;
+                else {
+                    qpow::get_nonce_hash(header, nonce, hash);
+                    char hx[129];
+                    cp_bin_to_hex(hash, 64, hx);
+                    static const char* want =
+                        "8e64e3d8e0f38f882e8501f9e525df0a95d2e91e9cfc32c9248d756fb07780e2"
+                        "f8fdca2c5a54441e6fcd8d774a5f6aae72f36d1c76bc19f691a0d4f6c607e8cc";
+                    if(strcmp(hx, want) != 0){
+                        fprintf(stderr, "FAIL golden hash\n  got %s\n", hx);
+                        fail++;
+                    }
+                }
+            }
+            if(fail){
+                printf("%d qpow selftest failure(s)\n", fail);
+                return 1;
+            }
+            printf("qpow selftest passed\n");
+            return 0;
         }
     }
+
+    if(algo_sel == CP_ALGO_QUANTUS){
+        if(backend_sel == CP_BACKEND_NONE)
+            backend_sel = CP_BACKEND_CPU;
+        if(!cp_algo_supports(algo_sel, backend_sel)){
+            char qb[64];
+            cp_algo_format_backends(CP_ALGO_QUANTUS, qb, (int)sizeof(qb));
+            fprintf(stderr,
+                    "--algo quantus does not support this --backend "
+                    "(supported in this build: %s)\n", qb);
+            return 1;
+        }
+        if(!pool_specified && !g_mock && !list_devices){
+            fprintf(stderr, "--pool required for --algo quantus (no default host)\n");
+            return 1;
+        }
+    } else if(!list_devices && backend_sel != CP_BACKEND_NONE &&
+              !cp_algo_supports(algo_sel, backend_sel)){
+        char pb[64];
+        cp_algo_format_backends(algo_sel, pb, (int)sizeof(pb));
+        fprintf(stderr,
+                "--backend not available for --algo %s (supported: %s)\n",
+                cp_algo_name(algo_sel), pb);
+        return 1;
+    }
+
+    cp_worker_set_algo((int)algo_sel);
 
     if(list_devices){
         int n = 0;
@@ -500,16 +883,38 @@ int main(int argc, char** argv)
                 n += cp_worker_list_devices();
             }
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+            if(cp_worker_has_onednn()){
+                if(ocl_platform >= 0)
+                    cp_worker_set_onednn_platform(ocl_platform);
+                if(cp_worker_select(CP_BACKEND_ONEDNN) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+            if(cp_worker_has_wgpu()){
+                if(cp_worker_select(CP_BACKEND_WGPU) != 0) return 1;
+                n += cp_worker_list_devices();
+            }
+#endif
             if(n <= 0){
-                printf("[list-devices] no CUDA/OpenCL backends in this build\n");
+                printf("[list-devices] no CUDA/OpenCL/OneDNN/wgpu backends in this build\n");
                 return 1;
             }
             return 0;
         }
         if(cp_worker_select(backend_sel) != 0) return 1;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(ocl_platform >= 0)
+        cp_worker_set_ocl_platform(ocl_platform);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(ocl_platform >= 0)
+        cp_worker_set_onednn_platform(ocl_platform);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
         if(ocl_platform >= 0)
-            cp_worker_set_ocl_platform(ocl_platform);
+            cp_worker_set_onednn_platform(ocl_platform);
 #endif
         n = cp_worker_list_devices();
         return n > 0 ? 0 : 1;
@@ -522,8 +927,12 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_platform(ocl_platform);
     if(ocl_tile_mr > 0)
         cp_worker_set_ocl_tile(ocl_tile_mr, ocl_tile_nr);
+    if(ocl_macro_m > 0)
+        cp_worker_set_ocl_macro(ocl_macro_m, ocl_macro_n);
     if(ocl_issue_mode != 0)
         cp_worker_set_ocl_issue_mode(ocl_issue_mode);
+    if(ocl_dot_policy != 0)
+        cp_worker_set_ocl_dot_policy(ocl_dot_policy);
     if(ocl_cpm_int)
         cp_worker_set_ocl_cpm_int(1);
     if(ocl_lds)
@@ -679,7 +1088,44 @@ int main(int argc, char** argv)
     wallet_global[sizeof(wallet_global) - 1] = 0;
 
     /* Offline mock skips the pool; no fee reconnects. */
-    cp_fee_init(wallet_global, g_mock ? 0 : 1);
+    cp_fee_init(wallet_global, g_mock ? 0 : 1, algo_sel);
+
+    if(algo_sel == CP_ALGO_QUANTUS){
+        if(g_mock){
+            fprintf(stderr, "--mock is not supported with --algo quantus yet\n");
+            return 1;
+        }
+        printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
+        fflush(stdout);
+        if(cp_worker_backend_id() == CP_BACKEND_WGPU){
+            /* No --devices → auto (all mining adapters). Explicit → those indices. */
+            if(devices_specified)
+                cp_worker_init(devs, ndev);
+            else
+                cp_worker_init(NULL, 0);
+            if(!cp_worker_is_ready()){
+                fprintf(stderr, "wgpu backend init failed\n");
+                return 1;
+            }
+        }
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
+            if(!ndev){ devs[0] = 0; ndev = 1; }
+            if(cp_qpow_opencl_worker_init(devs, ndev) != 0){
+                fprintf(stderr, "quantus opencl backend init failed\n");
+                return 1;
+            }
+        }
+#endif
+        const int qrc = run_quantus_pool(pool_host, pool_port);
+        if(cp_worker_backend_id() == CP_BACKEND_WGPU)
+            cp_worker_shutdown();
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        else if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+            cp_qpow_opencl_worker_shutdown();
+#endif
+        return qrc;
+    }
 
     cp_worker_apply_backend_defaults();
     cp_worker_set_period_gemm(!no_period_gemm);
@@ -694,8 +1140,37 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU
+       && cp_worker_algo() == 0
+       && period_batch == CP_PERIOD_BATCH_DEFAULT){
+        period_batch = CP_MACRO_BATCH_DEFAULT;
+    }
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+        if(period_batch == CP_PERIOD_BATCH_DEFAULT){
+            period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+        }
+        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
+            row_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+        }
+    }
+#endif
     cp_worker_set_period_batch(period_batch);
     cp_worker_set_row_period_batch(row_period_batch);
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
+     * Period batch must be set before init (backend banner + scan loop read batch at init). */
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+        cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
+        if(onednn_layout){
+            cp_onednn_worker_set_gemm_layout(onednn_layout);
+        }
+        cp_onednn_worker_init(devs, ndev);
+        cp_worker_apply_backend_defaults();
+    }
+#endif
     cp_worker_set_step_major_ap(step_major_ap);
     cp_worker_set_cutlass_fused(cutlass_fused);
     pearl_set_cutlass_fused(cutlass_fused);
@@ -743,6 +1218,7 @@ int main(int argc, char** argv)
         int col_parts = cp_pp_num_col_parts(g_n_active, contiguous);
         const char *tile_layout_name =
             cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) ? "contiguous 16x16 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -772,6 +1248,35 @@ int main(int argc, char** argv)
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
                    period_batch, period_batch * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+        } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
+            printf("[mode] scan: wgpu fused GEMM + XOR + device jackpot (8x8)\n");
+            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
+                   period_batch, period_batch * 256);
+            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+        } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
+            /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
+            const double panel_tiles =
+                    (double)row_period_batch * (double)period_batch;
+            if(onednn_fused_jackpot){
+                printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
+                printf("[mode] period batch: row=%d col=%d\n", row_period_batch, period_batch);
+            } else {
+                const int tile_xor_words = K_DIM / R_RANK;
+                printf("[mode] scan: oneDNN Case 5 GEMM + device fold/BLAKE jackpot (batched enqueue)\n");
+                printf("[mode] period batch: row=%d col=%d (~%.1f MiB tile_xor/panel on GPU)\n",
+                       row_period_batch, period_batch,
+                       panel_tiles * (double)tile_xor_words * (double)sizeof(uint32_t)
+                               / (1024.0 * 1024.0));
+            }
+            {
+                const char *layout_msg = onednn_layout;
+                if(!layout_msg){
+                    const char *env_layout = getenv("CASE5_GEMM_LAYOUT");
+                    layout_msg = (env_layout && env_layout[0]) ? env_layout : "TN";
+                }
+                printf("[mode] host signal ~%.0f MiB; device layout %s on Intel GPU\n",
+                       host_mib, layout_msg);
+            }
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
@@ -835,6 +1340,10 @@ int main(int argc, char** argv)
     fflush(stdout);
 
     cp_worker_init(devs, ndev);
+    if(!cp_worker_is_ready()){
+        fprintf(stderr, "[%s] backend init failed; exiting\n", cp_worker_backend_name());
+        return 1;
+    }
     {
         const int contiguous = cp_worker_uses_contiguous_tiles();
         const uint64_t t_tiles =
