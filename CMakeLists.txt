@@ -84,7 +84,7 @@ endif()
 # BLAKE3
 set(B3_DIR ${CMAKE_SOURCE_DIR}/third_party/blake3)
 if(NOT EXISTS ${B3_DIR}/blake3.c)
-    message(FATAL_ERROR "Run build.ps1 once to fetch BLAKE3, or vendor third_party/blake3")
+    message(FATAL_ERROR "Run build.sh (any shell, including MSYS2) or build.ps1 (MSVC) once to fetch BLAKE3, or vendor third_party/blake3")
 endif()
 list(APPEND CP_INCLUDE_DIRS ${B3_DIR})
 

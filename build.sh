@@ -349,6 +349,27 @@ if [[ -n "$CMAKE_EXE" ]]; then
         cmake_args+=(-DCP_CUDA_ARCH="${CUDA_ARCH}")
     fi
 
+    # On Windows CMake defaults to an MSVC generator (Visual Studio / NMake).
+    # Under MSYS2 or Cygwin there is no MSVC on PATH, so configure dies with
+    # "Running 'nmake' '-?' failed" and then "CMAKE_CXX_COMPILER not set".
+    # Name a generator that exists here and the compilers to go with it, but
+    # only when gcc/g++ really are present: a shell that has MSVC instead
+    # should keep CMake's own defaults.
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] &&
+       command -v gcc >/dev/null 2>&1 &&
+       command -v g++ >/dev/null 2>&1; then
+        cp_generator="MinGW Makefiles"
+        if command -v ninja >/dev/null 2>&1; then
+            cp_generator="Ninja"
+        fi
+        cmake_args+=(
+            -G "${cp_generator}"
+            -DCMAKE_C_COMPILER=gcc
+            -DCMAKE_CXX_COMPILER=g++
+        )
+        log "MSYS2/MinGW detected: generator ${cp_generator}, gcc/g++"
+    fi
+
     log "CMake configure"
     cmake "${cmake_args[@]}" \
         || fail "CMake configure failed"
@@ -362,8 +383,13 @@ if [[ -n "$CMAKE_EXE" ]]; then
     if [[ -z "$exe" ]]; then
         fail "cppminer not found after build"
     fi
-    cp -f "$exe" "${PROJECT_ROOT}/cppminer"
-    log "Done: ${PROJECT_ROOT}/cppminer"
+    # Keep the extension on Windows, or the copy is not runnable.
+    cp_out_name="cppminer"
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+        cp_out_name="cppminer.exe"
+    fi
+    cp -f "$exe" "${PROJECT_ROOT}/${cp_out_name}"
+    log "Done: ${PROJECT_ROOT}/${cp_out_name}"
 else
     log "Skipping CMake build (cmake not available)"
 fi
