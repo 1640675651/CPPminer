@@ -257,6 +257,13 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 |--------|----------|
 | Radeon Pro 5500M DP4A | ~5.0 TH/s |
 
+### Intel GPU (OneDNN)
+
+| Device | Layout | Hashrate |
+|--------|--------|----------|
+| UHD 770 | TN | ~1.3 TH/s |
+| Xe-LPG 64EU (Core Ultra 9 275HX) | NT | ~3.0 TH/s |
+
 ### Other GPU (OpenCL)
 | Device | Tile size | Hashrate |
 |--------|-----------|----------|
