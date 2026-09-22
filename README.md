@@ -127,20 +127,23 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend onednn --fused-jackpot --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
-# Offline mock: first share + zk-pow verify (no pool; Pearl only)
+# Offline mock: first share + verify (no pool)
 .\cppminer.exe --backend onednn --mock
 .\cppminer.exe --backend cuda --mock
 .\cppminer.exe --backend opencl --mock
 .\cppminer.exe --backend cpu --mock
+.\cppminer.exe --algo quantus --backend cpu --mock
+.\cppminer.exe --algo quantus --backend opencl --devices 0 --mock
+.\cppminer.exe --algo quantus --backend wgpu --devices 0 --mock
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: not `wgpu`. `--pool` required for Quantus (no default host) |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: not `wgpu`. `--pool` required for Quantus unless `--mock` |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
-| `--pool` | `stratum+tcp://host:port` (required for `--algo quantus`) |
+| `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
@@ -157,8 +160,8 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
-| `--mock` / `-mock` | Offline: fixed job id, mine until first share, verify, exit (implies dry-run+verify) |
-| `--mock-diff D` | Mock pool difficulty (default 58; higher = longer before first share) |
+| `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
+| `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **58** (jackpot curve); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `separate` (default), `reuse`, or `fused` matrix prepack |
 | `--simd ISA` | CPU: `auto` (default), `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar` |

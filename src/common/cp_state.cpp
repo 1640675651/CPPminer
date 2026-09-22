@@ -15,9 +15,9 @@ char agent_global[64] = "cppminer/0.4";
 int g_dry_run = 0;
 int g_plain_verify = 0;
 int g_mock = 0;
-/* Mock scan difficulty (cp_target_from_difficulty). Higher = rarer shares / longer run.
- * ~58 is typically a few–tens of seconds on --dev before the first share. */
-double g_mock_diff = 58.0;
+/* Set only via --mock-diff; ignored unless g_mock_diff_forced. */
+double g_mock_diff = 0.0;
+int g_mock_diff_forced = 0;
 uint32_t g_cert_version = 3;
 int g_cert_version_forced = 0;
 int g_cpu_matrix_gen = 0;
@@ -31,4 +31,14 @@ uint32_t cp_resolve_cert_version(uint32_t notify_cert_version)
     if(notify_cert_version >= 1 && notify_cert_version <= 3)
         return notify_cert_version;
     return g_cert_version;
+}
+
+double cp_resolve_mock_diff(int algo_quantus)
+{
+    if(g_mock_diff_forced){
+        double d = g_mock_diff;
+        if(d < 1.0) d = 1.0;
+        return d;
+    }
+    return algo_quantus ? CP_MOCK_DIFF_QUANTUS_DEFAULT : CP_MOCK_DIFF_PEARL_DEFAULT;
 }

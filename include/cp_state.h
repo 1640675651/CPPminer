@@ -25,7 +25,10 @@ extern char agent_global[64];
 extern int g_dry_run;
 extern int g_plain_verify;
 extern int g_mock;
+/* CLI --mock-diff value; only used when g_mock_diff_forced != 0. */
 extern double g_mock_diff;
+/* Nonzero if --mock-diff was set (overrides algo-specific defaults). */
+extern int g_mock_diff_forced;
 /* Certificate version for noise-seed derivation (1/2=legacy, 3=salted). Default 3. */
 extern uint32_t g_cert_version;
 /* Nonzero if --cert-version was set (forces g_cert_version over notify). */
@@ -37,6 +40,8 @@ extern int g_qpow_threads;
 
 /* Resolve cert version: forced CLI, else notify (1..3), else g_cert_version. */
 uint32_t cp_resolve_cert_version(uint32_t notify_cert_version);
+/* Resolve mock difficulty: forced CLI, else Pearl/Quantus algo default. */
+double cp_resolve_mock_diff(int algo_quantus);
 
 #ifdef __cplusplus
 }

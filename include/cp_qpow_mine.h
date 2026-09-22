@@ -12,6 +12,10 @@ extern "C" {
 int cp_qpow_mine_job(const CpQpowJob* job, int sock, int* msg_id,
                      const char* worker_name);
 
+/* Offline --mock: fixed job, mine until first share, Poseidon2-verify, exit.
+ * Returns 0 on PASS, 1 on FAIL. Difficulty via cp_resolve_mock_diff (U512). */
+int cp_qpow_mine_mock(const char* worker_name);
+
 #ifdef __cplusplus
 }
 #endif

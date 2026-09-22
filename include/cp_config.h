@@ -54,4 +54,10 @@
 #define CP_JOB_FEE_SWITCH  1 /* reconnect + re-authorize for developer fee wallet */
 #define CP_JOB_CANCELLED (-1)
 
+/* Offline --mock defaults (different difficulty definitions per algo).
+ * Pearl: cp_target_from_difficulty jackpot curve (~few–tens of seconds on --dev).
+ * Quantus: Bitcoin-style U512::MAX / D (~1e6 hashes expected). */
+#define CP_MOCK_DIFF_PEARL_DEFAULT    58.0
+#define CP_MOCK_DIFF_QUANTUS_DEFAULT  1000000.0
+
 #endif /* CP_CONFIG_H */

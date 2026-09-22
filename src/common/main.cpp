@@ -54,7 +54,7 @@ static void print_usage(void)
         printf("                     pearl backends: %s\n", pb);
         printf("                     quantus backends: %s\n", qb);
     }
-    printf("  --pool URI         stratum+tcp://host:port (required for quantus)\n");
+    printf("  --pool URI         stratum+tcp://host:port (required for quantus unless --mock)\n");
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
     printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
@@ -149,8 +149,12 @@ static void print_usage(void)
     printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
     printf("                       default 3; without this flag, pool notify cert_version wins)\n");
     printf("  --mock / -mock       offline: fixed job, mine until first share, verify, exit\n");
-    printf("  --mock-diff D        mock difficulty (default %.0f; higher = longer before share)\n",
-           g_mock_diff);
+    printf("                       (pearl: zk-pow; quantus: Poseidon2 hash < target)\n");
+    printf("  --mock-diff D        mock difficulty (higher = longer before share).\n");
+    printf("                       default pearl=%.0f (jackpot curve) /\n",
+           CP_MOCK_DIFF_PEARL_DEFAULT);
+    printf("                       quantus=%.0f (U512::MAX / D)\n",
+           CP_MOCK_DIFF_QUANTUS_DEFAULT);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
     printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
@@ -744,6 +748,7 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--mock-diff") && i + 1 < argc){
             g_mock_diff = atof(argv[++i]);
             if(g_mock_diff < 1.0) g_mock_diff = 1.0;
+            g_mock_diff_forced = 1;
         } else if(!strcmp(argv[i], "--align-test")){
             align_test = 1;
         } else if(!strcmp(argv[i], "--align-test-prod")){
@@ -1091,10 +1096,6 @@ int main(int argc, char** argv)
     cp_fee_init(wallet_global, g_mock ? 0 : 1, algo_sel);
 
     if(algo_sel == CP_ALGO_QUANTUS){
-        if(g_mock){
-            fprintf(stderr, "--mock is not supported with --algo quantus yet\n");
-            return 1;
-        }
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
         fflush(stdout);
         if(cp_worker_backend_id() == CP_BACKEND_WGPU){
@@ -1117,7 +1118,12 @@ int main(int argc, char** argv)
             }
         }
 #endif
-        const int qrc = run_quantus_pool(pool_host, pool_port);
+        int qrc;
+        if(g_mock){
+            qrc = cp_qpow_mine_mock(worker_global);
+        } else {
+            qrc = run_quantus_pool(pool_host, pool_port);
+        }
         if(cp_worker_backend_id() == CP_BACKEND_WGPU)
             cp_worker_shutdown();
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -1367,14 +1373,15 @@ int main(int argc, char** argv)
         header[10] = 0x01; /* mock revision */
 
         /* Mock difficulty → pool target (same path as mining.set_difficulty). */
+        const double mock_diff = cp_resolve_mock_diff(0);
         uint32_t tgt[8];
-        cp_target_from_difficulty(g_mock_diff, tgt);
+        cp_target_from_difficulty(mock_diff, tgt);
         char target_hex[65];
         cp_le_words_to_be_target_hex(tgt, target_hex);
 
         printf("[mock] job_id=%s (offline, no pool)\n", k_mock_job_id);
         printf("[mock] difficulty=%.1f target=%.16s... cert_version=%u%s\n",
-               g_mock_diff, target_hex, (unsigned)g_cert_version,
+               mock_diff, target_hex, (unsigned)g_cert_version,
                g_cert_version_forced ? " (forced)" : "");
         printf("[mock] mining until first share + zk-pow verify...\n");
         fflush(stdout);
