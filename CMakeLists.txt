@@ -66,15 +66,19 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
 
-# Quantus Poseidon2 AVX2 TU (separate compile unit for /arch:AVX2).
-add_library(cp_qpow_avx2 OBJECT src/qpow/cpu/simd_avx2.cpp)
-target_include_directories(cp_qpow_avx2 PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/qpow/include
-    ${CMAKE_SOURCE_DIR}/include)
-if(MSVC)
-    target_compile_options(cp_qpow_avx2 PRIVATE /O2 /arch:AVX2)
-else()
-    target_compile_options(cp_qpow_avx2 PRIVATE -O3 -mavx2)
+# Quantus Poseidon2 AVX2 TU (x86 only; non-x86 uses scalar stubs in miner.cpp).
+set(CP_QPOW_AVX2_OBJECTS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    add_library(cp_qpow_avx2 OBJECT src/qpow/cpu/simd_avx2.cpp)
+    target_include_directories(cp_qpow_avx2 PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/qpow/include
+        ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(cp_qpow_avx2 PRIVATE /O2 /arch:AVX2)
+    else()
+        target_compile_options(cp_qpow_avx2 PRIVATE -O3 -mavx2)
+    endif()
+    list(APPEND CP_QPOW_AVX2_OBJECTS $<TARGET_OBJECTS:cp_qpow_avx2>)
 endif()
 
 # BLAKE3
@@ -385,7 +389,7 @@ else()
     add_compile_definitions(CP_ENABLE_WGPU=0)
 endif()
 
-add_executable(cppminer ${CP_SOURCES} $<TARGET_OBJECTS:cp_qpow_avx2>)
+add_executable(cppminer ${CP_SOURCES} ${CP_QPOW_AVX2_OBJECTS})
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)

@@ -1,5 +1,7 @@
 #include "qpow/miner.hpp"
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+
 #include <immintrin.h>
 
 #if defined(_MSC_VER)
@@ -326,3 +328,5 @@ int test_avx2_hash_parity() {
 }
 
 }  // namespace qpow
+
+#endif  // x86
