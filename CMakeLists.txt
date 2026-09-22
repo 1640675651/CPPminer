@@ -61,6 +61,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/opencl
     ${CMAKE_SOURCE_DIR}/src/onednn
     ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
     ${CMAKE_SOURCE_DIR}/src/qpow/opencl
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
@@ -376,7 +377,9 @@ else()
 endif()
 
 if(CP_ENABLE_WGPU)
-    list(APPEND CP_SOURCES src/qpow/wgpu/cp_wgpu_worker.cpp)
+    list(APPEND CP_SOURCES
+        src/qpow/wgpu/cp_wgpu_worker.cpp
+        src/pearl/wgpu/cp_pearl_wgpu_worker.cpp)
     add_compile_definitions(CP_ENABLE_WGPU=1)
 else()
     add_compile_definitions(CP_ENABLE_WGPU=0)
@@ -638,6 +641,82 @@ if(CP_ENABLE_WGPU)
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.so"
                 COMMENT "Copy libcp_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+
+    # Pearl wgpu FFI (separate crate from Quantus).
+    set(CP_PEARL_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-pearl-wgpu-ffi)
+    set(CP_PEARL_WGPU_FFI_MANIFEST ${CP_PEARL_WGPU_FFI_DIR}/Cargo.toml)
+    if(WIN32)
+        set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll.lib)
+        set(_cp_pearl_wgpu_dll ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll)
+    else()
+        set(_cp_pearl_wgpu_so ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.so)
+        set(_cp_pearl_wgpu_dylib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.dylib)
+    endif()
+    set(_cp_link_pearl_wgpu_ffi FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_PEARL_WGPU_FFI_MANIFEST})
+        file(GLOB _cp_pearl_wgpu_rs CONFIGURE_DEPENDS ${CP_PEARL_WGPU_FFI_DIR}/src/*.rs)
+        file(GLOB _cp_pearl_wgpu_shaders CONFIGURE_DEPENDS
+            ${CMAKE_SOURCE_DIR}/src/pearl/wgpu/kernels/*.wgsl)
+        if(WIN32)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_dylib})
+        else()
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_pearl_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_PEARL_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_PEARL_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_PEARL_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_PEARL_WGPU_FFI_MANIFEST}
+                ${_cp_pearl_wgpu_rs}
+                ${_cp_pearl_wgpu_shaders}
+            COMMENT "Building cp-pearl-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_pearl_wgpu_ffi_build DEPENDS ${_cp_pearl_wgpu_build_out})
+        add_dependencies(cppminer cp_pearl_wgpu_ffi_build)
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: cargo will build ${_cp_pearl_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_pearl_wgpu_implib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_pearl_wgpu_dylib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_pearl_wgpu_so})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_so}")
+    else()
+        message(WARNING "cp-pearl-wgpu-ffi unavailable; pearl --backend wgpu will fail at init")
+    endif()
+
+    if(_cp_link_pearl_wgpu_ffi)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_pearl_wgpu_ffi.dll"
+                COMMENT "Copy cp_pearl_wgpu_ffi.dll next to cppminer")
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_dylib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_so})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.so"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.so next to cppminer")
         endif()
     endif()
 endif()

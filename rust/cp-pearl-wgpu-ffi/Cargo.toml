@@ -1,0 +1,17 @@
+[package]
+name = "cp-pearl-wgpu-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI: Pearl wgpu fused GEMM+jackpot for CPPminer"
+publish = false
+
+[lib]
+name = "cp_pearl_wgpu_ffi"
+crate-type = ["staticlib", "rlib", "cdylib"]
+
+[dependencies]
+wgpu = "27.0.1"
+bytemuck = { version = "1.16", features = ["derive"] }
+parking_lot = "0.12"
+pollster = "0.4"
+blake3 = "1.5"

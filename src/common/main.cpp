@@ -828,11 +828,12 @@ int main(int argc, char** argv)
         char pb[64];
         cp_algo_format_backends(algo_sel, pb, (int)sizeof(pb));
         fprintf(stderr,
-                "--backend not available for --algo %s "
-                "(supported: %s; note: wgpu is quantus-only)\n",
+                "--backend not available for --algo %s (supported: %s)\n",
                 cp_algo_name(algo_sel), pb);
         return 1;
     }
+
+    cp_worker_set_algo((int)algo_sel);
 
     if(list_devices){
         int n = 0;
@@ -1106,6 +1107,13 @@ int main(int argc, char** argv)
         cp_worker_apply_backend_defaults();
     }
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU
+       && cp_worker_algo() == 0
+       && period_batch == CP_PERIOD_BATCH_DEFAULT){
+        period_batch = CP_MACRO_BATCH_DEFAULT;
+    }
+#endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
         if(period_batch == CP_PERIOD_BATCH_DEFAULT){
@@ -1206,6 +1214,11 @@ int main(int argc, char** argv)
             printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
                    period_batch, period_batch * tiles_per_macro);
+            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+        } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
+            printf("[mode] scan: wgpu fused GEMM + XOR + device jackpot (8x8)\n");
+            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
+                   period_batch, period_batch * 256);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */

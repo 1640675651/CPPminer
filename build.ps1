@@ -463,6 +463,15 @@ try {
             Copy-Item $wgpuDll (Join-Path $Root "cp_wgpu_ffi.dll") -Force
             Write-Host "=== Copied cp_wgpu_ffi.dll ==="
         }
+        $pearlWgpuDll = @(
+            (Join-Path $CmakeBuild "Release\cp_pearl_wgpu_ffi.dll"),
+            (Join-Path $CmakeBuild "cp_pearl_wgpu_ffi.dll"),
+            (Join-Path $Root "rust\cp-pearl-wgpu-ffi\target\release\cp_pearl_wgpu_ffi.dll")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($pearlWgpuDll) {
+            Copy-Item $pearlWgpuDll (Join-Path $Root "cp_pearl_wgpu_ffi.dll") -Force
+            Write-Host "=== Copied cp_pearl_wgpu_ffi.dll ==="
+        }
     }
 
     Write-Host "=== Done: $OutExe ==="

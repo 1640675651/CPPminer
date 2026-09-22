@@ -1,6 +1,7 @@
 #include "cp_worker.h"
 #include "cp_noise.h"
 #include "cp_proof.h"
+#include "cp_util.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -20,9 +21,22 @@
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
 #include "cp_wgpu_worker.h"
+#include "cp_pearl_wgpu_worker.h"
 #endif
 
 static CpBackendId g_backend = CP_BACKEND_NONE;
+/* 0 = pearl, 1 = quantus (matches CpAlgoId). */
+static int g_algo = 0;
+
+extern "C" void cp_worker_set_algo(int algo_id)
+{
+    g_algo = algo_id;
+}
+
+extern "C" int cp_worker_algo(void)
+{
+    return g_algo;
+}
 
 extern "C" int cp_worker_has_cpu(void)
 {
@@ -168,7 +182,10 @@ extern "C" void cp_worker_init(int* devices, int ndev)
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     case CP_BACKEND_WGPU:
-        cp_wgpu_worker_init(devices, ndev);
+        if(g_algo == 0)
+            cp_pearl_wgpu_worker_init(devices, ndev);
+        else
+            cp_wgpu_worker_init(devices, ndev);
         return;
 #endif
     default:
@@ -186,6 +203,8 @@ extern "C" int cp_worker_is_ready(void)
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     case CP_BACKEND_WGPU:
+        if(g_algo == 0)
+            return cp_pearl_wgpu_worker_is_ready();
         return cp_wgpu_worker_is_ready();
 #endif
     default:
@@ -295,6 +314,8 @@ extern "C" int cp_worker_list_devices(void)
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     case CP_BACKEND_WGPU:
+        if(g_algo == 0)
+            return cp_pearl_wgpu_worker_list_devices();
         return cp_wgpu_worker_list_devices();
 #endif
     case CP_BACKEND_CPU:
@@ -322,7 +343,12 @@ extern "C" void cp_worker_shutdown(void)
     case CP_BACKEND_ONEDNN: cp_onednn_worker_shutdown(); break;
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
-    case CP_BACKEND_WGPU: cp_wgpu_worker_shutdown(); break;
+    case CP_BACKEND_WGPU:
+        if(g_algo == 0)
+            cp_pearl_wgpu_worker_shutdown();
+        else
+            cp_wgpu_worker_shutdown();
+        break;
 #endif
     default: break;
     }
@@ -335,6 +361,13 @@ extern "C" void cp_worker_apply_backend_defaults(void)
         (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
          layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8 || layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16);
     pearl_set_contiguous_tiles(contiguous);
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0) {
+        /* Match fused 8x8 kernel: jackpot scale, MAC accounting, proof layout. */
+        cp_pp_set_hash_tile(8, 8);
+        pearl_set_contiguous_tile_shape(8, 8);
+    }
+#endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_contiguous_tiles(contiguous);
@@ -374,6 +407,10 @@ extern "C" void cp_worker_set_period_batch(int batch)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         cp_onednn_worker_set_col_period_batch(batch);
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        cp_pearl_wgpu_worker_set_macro_batch(batch);
 #endif
     (void)batch;
 }
@@ -487,6 +524,10 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         return cp_onednn_worker_handles_matrix_prep();
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        return cp_pearl_wgpu_worker_handles_matrix_prep();
+#endif
     return 0;
 }
 
@@ -508,6 +549,10 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         cp_onednn_worker_begin_job(job_key, m, n, cert_version);
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        cp_pearl_wgpu_worker_begin_job(job_key, m, n, cert_version);
 #endif
     (void)job_key;
     (void)m;
@@ -538,6 +583,10 @@ extern "C" int cp_worker_default_tile_layout(void)
             return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
         return CP_TILE_LAYOUT_CONTIGUOUS;
     }
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
 #endif
     return CP_TILE_LAYOUT_SCATTERED;
 }
@@ -583,6 +632,16 @@ extern "C" int cp_worker_mine_attempt(
             h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
             out_t_rows, out_t_cols, out_tiles_scanned);
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        if(g_algo == 0)
+            return cp_pearl_wgpu_worker_mine_attempt(
+                ab_seed, ab_seed_len, job_key, pool_tgt, m, n, cpu_matrices,
+                h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
+                out_t_rows, out_t_cols, out_tiles_scanned);
+        fprintf(stderr, "[worker] mine_attempt: quantus wgpu uses qpow path\n");
+        return -1;
+#endif
     default:
         fprintf(stderr, "[worker] mine_attempt: no backend\n");
         return -1;
@@ -609,6 +668,12 @@ extern "C" int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     case CP_BACKEND_ONEDNN:
         return cp_onednn_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    case CP_BACKEND_WGPU:
+        if(g_algo == 0)
+            return cp_pearl_wgpu_worker_fetch_share_signals(h_A_sig, h_Bt_sig);
+        return -1;
 #endif
     default:
         fprintf(stderr, "[worker] fetch_share_signals: no backend\n");

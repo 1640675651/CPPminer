@@ -29,6 +29,10 @@ CpBackendId cp_worker_backend_id(void);
 /* Select backend before init when several are compiled. Returns 0 on ok. */
 int cp_worker_select(CpBackendId id);
 
+/* Algo for backends shared by pearl/quantus (wgpu). Call before init/list. */
+void cp_worker_set_algo(int algo_id); /* CpAlgoId without including cp_algo.h */
+int cp_worker_algo(void);
+
 void cp_worker_init(int* devices, int ndev);
 int cp_worker_is_ready(void);
 void cp_worker_shutdown(void);
