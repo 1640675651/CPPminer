@@ -17,6 +17,7 @@
 - GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s) (DONE)
 - Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s) (DONE)
 - `--wgpu-tile 4x4|4x8|8x8|8x16[/64x64|/128x128]` and `--wgpu-macro`, same tiles/hash tiles as OpenCL; shader tile code generated at engine init (default stays 8x8/128) (DONE)
+- Bind a_pre / b_pre / a_sig in windows under `max_storage_buffer_binding_size` (512 MiB buffers vs 256 MiB on Mali); scan batches split only where a macro column exceeds the limit (DONE)
 
 ## v0.4
 - ARM CPU + NEON support.

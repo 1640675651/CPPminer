@@ -53,7 +53,13 @@ struct PearlScanParams {
     micro_m_count: i32,
     wg_x: i32,
     batch_count: i32,
+    // a_pre / b_pre are bound from macro row a_im_base / macro column b_jm_base
+    // (max_storage_buffer_binding_size can be below the full buffer, e.g. 256 MiB on Mali).
+    a_im_base: i32,
+    b_jm_base: i32,
     _pad2: i32,
+    _pad3: i32,
+    _pad4: i32,
 }
 
 @group(0) @binding(0) var<storage, read> a_pre: array<vec4<u32>>;
@@ -215,8 +221,8 @@ fn pearl_macro_gemm_xor(
         let b_off = u32(hash_tc * HASH_REG_TILES_N + half) * KG_VEC4_B;
         acc = Acc(); // naga hoists loop-local vars to function entry: re-zero explicitly
         for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
-            let a_kb = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A + a_off;
-            let b_kb = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B + b_off;
+            let a_kb = (u32(im - params.a_im_base) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A + a_off;
+            let b_kb = (u32(jm - params.b_jm_base) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B + b_off;
             for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
                 kgroup_global(&acc, a_kb + kg * STRIP_VEC4_A, b_kb + kg * STRIP_VEC4_B);
             }
@@ -265,8 +271,8 @@ fn pearl_macro_gemm_xor_lds(
         let b_off = u32(hash_tc * HASH_REG_TILES_N + half) * KG_VEC4_B;
         acc = Acc(); // naga hoists loop-local vars to function entry: re-zero explicitly
         for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
-            let a_src = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A;
-            let b_src = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B;
+            let a_src = (u32(im - params.a_im_base) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A;
+            let b_src = (u32(jm - params.b_jm_base) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B;
             for (var v = lid; v < KB_VEC4_A; v = v + WG_SIZE) {
                 lds_a[v] = a_pre[a_src + v];
             }

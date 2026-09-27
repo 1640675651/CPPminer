@@ -613,7 +613,8 @@ fn d_mt_compute_blake(
 fn d_b3_mat_padded_byte(mat_off: u32, raw_len: u32, pos: i32) -> u32 {
     let gi = mat_off + u32(pos);
     if (gi < raw_len) {
-        return i32_as_u8(load_s8_from_u32_word(chunk_mat[gi >> 2u], gi));
+        let base_word = u32(chunk_params.bid_begin) * u32(CP_MT_THREADS * D_B3_CHUNK / 4);
+        return i32_as_u8(load_s8_from_u32_word(chunk_mat[(gi >> 2u) - base_word], gi));
     }
     return 0u;
 }
@@ -693,6 +694,10 @@ struct PearlPrepackBParams {
     has_signal: i32,
     wg_x: i32,
     g_begin: i32,
+    jm_base: i32, // b_pre_out is bound from macro column jm_base
+    _pad0: i32,
+    _pad1: i32,
+    _pad2: i32,
 }
 
 struct PearlPrepackAParams {
@@ -703,14 +708,14 @@ struct PearlPrepackAParams {
     macro_rows: i32,
     wg_x: i32,
     g_begin: i32,
-    _pad1: i32,
+    im_base: i32, // a_pre_out / a_signal are bound from macro row im_base
 }
 
 struct PearlMerkleChunkParams {
     raw_len: u32,
     pad_len: u32,
     num_chunks: i32,
-    _pad: i32,
+    bid_begin: i32, // first block of this dispatch; chunk_mat is bound from its first byte
 }
 
 struct PearlMerkleMtParams {
@@ -767,7 +772,7 @@ fn pearl_gen_random_matrix(
         let byte = i32_as_u8(i32(s.y % 128u) - 64);
         packed = packed | (byte << u32(i * 8));
     }
-    gen_out[u32(word_idx)] = packed;
+    gen_out[u32(word_idx - gen_params.word_begin)] = packed; // bound from word_begin
 }
 
 // ---------------------------------------------------------------------------
@@ -849,7 +854,7 @@ fn pearl_fused_prepack_b(
     workgroupBarrier();
 
     if (col == 0) {
-        let block_base = (u32(jm) * u32(pre_b_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_B);
+        let block_base = (u32(jm - pre_b_params.jm_base) * u32(pre_b_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_B);
         for (var kg = 0; kg < K_GROUPS; kg = kg + 1) {
             let dst = block_base + u32(kg) * u32(MACRO_KG_STRIP_B) + u32(tc) * u32(KG_SLICE_B);
             for (var j = 0; j < NR; j = j + 1) {
@@ -902,7 +907,7 @@ fn pearl_fused_prepack_a(
 
     let kg = lid / MR;
     let r = lid % MR;
-    let sig_row = u32(row0 + r) * u32(pre_a_params.K);
+    let sig_row = u32(row0 + r - pre_a_params.im_base * MACRO_M) * u32(pre_a_params.K);
     for (var kb = 0; kb < pre_a_params.blocks_k; kb = kb + 1) {
         let l0 = u32(kb * KR + kg * 4);
         let sig_word = a_signal[(sig_row + l0) >> 2u];
@@ -914,7 +919,7 @@ fn pearl_fused_prepack_a(
             let sig = load_s8_from_u32_word(sig_word, ko);
             packed = packed | (i32_as_u8(sig + (pos - neg)) << (ko * 8u));
         }
-        let block_base = (u32(im) * u32(pre_a_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_A);
+        let block_base = (u32(im - pre_a_params.im_base) * u32(pre_a_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_A);
         let dst = block_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A) + u32(r) * 4u;
         a_pre_out[dst >> 2u] = packed;
     }
@@ -933,11 +938,10 @@ fn pearl_fused_prepack_a(
 fn pearl_keyed_chunk_roots(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_invocation_index: u32,
-    @builtin(num_workgroups) num_workgroups: vec3<u32>,
 ) {
     let tid = i32(local_invocation_index);
-    let bid = i32(workgroup_id.x);
-    let num_grid_blocks = i32(num_workgroups.x);
+    let bid = chunk_params.bid_begin + i32(workgroup_id.x);
+    let num_grid_blocks = (chunk_params.num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
     let is_last_block = (bid == num_grid_blocks - 1);
     let global_chunk = bid * CP_MT_THREADS + tid;
 
