@@ -73,6 +73,8 @@ extern "C" void cp_pearl_wgpu_worker_set_macro_batch(int batch) {
     g_macro_batch = batch;
 }
 
+extern "C" void cp_pearl_wgpu_worker_set_use_lds(int mode) { cp_pearl_wgpu_set_lds(mode); }
+
 extern "C" int cp_pearl_wgpu_worker_list_devices(void) {
     return cp_pearl_wgpu_list_devices();
 }

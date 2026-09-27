@@ -15,6 +15,15 @@ const NUM_MILESTONES: i32 = 32;
 const MACRO_KB_BLOCK: u64 = 16384; // bytes per macro x kb panel
 const HASH_TILES_PER_MACRO: u64 = (MICRO as u64) * (MICRO as u64); // 256
 const B3_CHUNK: u64 = 1024;
+/// Workgroup storage of pearl_macro_gemm_xor_lds: A + B macro k-block, 16 KiB each.
+const GEMM_LDS_BYTES: u32 = 32768;
+
+/// --wgpu-lds: -1 auto (discrete GPUs only), 0 off, 1 on. Read at engine creation.
+static LDS_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+pub fn set_lds_mode(mode: i32) {
+    LDS_MODE.store(mode.clamp(-1, 1), Ordering::Relaxed);
+}
 
 const PREP_WGSL_RAW: &str =
     include_str!("../../../src/pearl/wgpu/kernels/pearl_prep.wgsl");
@@ -464,7 +473,33 @@ impl PearlEngine {
             eprintln!("[pearl-wgpu] pipeline reduce_roots failed: {err}");
             return Err(format!("pipeline: {err}"));
         }
-        let (gemm_xor, e) = mk_pipe(&gemm_module, "pearl_macro_gemm_xor", "gemm_xor");
+        // --wgpu-lds: auto = on for discrete GPUs (GTX 1070 ~3.4 -> ~4.2 TMAC/s), off otherwise
+        // (UHD 770 ~455 -> ~380 GMAC/s).
+        let storage_limit = device.limits().max_compute_workgroup_storage_size;
+        let lds_fits = storage_limit >= GEMM_LDS_BYTES;
+        let lds_mode = LDS_MODE.load(Ordering::Relaxed);
+        let want_lds = match lds_mode {
+            0 => false,
+            1 => true,
+            _ => info.device_type == wgpu::DeviceType::DiscreteGpu,
+        };
+        if want_lds && !lds_fits {
+            eprintln!(
+                "[pearl-wgpu] LDS staging needs {GEMM_LDS_BYTES} B workgroup storage (device limit {storage_limit} B); using direct loads"
+            );
+        }
+        let use_lds = want_lds && lds_fits;
+        let gemm_entry = if use_lds { "pearl_macro_gemm_xor_lds" } else { "pearl_macro_gemm_xor" };
+        eprintln!(
+            "[pearl-wgpu] LDS staging: {} (--wgpu-lds {})",
+            if use_lds { "on" } else { "off" },
+            match lds_mode {
+                0 => "off",
+                1 => "on",
+                _ => "auto",
+            }
+        );
+        let (gemm_xor, e) = mk_pipe(&gemm_module, gemm_entry, "gemm_xor");
         if let Some(err) = e {
             eprintln!("[pearl-wgpu] pipeline gemm_xor failed: {err}");
             return Err(format!("pipeline: {err}"));

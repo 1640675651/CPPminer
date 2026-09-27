@@ -57,6 +57,8 @@ void cp_worker_set_ocl_dot_policy(int policy);
 void cp_worker_set_ocl_cpm_int(int on);
 /* OpenCL-only: stage A/B panels in local memory (0 = off default, 1 = on). */
 void cp_worker_set_ocl_lds(int on);
+/* wgpu-only (pearl): stage A/B panels in workgroup memory (-1 = auto default, 0 = off, 1 = on). */
+void cp_worker_set_wgpu_lds(int mode);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 

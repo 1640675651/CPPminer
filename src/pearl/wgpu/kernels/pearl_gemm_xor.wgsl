@@ -162,6 +162,64 @@ fn digest_beats_target(digest: ptr<function, array<u32, 8>>) -> bool {
     return true;
 }
 
+// 8x8 accumulator tile as 16 named vec4s (cJ_lo = A rows 0-3, cJ_hi = A rows 4-7, B col J).
+// Only XOR-folded, so element order is irrelevant. Named fields instead of array<i32, 64> keep
+// the tile in registers on compilers that don't fully unroll (Intel IGC spills the array).
+struct Acc {
+    c0_lo: vec4<i32>, c0_hi: vec4<i32>,
+    c1_lo: vec4<i32>, c1_hi: vec4<i32>,
+    c2_lo: vec4<i32>, c2_hi: vec4<i32>,
+    c3_lo: vec4<i32>, c3_hi: vec4<i32>,
+    c4_lo: vec4<i32>, c4_hi: vec4<i32>,
+    c5_lo: vec4<i32>, c5_hi: vec4<i32>,
+    c6_lo: vec4<i32>, c6_hi: vec4<i32>,
+    c7_lo: vec4<i32>, c7_hi: vec4<i32>,
+}
+
+// One k-group: a_lo/a_hi = MR packed A words, b_lo/b_hi = NR packed B words.
+fn acc_kgroup(acc: ptr<function, Acc>, a_lo: vec4<u32>, a_hi: vec4<u32>, b_lo: vec4<u32>, b_hi: vec4<u32>) {
+    (*acc).c0_lo += dot4x(a_lo, b_lo.x); (*acc).c0_hi += dot4x(a_hi, b_lo.x);
+    (*acc).c1_lo += dot4x(a_lo, b_lo.y); (*acc).c1_hi += dot4x(a_hi, b_lo.y);
+    (*acc).c2_lo += dot4x(a_lo, b_lo.z); (*acc).c2_hi += dot4x(a_hi, b_lo.z);
+    (*acc).c3_lo += dot4x(a_lo, b_lo.w); (*acc).c3_hi += dot4x(a_hi, b_lo.w);
+    (*acc).c4_lo += dot4x(a_lo, b_hi.x); (*acc).c4_hi += dot4x(a_hi, b_hi.x);
+    (*acc).c5_lo += dot4x(a_lo, b_hi.y); (*acc).c5_hi += dot4x(a_hi, b_hi.y);
+    (*acc).c6_lo += dot4x(a_lo, b_hi.z); (*acc).c6_hi += dot4x(a_hi, b_hi.z);
+    (*acc).c7_lo += dot4x(a_lo, b_hi.w); (*acc).c7_hi += dot4x(a_hi, b_hi.w);
+}
+
+// Milestone XOR fold of the tile into msg[16] (fuse_jackpot online path).
+fn milestone_fold(acc: ptr<function, Acc>, msg: ptr<function, array<u32, 16>>, ms: i32) {
+    let a = *acc;
+    let xv = bitcast<vec4<u32>>(
+        a.c0_lo ^ a.c0_hi ^ a.c1_lo ^ a.c1_hi ^ a.c2_lo ^ a.c2_hi ^ a.c3_lo ^ a.c3_hi
+        ^ a.c4_lo ^ a.c4_hi ^ a.c5_lo ^ a.c5_hi ^ a.c6_lo ^ a.c6_hi ^ a.c7_lo ^ a.c7_hi);
+    let x = xv.x ^ xv.y ^ xv.z ^ xv.w;
+    if (ms < PP_MAX_MILESTONES) {
+        let tid = ms % PP_JACKPOT_WORDS;
+        var contribution = x;
+        if (ms + PP_JACKPOT_WORDS < params.num_milestones) {
+            contribution = pp_rotl32(x, u32(PP_LROT));
+        }
+        (*msg)[tid] = (*msg)[tid] ^ contribution;
+    }
+}
+
+fn finish_tile(msg: ptr<function, array<u32, 16>>, im: i32, jm: i32, tr: i32, tc: i32) {
+    var digest: array<u32, 8>;
+    b3_compress64(msg, &digest);
+    if (!digest_beats_target(&digest)) {
+        return;
+    }
+    let exchanged = atomicCompareExchangeWeak(&found_flag, 0, 1);
+    if (exchanged.old_value != 0) {
+        return;
+    }
+    out_t_rows[0] = im * MACRO_M + tr * MR;
+    out_t_cols[0] = jm * MACRO_N + tc * HASH_NR;
+}
+
+// Direct global loads: each WI reads its own A/B slices per k-group.
 @compute @workgroup_size(256)
 fn pearl_macro_gemm_xor(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
@@ -180,36 +238,12 @@ fn pearl_macro_gemm_xor(
     let jm = mb / params.macro_rows;
     let im = mb % params.macro_rows;
 
-    // Column-major WI layout (!CASE32_WI_ROWMAJOR)
-    let tr_in_slice = lid % params.micro_m_count;
-    let hash_tc = lid / params.micro_m_count;
-    if (tr_in_slice >= params.micro_m_count) {
-        return;
-    }
-
-    let tr = params.micro_m_begin + tr_in_slice;
+    // Column-major WI layout (!CASE32_WI_ROWMAJOR); HASH_REG_TILES_N == 1
+    let tr = params.micro_m_begin + lid % MICRO_M;
+    let tc = lid / MICRO_M;
 
     var msg: array<u32, 16>;
-    for (var i = 0; i < PP_JACKPOT_WORDS; i = i + 1) {
-        msg[i] = 0u;
-    }
-
-    // HASH_REG_TILES_N == 1
-    let tc = hash_tc;
-
-    // 8x8 accumulator tile as 16 named vec4s (cJ_lo = A rows 0-3, cJ_hi = A rows 4-7, B col J).
-    // Only XOR-folded, so element order is irrelevant. Named locals instead of an array keep the
-    // tile in registers on compilers that don't fully unroll (Intel IGC spills array<i32, 64>).
-    var c0_lo = vec4<i32>(0); var c0_hi = vec4<i32>(0);
-    var c1_lo = vec4<i32>(0); var c1_hi = vec4<i32>(0);
-    var c2_lo = vec4<i32>(0); var c2_hi = vec4<i32>(0);
-    var c3_lo = vec4<i32>(0); var c3_hi = vec4<i32>(0);
-    var c4_lo = vec4<i32>(0); var c4_hi = vec4<i32>(0);
-    var c5_lo = vec4<i32>(0); var c5_hi = vec4<i32>(0);
-    var c6_lo = vec4<i32>(0); var c6_hi = vec4<i32>(0);
-    var c7_lo = vec4<i32>(0); var c7_hi = vec4<i32>(0);
-
-    var ms = 0;
+    var acc: Acc;
     for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
         let a_kb_base = u32(im) * u32(params.blocks_k) * u32(MACRO_KB_BLOCK_A)
             + u32(kb) * u32(MACRO_KB_BLOCK_A);
@@ -219,52 +253,72 @@ fn pearl_macro_gemm_xor(
         for (var kg = 0; kg < KGROUPS; kg = kg + 1) {
             let a_kg = a_kb_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A);
             let b_kg = b_kb_base + u32(kg) * u32(MACRO_KG_STRIP_B) + u32(tc) * u32(KG_SLICE_B);
-
             // a_kg / b_kg are 32-byte aligned: MR (NR) packed u32 words = two vec4 loads.
-            let a_lo = a_pre[a_kg / 16u];
-            let a_hi = a_pre[a_kg / 16u + 1u];
-            let b_lo = b_pre[b_kg / 16u];
-            let b_hi = b_pre[b_kg / 16u + 1u];
-
-            c0_lo += dot4x(a_lo, b_lo.x); c0_hi += dot4x(a_hi, b_lo.x);
-            c1_lo += dot4x(a_lo, b_lo.y); c1_hi += dot4x(a_hi, b_lo.y);
-            c2_lo += dot4x(a_lo, b_lo.z); c2_hi += dot4x(a_hi, b_lo.z);
-            c3_lo += dot4x(a_lo, b_lo.w); c3_hi += dot4x(a_hi, b_lo.w);
-            c4_lo += dot4x(a_lo, b_hi.x); c4_hi += dot4x(a_hi, b_hi.x);
-            c5_lo += dot4x(a_lo, b_hi.y); c5_hi += dot4x(a_hi, b_hi.y);
-            c6_lo += dot4x(a_lo, b_hi.z); c6_hi += dot4x(a_hi, b_hi.z);
-            c7_lo += dot4x(a_lo, b_hi.w); c7_hi += dot4x(a_hi, b_hi.w);
+            acc_kgroup(&acc, a_pre[a_kg / 16u], a_pre[a_kg / 16u + 1u],
+                       b_pre[b_kg / 16u], b_pre[b_kg / 16u + 1u]);
         }
-
-        // Milestone XOR fold into msg[16] (fuse_jackpot online path)
-        let xv = bitcast<vec4<u32>>(
-            c0_lo ^ c0_hi ^ c1_lo ^ c1_hi ^ c2_lo ^ c2_hi ^ c3_lo ^ c3_hi
-            ^ c4_lo ^ c4_hi ^ c5_lo ^ c5_hi ^ c6_lo ^ c6_hi ^ c7_lo ^ c7_hi);
-        let x = xv.x ^ xv.y ^ xv.z ^ xv.w;
-        if (ms < PP_MAX_MILESTONES) {
-            let tid = ms % PP_JACKPOT_WORDS;
-            var contribution = x;
-            if (ms + PP_JACKPOT_WORDS < params.num_milestones) {
-                contribution = pp_rotl32(x, u32(PP_LROT));
-            }
-            msg[tid] = msg[tid] ^ contribution;
-        }
-        ms = ms + 1;
+        milestone_fold(&acc, &msg, kb);
     }
-
-    var digest: array<u32, 8>;
-    b3_compress64(&msg, &digest);
-    if (!digest_beats_target(&digest)) {
-        return;
-    }
-
-    let exchanged = atomicCompareExchangeWeak(&found_flag, 0, 1);
-    if (exchanged.old_value != 0) {
-        return;
-    }
-
-    let t_rows = im * MACRO_M + tr * MR;
-    let t_cols = jm * MACRO_N + hash_tc * HASH_NR;
-    out_t_rows[0] = t_rows;
-    out_t_cols[0] = t_cols;
+    finish_tile(&msg, im, jm, tr, tc);
 }
+
+// LDS staging (--wgpu-lds, like the OpenCL CASE32_USE_LDS path): per k-block, all WIs copy the
+// whole macro A and B k-block (16 KiB each, contiguous in a_pre/b_pre) into workgroup memory,
+// barrier, compute all KGROUPS k-groups from it, barrier. Needs 32 KiB workgroup storage.
+// GTX 1070: ~4.2 TMAC/s vs ~3.4 direct (8/16 k-group panels and double buffering were slower);
+// UHD 770: ~380 GMAC/s vs ~455 direct.
+const KB_VEC4: u32 = 1024u;  // MACRO_KB_BLOCK_A / 16
+const STRIP_VEC4: u32 = 32u; // MACRO_KG_STRIP_A / 16
+
+var<workgroup> lds_a: array<vec4<u32>, KB_VEC4>;
+var<workgroup> lds_b: array<vec4<u32>, KB_VEC4>;
+
+@compute @workgroup_size(256)
+fn pearl_macro_gemm_xor_lds(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) local_invocation_index: u32,
+) {
+    let local_wg = i32(workgroup_id.y) * params.wg_x + i32(workgroup_id.x);
+    if (local_wg >= params.batch_count) {
+        return;
+    }
+    let lid = local_invocation_index;
+    if (lid == 0u) {
+        lds_a[0] = vec4<u32>(bitcast<u32>(atomicLoad(&found_flag)));
+    }
+    if (workgroupUniformLoad(&lds_a[0]).x != 0u) {
+        return;
+    }
+    workgroupBarrier(); // all WIs have read lds_a[0] before the first copy overwrites it
+
+    let mb = params.mb_begin + local_wg;
+    let jm = mb / params.macro_rows;
+    let im = mb % params.macro_rows;
+    let tr = params.micro_m_begin + i32(lid) % MICRO_M;
+    let tc = i32(lid) / MICRO_M;
+
+    let a_off = u32(tr) * u32(KG_BYTES_A / 16);
+    let b_off = u32(tc) * u32(KG_SLICE_B / 16);
+
+    var msg: array<u32, 16>;
+    var acc: Acc;
+    for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
+        let a_src = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4;
+        let b_src = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4;
+        for (var v = lid; v < KB_VEC4; v = v + 256u) {
+            lds_a[v] = a_pre[a_src + v];
+            lds_b[v] = b_pre[b_src + v];
+        }
+        workgroupBarrier();
+
+        for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
+            let sa = kg * STRIP_VEC4 + a_off;
+            let sb = kg * STRIP_VEC4 + b_off;
+            acc_kgroup(&acc, lds_a[sa], lds_a[sa + 1u], lds_b[sb], lds_b[sb + 1u]);
+        }
+        milestone_fold(&acc, &msg, kb);
+        workgroupBarrier();
+    }
+    finish_tile(&msg, im, jm, tr, tc);
+}
+

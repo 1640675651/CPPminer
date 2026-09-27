@@ -4,7 +4,7 @@ Cross-platform multi-algo miner written in C++. Select the algorithm at runtime 
 
 | Algo | Backends | PoW |
 |------|----------|-----|
-| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` | GEMM+XOR jackpot + `plain_proof` |
+| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` | GEMM+XOR jackpot + `plain_proof` |
 | `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
 Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
@@ -15,6 +15,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | CUDA | `src/cuda/` | Pearl: Pascal CUTLASS fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
+| Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
@@ -27,7 +28,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
-- **wgpu build:** Rust toolchain; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` (`engine-gpu`). Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Quantus only.
+- **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
 
 ## Build options (CMake)
 
@@ -46,7 +47,7 @@ cmake --build build --config Release
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
-| `CP_ENABLE_WGPU` | OFF | Quantus wgpu GpuEngine (Rust FFI; fetches `third_party/quantus-miner`) |
+| `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-wgpu-ffi`; fetches `third_party/quantus-miner`) |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
@@ -54,7 +55,7 @@ Enable multiple backends in one binary; select at runtime with `--backend`. Both
 
 | | cpu | cuda | opencl | onednn | wgpu |
 |--|-----|------|--------|--------|------|
-| pearl | ✓ | ✓ | ✓ | ✓ | ✗ |
+| pearl | ✓ | ✓ | ✓ | ✓ | ✓ |
 | quantus | ✓ | ✗ | ✓ | ✗ | ✓ |
 
 ## Build (Windows)
@@ -76,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
-Produces `cppminer.exe` in the repo root (plus `cp_wgpu_ffi.dll` when wgpu is enabled).
+Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_wgpu_ffi.dll` when wgpu is enabled).
 
 ## Build (*nix)
 ```bash
@@ -119,6 +120,10 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
 
+# Pearl wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU; LDS staging auto-on for discrete GPUs)
+.\cppminer.exe --backend wgpu --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
+  --wallet prl1... --worker worker_name --devices 0
+
 # OneDNN (Intel GPU gemmstone + GPU jackpot)
 .\cppminer.exe --backend onednn --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
   --wallet prl1... --worker worker_name
@@ -131,6 +136,7 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend onednn --mock
 .\cppminer.exe --backend cuda --mock
 .\cppminer.exe --backend opencl --mock
+.\cppminer.exe --backend wgpu --devices 0 --mock
 .\cppminer.exe --backend cpu --mock
 .\cppminer.exe --algo quantus --backend cpu --mock
 .\cppminer.exe --algo quantus --backend opencl --devices 0 --mock
@@ -141,7 +147,7 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: not `wgpu`. `--pool` required for Quantus unless `--mock` |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
@@ -181,6 +187,12 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
 
 `--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-macro` sets the WG macro block (work-group covers one macro); it is independent of the register tile. Examples: `--ocl-tile 4x8 --ocl-macro 64x64` or `--ocl-tile 4x8/64x64`. `--ocl-issue` / `--ocl-dot` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** picks the best available accelerated dot, then float **B-scalar broadcast** fallback.
+
+### wgpu options (Pearl)
+
+| Flag | Description |
+|------|-------------|
+| `--wgpu-lds on/off` | Stage A/B k-block panels in workgroup memory (needs 32 KiB; default `on` for discrete GPUs, `off` for integrated) |
 
 ### OneDNN options
 

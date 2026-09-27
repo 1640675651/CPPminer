@@ -13,6 +13,7 @@ int cp_pearl_wgpu_worker_is_ready(void);
 int cp_pearl_wgpu_worker_list_devices(void);
 int cp_pearl_wgpu_worker_handles_matrix_prep(void);
 void cp_pearl_wgpu_worker_set_macro_batch(int batch);
+void cp_pearl_wgpu_worker_set_use_lds(int mode); /* -1 auto, 0 off, 1 on */
 void cp_pearl_wgpu_worker_begin_job(const uint8_t job_key[32], int m, int n,
                                     uint32_t cert_version);
 

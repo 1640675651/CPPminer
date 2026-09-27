@@ -2,7 +2,7 @@
 
 mod engine;
 
-use engine::{pearl_a_noise_seed_from_hash, list_devices, PearlEngine, ScanOutcome};
+use engine::{pearl_a_noise_seed_from_hash, list_devices, set_lds_mode, PearlEngine, ScanOutcome};
 use parking_lot::Mutex;
 use std::os::raw::c_int;
 use std::slice;
@@ -17,6 +17,12 @@ fn engine_slot() -> &'static Mutex<Option<PearlEngine>> {
 #[no_mangle]
 pub unsafe extern "C" fn cp_pearl_wgpu_list_devices() -> c_int {
     list_devices()
+}
+
+/// LDS staging mode for the GEMM kernel: -1 auto, 0 off, 1 on. Call before cp_pearl_wgpu_init.
+#[no_mangle]
+pub extern "C" fn cp_pearl_wgpu_set_lds(mode: c_int) {
+    set_lds_mode(mode);
 }
 
 #[no_mangle]

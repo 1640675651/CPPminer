@@ -103,6 +103,10 @@ static void print_usage(void)
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    printf("  --wgpu-lds on|off  wgpu (pearl) stage A/B in workgroup memory\n");
+    printf("                     (default: on for discrete GPUs, off for integrated)\n");
+#endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (CUDA debug)\n");
@@ -453,6 +457,7 @@ int main(int argc, char** argv)
     int ocl_dot_policy = 0; /* Case32OclDotPolicy */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
+    int wgpu_lds = -1;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     if(simd_env_invalid)
@@ -633,6 +638,24 @@ int main(int argc, char** argv)
                 ocl_lds = 0;
             } else {
                 fprintf(stderr, "invalid --ocl-lds %s (expected on or off)\n", v);
+                return 1;
+            }
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+        } else if(!strncmp(argv[i], "--wgpu-lds", 10)){
+            const char* v = argv[i] + 10;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--wgpu-lds requires on or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
+                wgpu_lds = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
+                wgpu_lds = 0;
+            } else {
+                fprintf(stderr, "invalid --wgpu-lds %s (expected on or off)\n", v);
                 return 1;
             }
 #endif
@@ -952,6 +975,10 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_cpm_int(1);
     if(ocl_lds)
         cp_worker_set_ocl_lds(1);
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(wgpu_lds >= 0)
+        cp_worker_set_wgpu_lds(wgpu_lds);
 #endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){

@@ -296,6 +296,15 @@ extern "C" void cp_worker_set_ocl_lds(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_wgpu_lds(int mode)
+{
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    cp_pearl_wgpu_worker_set_use_lds(mode);
+#else
+    (void)mode;
+#endif
+}
+
 extern "C" void cp_worker_configure_ocl_tile(int device_index)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
