@@ -397,10 +397,19 @@ impl PearlEngine {
         }
 
         device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let gemm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pearl_gemm_xor"),
-            source: wgpu::ShaderSource::Wgsl(GEMM_WGSL.into()),
-        });
+        // Loop bounding blocks driver unrolling, spilling acc[]/a_pack/b_pack to local memory
+        // (~36x slower on GTX 1070). All loops in this shader have fixed or uniform trip counts.
+        let mut gemm_checks = wgpu::ShaderRuntimeChecks::checked();
+        gemm_checks.force_loop_bounding = false;
+        let gemm_module = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("pearl_gemm_xor"),
+                    source: wgpu::ShaderSource::Wgsl(GEMM_WGSL.into()),
+                },
+                gemm_checks,
+            )
+        };
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             eprintln!("[pearl-wgpu] gemm shader create failed: {err}");
             return Err(format!("gemm shader: {err}"));
@@ -612,10 +621,20 @@ impl PearlEngine {
     fn dispatch_chunked(
         &self,
         total: u32,
+        write_and_encode: impl FnMut(u32 /*g_begin*/, u32 /*wg_x*/, u32 /*wg_y*/, i32 /*wg_x_i*/) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.dispatch_chunked_cap(total, self.max_wg_submit, write_and_encode)
+    }
+
+    /// Like `dispatch_chunked`, with an explicit per-submit workgroup cap.
+    fn dispatch_chunked_cap(
+        &self,
+        total: u32,
+        cap: u32,
         mut write_and_encode: impl FnMut(u32 /*g_begin*/, u32 /*wg_x*/, u32 /*wg_y*/, i32 /*wg_x_i*/) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut g0 = 0u32;
-        let cap = self.max_wg_submit.max(1);
+        let cap = cap.max(1);
         while g0 < total {
             let chunk = (total - g0).min(cap);
             let (wg_x, wg_y, wg_x_i) = dispatch_2d(chunk);
@@ -1075,13 +1094,11 @@ impl PearlEngine {
 
         let (total_wg, blocks_k, macro_rows) = {
             let job = self.job.as_ref().unwrap();
-            (
-                (job.macro_rows * MICRO * job.blocks_k) as u32,
-                job.blocks_k,
-                job.macro_rows,
-            )
+            ((job.macro_rows * MICRO) as u32, job.blocks_k, job.macro_rows)
         };
-        self.dispatch_chunked(total_wg, |g_begin, wg_x, wg_y, wg_x_i| {
+        // Each WG covers all blocks_k k-blocks, so scale the TDR cap down accordingly.
+        let cap = self.max_wg_submit / (blocks_k.max(1) as u32);
+        self.dispatch_chunked_cap(total_wg, cap, |g_begin, wg_x, wg_y, wg_x_i| {
             let job = self.job.as_ref().unwrap();
             self.write_uniform(
                 &job.u_pre_a,

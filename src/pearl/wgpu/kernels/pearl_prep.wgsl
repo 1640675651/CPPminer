@@ -20,7 +20,7 @@
 //   @binding(3) pairs             : storage read array<u32>
 //   @binding(4) b_signal_colmajor : storage read array<i32>  // signed bytes (optional; has_signal)
 //
-// Entry: pearl_fused_prepack_a  @workgroup_size(8)  @group(0) bindings 10-14
+// Entry: pearl_fused_prepack_a  @workgroup_size(256)  @group(0) bindings 10-14
 //   @binding(0) params       : uniform PearlPrepackAParams
 //   @binding(1) a_pre_out    : storage rw   array<u32>
 //   @binding(2) a_noise_seed : storage read array<u32, 8>
@@ -425,14 +425,6 @@ fn store_u8_packed_b(byte_off: u32, val: u32) {
     let mask = ~(0xffu << shift);
     b_pre_out[wi] = (b_pre_out[wi] & mask) | ((val & 0xffu) << shift);
 }
-
-fn store_u8_packed_a(byte_off: u32, val: u32) {
-    let wi = byte_off / 4u;
-    let shift = (byte_off % 4u) * 8u;
-    let mask = ~(0xffu << shift);
-    a_pre_out[wi] = (a_pre_out[wi] & mask) | ((val & 0xffu) << shift);
-}
-
 // ---------------------------------------------------------------------------
 // Merkle helpers
 // ---------------------------------------------------------------------------
@@ -877,45 +869,52 @@ fn pearl_fused_prepack_b(
 @group(0) @binding(13) var<storage, read> a_pairs: array<u32>;
 @group(0) @binding(14) var<storage, read> a_signal: array<u32>;
 
-@compute @workgroup_size(8)
+// One WG per (im, tr) group of MR rows, covering all blocks_k k-blocks: each row's noise
+// (rank bytes, rank/32 digests) is hashed once into `stripe`, then each WI emits one packed
+// u32 (4 k-values of one row) per k-block. Requires rank % 32 == 0, rank <= 128, K % 4 == 0.
+@compute @workgroup_size(256)
 fn pearl_fused_prepack_a(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_invocation_index: u32,
 ) {
     let g = pre_a_params.g_begin + i32(workgroup_id.y) * pre_a_params.wg_x + i32(workgroup_id.x);
     let tr = g % MICRO_M;
-    let kb = (g / MICRO_M) % pre_a_params.blocks_k;
-    let im = g / (MICRO_M * pre_a_params.blocks_k);
-    let row = i32(local_invocation_index);
-    if (im >= pre_a_params.macro_rows || row >= MR) {
+    let im = g / MICRO_M;
+    if (im >= pre_a_params.macro_rows) {
         return;
     }
+    let lid = i32(local_invocation_index);
+    let row0 = (im * MICRO_M + tr) * MR;
 
-    let k0 = kb * KR;
-    let nrow = (im * MICRO_M + tr) * MR + row;
-    var el: array<u32, 128>;
-    ocl_generate_uniform_row(nrow, pre_a_params.rank, a_noise_seed, 0, &el);
-
-    for (var t = 0; t < KR; t = t + 1) {
-        let l = k0 + t;
-        let pos = sign_extend_i8(el[a_pairs[u32(l) * 2u]]);
-        let neg = sign_extend_i8(el[a_pairs[u32(l) * 2u + 1u]]);
-        let sidx = u32(nrow) * u32(pre_a_params.K) + u32(l);
-        let sig = load_s8_from_u32_word(a_signal[sidx >> 2u], sidx);
-        stripe[row][t] = i32_as_u8(sig + (pos - neg));
+    let hashes_per_row = pre_a_params.rank / D_B3_OUT;
+    if (lid < MR * hashes_per_row) {
+        let r = lid / hashes_per_row;
+        let h = lid % hashes_per_row;
+        var digest: array<u32, 32>;
+        d_get_random_hash((row0 + r) * hashes_per_row + h, 0, a_noise_seed, 0, &digest);
+        for (var k = 0; k < D_B3_OUT; k = k + 1) {
+            stripe[r][h * D_B3_OUT + k] = i32_as_u8(i32(digest[k] & CP_RANGE_MASK) - CP_ZERO_PT);
+        }
     }
     workgroupBarrier();
 
-    if (row == 0) {
-        let block_base = (u32(im) * u32(pre_a_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_A);
-        for (var kg = 0; kg < K_GROUPS; kg = kg + 1) {
-            let dst = block_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A);
-            for (var r = 0; r < MR; r = r + 1) {
-                for (var ko = 0; ko < 4; ko = ko + 1) {
-                    store_u8_packed_a(dst + u32(r) * 4u + u32(ko), stripe[r][kg * 4 + ko]);
-                }
-            }
+    let kg = lid / MR;
+    let r = lid % MR;
+    let sig_row = u32(row0 + r) * u32(pre_a_params.K);
+    for (var kb = 0; kb < pre_a_params.blocks_k; kb = kb + 1) {
+        let l0 = u32(kb * KR + kg * 4);
+        let sig_word = a_signal[(sig_row + l0) >> 2u];
+        var packed = 0u;
+        for (var ko = 0u; ko < 4u; ko = ko + 1u) {
+            let l = l0 + ko;
+            let pos = sign_extend_i8(stripe[r][a_pairs[l * 2u]]);
+            let neg = sign_extend_i8(stripe[r][a_pairs[l * 2u + 1u]]);
+            let sig = load_s8_from_u32_word(sig_word, ko);
+            packed = packed | (i32_as_u8(sig + (pos - neg)) << (ko * 8u));
         }
+        let block_base = (u32(im) * u32(pre_a_params.blocks_k) + u32(kb)) * u32(MACRO_KB_BLOCK_A);
+        let dst = block_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A) + u32(r) * 4u;
+        a_pre_out[dst >> 2u] = packed;
     }
 }
 

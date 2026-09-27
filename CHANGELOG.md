@@ -7,6 +7,10 @@
 - Introduce quantus algorithm (DONE)
 - Quantus wgpu backend via quantus-miner GpuEngine FFI (DONE)
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl (DONE)
+- Pearl wgpu backend (DONE)
+- Pearl wgpu: disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~3.1 TMAC/s) (DONE)
+- Pearl wgpu: rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070 (DONE)
+- Pearl wgpu: vec4<u32> A/B panel loads in the GEMM shader (DONE)
 - Configurable matrix size (TODO)
 
 ## v0.4

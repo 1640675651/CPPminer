@@ -2,8 +2,8 @@
 // Port of fuse_jackpot=1 / CASE32_COALESCE / packed-dot path from case33_gemm_xor.cl
 //
 // Binding layout (group 0):
-//   @binding(0) a_pre        : storage read  array<u32>   // packed int8 panels (LE u32 words)
-//   @binding(1) b_pre        : storage read  array<u32>
+//   @binding(0) a_pre        : storage read  array<vec4<u32>>   // packed int8 panels (LE u32 words)
+//   @binding(1) b_pre        : storage read  array<vec4<u32>>
 //   @binding(2) params       : uniform       PearlScanParams
 //   @binding(3) a_key8       : storage read  array<u32, 8>
 //   @binding(4) bound        : storage read  array<u32, 8>
@@ -54,22 +54,14 @@ struct PearlScanParams {
     _pad2: i32,
 }
 
-@group(0) @binding(0) var<storage, read> a_pre: array<u32>;
-@group(0) @binding(1) var<storage, read> b_pre: array<u32>;
+@group(0) @binding(0) var<storage, read> a_pre: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> b_pre: array<vec4<u32>>;
 @group(0) @binding(2) var<uniform> params: PearlScanParams;
 @group(0) @binding(3) var<storage, read> a_key8: array<u32, 8>;
 @group(0) @binding(4) var<storage, read> bound: array<u32, 8>;
 @group(0) @binding(5) var<storage, read_write> found_flag: atomic<i32>;
 @group(0) @binding(6) var<storage, read_write> out_t_rows: array<i32, 1>;
 @group(0) @binding(7) var<storage, read_write> out_t_cols: array<i32, 1>;
-
-fn load_u32_a(byte_off: u32) -> u32 {
-    return a_pre[byte_off / 4u];
-}
-
-fn load_u32_b(byte_off: u32) -> u32 {
-    return b_pre[byte_off / 4u];
-}
 
 fn pp_rotl32(x: u32, s: u32) -> u32 {
     return (x << s) | (x >> (32u - s));
@@ -216,14 +208,13 @@ fn pearl_macro_gemm_xor(
             let a_kg = a_kb_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A);
             let b_kg = b_kb_base + u32(kg) * u32(MACRO_KG_STRIP_B) + u32(tc) * u32(KG_SLICE_B);
 
-            var a_pack: array<u32, 8>;
-            var b_pack: array<u32, 8>;
-            for (var i = 0; i < MR; i = i + 1) {
-                a_pack[i] = load_u32_a(a_kg + u32(i) * u32(RANK));
-            }
-            for (var j = 0; j < NR; j = j + 1) {
-                b_pack[j] = load_u32_b(b_kg + u32(j) * u32(RANK));
-            }
+            // a_kg / b_kg are 32-byte aligned: MR (NR) packed u32 words = two vec4 loads.
+            let a_lo = a_pre[a_kg / 16u];
+            let a_hi = a_pre[a_kg / 16u + 1u];
+            let b_lo = b_pre[b_kg / 16u];
+            let b_hi = b_pre[b_kg / 16u + 1u];
+            let a_pack = array<u32, 8>(a_lo.x, a_lo.y, a_lo.z, a_lo.w, a_hi.x, a_hi.y, a_hi.z, a_hi.w);
+            let b_pack = array<u32, 8>(b_lo.x, b_lo.y, b_lo.z, b_lo.w, b_hi.x, b_hi.y, b_hi.z, b_hi.w);
 
             // Packed int8 dots: acc[j*MR+i] += dot4I8Packed(a_pack[i], b_pack[j])
             for (var j = 0; j < NR; j = j + 1) {
