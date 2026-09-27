@@ -13,6 +13,8 @@ extern "C" {
 int cp_pearl_wgpu_list_devices(void);
 /* GEMM LDS staging: -1 auto (discrete GPUs only), 0 off, 1 on. Call before init. */
 void cp_pearl_wgpu_set_lds(int mode);
+/* GEMM register tile 4x4/4x8/8x8/8x16, macro 64x64/128x128. Call before init. 0 ok, -1 invalid. */
+int cp_pearl_wgpu_set_tile(int mr, int nr, int macro_m, int macro_n);
 int cp_pearl_wgpu_init(const int* devices, int ndev); /* 0 ok */
 void cp_pearl_wgpu_shutdown(void);
 int cp_pearl_wgpu_is_ready(void);

@@ -305,6 +305,26 @@ extern "C" void cp_worker_set_wgpu_lds(int mode)
 #endif
 }
 
+extern "C" void cp_worker_set_wgpu_tile(int mr, int nr)
+{
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    cp_pearl_wgpu_worker_set_tile(mr, nr);
+#else
+    (void)mr;
+    (void)nr;
+#endif
+}
+
+extern "C" void cp_worker_set_wgpu_macro(int macro_m, int macro_n)
+{
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    cp_pearl_wgpu_worker_set_macro(macro_m, macro_n);
+#else
+    (void)macro_m;
+    (void)macro_n;
+#endif
+}
+
 extern "C" void cp_worker_configure_ocl_tile(int device_index)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -382,9 +402,10 @@ extern "C" void cp_worker_apply_backend_defaults(void)
     pearl_set_contiguous_tiles(contiguous);
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0) {
-        /* Match fused 8x8 kernel: jackpot scale, MAC accounting, proof layout. */
-        cp_pp_set_hash_tile(8, 8);
-        pearl_set_contiguous_tile_shape(8, 8);
+        /* Match the fused kernel's hash tile: jackpot scale, MAC accounting, proof layout. */
+        cp_pp_set_hash_tile(cp_pearl_wgpu_worker_hash_tile_mr(), cp_pearl_wgpu_worker_hash_tile_w());
+        pearl_set_contiguous_tile_shape(cp_pearl_wgpu_worker_hash_tile_mr(),
+                                        cp_pearl_wgpu_worker_hash_tile_w());
     }
 #endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -616,8 +637,13 @@ extern "C" int cp_worker_default_tile_layout(void)
     }
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
-    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
-        return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0) {
+        if(cp_pearl_wgpu_worker_hash_tile_mr() == 4 && cp_pearl_wgpu_worker_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_4x8;
+        if(cp_pearl_wgpu_worker_hash_tile_w() == 8)
+            return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+        return CP_TILE_LAYOUT_CONTIGUOUS;
+    }
 #endif
     return CP_TILE_LAYOUT_SCATTERED;
 }

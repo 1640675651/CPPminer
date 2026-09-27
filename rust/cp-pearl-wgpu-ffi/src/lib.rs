@@ -2,7 +2,9 @@
 
 mod engine;
 
-use engine::{pearl_a_noise_seed_from_hash, list_devices, set_lds_mode, PearlEngine, ScanOutcome};
+use engine::{
+    pearl_a_noise_seed_from_hash, list_devices, set_lds_mode, set_tile, PearlEngine, ScanOutcome,
+};
 use parking_lot::Mutex;
 use std::os::raw::c_int;
 use std::slice;
@@ -23,6 +25,19 @@ pub unsafe extern "C" fn cp_pearl_wgpu_list_devices() -> c_int {
 #[no_mangle]
 pub extern "C" fn cp_pearl_wgpu_set_lds(mode: c_int) {
     set_lds_mode(mode);
+}
+
+/// GEMM register tile (4x4, 4x8, 8x8, 8x16) and macro (64x64, 128x128). Call before
+/// cp_pearl_wgpu_init. Returns 0, or -1 if the combination is unsupported.
+#[no_mangle]
+pub extern "C" fn cp_pearl_wgpu_set_tile(mr: c_int, nr: c_int, macro_m: c_int, macro_n: c_int) -> c_int {
+    match set_tile(mr, nr, macro_m, macro_n) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[pearl-wgpu] {e}");
+            -1
+        }
+    }
 }
 
 #[no_mangle]

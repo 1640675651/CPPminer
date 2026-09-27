@@ -59,6 +59,9 @@ void cp_worker_set_ocl_cpm_int(int on);
 void cp_worker_set_ocl_lds(int on);
 /* wgpu-only (pearl): stage A/B panels in workgroup memory (-1 = auto default, 0 = off, 1 = on). */
 void cp_worker_set_wgpu_lds(int mode);
+/* wgpu-only (pearl): register tile 4x4/4x8/8x8/8x16 (default 8x8), macro 64x64/128x128. */
+void cp_worker_set_wgpu_tile(int mr, int nr);
+void cp_worker_set_wgpu_macro(int macro_m, int macro_n);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 

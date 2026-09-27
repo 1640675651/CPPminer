@@ -27,6 +27,9 @@ struct ZeroBCache {
 
 static int g_context_ready = 0;
 static int g_macro_batch = CP_MACRO_BATCH_DEFAULT;
+static int g_tile_mr = 8;
+static int g_tile_nr = 8;
+static int g_macro = 128;
 
 static int cancel_check_thunk(void) { return cp_job_should_cancel() != 0 ? 1 : 0; }
 
@@ -75,21 +78,42 @@ extern "C" void cp_pearl_wgpu_worker_set_macro_batch(int batch) {
 
 extern "C" void cp_pearl_wgpu_worker_set_use_lds(int mode) { cp_pearl_wgpu_set_lds(mode); }
 
+extern "C" void cp_pearl_wgpu_worker_set_tile(int mr, int nr) {
+    g_tile_mr = mr;
+    g_tile_nr = nr;
+}
+
+extern "C" void cp_pearl_wgpu_worker_set_macro(int macro_m, int macro_n) {
+    (void)macro_n;
+    g_macro = macro_m;
+}
+
+extern "C" int cp_pearl_wgpu_worker_hash_tile_mr(void) { return g_tile_mr; }
+
+extern "C" int cp_pearl_wgpu_worker_hash_tile_w(void) {
+    return (g_tile_mr == 4 && g_tile_nr == 4) ? 8 : g_tile_nr;
+}
+
 extern "C" int cp_pearl_wgpu_worker_list_devices(void) {
     return cp_pearl_wgpu_list_devices();
 }
 
 extern "C" void cp_pearl_wgpu_worker_init(int *devices, int ndev) {
-    if (cp_pearl_wgpu_init(devices, ndev) != 0) {
+    if (cp_pearl_wgpu_set_tile(g_tile_mr, g_tile_nr, g_macro, g_macro) != 0 ||
+        cp_pearl_wgpu_init(devices, ndev) != 0) {
         fprintf(stderr, "[pearl-wgpu] init failed\n");
         g_context_ready = 0;
         return;
     }
     g_context_ready = 1;
-    /* Jackpot bound + proof layout must use 8x8 (not default PP_HASH_W=16). */
-    cp_pp_set_hash_tile(8, 8);
-    pearl_set_contiguous_tile_shape(8, 8);
-    printf("[pearl-wgpu] fixed tile 8x8, macro 128x128, KR=128, GPU prep + fused jackpot\n");
+    /* Jackpot bound + proof layout use the kernel's hash tile (not default PP_HASH_W=16). */
+    const int hash_mr = cp_pearl_wgpu_worker_hash_tile_mr();
+    const int hash_w = cp_pearl_wgpu_worker_hash_tile_w();
+    cp_pp_set_hash_tile(hash_mr, hash_w);
+    pearl_set_contiguous_tile_shape(hash_mr, hash_w);
+    printf("[pearl-wgpu] register tile %dx%d, hash tile %dx%d, macro %dx%d, KR=128, GPU prep + "
+           "fused jackpot\n",
+           g_tile_mr, g_tile_nr, hash_mr, hash_w, g_macro, g_macro);
     printf("[pearl-wgpu] jackpot scale tile %dx%d factor=%llu\n", cp_pp_hash_tile_h(),
            cp_pp_hash_tile_w(), (unsigned long long)cp_jackpot_scale_factor());
     printf("[pearl-wgpu] macro batch: %d blocks\n", g_macro_batch);
@@ -148,8 +172,8 @@ extern "C" int cp_pearl_wgpu_worker_mine_attempt(
         *out_t_cols = -1;
     }
 
-    if (m % 128 != 0 || n % 128 != 0) {
-        fprintf(stderr, "[pearl-wgpu] m,n must be multiples of 128 (got %dx%d)\n", m, n);
+    if (m % g_macro != 0 || n % g_macro != 0) {
+        fprintf(stderr, "[pearl-wgpu] m,n must be multiples of %d (got %dx%d)\n", g_macro, m, n);
         return -1;
     }
 
@@ -190,13 +214,15 @@ extern "C" int cp_pearl_wgpu_worker_mine_attempt(
     }
 
     uint32_t bound[8];
-    cp_pp_set_hash_tile(8, 8);
+    const int hash_mr = cp_pearl_wgpu_worker_hash_tile_mr();
+    const int hash_w = cp_pearl_wgpu_worker_hash_tile_w();
+    cp_pp_set_hash_tile(hash_mr, hash_w);
     cp_scale_jackpot_target(pool_tgt, bound);
     uint32_t a_key8[8];
     memcpy(a_key8, scan_key, 32);
 
-    const int row_parts = m / 8;
-    const int col_parts = n / 8;
+    const int row_parts = m / hash_mr;
+    const int col_parts = n / hash_w;
     const int total_tiles = row_parts * col_parts;
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();

@@ -3,20 +3,13 @@
 use bytemuck::{Pod, Zeroable};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-// Fixed tiling (MR=NR=8, MACRO=128, KR=128, K=4096).
-const MR: i32 = 8;
-const NR: i32 = 8;
-const MACRO: i32 = 128;
 const KR: i32 = 128;
 const R_RANK: i32 = 128;
-const MICRO: i32 = 16;
 const BLOCKS_K: i32 = 32;
 const NUM_MILESTONES: i32 = 32;
-const MACRO_KB_BLOCK: u64 = 16384; // bytes per macro x kb panel
-const HASH_TILES_PER_MACRO: u64 = (MICRO as u64) * (MICRO as u64); // 256
 const B3_CHUNK: u64 = 1024;
-/// Workgroup storage of pearl_macro_gemm_xor_lds: A + B macro k-block, 16 KiB each.
-const GEMM_LDS_BYTES: u32 = 32768;
+/// Prepack row/column group (pearl_prep.wgsl MR/NR), independent of the GEMM register tile.
+const PREP_GROUP: i32 = 8;
 
 /// --wgpu-lds: -1 auto (discrete GPUs only), 0 off, 1 on. Read at engine creation.
 static LDS_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -25,13 +18,128 @@ pub fn set_lds_mode(mode: i32) {
     LDS_MODE.store(mode.clamp(-1, 1), Ordering::Relaxed);
 }
 
+/// GEMM register tile + macro block (same choices as --ocl-tile / --ocl-macro).
+#[derive(Clone, Copy)]
+struct TileConfig {
+    mr: i32,
+    nr: i32,
+    macro_mn: i32,
+}
+
+impl TileConfig {
+    /// Jackpot hash tile width: 4x4 register tiles hash as 4x8 (two halves per WI).
+    fn hash_nr(&self) -> i32 {
+        if self.mr == 4 && self.nr == 4 { 8 } else { self.nr }
+    }
+    fn wg_size(&self) -> u32 {
+        ((self.macro_mn / self.mr) * (self.macro_mn / self.hash_nr())) as u32
+    }
+    fn hash_tiles_per_macro(&self) -> u64 {
+        self.wg_size() as u64
+    }
+    /// Bytes of one packed macro x k-block panel (A or B).
+    fn kb_block_bytes(&self) -> u64 {
+        (self.macro_mn as u64) * (KR as u64)
+    }
+    /// Workgroup storage of pearl_macro_gemm_xor_lds: A + B macro k-block.
+    fn lds_bytes(&self) -> u32 {
+        (2 * self.kb_block_bytes()) as u32
+    }
+}
+
+static TILE: std::sync::Mutex<TileConfig> =
+    std::sync::Mutex::new(TileConfig { mr: 8, nr: 8, macro_mn: 128 });
+
+/// Register tile 4x4, 4x8, 8x8 or 8x16; macro 64x64 or 128x128. Read at engine creation.
+pub fn set_tile(mr: i32, nr: i32, macro_m: i32, macro_n: i32) -> Result<(), String> {
+    let tile_ok = matches!((mr, nr), (4, 4) | (4, 8) | (8, 8) | (8, 16));
+    if !tile_ok {
+        return Err(format!("register tile must be 4x4, 4x8, 8x8 or 8x16 (got {mr}x{nr})"));
+    }
+    if macro_m != macro_n || !(macro_m == 64 || macro_m == 128) {
+        return Err(format!("macro must be 64x64 or 128x128 (got {macro_m}x{macro_n})"));
+    }
+    *TILE.lock().unwrap() = TileConfig { mr, nr, macro_mn: macro_m };
+    Ok(())
+}
+
 const PREP_WGSL_RAW: &str =
     include_str!("../../../src/pearl/wgpu/kernels/pearl_prep.wgsl");
-const GEMM_WGSL: &str =
+const GEMM_WGSL_RAW: &str =
     include_str!("../../../src/pearl/wgpu/kernels/pearl_gemm_xor.wgsl");
 
-fn prep_wgsl() -> &'static str {
-    PREP_WGSL_RAW
+fn inject(src: &str, marker: &str, code: &str) -> String {
+    assert!(src.contains(marker), "shader marker {marker} missing");
+    src.replacen(marker, code, 1)
+}
+
+fn prep_wgsl(tile: &TileConfig) -> String {
+    let m = tile.macro_mn;
+    inject(
+        PREP_WGSL_RAW,
+        "// @MACRO_CONFIG@",
+        &format!("const MACRO_M: i32 = {m};\nconst MACRO_N: i32 = {m};"),
+    )
+}
+
+/// Tile constants plus per-tile accumulator code. The accumulator is named vec4<i32> fields
+/// (cJ_I = A rows 4I..4I+3 x B col J), not array<i32, MR*NR>: Intel IGC spills the array.
+fn gemm_wgsl(tile: &TileConfig) -> String {
+    use std::fmt::Write;
+    let (mr, nr, hash_nr, m) = (tile.mr, tile.nr, tile.hash_nr(), tile.macro_mn);
+    let av = (mr / 4) as usize;
+    let bv = (nr / 4) as usize;
+    let lanes = ["x", "y", "z", "w"];
+    let fields: Vec<String> =
+        (0..nr as usize).flat_map(|j| (0..av).map(move |i| format!("c{j}_{i}"))).collect();
+
+    let mut s = String::new();
+    let _ = writeln!(s, "const MR: i32 = {mr};");
+    let _ = writeln!(s, "const NR: i32 = {nr};");
+    let _ = writeln!(s, "const HASH_NR: i32 = {hash_nr};");
+    let _ = writeln!(s, "const MACRO_M: i32 = {m};");
+    let _ = writeln!(s, "const MACRO_N: i32 = {m};");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "struct Acc {{");
+    for f in &fields {
+        let _ = writeln!(s, "    {f}: vec4<i32>,");
+    }
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s);
+
+    let a_params: Vec<String> = (0..av).map(|i| format!("a{i}: vec4<u32>")).collect();
+    let b_params: Vec<String> = (0..bv).map(|i| format!("b{i}: vec4<u32>")).collect();
+    let _ = writeln!(
+        s,
+        "fn acc_kgroup(acc: ptr<function, Acc>, {}, {}) {{",
+        a_params.join(", "),
+        b_params.join(", ")
+    );
+    for j in 0..nr as usize {
+        let b = format!("b{}.{}", j / 4, lanes[j % 4]);
+        for i in 0..av {
+            let _ = writeln!(s, "    (*acc).c{j}_{i} += dot4x(a{i}, {b});");
+        }
+    }
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s);
+
+    let terms: Vec<String> = fields.iter().map(|f| format!("a.{f}")).collect();
+    let _ = writeln!(s, "fn acc_xor(acc: ptr<function, Acc>) -> u32 {{");
+    let _ = writeln!(s, "    let a = *acc;");
+    let _ = writeln!(s, "    let xv = bitcast<vec4<u32>>({});", terms.join(" ^ "));
+    let _ = writeln!(s, "    return xv.x ^ xv.y ^ xv.z ^ xv.w;");
+    let _ = writeln!(s, "}}");
+
+    for (name, a_buf, b_buf) in [("kgroup_global", "a_pre", "b_pre"), ("kgroup_lds", "lds_a", "lds_b")] {
+        let a_args: Vec<String> = (0..av).map(|i| format!("{a_buf}[ai + {i}u]")).collect();
+        let b_args: Vec<String> = (0..bv).map(|i| format!("{b_buf}[bi + {i}u]")).collect();
+        let _ = writeln!(s);
+        let _ = writeln!(s, "fn {name}(acc: ptr<function, Acc>, ai: u32, bi: u32) {{");
+        let _ = writeln!(s, "    acc_kgroup(acc, {}, {});", a_args.join(", "), b_args.join(", "));
+        let _ = writeln!(s, "}}");
+    }
+    inject(GEMM_WGSL_RAW, "// @TILE_CONFIG@", &s)
 }
 
 // Domain salt: blake3("pearl/cert-v3/noise-seed/A") - pinned in pearl seed.rs / cp_noise.c
@@ -320,6 +428,7 @@ pub struct PearlEngine {
     job: Option<JobBuffers>,
     device_type: wgpu::DeviceType,
     max_wg_submit: u32,
+    tile: TileConfig,
 }
 
 pub enum ScanOutcome {
@@ -394,7 +503,32 @@ impl PearlEngine {
             );
         }
 
-        let prep_src = prep_wgsl();
+        let tile = *TILE.lock().unwrap();
+        let limits = device.limits();
+        let wg_size = tile.wg_size();
+        if wg_size > limits.max_compute_invocations_per_workgroup
+            || wg_size > limits.max_compute_workgroup_size_x
+        {
+            return Err(format!(
+                "tile {}x{} / macro {m}x{m} needs {wg_size} invocations per workgroup (device max {})",
+                tile.mr,
+                tile.nr,
+                limits
+                    .max_compute_invocations_per_workgroup
+                    .min(limits.max_compute_workgroup_size_x),
+                m = tile.macro_mn
+            ));
+        }
+        eprintln!(
+            "[pearl-wgpu] register tile {}x{}, hash tile {}x{}, macro {m}x{m}, {wg_size} WI/WG",
+            tile.mr,
+            tile.nr,
+            tile.mr,
+            tile.hash_nr(),
+            m = tile.macro_mn
+        );
+
+        let prep_src = prep_wgsl(&tile);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let prep_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pearl_prep"),
@@ -414,7 +548,7 @@ impl PearlEngine {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("pearl_gemm_xor"),
-                    source: wgpu::ShaderSource::Wgsl(GEMM_WGSL.into()),
+                    source: wgpu::ShaderSource::Wgsl(gemm_wgsl(&tile).into()),
                 },
                 gemm_checks,
             )
@@ -475,8 +609,9 @@ impl PearlEngine {
         }
         // --wgpu-lds: auto = on for discrete GPUs (GTX 1070 ~3.4 -> ~4.2 TMAC/s), off otherwise
         // (UHD 770 ~455 -> ~380 GMAC/s).
-        let storage_limit = device.limits().max_compute_workgroup_storage_size;
-        let lds_fits = storage_limit >= GEMM_LDS_BYTES;
+        let storage_limit = limits.max_compute_workgroup_storage_size;
+        let lds_bytes = tile.lds_bytes();
+        let lds_fits = storage_limit >= lds_bytes;
         let lds_mode = LDS_MODE.load(Ordering::Relaxed);
         let want_lds = match lds_mode {
             0 => false,
@@ -485,7 +620,7 @@ impl PearlEngine {
         };
         if want_lds && !lds_fits {
             eprintln!(
-                "[pearl-wgpu] LDS staging needs {GEMM_LDS_BYTES} B workgroup storage (device limit {storage_limit} B); using direct loads"
+                "[pearl-wgpu] LDS staging needs {lds_bytes} B workgroup storage (device limit {storage_limit} B); using direct loads"
             );
         }
         let use_lds = want_lds && lds_fits;
@@ -521,6 +656,7 @@ impl PearlEngine {
             job: None,
             device_type: info.device_type,
             max_wg_submit,
+            tile,
         })
     }
 
@@ -552,9 +688,10 @@ impl PearlEngine {
         if m <= 0 || n <= 0 || k <= 0 {
             return Err("invalid dims".into());
         }
-        if m % MACRO != 0 || n % MACRO != 0 || k % KR != 0 {
+        let macro_mn = self.tile.macro_mn;
+        if m % macro_mn != 0 || n % macro_mn != 0 || k % KR != 0 {
             return Err(format!(
-                "dims must be multiples of MACRO={MACRO}/KR={KR} (got m={m} n={n} k={k})"
+                "dims must be multiples of MACRO={macro_mn}/KR={KR} (got m={m} n={n} k={k})"
             ));
         }
         let blocks_k = k / KR;
@@ -563,10 +700,10 @@ impl PearlEngine {
                 "[pearl-wgpu] warning: blocks_k={blocks_k} (expected {BLOCKS_K} for K=4096)"
             );
         }
-        let macro_rows = m / MACRO;
-        let macro_cols = n / MACRO;
+        let macro_rows = m / macro_mn;
+        let macro_cols = n / macro_mn;
         let macro_blocks = macro_rows * macro_cols;
-        let tile_count = (m / MR) * (n / NR);
+        let tile_count = (m / self.tile.mr) * (n / self.tile.hash_nr());
 
         if let Some(ref j) = self.job {
             if j.m == m && j.n == n && j.k == k {
@@ -574,8 +711,9 @@ impl PearlEngine {
             }
         }
 
-        let a_pre_bytes = (macro_rows as u64) * (blocks_k as u64) * MACRO_KB_BLOCK;
-        let b_pre_bytes = (macro_cols as u64) * (blocks_k as u64) * MACRO_KB_BLOCK;
+        let kb_block = self.tile.kb_block_bytes();
+        let a_pre_bytes = (macro_rows as u64) * (blocks_k as u64) * kb_block;
+        let b_pre_bytes = (macro_cols as u64) * (blocks_k as u64) * kb_block;
         let a_sig_bytes = ((m as u64) * (k as u64)).next_multiple_of(4);
         let pairs_bytes = (k as u64) * 2 * 4;
 
@@ -777,7 +915,7 @@ impl PearlEngine {
 
         let total_wg = {
             let job = self.job.as_ref().unwrap();
-            (job.macro_cols * MICRO * job.blocks_k) as u32
+            (job.n / PREP_GROUP * job.blocks_k) as u32
         };
         let blocks_k = self.job.as_ref().unwrap().blocks_k;
         let macro_cols = self.job.as_ref().unwrap().macro_cols;
@@ -1129,7 +1267,7 @@ impl PearlEngine {
 
         let (total_wg, blocks_k, macro_rows) = {
             let job = self.job.as_ref().unwrap();
-            ((job.macro_rows * MICRO) as u32, job.blocks_k, job.macro_rows)
+            ((job.m / PREP_GROUP) as u32, job.blocks_k, job.macro_rows)
         };
         // Each WG covers all blocks_k k-blocks, so scale the TDR cap down accordingly.
         let cap = self.max_wg_submit / (blocks_k.max(1) as u32);
@@ -1242,7 +1380,7 @@ impl PearlEngine {
                     macro_cols: job.macro_cols,
                     mb_begin: mb0,
                     micro_m_begin: 0,
-                    micro_m_count: MICRO,
+                    micro_m_count: self.tile.macro_mn / self.tile.mr,
                     wg_x: wg_x_i,
                     batch_count,
                     _pad2: 0,
@@ -1309,7 +1447,7 @@ impl PearlEngine {
                 found_bytes[2],
                 found_bytes[3],
             ]);
-            tiles_scanned += (batch_count as u64) * HASH_TILES_PER_MACRO;
+            tiles_scanned += (batch_count as u64) * self.tile.hash_tiles_per_macro();
             on_progress(tiles_scanned);
 
             if found != 0 {

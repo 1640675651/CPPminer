@@ -8,12 +8,15 @@
 - Quantus wgpu backend via quantus-miner GpuEngine FFI (DONE)
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl (DONE)
 - Pearl wgpu backend (DONE)
-- Pearl wgpu: vec4<u32> A/B panel loads in the GEMM shader (DONE)
-- Pearl wgpu: disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s) (DONE)
-- Pearl wgpu: rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070 (DONE)
-- Pearl wgpu: GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s) (DONE)
-- Pearl wgpu: single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s) (DONE)
 - Configurable matrix size (TODO)
+
+### Pearl wgpu
+- vec4<u32> A/B panel loads in the GEMM shader (DONE)
+- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s) (DONE)
+- Rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070 (DONE)
+- GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s) (DONE)
+- Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s) (DONE)
+- `--wgpu-tile 4x4|4x8|8x8|8x16[/64x64|/128x128]` and `--wgpu-macro`, same tiles/hash tiles as OpenCL; shader tile code generated at engine init (default stays 8x8/128) (DONE)
 
 ## v0.4
 - ARM CPU + NEON support.

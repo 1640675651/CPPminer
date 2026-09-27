@@ -192,7 +192,11 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--wgpu-lds on/off` | Stage A/B k-block panels in workgroup memory (needs 32 KiB; default `on` for discrete GPUs, `off` for integrated) |
+| `--wgpu-tile MxN[/MmMm]` | Register tile: `8x8` (default), `4x4`, `4x8`, or `8x16`. Optional `/64x64` or `/128x128` sets the macro (same as `--wgpu-macro`) |
+| `--wgpu-macro MxN` | Macro block: `64x64` or `128x128` (default `128x128`) |
+| `--wgpu-lds on/off` | Stage A/B k-block panels in workgroup memory (needs 2×macro×128 B: 32 KiB at 128, 16 KiB at 64; default `on` for discrete GPUs, `off` for integrated) |
+
+Tile choices match `--ocl-tile` / `--ocl-macro`, including the hash tile used for the jackpot and proof (`4x4` hashes as `4x8`, one work-item per hash tile computing two 4x4 halves). A workgroup covers one macro with one work-item per hash tile (e.g. 256 for 8x8/128, 512 for 4x8/128, 32 for 8x16/64). Smaller tiles use fewer registers per work-item (useful on GPUs with small register files); on a GTX 1070 the default 8x8/128 with LDS is fastest.
 
 ### OneDNN options
 

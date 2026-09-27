@@ -43,21 +43,23 @@
 //   @binding(1) job_key : storage read  array<u32, 8>
 //   @binding(2) roots   : storage rw    array<u32>
 
+// engine.rs replaces the marker with MACRO_M / MACRO_N (64 or 128). MR/NR here are the prepack
+// row/column group sizes; the packed layout (row*4 within a MACRO*4-byte k-group strip) does not
+// depend on the GEMM register tile.
+// @MACRO_CONFIG@
 const MR: i32 = 8;
 const NR: i32 = 8;
 const KR: i32 = 128;
 const R_RANK: i32 = 128;
-const MACRO_M: i32 = 128;
-const MACRO_N: i32 = 128;
-const MICRO_M: i32 = 16;
-const MICRO_N: i32 = 16;
-const K_GROUPS: i32 = 32;
-const KG_BYTES_A: i32 = 32;
-const KG_SLICE_B: i32 = 32;
-const MACRO_KG_STRIP_A: i32 = 512;
-const MACRO_KG_STRIP_B: i32 = 512;
-const MACRO_KB_BLOCK_A: i32 = 16384;
-const MACRO_KB_BLOCK_B: i32 = 16384;
+const MICRO_M: i32 = MACRO_M / MR;
+const MICRO_N: i32 = MACRO_N / NR;
+const K_GROUPS: i32 = KR / 4;
+const KG_BYTES_A: i32 = MR * 4;
+const KG_SLICE_B: i32 = NR * 4;
+const MACRO_KG_STRIP_A: i32 = MICRO_M * KG_BYTES_A;
+const MACRO_KG_STRIP_B: i32 = MICRO_N * KG_SLICE_B;
+const MACRO_KB_BLOCK_A: i32 = K_GROUPS * MACRO_KG_STRIP_A;
+const MACRO_KB_BLOCK_B: i32 = K_GROUPS * MACRO_KG_STRIP_B;
 
 const D_B3_BLOCK: i32 = 64;
 const D_B3_CHUNK: i32 = 1024;

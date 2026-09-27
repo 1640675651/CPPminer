@@ -106,6 +106,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("  --wgpu-lds on|off  wgpu (pearl) stage A/B in workgroup memory\n");
     printf("                     (default: on for discrete GPUs, off for integrated)\n");
+    printf("  --wgpu-tile MxN[/MmMm]  wgpu (pearl) register tile: 4x4, 4x8, 8x8 (default), 8x16;\n");
+    printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
+    printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
 #endif
     printf("  --dev                m=n=8192 for testing\n");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -458,6 +461,10 @@ int main(int argc, char** argv)
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
     int wgpu_lds = -1;
+    int wgpu_tile_mr = 0;
+    int wgpu_tile_nr = 0;
+    int wgpu_macro_m = 0;
+    int wgpu_macro_n = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
 
     if(simd_env_invalid)
@@ -656,6 +663,57 @@ int main(int argc, char** argv)
                 wgpu_lds = 0;
             } else {
                 fprintf(stderr, "invalid --wgpu-lds %s (expected on or off)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--wgpu-tile", 11)){
+            const char* v = argv[i] + 11;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--wgpu-tile requires MxN or MxN/MACROMxMACRON "
+                                "(e.g. 4x8, 4x8/64x64)\n");
+                return 1;
+            }
+            int tile_macro_m = 0, tile_macro_n = 0;
+            const int nfields = sscanf(v, "%dx%d/%dx%d", &wgpu_tile_mr, &wgpu_tile_nr,
+                                       &tile_macro_m, &tile_macro_n);
+            if(nfields != 2 && nfields != 4){
+                fprintf(stderr,
+                        "invalid --wgpu-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
+                        "or MxN/64x64|128x128)\n",
+                        v);
+                return 1;
+            }
+            if(!((wgpu_tile_mr == 4 && (wgpu_tile_nr == 4 || wgpu_tile_nr == 8)) ||
+                 (wgpu_tile_mr == 8 && (wgpu_tile_nr == 8 || wgpu_tile_nr == 16)))){
+                fprintf(stderr,
+                        "invalid --wgpu-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
+                return 1;
+            }
+            if(nfields == 4){
+                if(!((tile_macro_m == 64 && tile_macro_n == 64) ||
+                     (tile_macro_m == 128 && tile_macro_n == 128))){
+                    fprintf(stderr,
+                            "invalid --wgpu-tile macro in %s (expected 64x64 or 128x128)\n",
+                            v);
+                    return 1;
+                }
+                wgpu_macro_m = tile_macro_m;
+                wgpu_macro_n = tile_macro_n;
+            }
+        } else if(!strncmp(argv[i], "--wgpu-macro", 12)){
+            const char* v = argv[i] + 12;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--wgpu-macro requires MxN (64x64 or 128x128)\n");
+                return 1;
+            }
+            if(sscanf(v, "%dx%d", &wgpu_macro_m, &wgpu_macro_n) != 2 ||
+               !((wgpu_macro_m == 64 && wgpu_macro_n == 64) ||
+                 (wgpu_macro_m == 128 && wgpu_macro_n == 128))){
+                fprintf(stderr,
+                        "invalid --wgpu-macro %s (expected 64x64 or 128x128)\n", v);
                 return 1;
             }
 #endif
@@ -979,6 +1037,10 @@ int main(int argc, char** argv)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(wgpu_lds >= 0)
         cp_worker_set_wgpu_lds(wgpu_lds);
+    if(wgpu_tile_mr > 0)
+        cp_worker_set_wgpu_tile(wgpu_tile_mr, wgpu_tile_nr);
+    if(wgpu_macro_m > 0)
+        cp_worker_set_wgpu_macro(wgpu_macro_m, wgpu_macro_n);
 #endif
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){
@@ -1303,9 +1365,13 @@ int main(int argc, char** argv)
                    batch_size, batch_size * tiles_per_macro);
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
-            printf("[mode] scan: wgpu fused GEMM + XOR + device jackpot (8x8)\n");
+            const int wgpu_macro = wgpu_macro_m > 0 ? wgpu_macro_m : 128;
+            const int hash_mr = cp_pp_hash_tile_h();
+            const int hash_w = cp_pp_hash_tile_w();
+            printf("[mode] scan: wgpu fused GEMM + XOR + device jackpot (hash %dx%d, macro %dx%d)\n",
+                   hash_mr, hash_w, wgpu_macro, wgpu_macro);
             printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
-                   batch_size, batch_size * 256);
+                   batch_size, batch_size * (wgpu_macro / hash_mr) * (wgpu_macro / hash_w));
             printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */

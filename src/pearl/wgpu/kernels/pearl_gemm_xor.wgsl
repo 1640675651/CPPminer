@@ -11,33 +11,35 @@
 //   @binding(6) out_t_rows   : storage rw    array<i32, 1>
 //   @binding(7) out_t_cols   : storage rw    array<i32, 1>
 //
-// Dispatch: workgroups = macro tiles in batch; workgroup_size = 256
-//   (one WI per hash tile in macro; micro_m_count=16, HASH_MICRO_N=16)
+// Dispatch: workgroups = macro tiles in batch; one WI per hash tile in the macro
+//   (WG_SIZE = MICRO_M * HASH_MICRO_N, column-major like !CASE32_WI_ROWMAJOR).
+//
+// engine.rs replaces the marker below with MR, NR, HASH_NR, MACRO_M, MACRO_N and the generated
+// tile code (struct Acc, acc_kgroup, acc_xor, kgroup_global, kgroup_lds) for the register tile.
+// Register tiles 4x4 (hash 4x8: two 4x4 halves per WI), 4x8, 8x8, 8x16; macro 64 or 128.
+// Packed layout (both tiles): byte ((im*blocks_k + kb)*KGROUPS + kg)*MACRO_M*4 + row*4 + k%4.
 
 requires packed_4x8_integer_dot_product;
 
-const MR: i32 = 8;
-const NR: i32 = 8;
-const HASH_NR: i32 = 8;
-const MACRO_M: i32 = 128;
-const MACRO_N: i32 = 128;
+// @TILE_CONFIG@
+
 const KR: i32 = 128;
 const RANK: i32 = 4;
 const R_RANK: i32 = 128;
-const MICRO_M: i32 = 16;
-const MICRO_N: i32 = 16;
-const HASH_MICRO_N: i32 = 16;
-const KGROUPS: i32 = 32;
-const KG_BYTES_A: i32 = 32;
-const KG_SLICE_B: i32 = 32;
-const MACRO_KG_STRIP_A: i32 = 512;
-const MACRO_KG_STRIP_B: i32 = 512;
-const MACRO_KB_BLOCK_A: i32 = 16384;
-const MACRO_KB_BLOCK_B: i32 = 16384;
+const KGROUPS: i32 = KR / RANK;
+const MICRO_M: i32 = MACRO_M / MR;
+const HASH_MICRO_N: i32 = MACRO_N / HASH_NR;
+const HASH_REG_TILES_N: i32 = HASH_NR / NR;
+const WG_SIZE: u32 = u32(MICRO_M * HASH_MICRO_N);
+const KG_VEC4_A: u32 = u32(MR / 4);  // one k-group of one register tile row block
+const KG_VEC4_B: u32 = u32(NR / 4);
+const STRIP_VEC4_A: u32 = u32(MACRO_M / 4); // one k-group of the whole macro (MACRO_M*RANK B)
+const STRIP_VEC4_B: u32 = u32(MACRO_N / 4);
+const KB_VEC4_A: u32 = u32(KGROUPS) * STRIP_VEC4_A; // one k-block of the macro
+const KB_VEC4_B: u32 = u32(KGROUPS) * STRIP_VEC4_B;
 const PP_JACKPOT_WORDS: i32 = 16;
 const PP_LROT: i32 = 13;
 const PP_MAX_MILESTONES: i32 = 32;
-const HASH_REG_TILES_N: i32 = 1;
 
 struct PearlScanParams {
     N: i32,
@@ -162,39 +164,9 @@ fn digest_beats_target(digest: ptr<function, array<u32, 8>>) -> bool {
     return true;
 }
 
-// 8x8 accumulator tile as 16 named vec4s (cJ_lo = A rows 0-3, cJ_hi = A rows 4-7, B col J).
-// Only XOR-folded, so element order is irrelevant. Named fields instead of array<i32, 64> keep
-// the tile in registers on compilers that don't fully unroll (Intel IGC spills the array).
-struct Acc {
-    c0_lo: vec4<i32>, c0_hi: vec4<i32>,
-    c1_lo: vec4<i32>, c1_hi: vec4<i32>,
-    c2_lo: vec4<i32>, c2_hi: vec4<i32>,
-    c3_lo: vec4<i32>, c3_hi: vec4<i32>,
-    c4_lo: vec4<i32>, c4_hi: vec4<i32>,
-    c5_lo: vec4<i32>, c5_hi: vec4<i32>,
-    c6_lo: vec4<i32>, c6_hi: vec4<i32>,
-    c7_lo: vec4<i32>, c7_hi: vec4<i32>,
-}
-
-// One k-group: a_lo/a_hi = MR packed A words, b_lo/b_hi = NR packed B words.
-fn acc_kgroup(acc: ptr<function, Acc>, a_lo: vec4<u32>, a_hi: vec4<u32>, b_lo: vec4<u32>, b_hi: vec4<u32>) {
-    (*acc).c0_lo += dot4x(a_lo, b_lo.x); (*acc).c0_hi += dot4x(a_hi, b_lo.x);
-    (*acc).c1_lo += dot4x(a_lo, b_lo.y); (*acc).c1_hi += dot4x(a_hi, b_lo.y);
-    (*acc).c2_lo += dot4x(a_lo, b_lo.z); (*acc).c2_hi += dot4x(a_hi, b_lo.z);
-    (*acc).c3_lo += dot4x(a_lo, b_lo.w); (*acc).c3_hi += dot4x(a_hi, b_lo.w);
-    (*acc).c4_lo += dot4x(a_lo, b_hi.x); (*acc).c4_hi += dot4x(a_hi, b_hi.x);
-    (*acc).c5_lo += dot4x(a_lo, b_hi.y); (*acc).c5_hi += dot4x(a_hi, b_hi.y);
-    (*acc).c6_lo += dot4x(a_lo, b_hi.z); (*acc).c6_hi += dot4x(a_hi, b_hi.z);
-    (*acc).c7_lo += dot4x(a_lo, b_hi.w); (*acc).c7_hi += dot4x(a_hi, b_hi.w);
-}
-
-// Milestone XOR fold of the tile into msg[16] (fuse_jackpot online path).
-fn milestone_fold(acc: ptr<function, Acc>, msg: ptr<function, array<u32, 16>>, ms: i32) {
-    let a = *acc;
-    let xv = bitcast<vec4<u32>>(
-        a.c0_lo ^ a.c0_hi ^ a.c1_lo ^ a.c1_hi ^ a.c2_lo ^ a.c2_hi ^ a.c3_lo ^ a.c3_hi
-        ^ a.c4_lo ^ a.c4_hi ^ a.c5_lo ^ a.c5_hi ^ a.c6_lo ^ a.c6_hi ^ a.c7_lo ^ a.c7_hi);
-    let x = xv.x ^ xv.y ^ xv.z ^ xv.w;
+// Milestone XOR fold of one register tile (x = acc_xor) into msg[16] (fuse_jackpot online path).
+// XOR is linear, so the two 4x4 halves of a 4x8 hash tile can fold in separately.
+fn milestone_fold(x: u32, msg: ptr<function, array<u32, 16>>, ms: i32) {
     if (ms < PP_MAX_MILESTONES) {
         let tid = ms % PP_JACKPOT_WORDS;
         var contribution = x;
@@ -205,7 +177,7 @@ fn milestone_fold(acc: ptr<function, Acc>, msg: ptr<function, array<u32, 16>>, m
     }
 }
 
-fn finish_tile(msg: ptr<function, array<u32, 16>>, im: i32, jm: i32, tr: i32, tc: i32) {
+fn finish_tile(msg: ptr<function, array<u32, 16>>, im: i32, jm: i32, tr: i32, hash_tc: i32) {
     var digest: array<u32, 8>;
     b3_compress64(msg, &digest);
     if (!digest_beats_target(&digest)) {
@@ -216,11 +188,11 @@ fn finish_tile(msg: ptr<function, array<u32, 16>>, im: i32, jm: i32, tr: i32, tc
         return;
     }
     out_t_rows[0] = im * MACRO_M + tr * MR;
-    out_t_cols[0] = jm * MACRO_N + tc * HASH_NR;
+    out_t_cols[0] = jm * MACRO_N + hash_tc * HASH_NR;
 }
 
 // Direct global loads: each WI reads its own A/B slices per k-group.
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG_SIZE)
 fn pearl_macro_gemm_xor(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_invocation_index: u32,
@@ -238,42 +210,36 @@ fn pearl_macro_gemm_xor(
     let jm = mb / params.macro_rows;
     let im = mb % params.macro_rows;
 
-    // Column-major WI layout (!CASE32_WI_ROWMAJOR); HASH_REG_TILES_N == 1
     let tr = params.micro_m_begin + lid % MICRO_M;
-    let tc = lid / MICRO_M;
+    let hash_tc = lid / MICRO_M;
+    let a_off = u32(tr) * KG_VEC4_A;
 
     var msg: array<u32, 16>;
     var acc: Acc;
-    for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
-        let a_kb_base = u32(im) * u32(params.blocks_k) * u32(MACRO_KB_BLOCK_A)
-            + u32(kb) * u32(MACRO_KB_BLOCK_A);
-        let b_kb_base = u32(jm) * u32(params.blocks_k) * u32(MACRO_KB_BLOCK_B)
-            + u32(kb) * u32(MACRO_KB_BLOCK_B);
-
-        for (var kg = 0; kg < KGROUPS; kg = kg + 1) {
-            let a_kg = a_kb_base + u32(kg) * u32(MACRO_KG_STRIP_A) + u32(tr) * u32(KG_BYTES_A);
-            let b_kg = b_kb_base + u32(kg) * u32(MACRO_KG_STRIP_B) + u32(tc) * u32(KG_SLICE_B);
-            // a_kg / b_kg are 32-byte aligned: MR (NR) packed u32 words = two vec4 loads.
-            acc_kgroup(&acc, a_pre[a_kg / 16u], a_pre[a_kg / 16u + 1u],
-                       b_pre[b_kg / 16u], b_pre[b_kg / 16u + 1u]);
+    for (var half = 0; half < HASH_REG_TILES_N; half = half + 1) {
+        let b_off = u32(hash_tc * HASH_REG_TILES_N + half) * KG_VEC4_B;
+        acc = Acc(); // naga hoists loop-local vars to function entry: re-zero explicitly
+        for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
+            let a_kb = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A + a_off;
+            let b_kb = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B + b_off;
+            for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
+                kgroup_global(&acc, a_kb + kg * STRIP_VEC4_A, b_kb + kg * STRIP_VEC4_B);
+            }
+            milestone_fold(acc_xor(&acc), &msg, kb);
         }
-        milestone_fold(&acc, &msg, kb);
     }
-    finish_tile(&msg, im, jm, tr, tc);
+    finish_tile(&msg, im, jm, tr, hash_tc);
 }
 
 // LDS staging (--wgpu-lds, like the OpenCL CASE32_USE_LDS path): per k-block, all WIs copy the
-// whole macro A and B k-block (16 KiB each, contiguous in a_pre/b_pre) into workgroup memory,
-// barrier, compute all KGROUPS k-groups from it, barrier. Needs 32 KiB workgroup storage.
-// GTX 1070: ~4.2 TMAC/s vs ~3.4 direct (8/16 k-group panels and double buffering were slower);
-// UHD 770: ~380 GMAC/s vs ~455 direct.
-const KB_VEC4: u32 = 1024u;  // MACRO_KB_BLOCK_A / 16
-const STRIP_VEC4: u32 = 32u; // MACRO_KG_STRIP_A / 16
+// whole macro A and B k-block (MACRO*128 B each, contiguous in a_pre/b_pre) into workgroup
+// memory, barrier, compute all KGROUPS k-groups from it, barrier. Needs MACRO*256 B workgroup
+// storage (32 KiB at macro 128). 8x8/128: GTX 1070 ~4.2 TMAC/s vs ~3.4 direct (8/16 k-group
+// panels and double buffering were slower); UHD 770 ~380 GMAC/s vs ~455 direct.
+var<workgroup> lds_a: array<vec4<u32>, KB_VEC4_A>;
+var<workgroup> lds_b: array<vec4<u32>, KB_VEC4_B>;
 
-var<workgroup> lds_a: array<vec4<u32>, KB_VEC4>;
-var<workgroup> lds_b: array<vec4<u32>, KB_VEC4>;
-
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG_SIZE)
 fn pearl_macro_gemm_xor_lds(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_invocation_index: u32,
@@ -295,30 +261,31 @@ fn pearl_macro_gemm_xor_lds(
     let jm = mb / params.macro_rows;
     let im = mb % params.macro_rows;
     let tr = params.micro_m_begin + i32(lid) % MICRO_M;
-    let tc = i32(lid) / MICRO_M;
-
-    let a_off = u32(tr) * u32(KG_BYTES_A / 16);
-    let b_off = u32(tc) * u32(KG_SLICE_B / 16);
+    let hash_tc = i32(lid) / MICRO_M;
+    let a_off = u32(tr) * KG_VEC4_A;
 
     var msg: array<u32, 16>;
     var acc: Acc;
-    for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
-        let a_src = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4;
-        let b_src = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4;
-        for (var v = lid; v < KB_VEC4; v = v + 256u) {
-            lds_a[v] = a_pre[a_src + v];
-            lds_b[v] = b_pre[b_src + v];
-        }
-        workgroupBarrier();
+    for (var half = 0; half < HASH_REG_TILES_N; half = half + 1) {
+        let b_off = u32(hash_tc * HASH_REG_TILES_N + half) * KG_VEC4_B;
+        acc = Acc(); // naga hoists loop-local vars to function entry: re-zero explicitly
+        for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
+            let a_src = (u32(im) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_A;
+            let b_src = (u32(jm) * u32(params.blocks_k) + u32(kb)) * KB_VEC4_B;
+            for (var v = lid; v < KB_VEC4_A; v = v + WG_SIZE) {
+                lds_a[v] = a_pre[a_src + v];
+            }
+            for (var v = lid; v < KB_VEC4_B; v = v + WG_SIZE) {
+                lds_b[v] = b_pre[b_src + v];
+            }
+            workgroupBarrier();
 
-        for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
-            let sa = kg * STRIP_VEC4 + a_off;
-            let sb = kg * STRIP_VEC4 + b_off;
-            acc_kgroup(&acc, lds_a[sa], lds_a[sa + 1u], lds_b[sb], lds_b[sb + 1u]);
+            for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
+                kgroup_lds(&acc, kg * STRIP_VEC4_A + a_off, kg * STRIP_VEC4_B + b_off);
+            }
+            milestone_fold(acc_xor(&acc), &msg, kb);
+            workgroupBarrier();
         }
-        milestone_fold(&acc, &msg, kb);
-        workgroupBarrier();
     }
-    finish_tile(&msg, im, jm, tr, tc);
+    finish_tile(&msg, im, jm, tr, hash_tc);
 }
-
