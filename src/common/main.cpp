@@ -905,6 +905,10 @@ int main(int argc, char** argv)
                 fprintf(stderr, "FAIL job fields\n");
                 fail++;
             }
+            if(cp_qpow_nonce_thread_selftest()){
+                fprintf(stderr, "FAIL nonce thread separation\n");
+                fail++;
+            }
             /* One Poseidon2 hash against known midstate/header path. */
             {
                 uint8_t header[32], nonce[64], hash[64];

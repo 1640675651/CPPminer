@@ -1,6 +1,8 @@
 #include "cp_pool.h"
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
+#include "cp_json_frame.h"
+#include "cp_json_text.hpp"
 #include "cp_platform.h"
 #include "cp_qpow_pool.h"
 #include "cp_state.h"
@@ -16,8 +18,8 @@
 #include <thread>
 
 static int tcp_sock = -1;
-static double g_diff = 32.0;
-static int g_submit_inflight = 0;
+static std::atomic<double> g_diff{32.0};
+static std::atomic<int> g_submit_inflight{0};
 static std::atomic<int> g_net_reader_run{0};
 static std::atomic<int> g_net_conn_lost{0};
 static std::mutex g_net_mx;
@@ -95,57 +97,29 @@ static int net_wait_readable(int sock, int timeout_ms)
 #endif
 }
 
-static int net_buf_has_complete_json(void)
+static int net_buf_message_state(void)
 {
     char* start = (char*)memchr(net_buf, '{', net_pos);
     if(!start) return 0;
-    int depth = 0;
-    for(char* p = start; p < net_buf + net_pos; p++){
-        if(*p == '{') depth++;
-        else if(*p == '}'){
-            depth--;
-            if(depth == 0) return 1;
-        }
-    }
-    return 0;
+    size_t len = 0;
+    return cp_json_object_length(start, (size_t)(net_buf + net_pos - start), &len);
 }
 
-static char* pop_json_message(int sock)
+/* Extract only buffered data; the caller handles readable waits and recv. */
+static char* pop_json_message(void)
 {
-    while(1){
-        char* start = (char*)memchr(net_buf, '{', net_pos);
-        if(!start){
-            if(net_pos >= (int)sizeof(net_buf) - 1) net_pos = 0;
-            int n = recv(sock, net_buf + net_pos, (int)sizeof(net_buf) - net_pos - 1, 0);
-            if(n <= 0) return NULL;
-            net_pos += n;
-            continue;
-        }
-        int depth = 0;
-        char* end = start;
-        for(; end < net_buf + net_pos; end++){
-            if(*end == '{') depth++;
-            else if(*end == '}'){
-                depth--;
-                if(depth == 0) break;
-            }
-        }
-        if(depth != 0 || end >= net_buf + net_pos){
-            if(net_pos >= (int)sizeof(net_buf) - 1) net_pos = 0;
-            int n = recv(sock, net_buf + net_pos, (int)sizeof(net_buf) - net_pos - 1, 0);
-            if(n <= 0) return NULL;
-            net_pos += n;
-            continue;
-        }
-        int len = (int)(end - start) + 1;
-        if(len >= (int)sizeof(json_msg)) len = (int)sizeof(json_msg) - 1;
-        memcpy(json_msg, start, (size_t)len);
-        json_msg[len] = 0;
-        int tail = (int)(net_buf + net_pos - (end + 1));
-        memmove(net_buf, end + 1, (size_t)tail);
-        net_pos = tail;
-        return json_msg;
-    }
+    char* start = (char*)memchr(net_buf, '{', net_pos);
+    if(!start) return NULL;
+    size_t frame_len = 0;
+    if(cp_json_object_length(start, (size_t)(net_buf + net_pos - start), &frame_len) != 1)
+        return NULL;
+    const int len = (int)frame_len;
+    memcpy(json_msg, start, (size_t)len);
+    json_msg[len] = 0;
+    const int tail = (int)(net_buf + net_pos - (start + frame_len));
+    memmove(net_buf, start + frame_len, (size_t)tail);
+    net_pos = tail;
+    return json_msg;
 }
 
 static void pool_dispatch_line(const char* line)
@@ -163,8 +137,8 @@ static void pool_dispatch_line(const char* line)
             }
         }
         if(d > 0.0){
-            g_diff = d;
-            printf("[pool] mining.set_difficulty %.0f%s\n", g_diff,
+            g_diff.store(d);
+            printf("[pool] mining.set_difficulty %.0f%s\n", d,
                    cp_job_mining_active() ? " (during mine)" : "");
             fflush(stdout);
         }
@@ -172,12 +146,12 @@ static void pool_dispatch_line(const char* line)
     }
 
     if(strstr(line, "result") || strstr(line, "error")){
-        if(g_submit_inflight)
+        if(g_submit_inflight.load())
             printf("[pool] submit response: %s\n", line);
         else
             printf("[pool] jsonrpc: %s\n", line);
         fflush(stdout);
-        g_submit_inflight = 0;
+        g_submit_inflight.store(0);
         return;
     }
 
@@ -204,7 +178,7 @@ static void pool_dispatch_line(const char* line)
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
         if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
-            cp_target_from_difficulty(g_diff, tgt);
+            cp_target_from_difficulty(g_diff.load(), tgt);
 
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
@@ -232,19 +206,34 @@ static void pool_net_reader_thread(void)
     while(g_net_reader_run.load()){
         /* Drain buffered messages before waiting — pool often sends authorize
          * ack + mining.notify back-to-back in one TCP segment. */
-        if(!net_buf_has_complete_json()){
-            if(!net_wait_readable(tcp_sock, 100)) continue;
+        int state;
+        {
+            std::lock_guard<std::mutex> lk(g_net_mx);
+            state = net_buf_message_state();
+            if(state == 1){
+                char* line = pop_json_message();
+                printf("[pool-raw] %s\n", line); fflush(stdout);
+                pool_dispatch_line(line);
+                continue;
+            }
         }
+        if(state < 0 || net_pos >= (int)sizeof(net_buf) - 1){
+            g_net_conn_lost.store(1);
+            g_inbox_cv.notify_all();
+            printf("[net] invalid or oversized pool message\n"); fflush(stdout);
+            return;
+        }
+        if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load()) continue;
         std::lock_guard<std::mutex> lk(g_net_mx);
-        char* line = pop_json_message(tcp_sock);
-        if(!line){
+        int n = recv(tcp_sock, net_buf + net_pos,
+                     (int)sizeof(net_buf) - net_pos - 1, 0);
+        if(n <= 0){
             g_net_conn_lost.store(1);
             g_inbox_cv.notify_all();
             printf("[net] connection lost (reader)\n"); fflush(stdout);
             return;
         }
-        printf("[pool-raw] %s\n", line); fflush(stdout);
-        pool_dispatch_line(line);
+        net_pos += n;
     }
 }
 
@@ -271,20 +260,21 @@ int cp_pool_socket(void)
 int cp_pool_send_authorize(int msg_id, const char* wallet,
                            const char* worker, const char* agent)
 {
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.authorize\","
-        "\"params\":{\"wallet\":\"%s\",\"worker\":\"%s\",\"agent\":\"%s\"}}",
-        msg_id, wallet, worker, agent);
+    const std::string msg =
+        "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(msg_id) +
+        ",\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
+        cp_json_escape(wallet) + "\",\"worker\":\"" + cp_json_escape(worker) +
+        "\",\"agent\":\"" + cp_json_escape(agent) + "\"}}";
     printf("[net] LuckyPool authorize (wallet/worker/agent)\n"); fflush(stdout);
-    return cp_send_json(tcp_sock, msg);
+    return cp_send_json(tcp_sock, msg.c_str());
 }
 
 int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
                                     const char* plain_b64, double hs)
 {
     size_t blen = plain_b64 ? strlen(plain_b64) : 0;
-    size_t need = blen + 256;
+    const std::string escaped_job_id = cp_json_escape(job_id);
+    size_t need = blen + escaped_job_id.size() + 256;
     char* sub = (char*)malloc(need);
     if(!sub){
         fprintf(stderr, "[net] plain_proof submit OOM (%zu b64 bytes)\n", blen);
@@ -293,7 +283,7 @@ int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
     int nw = snprintf(sub, need,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.submit\","
         "\"params\":{\"job_id\":\"%s\",\"plain_proof\":\"%s\",\"hs\":%.0f}}",
-        msg_id, job_id, plain_b64, hs);
+        msg_id, escaped_job_id.c_str(), plain_b64 ? plain_b64 : "", hs);
     if(nw < 0 || (size_t)nw >= need){
         fprintf(stderr, "[net] plain_proof submit JSON too large (b64=%zu need>=%zu)\n",
                 blen, need);
@@ -339,11 +329,14 @@ int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
                     std::chrono::milliseconds(timeout_ms < 0 ? 60000 : timeout_ms);
     std::lock_guard<std::mutex> lk(g_net_mx);
     while(1){
-        if(net_buf_has_complete_json()){
-            char* line = pop_json_message(tcp_sock);
+        int state = net_buf_message_state();
+        if(state < 0) return -1;
+        if(state == 1){
+            char* line = pop_json_message();
             if(!line) return -1;
-            strncpy(out, line, out_cap - 1);
-            out[out_cap - 1] = 0;
+            const size_t line_len = strlen(line);
+            if(line_len >= out_cap) return -1;
+            memcpy(out, line, line_len + 1);
             return 1;
         }
         int remain_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -351,6 +344,7 @@ int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
                             .count();
         if(remain_ms <= 0) return 0;
         if(remain_ms > 200) remain_ms = 200;
+        if(net_pos >= (int)sizeof(net_buf) - 1) return -1;
         if(!net_wait_readable(tcp_sock, remain_ms)) continue;
         int n = recv(tcp_sock, net_buf + net_pos,
                      (int)sizeof(net_buf) - net_pos - 1, 0);
@@ -361,11 +355,16 @@ int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
 
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
 {
+    if(!out || out_cap == 0) return -1;
     std::unique_lock<std::mutex> lk(g_inbox_mx);
     for(;;){
         if(!g_pool_inbox.empty()){
-            strncpy(out, g_pool_inbox.front().c_str(), out_cap - 1);
-            out[out_cap - 1] = 0;
+            const std::string& line = g_pool_inbox.front();
+            if(line.size() >= out_cap){
+                g_pool_inbox.pop_front();
+                return -1;
+            }
+            memcpy(out, line.c_str(), line.size() + 1);
             g_pool_inbox.pop_front();
             return 1;
         }
@@ -388,12 +387,12 @@ int cp_pool_conn_lost(void)
 
 void cp_pool_set_submit_inflight(int on)
 {
-    g_submit_inflight = on;
+    g_submit_inflight.store(on);
 }
 
 void cp_pool_log_share_submit_outcome(void)
 {
-    if(g_submit_inflight)
+    if(g_submit_inflight.load())
         printf("[plain] share submitted; pool ack pending (reader will log [pool] submit response)\n");
     else
         printf("[plain] share submitted; pool response already received\n");
@@ -466,10 +465,10 @@ int cp_pool_take_pending_job(CpPendingJob* out)
 
 double cp_pool_difficulty(void)
 {
-    return g_diff;
+    return g_diff.load();
 }
 
 void cp_pool_set_difficulty(double d)
 {
-    g_diff = d;
+    g_diff.store(d);
 }

@@ -246,37 +246,87 @@ void cp_bin_to_hex(const uint8_t* in, size_t n, char* out)
 
 int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap)
 {
-    int n = (int)strlen(hex);
-    if((n & 1) != 0) return 0;
-    int nb = n / 2;
-    if(nb > out_cap) return 0;
+    if(!hex || !out || out_cap < 0) return 0;
+    size_t n = strlen(hex);
+    if((n & 1) != 0 || n / 2 > (size_t)out_cap) return 0;
+    int nb = (int)(n / 2);
     for(int i = 0; i < nb; i++){
-        unsigned v = 0;
-        if(sscanf(hex + i*2, "%02x", &v) != 1) return 0;
-        out[i] = (uint8_t)v;
+        unsigned value = 0;
+        for(int j = 0; j < 2; ++j){
+            const unsigned char c = (unsigned char)hex[i * 2 + j];
+            unsigned digit;
+            if(c >= '0' && c <= '9') digit = c - '0';
+            else if(c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if(c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else return 0;
+            value = (value << 4) | digit;
+        }
+        out[i] = (uint8_t)value;
     }
     return nb;
 }
 
+/* Find a JSON member name, skipping string contents (including escapes).
+ * The pool protocol uses unique member names for the fields read here. */
+static const char* cp_json_value(const char* json, const char* key)
+{
+    if(!json || !key || !*key) return NULL;
+    const size_t key_len = strlen(key);
+    for(const char* p = json; *p; ++p){
+        if(*p != '"') continue;
+        const char* begin = ++p;
+        while(*p && *p != '"'){
+            if(*p == '\\' && p[1]) ++p;
+            ++p;
+        }
+        if(!*p) return NULL;
+        const char* after = p + 1;
+        while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+        if((size_t)(p - begin) == key_len && !memcmp(begin, key, key_len) && *after == ':'){
+            ++after;
+            while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+            return after;
+        }
+    }
+    return NULL;
+}
+
 int cp_json_str(const char* json, const char* key, char* out, int outlen)
 {
-    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
-    const char* p = strstr(json,pat); if(!p) return 0;
-    p += strlen(pat);
-    while(*p==' '||*p==':') p++;
-    if(*p!='"') return 0; p++;
-    int i=0;
-    while(*p && *p!='"' && i<outlen-1) out[i++]=*p++;
-    out[i]=0; return 1;
+    if(!out || outlen <= 0) return 0;
+    out[0] = 0;
+    const char* p = cp_json_value(json, key);
+    if(!p || *p++ != '"') return 0;
+    int i = 0;
+    while(*p && *p != '"'){
+        unsigned char c = (unsigned char)*p++;
+        if(c == '\\'){
+            c = (unsigned char)*p++;
+            switch(c){
+                case '"': case '\\': case '/': break;
+                case 'b': c = '\b'; break;
+                case 'f': c = '\f'; break;
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                default: out[0] = 0; return 0;
+            }
+        }
+        if(c < 0x20 || i >= outlen - 1){ out[0] = 0; return 0; }
+        out[i++] = (char)c;
+    }
+    if(*p != '"'){ out[0] = 0; return 0; }
+    out[i] = 0;
+    return 1;
 }
 
 double cp_json_num(const char* json, const char* key)
 {
-    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
-    const char* p = strstr(json,pat); if(!p) return 0;
-    p += strlen(pat);
-    while(*p==' '||*p==':') p++;
-    return atof(p);
+    const char* p = cp_json_value(json, key);
+    if(!p) return 0;
+    char* end = NULL;
+    double value = strtod(p, &end);
+    return end != p && isfinite(value) ? value : 0;
 }
 
 static int g_pp_hash_h_override = 0;

@@ -16,6 +16,9 @@ int cp_qpow_mine_job(const CpQpowJob* job, int sock, int* msg_id,
  * Returns 0 on PASS, 1 on FAIL. Difficulty via cp_resolve_mock_diff (U512). */
 int cp_qpow_mine_mock(const char* worker_name);
 
+/* Returns 0 if CPU thread nonce ranges remain distinct for all extranonce lengths. */
+int cp_qpow_nonce_thread_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif
