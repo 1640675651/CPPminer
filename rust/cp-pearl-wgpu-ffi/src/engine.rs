@@ -381,7 +381,7 @@ impl PearlEngine {
             wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
         ) {
             eprintln!(
-                "[pearl-wgpu] iGPU: capping submits at {max_wg_submit} WGs (Windows TDR); production prep is slow - prefer a discrete GPU or --dev"
+                "[pearl-wgpu] iGPU: capping submits at {max_wg_submit} WGs (Windows TDR)"
             );
         }
 

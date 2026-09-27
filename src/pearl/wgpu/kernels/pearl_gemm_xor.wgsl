@@ -63,6 +63,11 @@ struct PearlScanParams {
 @group(0) @binding(6) var<storage, read_write> out_t_rows: array<i32, 1>;
 @group(0) @binding(7) var<storage, read_write> out_t_cols: array<i32, 1>;
 
+fn dot4x(a: vec4<u32>, b: u32) -> vec4<i32> {
+    return vec4<i32>(
+        dot4I8Packed(a.x, b), dot4I8Packed(a.y, b), dot4I8Packed(a.z, b), dot4I8Packed(a.w, b));
+}
+
 fn pp_rotl32(x: u32, s: u32) -> u32 {
     return (x << s) | (x >> (32u - s));
 }
@@ -192,10 +197,17 @@ fn pearl_macro_gemm_xor(
     // HASH_REG_TILES_N == 1
     let tc = hash_tc;
 
-    var acc: array<i32, 64>; // NR * MR = 64
-    for (var i = 0; i < NR * MR; i = i + 1) {
-        acc[i] = 0;
-    }
+    // 8x8 accumulator tile as 16 named vec4s (cJ_lo = A rows 0-3, cJ_hi = A rows 4-7, B col J).
+    // Only XOR-folded, so element order is irrelevant. Named locals instead of an array keep the
+    // tile in registers on compilers that don't fully unroll (Intel IGC spills array<i32, 64>).
+    var c0_lo = vec4<i32>(0); var c0_hi = vec4<i32>(0);
+    var c1_lo = vec4<i32>(0); var c1_hi = vec4<i32>(0);
+    var c2_lo = vec4<i32>(0); var c2_hi = vec4<i32>(0);
+    var c3_lo = vec4<i32>(0); var c3_hi = vec4<i32>(0);
+    var c4_lo = vec4<i32>(0); var c4_hi = vec4<i32>(0);
+    var c5_lo = vec4<i32>(0); var c5_hi = vec4<i32>(0);
+    var c6_lo = vec4<i32>(0); var c6_hi = vec4<i32>(0);
+    var c7_lo = vec4<i32>(0); var c7_hi = vec4<i32>(0);
 
     var ms = 0;
     for (var kb = 0; kb < params.blocks_k; kb = kb + 1) {
@@ -213,24 +225,22 @@ fn pearl_macro_gemm_xor(
             let a_hi = a_pre[a_kg / 16u + 1u];
             let b_lo = b_pre[b_kg / 16u];
             let b_hi = b_pre[b_kg / 16u + 1u];
-            let a_pack = array<u32, 8>(a_lo.x, a_lo.y, a_lo.z, a_lo.w, a_hi.x, a_hi.y, a_hi.z, a_hi.w);
-            let b_pack = array<u32, 8>(b_lo.x, b_lo.y, b_lo.z, b_lo.w, b_hi.x, b_hi.y, b_hi.z, b_hi.w);
 
-            // Packed int8 dots: acc[j*MR+i] += dot4I8Packed(a_pack[i], b_pack[j])
-            for (var j = 0; j < NR; j = j + 1) {
-                let base = j * MR;
-                let b0 = b_pack[j];
-                for (var i = 0; i < MR; i = i + 1) {
-                    acc[base + i] = acc[base + i] + dot4I8Packed(a_pack[i], b0);
-                }
-            }
+            c0_lo += dot4x(a_lo, b_lo.x); c0_hi += dot4x(a_hi, b_lo.x);
+            c1_lo += dot4x(a_lo, b_lo.y); c1_hi += dot4x(a_hi, b_lo.y);
+            c2_lo += dot4x(a_lo, b_lo.z); c2_hi += dot4x(a_hi, b_lo.z);
+            c3_lo += dot4x(a_lo, b_lo.w); c3_hi += dot4x(a_hi, b_lo.w);
+            c4_lo += dot4x(a_lo, b_hi.x); c4_hi += dot4x(a_hi, b_hi.x);
+            c5_lo += dot4x(a_lo, b_hi.y); c5_hi += dot4x(a_hi, b_hi.y);
+            c6_lo += dot4x(a_lo, b_hi.z); c6_hi += dot4x(a_hi, b_hi.z);
+            c7_lo += dot4x(a_lo, b_hi.w); c7_hi += dot4x(a_hi, b_hi.w);
         }
 
         // Milestone XOR fold into msg[16] (fuse_jackpot online path)
-        var x = 0u;
-        for (var i = 0; i < NR * MR; i = i + 1) {
-            x = x ^ bitcast<u32>(acc[i]);
-        }
+        let xv = bitcast<vec4<u32>>(
+            c0_lo ^ c0_hi ^ c1_lo ^ c1_hi ^ c2_lo ^ c2_hi ^ c3_lo ^ c3_hi
+            ^ c4_lo ^ c4_hi ^ c5_lo ^ c5_hi ^ c6_lo ^ c6_hi ^ c7_lo ^ c7_hi);
+        let x = xv.x ^ xv.y ^ xv.z ^ xv.w;
         if (ms < PP_MAX_MILESTONES) {
             let tid = ms % PP_JACKPOT_WORDS;
             var contribution = x;
