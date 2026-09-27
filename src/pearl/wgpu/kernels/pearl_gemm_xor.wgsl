@@ -65,11 +65,6 @@ struct PearlScanParams {
 @group(0) @binding(6) var<storage, read_write> out_t_rows: array<i32, 1>;
 @group(0) @binding(7) var<storage, read_write> out_t_cols: array<i32, 1>;
 
-fn dot4x(a: vec4<u32>, b: u32) -> vec4<i32> {
-    return vec4<i32>(
-        dot4I8Packed(a.x, b), dot4I8Packed(a.y, b), dot4I8Packed(a.z, b), dot4I8Packed(a.w, b));
-}
-
 fn pp_rotl32(x: u32, s: u32) -> u32 {
     return (x << s) | (x >> (32u - s));
 }

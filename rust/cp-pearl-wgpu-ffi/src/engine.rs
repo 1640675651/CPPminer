@@ -115,10 +115,14 @@ fn gemm_wgsl(tile: &TileConfig) -> String {
         a_params.join(", "),
         b_params.join(", ")
     );
+    // Every dot4I8Packed operand is written out fresh: naga's MSL backend names the packed_char4
+    // temp after the argument expression, so reusing one (e.g. a helper's `b` param) redefines it.
     for j in 0..nr as usize {
         let b = format!("b{}.{}", j / 4, lanes[j % 4]);
         for i in 0..av {
-            let _ = writeln!(s, "    (*acc).c{j}_{i} += dot4x(a{i}, {b});");
+            let dots: Vec<String> =
+                lanes.iter().map(|l| format!("dot4I8Packed(a{i}.{l}, {b})")).collect();
+            let _ = writeln!(s, "    (*acc).c{j}_{i} += vec4<i32>({});", dots.join(", "));
         }
     }
     let _ = writeln!(s, "}}");
