@@ -6,6 +6,7 @@
 #include "cp_pool.h"
 #include "cp_proof.h"
 #include "cp_state.h"
+#include "cp_share_witness.h"
 #include "cp_util.h"
 #include "cp_worker.h"
 
@@ -38,6 +39,8 @@ struct ShareSnapshot {
     int8_t *bt_sig = nullptr;
     size_t sz_bt = 0;
     int bt_owned = 0;
+    /* Set instead of a_sig/bt_sig when the backend proves from device sub-roots. */
+    CpShareWitness *witness = nullptr;
 };
 
 static int verify_proof_file(const char *hdr_path, const char *target_hex, const char *proof_path,
@@ -178,6 +181,7 @@ static void share_snapshot_delete(ShareSnapshot *snap) {
     if (snap->bt_owned) {
         free(snap->bt_sig);
     }
+    cp_share_witness_free(snap->witness);
     delete snap;
 }
 
@@ -186,6 +190,45 @@ static const int8_t *share_bt_for_proof(const ShareSnapshot *snap) {
         return snap->bt_sig;
     }
     return h_BpT_global;
+}
+
+static const uint8_t *mining_cfg_for_layout(int tile_layout) {
+    switch (tile_layout) {
+    case CP_TILE_LAYOUT_CUTLASS:
+        return PEARL_CUTLASS_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS_8x8:
+        return PEARL_CONTIGUOUS_8x8_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS_4x8:
+        return PEARL_CONTIGUOUS_4x8_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS_16x16:
+        return PEARL_CONTIGUOUS_16x16_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS:
+        return PEARL_CONTIGUOUS_CONFIG;
+    default:
+        return PEARL_SCATTERED_CONFIG;
+    }
+}
+
+static int build_snapshot_proof(const ShareSnapshot *snap, const CpShareJobCtx &job_ctx,
+                                char *b64, char *errbuf, size_t errcap) {
+    const CpShareWitness *w = snap->witness;
+    if (w) {
+        const CpMatrixWitness a = {w->a_subroots, w->a_num_subroots, w->a_blocks,
+                                   w->a_block_idx, w->a_num_blocks, w->a_root};
+        const CpMatrixWitness bt = {w->bt_subroots, w->bt_num_subroots, nullptr, nullptr, 0,
+                                    w->bt_num_subroots ? w->bt_root : nullptr};
+        return cp_proof_build_witness(snap->header, (size_t)snap->header_len,
+                                      mining_cfg_for_layout(w->tile_layout), 52, &a, &bt,
+                                      job_ctx.m, job_ctx.n, K_DIM, R_RANK, snap->t_rows,
+                                      snap->t_cols, w->tile_layout, b64, PLAIN_PROOF_B64_MAX,
+                                      errbuf, errcap);
+    }
+    const int tile_layout = cp_worker_proof_tile_layout();
+    return cp_proof_build(snap->header, (size_t)snap->header_len,
+                          mining_cfg_for_layout(tile_layout), 52, snap->a_sig,
+                          share_bt_for_proof(snap), job_ctx.m, job_ctx.n, K_DIM, R_RANK,
+                          snap->t_rows, snap->t_cols, tile_layout, b64, PLAIN_PROOF_B64_MAX,
+                          errbuf, errcap);
 }
 
 void CpShareQueueImpl::set_outcome(int outcome) {
@@ -217,31 +260,10 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
-    int tile_layout = cp_worker_default_tile_layout();
-    if (g_cutlass_fused) {
-        tile_layout = CP_TILE_LAYOUT_CUTLASS;
-    }
-
-    const uint8_t *mining_cfg = PEARL_SCATTERED_CONFIG;
-    if (tile_layout == CP_TILE_LAYOUT_CUTLASS) {
-        mining_cfg = PEARL_CUTLASS_CONFIG;
-    } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) {
-        mining_cfg = PEARL_CONTIGUOUS_8x8_CONFIG;
-    } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) {
-        mining_cfg = PEARL_CONTIGUOUS_4x8_CONFIG;
-    } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) {
-        mining_cfg = PEARL_CONTIGUOUS_16x16_CONFIG;
-    } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) {
-        mining_cfg = PEARL_CONTIGUOUS_CONFIG;
-    }
-
     char errbuf[512];
-    const int8_t *bt = share_bt_for_proof(snap);
+    errbuf[0] = 0;
     const double proof_started = cp_now_sec();
-    const int prc =
-            cp_proof_build(snap->header, (size_t)snap->header_len, mining_cfg, 52, snap->a_sig, bt,
-                           job_ctx.m, job_ctx.n, K_DIM, R_RANK, snap->t_rows, snap->t_cols,
-                           tile_layout, b64, PLAIN_PROOF_B64_MAX, errbuf, sizeof(errbuf));
+    const int prc = build_snapshot_proof(snap, job_ctx, b64, errbuf, sizeof(errbuf));
     const double proof_build_sec = cp_now_sec() - proof_started;
     if (prc != 0) {
         printf("[plain] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
@@ -415,11 +437,7 @@ extern "C" void cp_share_queue_destroy(CpShareQueue *q) {
     while (!q->impl.pending.empty()) {
         ShareSnapshot *snap = q->impl.pending.front();
         q->impl.pending.pop_front();
-        free(snap->a_sig);
-        if (snap->bt_owned) {
-            free(snap->bt_sig);
-        }
-        delete snap;
+        share_snapshot_delete(snap);
     }
     free(q->impl.returned_a);
     free(q->impl.returned_bt);
@@ -497,20 +515,12 @@ extern "C" void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, 
     }
 }
 
-extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit,
-                                          const uint8_t *header, int hlen, const char *job_id,
-                                          const char *target_hex, int8_t **a_io, size_t sz_a,
-                                          int8_t **bt_io, size_t sz_bt) {
-    if (!q || !hit || !header || hlen <= 0 || !job_id || !a_io || !*a_io || sz_a == 0) {
-        return -1;
-    }
-    if (hit->handoff_bt && (!bt_io || !*bt_io || sz_bt == 0)) {
-        return -1;
-    }
-
+static ShareSnapshot *new_snapshot(const CpShareQueue *q, const CpShareHit *hit,
+                                   const uint8_t *header, int hlen, const char *job_id,
+                                   const char *target_hex) {
     auto *snap = new (std::nothrow) ShareSnapshot();
     if (!snap) {
-        return -1;
+        return nullptr;
     }
 
     snap->nonce = hit->nonce;
@@ -518,8 +528,6 @@ extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit
     snap->t_cols = hit->t_cols;
     snap->tiles_since_prev = hit->tiles_since_prev;
     snap->interval_sec = hit->interval_sec;
-    snap->sz_a = sz_a;
-    snap->sz_bt = sz_bt;
 
     strncpy(snap->job_id, job_id, sizeof(snap->job_id) - 1);
     snap->job_id[sizeof(snap->job_id) - 1] = '\0';
@@ -533,6 +541,59 @@ extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit
     const size_t hdr_copy = (size_t)hlen < sizeof(snap->header) ? (size_t)hlen : sizeof(snap->header);
     memcpy(snap->header, header, hdr_copy);
     snap->header_len = (int)hdr_copy;
+    return snap;
+}
+
+extern "C" int cp_share_queue_enqueue_witness(CpShareQueue *q, const CpShareHit *hit,
+                                              const uint8_t *header, int hlen,
+                                              const char *job_id, const char *target_hex,
+                                              CpShareWitness **witness_io) {
+    if (!q || !hit || !header || hlen <= 0 || !job_id || !witness_io || !*witness_io) {
+        return -1;
+    }
+    ShareSnapshot *snap = new_snapshot(q, hit, header, hlen, job_id, target_hex);
+    if (!snap) {
+        return -1;
+    }
+    {
+        std::unique_lock<std::mutex> lock(q->impl.mtx);
+        if (!q->impl.job_active || q->impl.shutdown) {
+            delete snap;
+            return -1;
+        }
+        q->impl.cv.wait(lock, [&] {
+            return q->impl.shutdown ||
+                   ((int)q->impl.pending.size() < q->impl.max_depth && q->impl.in_flight == 0);
+        });
+        if (q->impl.shutdown || !q->impl.job_active) {
+            delete snap;
+            return -1;
+        }
+        snap->witness = *witness_io;
+        *witness_io = nullptr;
+        q->impl.pending.push_back(snap);
+    }
+    q->impl.cv.notify_one();
+    return 0;
+}
+
+extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit,
+                                          const uint8_t *header, int hlen, const char *job_id,
+                                          const char *target_hex, int8_t **a_io, size_t sz_a,
+                                          int8_t **bt_io, size_t sz_bt) {
+    if (!q || !hit || !header || hlen <= 0 || !job_id || !a_io || !*a_io || sz_a == 0) {
+        return -1;
+    }
+    if (hit->handoff_bt && (!bt_io || !*bt_io || sz_bt == 0)) {
+        return -1;
+    }
+
+    ShareSnapshot *snap = new_snapshot(q, hit, header, hlen, job_id, target_hex);
+    if (!snap) {
+        return -1;
+    }
+    snap->sz_a = sz_a;
+    snap->sz_bt = sz_bt;
 
     {
         std::unique_lock<std::mutex> lock(q->impl.mtx);

@@ -79,3 +79,9 @@ extern "C" int cp_cuda_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_
 {
     return cp_gpu_fetch_share_signals(h_A_sig, h_Bt_sig);
 }
+
+extern "C" int cp_cuda_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
+                                                  CpShareWitness** out)
+{
+    return cp_gpu_fetch_share_witness(t_rows, t_cols, tile_layout, out);
+}

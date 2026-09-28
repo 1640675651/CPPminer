@@ -2,13 +2,20 @@
 
 mod mining_config;
 mod verify;
+mod witness;
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mining_config::{mining_config_bytes, validate_tile_anchor};
-use pearl_blake3::{blake3_digest, pad_to_chunk_boundary, MerkleProof, MerkleTree};
+use pearl_blake3::{blake3_digest, MerkleProof};
 use serde::{Deserialize, Serialize};
 use verify::{jackpot_verify_detail, verify_plain_proof_with_pool_target};
-use zk_pow::api::proof::MiningConfiguration;
+use witness::{
+    build_matrix_proof_in_place, build_matrix_proof_witness, needed_blocks, zero_subroots,
+    MatrixWitness, BLOCK_BYTES,
+};
 
 /// BzMiner production hash tile (8x16 scattered cells within 128x256 period).
 const SCATTERED_ROWS: [usize; 8] = [0, 8, 32, 40, 64, 72, 96, 104];
@@ -21,7 +28,7 @@ const SCATTERED_COLS: [usize; 16] = [
 const CUTLASS_ROWS: [usize; 8] = [0, 1, 2, 3, 16, 17, 18, 19];
 const CUTLASS_COLS: [usize; 8] = [0, 1, 2, 3, 32, 33, 34, 35];
 
-const CONTIGUOUS_16x16_ROWS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const CONTIGUOUS_16X16_ROWS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileLayout {
@@ -70,14 +77,6 @@ fn job_key(header: &[u8], mining_config: &[u8]) -> [u8; 32] {
     blake3_digest(&buf, None)
 }
 
-fn mining_config_for_layout(layout: TileLayout) -> Result<MiningConfiguration, String> {
-    let (rows_pat, cols_pat) = row_patterns(layout);
-    let row_offsets: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
-    let col_offsets: Vec<u32> = cols_pat.iter().map(|&o| o as u32).collect();
-    let bytes = mining_config_bytes(4096, 128, &row_offsets, &col_offsets)?;
-    MiningConfiguration::from_bytes(&bytes).map_err(|e| e.to_string())
-}
-
 fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
     match layout {
         TileLayout::Scattered => (&SCATTERED_ROWS, &SCATTERED_COLS),
@@ -94,16 +93,16 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
             &[0, 1, 2, 3, 4, 5, 6, 7],
         ),
         TileLayout::Contiguous16x16 => (
-            &CONTIGUOUS_16x16_ROWS,
+            &CONTIGUOUS_16X16_ROWS,
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         ),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
     }
 }
 
-fn flatten_i8_row_major(data: &[i8], rows: usize, cols: usize) -> Vec<u8> {
-    debug_assert_eq!(data.len(), rows * cols);
-    data.iter().map(|&x| x as u8).collect()
+fn i8_as_bytes(data: &[i8]) -> &[u8] {
+    // SAFETY: i8 and u8 have the same size and alignment; the pool commits the raw bytes.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) }
 }
 
 fn build_matrix_proof(
@@ -112,41 +111,28 @@ fn build_matrix_proof(
     cols: usize,
     job_key: [u8; 32],
     row_indices: &[usize],
-) -> MatrixMerkleProof {
-    let flat = flatten_i8_row_major(matrix, rows, cols);
-    let padded = pad_to_chunk_boundary(&flat);
-    let tree = MerkleTree::new(&padded, job_key);
-    let leaf_indices = MerkleTree::compute_leaf_indices_from_rows(row_indices, (rows, cols));
-    MatrixMerkleProof {
-        proof: tree.get_multileaf_proof(&leaf_indices),
+) -> Result<MatrixMerkleProof, String> {
+    Ok(MatrixMerkleProof {
+        proof: build_matrix_proof_in_place(i8_as_bytes(matrix), rows, cols, job_key, row_indices)?,
         row_indices: row_indices.to_vec(),
-    }
+    })
 }
 
-fn build_plain_proof_b64(
+/// Validates the tile anchor and mining_config; returns (job_key, A rows, B^T rows) to prove.
+fn proof_rows(
     header: &[u8],
     mining_config: &[u8],
-    a: &[i8],
-    bt: &[i8],
-    m: usize,
-    n: usize,
     k: usize,
     rank: usize,
     t_rows: usize,
     t_cols: usize,
     layout: TileLayout,
-) -> Result<String, String> {
+) -> Result<([u8; 32], Vec<usize>, Vec<usize>), String> {
     if mining_config.len() != 52 {
         return Err(format!(
             "mining_config must be 52 bytes, got {}",
             mining_config.len()
         ));
-    }
-    if a.len() != m * k {
-        return Err(format!("A size mismatch: need {} got {}", m * k, a.len()));
-    }
-    if bt.len() != n * k {
-        return Err(format!("B^T size mismatch: need {} got {}", n * k, bt.len()));
     }
 
     let (rows_pat, cols_pat) = row_patterns(layout);
@@ -170,18 +156,132 @@ fn build_plain_proof_b64(
     let key = job_key(header, mining_config);
     let a_rows: Vec<usize> = rows_pat.iter().map(|o| t_rows + o).collect();
     let bt_rows: Vec<usize> = cols_pat.iter().map(|o| t_cols + o).collect();
+    Ok((key, a_rows, bt_rows))
+}
 
-    let pp = PlainProof {
+fn encode_plain_proof(pp: &PlainProof) -> Result<String, String> {
+    let bytes = bincode::serialize(pp).map_err(|e| format!("bincode serialize: {e}"))?;
+    Ok(STANDARD.encode(bytes))
+}
+
+struct ZeroSubroots {
+    key: [u8; 32],
+    rows: usize,
+    cols: usize,
+    subroots: Vec<[u8; 32]>,
+}
+
+/// One entry per job: every share of a job proves the same all-zero B^T.
+static ZERO_SUBROOTS: Mutex<Option<ZeroSubroots>> = Mutex::new(None);
+
+fn build_zero_matrix_proof(
+    rows: usize,
+    cols: usize,
+    key: [u8; 32],
+    row_indices: &[usize],
+) -> Result<MatrixMerkleProof, String> {
+    let mut cache = ZERO_SUBROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = matches!(&*cache, Some(c) if c.key == key && c.rows == rows && c.cols == cols);
+    if !hit {
+        *cache = Some(ZeroSubroots {
+            key,
+            rows,
+            cols,
+            subroots: zero_subroots(rows, cols, key),
+        });
+    }
+    let witness = MatrixWitness {
+        subroots: &cache.as_ref().unwrap().subroots,
+        blocks: None,
+        expected_root: None,
+    };
+    Ok(MatrixMerkleProof {
+        proof: build_matrix_proof_witness(rows, cols, key, row_indices, &witness)?,
+        row_indices: row_indices.to_vec(),
+    })
+}
+
+/// `bt = None` proves an all-zero B^T without a host copy of it.
+fn build_plain_proof_b64(
+    header: &[u8],
+    mining_config: &[u8],
+    a: &[i8],
+    bt: Option<&[i8]>,
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    t_rows: usize,
+    t_cols: usize,
+    layout: TileLayout,
+) -> Result<String, String> {
+    if a.len() != m * k {
+        return Err(format!("A size mismatch: need {} got {}", m * k, a.len()));
+    }
+    if let Some(bt) = bt {
+        if bt.len() != n * k {
+            return Err(format!("B^T size mismatch: need {} got {}", n * k, bt.len()));
+        }
+    }
+    let (key, a_rows, bt_rows) =
+        proof_rows(header, mining_config, k, rank, t_rows, t_cols, layout)?;
+
+    let a_proof = build_matrix_proof(a, m, k, key, &a_rows).map_err(|e| format!("A: {e}"))?;
+    let bt_proof = match bt {
+        Some(bt) => build_matrix_proof(bt, n, k, key, &bt_rows),
+        None => build_zero_matrix_proof(n, k, key, &bt_rows),
+    }
+    .map_err(|e| format!("B^T: {e}"))?;
+    encode_plain_proof(&PlainProof {
         m,
         n,
         k,
         noise_rank: rank,
-        a: build_matrix_proof(a, m, k, key, &a_rows),
-        bt: build_matrix_proof(bt, n, k, key, &bt_rows),
+        a: a_proof,
+        bt: bt_proof,
+    })
+}
+
+fn build_plain_proof_witness_b64(
+    header: &[u8],
+    mining_config: &[u8],
+    a: &MatrixWitness,
+    bt: &MatrixWitness,
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    t_rows: usize,
+    t_cols: usize,
+    layout: TileLayout,
+) -> Result<String, String> {
+    let (key, a_rows, bt_rows) =
+        proof_rows(header, mining_config, k, rank, t_rows, t_cols, layout)?;
+    let a_proof = build_matrix_proof_witness(m, k, key, &a_rows, a).map_err(|e| format!("A: {e}"))?;
+    let bt_proof = if bt.blocks.is_none() && bt.subroots.is_empty() {
+        let p = build_zero_matrix_proof(n, k, key, &bt_rows).map_err(|e| format!("B^T: {e}"))?;
+        if matches!(bt.expected_root, Some(r) if r != p.proof.root) {
+            return Err("B^T: zero-matrix root does not match device commitment".into());
+        }
+        p.proof
+    } else {
+        build_matrix_proof_witness(n, k, key, &bt_rows, bt).map_err(|e| format!("B^T: {e}"))?
     };
 
-    let bytes = bincode::serialize(&pp).map_err(|e| format!("bincode serialize: {e}"))?;
-    Ok(STANDARD.encode(bytes))
+    encode_plain_proof(&PlainProof {
+        m,
+        n,
+        k,
+        noise_rank: rank,
+        a: MatrixMerkleProof {
+            proof: a_proof,
+            row_indices: a_rows,
+        },
+        bt: MatrixMerkleProof {
+            proof: bt_proof,
+            row_indices: bt_rows,
+        },
+    })
 }
 
 fn write_err(out: Option<&mut [u8]>, msg: &str) {
@@ -199,6 +299,7 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 /// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8,
 /// 3 = contiguous 8x8, 4 = contiguous 4x8.
 /// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
+/// `bt` may be null: B^T is then all zeros (zero-B mining), proven without a host copy.
 #[no_mangle]
 pub unsafe extern "C" fn cp_proof_build(
     header: *const u8,
@@ -230,7 +331,7 @@ pub unsafe extern "C" fn cp_proof_build(
         -1
     };
 
-    if header.is_null() || mining_config.is_null() || a.is_null() || bt.is_null() || out_b64.is_null() {
+    if header.is_null() || mining_config.is_null() || a.is_null() || out_b64.is_null() {
         return fail("null pointer".into());
     }
     if m <= 0 || n <= 0 || k <= 0 || rank <= 0 {
@@ -249,7 +350,11 @@ pub unsafe extern "C" fn cp_proof_build(
     let header_slice = std::slice::from_raw_parts(header, header_len);
     let config_slice = std::slice::from_raw_parts(mining_config, config_len);
     let a_slice = std::slice::from_raw_parts(a, m * k);
-    let bt_slice = std::slice::from_raw_parts(bt, n * k);
+    let bt_slice = if bt.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(bt, n * k))
+    };
 
     let b64 = match build_plain_proof_b64(
         header_slice,
@@ -260,6 +365,172 @@ pub unsafe extern "C" fn cp_proof_build(
         n,
         k,
         rank,
+        t_rows as usize,
+        t_cols as usize,
+        layout,
+    ) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+
+    if b64.len() >= out_cap {
+        return fail(format!(
+            "out_b64 too small: need {} bytes, cap {}",
+            b64.len() + 1,
+            out_cap
+        ));
+    }
+
+    let out = std::slice::from_raw_parts_mut(out_b64, out_cap);
+    out[..b64.len()].copy_from_slice(b64.as_bytes());
+    out[b64.len()] = 0;
+    0
+}
+
+/// C mirror: `CpMatrixWitness` in cp_proof.h.
+#[repr(C)]
+pub struct CpMatrixWitness {
+    subroots: *const u8,
+    num_subroots: usize,
+    blocks: *const u8,
+    block_idx: *const u32,
+    num_blocks: usize,
+    root: *const u8,
+}
+
+unsafe fn matrix_witness_from_c(w: &CpMatrixWitness) -> Result<MatrixWitness<'_>, String> {
+    let subroots: &[[u8; 32]] = if w.subroots.is_null() || w.num_subroots == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(w.subroots as *const [u8; 32], w.num_subroots)
+    };
+    let blocks = if w.blocks.is_null() {
+        None
+    } else {
+        if w.block_idx.is_null() || w.num_blocks == 0 {
+            return Err("witness blocks without block indices".into());
+        }
+        let idx = std::slice::from_raw_parts(w.block_idx, w.num_blocks);
+        let data = std::slice::from_raw_parts(w.blocks, w.num_blocks * BLOCK_BYTES);
+        let map: BTreeMap<usize, &[u8]> = idx
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| (b as usize, &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]))
+            .collect();
+        Some(map)
+    };
+    let expected_root = if w.root.is_null() {
+        None
+    } else {
+        Some(*(w.root as *const [u8; 32]))
+    };
+    Ok(MatrixWitness {
+        subroots,
+        blocks,
+        expected_root,
+    })
+}
+
+/// Which `CP_WITNESS_BLOCK_BYTES` blocks of a matrix a proof reads.
+/// `is_bt` = 0: A rows anchored at `anchor` (t_rows); 1: B^T rows anchored at t_cols.
+/// Writes sorted block indices to `out_idx`; returns the count, or -1 on error / too small `cap`.
+#[no_mangle]
+pub unsafe extern "C" fn cp_proof_witness_blocks(
+    tile_layout: i32,
+    is_bt: i32,
+    anchor: i32,
+    rows: i32,
+    k: i32,
+    out_idx: *mut u32,
+    cap: usize,
+) -> i32 {
+    let layout = match TileLayout::from_i32(tile_layout) {
+        Ok(l) => l,
+        Err(_) => return -1,
+    };
+    if anchor < 0 || rows <= 0 || k <= 0 || out_idx.is_null() {
+        return -1;
+    }
+    let (rows_pat, cols_pat) = row_patterns(layout);
+    let pat = if is_bt != 0 { cols_pat } else { rows_pat };
+    let row_indices: Vec<usize> = pat.iter().map(|&o| anchor as usize + o).collect();
+    if row_indices.iter().any(|&r| r >= rows as usize) {
+        return -1;
+    }
+    let blocks = needed_blocks(rows as usize, k as usize, &row_indices);
+    if blocks.len() > cap {
+        return -1;
+    }
+    let out = std::slice::from_raw_parts_mut(out_idx, cap);
+    for (dst, &b) in out.iter_mut().zip(&blocks) {
+        *dst = b as u32;
+    }
+    blocks.len() as i32
+}
+
+/// Same output as `cp_proof_build`, but from device Merkle sub-roots plus only the blocks
+/// listed by `cp_proof_witness_blocks` (or none, for an all-zero matrix).
+#[no_mangle]
+pub unsafe extern "C" fn cp_proof_build_witness(
+    header: *const u8,
+    header_len: usize,
+    mining_config: *const u8,
+    config_len: usize,
+    a: *const CpMatrixWitness,
+    bt: *const CpMatrixWitness,
+    m: i32,
+    n: i32,
+    k: i32,
+    rank: i32,
+    t_rows: i32,
+    t_cols: i32,
+    tile_layout: i32,
+    out_b64: *mut u8,
+    out_cap: usize,
+    err: *mut u8,
+    err_cap: usize,
+) -> i32 {
+    let err_slice = if err.is_null() || err_cap == 0 {
+        None
+    } else {
+        Some(std::slice::from_raw_parts_mut(err, err_cap))
+    };
+
+    let fail = |msg: String| {
+        write_err(err_slice, &msg);
+        -1
+    };
+
+    if header.is_null() || mining_config.is_null() || a.is_null() || bt.is_null() || out_b64.is_null() {
+        return fail("null pointer".into());
+    }
+    if m <= 0 || n <= 0 || k <= 0 || rank <= 0 || t_rows < 0 || t_cols < 0 {
+        return fail("invalid dimensions".into());
+    }
+    let layout = match TileLayout::from_i32(tile_layout) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
+    let a_w = match matrix_witness_from_c(&*a) {
+        Ok(w) => w,
+        Err(e) => return fail(format!("A: {e}")),
+    };
+    let bt_w = match matrix_witness_from_c(&*bt) {
+        Ok(w) => w,
+        Err(e) => return fail(format!("B^T: {e}")),
+    };
+
+    let header_slice = std::slice::from_raw_parts(header, header_len);
+    let config_slice = std::slice::from_raw_parts(mining_config, config_len);
+    let b64 = match build_plain_proof_witness_b64(
+        header_slice,
+        config_slice,
+        &a_w,
+        &bt_w,
+        m as usize,
+        n as usize,
+        k as usize,
+        rank as usize,
         t_rows as usize,
         t_cols as usize,
         layout,
@@ -369,11 +640,92 @@ pub unsafe extern "C" fn cp_proof_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pearl_blake3::{pad_to_chunk_boundary, MerkleTree};
+
+    /// Stock pearl-blake3 full-tree proof: the reference every in-place / witness proof must match.
+    fn reference_matrix_proof(
+        matrix: &[i8],
+        rows: usize,
+        cols: usize,
+        key: [u8; 32],
+        row_indices: &[usize],
+    ) -> MatrixMerkleProof {
+        let flat: Vec<u8> = matrix.iter().map(|&x| x as u8).collect();
+        let tree = MerkleTree::new(&pad_to_chunk_boundary(&flat), key);
+        let leaf_indices = MerkleTree::compute_leaf_indices_from_rows(row_indices, (rows, cols));
+        MatrixMerkleProof {
+            proof: tree.get_multileaf_proof(&leaf_indices),
+            row_indices: row_indices.to_vec(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference_proof_b64(
+        header: &[u8],
+        config: &[u8],
+        a: &[i8],
+        bt: &[i8],
+        m: usize,
+        n: usize,
+        k: usize,
+        rank: usize,
+        t_rows: usize,
+        t_cols: usize,
+        layout: TileLayout,
+    ) -> String {
+        let (key, a_rows, bt_rows) =
+            proof_rows(header, config, k, rank, t_rows, t_cols, layout).unwrap();
+        encode_plain_proof(&PlainProof {
+            m,
+            n,
+            k,
+            noise_rank: rank,
+            a: reference_matrix_proof(a, m, k, key, &a_rows),
+            bt: reference_matrix_proof(bt, n, k, key, &bt_rows),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn in_place_matches_reference_unaligned_sizes() {
+        let key = [5u8; 32];
+        // rows * cols not a multiple of the chunk or block size: padded last chunk and block.
+        for &(rows, cols, ref rows_to_prove) in &[
+            (300usize, 1000usize, vec![0usize, 1, 150, 299]),
+            (7, 100, vec![2, 6]),
+            (1100, 257, vec![1000, 1099]),
+        ] {
+            let m = test_matrix(rows, cols, 11);
+            let reference = reference_matrix_proof(&m, rows, cols, key, rows_to_prove);
+            let got = build_matrix_proof(&m, rows, cols, key, rows_to_prove).unwrap();
+            assert_eq!(
+                bincode::serialize(&got).unwrap(),
+                bincode::serialize(&reference).unwrap(),
+                "rows={rows} cols={cols}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_subroots_match_reference() {
+        let key = [3u8; 32];
+        let data: Vec<u8> = test_matrix(300, 1000, 17).iter().map(|&x| x as u8).collect();
+        assert_eq!(
+            witness::matrix_subroots(&data, key),
+            witness::subroots_from_matrix(&data, key)
+        );
+        let zeros = vec![0u8; 300 * 1000];
+        assert_eq!(
+            zero_subroots(300, 1000, key),
+            witness::subroots_from_matrix(&zeros, key)
+        );
+    }
 
     #[test]
     fn round_trip_bincode_header() {
-        let m = 4;
-        let n = 4;
+        // Contiguous tile proves 8 A rows and 16 B^T rows.
+        let m = 8;
+        let n = 16;
         let k = 256;
         let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
         let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
@@ -385,7 +737,7 @@ mod tests {
             &header,
             &config,
             &a,
-            &bt,
+            Some(&bt),
             m,
             n,
             k,
@@ -419,7 +771,7 @@ mod tests {
             &header,
             &config,
             &a,
-            &bt,
+            Some(&bt),
             m,
             n,
             k,
@@ -452,7 +804,7 @@ mod tests {
             &header,
             &config,
             &a,
-            &bt,
+            Some(&bt),
             m,
             n,
             k,
@@ -475,24 +827,27 @@ mod tests {
         use zk_pow::api::proof::IncompleteBlockHeader;
         use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
 
-        let m = 4;
-        let n = 4;
-        let k = 256;
+        // zk-pow requires 16r <= k <= 4r^2 and r >= 128; use the production k/r.
+        let m = 8;
+        let n = 16;
+        let k = 4096;
+        let rank = 128;
         let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
         let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
         let header = [0u8; 76];
         let row_offsets: Vec<u32> = (0..8).map(|i| i as u32).collect();
         let col_offsets: Vec<u32> = (0..16).map(|i| i as u32).collect();
-        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let config =
+            mining_config_bytes(k as u32, rank as u16, &row_offsets, &col_offsets).unwrap();
         let b64 = build_plain_proof_b64(
             &header,
             &config,
             &a,
-            &bt,
+            Some(&bt),
             m,
             n,
             k,
-            256,
+            rank,
             0,
             0,
             TileLayout::Contiguous,
@@ -503,10 +858,179 @@ mod tests {
         let raw = STANDARD.decode(&b64).unwrap();
         let pp: ZkPlainProof = ZkPlainProof::deserialize_compat(&raw).unwrap();
         // Near-max share target that still scales under the rank-penalized factor
-        // (8*16*(k/r)*128 with r=256, k=256 → 16384).
-        let factor = primitive_types::U256::from(8u64 * 16 * 128);
+        // h*w*(k/r)*128 = 8*16*32*128.
+        let factor = primitive_types::U256::from(8u64 * 16 * (4096 / 128) * 128);
         let mut pool_target = [0u8; 32];
         (primitive_types::U256::MAX / factor).to_big_endian(&mut pool_target);
         verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target, 2).expect("verify");
+    }
+
+    fn test_matrix(rows: usize, k: usize, mul: usize) -> Vec<i8> {
+        (0..rows * k).map(|i| ((i * mul + i / 977) % 127) as i8 - 64).collect()
+    }
+
+    fn layout_config(layout: TileLayout, k: usize) -> [u8; 52] {
+        let (rows_pat, cols_pat) = row_patterns(layout);
+        let rows: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
+        let cols: Vec<u32> = cols_pat.iter().map(|&o| o as u32).collect();
+        mining_config_bytes(k as u32, 128, &rows, &cols).unwrap()
+    }
+
+    /// Blocks a device would download for these rows, zero-padded to BLOCK_BYTES.
+    fn device_blocks(data: &[i8], rows: usize, k: usize, row_indices: &[usize]) -> Vec<(usize, Vec<u8>)> {
+        needed_blocks(rows, k, row_indices)
+            .into_iter()
+            .map(|b| {
+                let mut block = vec![0u8; BLOCK_BYTES];
+                let start = (b * BLOCK_BYTES).min(data.len());
+                let end = ((b + 1) * BLOCK_BYTES).min(data.len());
+                for (dst, &src) in block.iter_mut().zip(&data[start..end]) {
+                    *dst = src as u8;
+                }
+                (b, block)
+            })
+            .collect()
+    }
+
+    fn assert_witness_matches(
+        m: usize,
+        n: usize,
+        k: usize,
+        t_rows: usize,
+        t_cols: usize,
+        layout: TileLayout,
+        zero_bt: bool,
+    ) {
+        let header: Vec<u8> = (0..76u8).collect();
+        let config = layout_config(layout, k);
+        let a = test_matrix(m, k, 7);
+        let bt = if zero_bt { vec![0i8; n * k] } else { test_matrix(n, k, 13) };
+
+        let reference =
+            reference_proof_b64(&header, &config, &a, &bt, m, n, k, 128, t_rows, t_cols, layout);
+        let in_place =
+            build_plain_proof_b64(&header, &config, &a, Some(&bt), m, n, k, 128, t_rows, t_cols, layout)
+                .expect("in-place proof");
+        assert_eq!(in_place, reference);
+
+        let key = job_key(&header, &config);
+        let (rows_pat, cols_pat) = row_patterns(layout);
+        let a_rows: Vec<usize> = rows_pat.iter().map(|o| t_rows + o).collect();
+        let bt_rows: Vec<usize> = cols_pat.iter().map(|o| t_cols + o).collect();
+        let a_bytes: Vec<u8> = a.iter().map(|&x| x as u8).collect();
+        let bt_bytes: Vec<u8> = bt.iter().map(|&x| x as u8).collect();
+
+        let a_sub = witness::subroots_from_matrix(&a_bytes, key);
+        let bt_sub = witness::subroots_from_matrix(&bt_bytes, key);
+        let a_blocks = device_blocks(&a, m, k, &a_rows);
+        let bt_blocks = device_blocks(&bt, n, k, &bt_rows);
+        let a_root = MerkleTree::new(&pad_to_chunk_boundary(&a_bytes), key).root();
+        let bt_root = MerkleTree::new(&pad_to_chunk_boundary(&bt_bytes), key).root();
+
+        let a_w = MatrixWitness {
+            subroots: &a_sub,
+            blocks: Some(a_blocks.iter().map(|(b, d)| (*b, d.as_slice())).collect()),
+            expected_root: Some(a_root),
+        };
+        let bt_w = MatrixWitness {
+            subroots: &bt_sub,
+            blocks: if zero_bt {
+                None
+            } else {
+                Some(bt_blocks.iter().map(|(b, d)| (*b, d.as_slice())).collect())
+            },
+            expected_root: Some(bt_root),
+        };
+        let got = build_plain_proof_witness_b64(
+            &header, &config, &a_w, &bt_w, m, n, k, 128, t_rows, t_cols, layout,
+        )
+        .expect("witness proof");
+        assert_eq!(got, reference);
+
+        if zero_bt {
+            let bt_empty = MatrixWitness {
+                subroots: &[],
+                blocks: None,
+                expected_root: Some(bt_root),
+            };
+            let got = build_plain_proof_witness_b64(
+                &header, &config, &a_w, &bt_empty, m, n, k, 128, t_rows, t_cols, layout,
+            )
+            .expect("witness proof, host zero B^T");
+            assert_eq!(got, reference);
+        }
+    }
+
+    #[test]
+    fn witness_matches_full_proof_partial_last_block() {
+        // 300 rows x 4 KiB = 1200 chunks: four full 256-chunk blocks plus a 176-chunk tail.
+        assert_witness_matches(300, 64, 4096, 288, 16, TileLayout::Contiguous, false);
+        assert_witness_matches(300, 64, 4096, 0, 0, TileLayout::Contiguous8x8, false);
+    }
+
+    #[test]
+    fn witness_matches_full_proof_scattered_multi_block() {
+        assert_witness_matches(300, 600, 4096, 128, 256, TileLayout::Scattered, false);
+    }
+
+    #[test]
+    fn witness_matches_full_proof_zero_bt() {
+        assert_witness_matches(300, 600, 4096, 128, 256, TileLayout::Scattered, true);
+        assert_witness_matches(256, 128, 4096, 64, 64, TileLayout::Contiguous4x8, true);
+    }
+
+    #[test]
+    fn witness_matches_full_proof_single_block() {
+        assert_witness_matches(16, 32, 4096, 8, 16, TileLayout::Contiguous, false);
+    }
+
+    fn assert_null_bt_matches(
+        m: usize,
+        n: usize,
+        t_rows: usize,
+        t_cols: usize,
+        layout: TileLayout,
+        header: &[u8],
+    ) {
+        let k = 4096;
+        let config = layout_config(layout, k);
+        let a = test_matrix(m, k, 7);
+        let zeros = vec![0i8; n * k];
+        let reference =
+            reference_proof_b64(header, &config, &a, &zeros, m, n, k, 128, t_rows, t_cols, layout);
+        let got =
+            build_plain_proof_b64(header, &config, &a, None, m, n, k, 128, t_rows, t_cols, layout)
+                .expect("null-B^T proof");
+        assert_eq!(got, reference);
+    }
+
+    #[test]
+    fn null_bt_matches_zero_matrix() {
+        let h1: Vec<u8> = (0..76u8).collect();
+        let h2: Vec<u8> = (0..76u8).rev().collect();
+        // Multi-block with a partial tail, then a cache hit, then a new job key.
+        assert_null_bt_matches(128, 600, 0, 256, TileLayout::Scattered, &h1);
+        assert_null_bt_matches(128, 600, 8, 64, TileLayout::Contiguous, &h1);
+        assert_null_bt_matches(128, 600, 0, 256, TileLayout::Scattered, &h2);
+        // Single block.
+        assert_null_bt_matches(16, 32, 8, 16, TileLayout::Contiguous, &h1);
+    }
+
+    #[test]
+    fn witness_rejects_corrupt_subroot() {
+        let (m, k) = (300usize, 4096usize);
+        let key = [9u8; 32];
+        let a = test_matrix(m, k, 7);
+        let a_bytes: Vec<u8> = a.iter().map(|&x| x as u8).collect();
+        let rows: Vec<usize> = (0..8).collect();
+        let mut sub = witness::subroots_from_matrix(&a_bytes, key);
+        sub[0][0] ^= 1;
+        let blocks = device_blocks(&a, m, k, &rows);
+        let w = MatrixWitness {
+            subroots: &sub,
+            blocks: Some(blocks.iter().map(|(b, d)| (*b, d.as_slice())).collect()),
+            expected_root: None,
+        };
+        assert!(build_matrix_proof_witness(m, k, key, &rows, &w).is_err());
     }
 }

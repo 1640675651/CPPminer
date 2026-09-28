@@ -1,22 +1,30 @@
 # Changelog
 
 ## v0.5 (tentative)
-- Experimental OneDNN backend for intel GPU (DONE)
-- Fix OpenCL dot product extension on intel GPU (DONE)
-- Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group (DONE) 
-- Introduce quantus algorithm (DONE)
-- Quantus wgpu backend via quantus-miner GpuEngine FFI (DONE)
-- Quantus OpenCL Poseidon2 worker under src/qpow/opencl (DONE)
-- Pearl wgpu backend (DONE)
+- Experimental OneDNN backend for intel GPU
+- Fix OpenCL dot product extension on intel GPU
+- Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group 
+- Introduce quantus algorithm
+- Quantus wgpu backend via quantus-miner GpuEngine FFI
+- Quantus OpenCL Poseidon2 worker under src/qpow/opencl
+- Pearl wgpu backend
+- Reduce host memory usage (CPU, CUDA, OpenCL DONE, OneDNN, Wgpu TODO)
 - Configurable matrix size (TODO)
 
 ### Pearl wgpu
-- vec4<u32> A/B panel loads in the GEMM shader (DONE)
-- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s) (DONE)
-- Rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070 (DONE)
-- GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s) (DONE)
-- Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s) (DONE)
-- `--wgpu-tile 4x4|4x8|8x8|8x16[/64x64|/128x128]` and `--wgpu-macro`, same tiles/hash tiles as OpenCL; shader tile code generated at engine init (default stays 8x8/128) (DONE)
+- vec4<u32> A/B panel loads in the GEMM shader
+- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s)
+- Rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070
+- GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s)
+- Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s)
+- `--wgpu-tile 4x4|4x8|8x8|8x16[/64x64|/128x128]` and `--wgpu-macro`, same tiles/hash tiles as OpenCL; shader tile code generated at engine init (default stays 8x8/128)
+- Bind a_pre / b_pre / a_sig in windows under `max_storage_buffer_binding_size` (512 MiB buffers vs 256 MiB on Mali); scan batches split only where a macro column exceeds the limit
+
+### Host memory reduction
+- GPU backend: per-hit D2H 512 MiB -> ~0.3-0.8 MiB, no 2x512 MiB host A/B buffers. See proof.md (CUDA, OpenCL DONE, OneDNN, Wgpu TODO)
+- CPU and OpenCL `--cpu-gen`: drop the 512 MiB all-zero host B^T buffer; proofs use zero-matrix Merkle sub-roots cached per job
+- CPU `--prepack fused` is now the default (~1.5 GiB steady vs ~2.5 GiB for separate)
+- Host-matrix proofs hash A/B^T in place: transient per-share peak ~1.5 GiB -> < 1 MiB (no flatten/pad/MerkleTree copies of the 512 MiB matrix)
 
 ## v0.4
 - ARM CPU + NEON support.

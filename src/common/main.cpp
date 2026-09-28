@@ -164,11 +164,12 @@ static void print_usage(void)
            CP_MOCK_DIFF_PEARL_DEFAULT);
     printf("                       quantus=%.0f (U512::MAX / D)\n",
            CP_MOCK_DIFF_QUANTUS_DEFAULT);
-    printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
+    printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
     printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
     printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
+    printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
     printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
 }
 
@@ -423,7 +424,7 @@ int main(int argc, char** argv)
     int cutlass_fused = -1;
     int onednn_fused_jackpot = 0;
     const char *onednn_layout = nullptr;
-    CpPrepackMode prepack_mode = CP_PREPACK_SEPARATE;
+    CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
     int simd_env_invalid = 0;
     {
@@ -450,6 +451,7 @@ int main(int argc, char** argv)
     int profile_prep = 0;
     int profile_prep_runs = 3;
     int simd_test = 0;
+    int prepack_test = 0;
     int list_devices = 0;
     int ocl_platform = -1;
     int ocl_tile_mr = 0;
@@ -808,6 +810,8 @@ int main(int argc, char** argv)
             }
         } else if(!strcmp(argv[i], "--simd-test")){
             simd_test = 1;
+        } else if(!strcmp(argv[i], "--prepack-test")){
+            prepack_test = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
         } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
@@ -1308,6 +1312,20 @@ int main(int argc, char** argv)
         return 1;
 #endif
     }
+    if(prepack_test){
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+        const int rc_reuse = case33_test_inplace_prepack(DEV_M_DIM, DEV_M_DIM, K_DIM);
+        printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", DEV_M_DIM,
+               rc_reuse == 0 ? "passed" : "failed", rc_reuse);
+        const int rc_fused = case33_test_fused_prepack(DEV_M_DIM, DEV_M_DIM, K_DIM, R_RANK);
+        printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", DEV_M_DIM,
+               rc_fused == 0 ? "passed" : "failed", rc_fused);
+        return (rc_reuse == 0 && rc_fused == 0) ? 0 : 1;
+#else
+        fprintf(stderr, "--prepack-test requires a CPU-enabled build\n");
+        return 1;
+#endif
+    }
 
     if(cutlass_fused){
         if(no_period_gemm){
@@ -1349,16 +1367,18 @@ int main(int argc, char** argv)
                g_dev_dims ? " (dev)" : " (production)");
         printf("[mode] tile layout: %s\n", tile_layout_name);
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
+            /* Host signal is A only: zero B^T is proven without a host buffer. */
+            const double sig_mib = (double)g_m_active * K_DIM / (1024.0 * 1024.0);
             printf("[mode] scan: fused GEMM + XOR + host jackpot\n");
             if(prepack_mode == CP_PREPACK_FUSED)
-                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (fused prepack)\n",
-                       host_mib * 2.0);
+                printf("[mode] matrix steady: ~%.0f MiB signal A + scan buffers (fused prepack)\n",
+                       sig_mib + host_mib);
             else if(prepack_mode == CP_PREPACK_REUSE)
-                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (reuse prepack)\n",
-                       host_mib * 2.0);
+                printf("[mode] matrix steady: ~%.0f MiB signal A + scan buffers (reuse prepack)\n",
+                       sig_mib + host_mib);
             else
-                printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
-                       host_mib, host_mib * 2.0);
+                printf("[mode] matrix peak: ~%.0f MiB host signal A + ~%.0f MiB prepack\n",
+                       sig_mib, host_mib * 2.0);
         } else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
             const int tiles_per_macro =
                 (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? (128 / 4) * (128 / 8)
@@ -1367,7 +1387,7 @@ int main(int argc, char** argv)
             printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
                    batch_size, batch_size * tiles_per_macro);
-            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+            printf("[mode] noisy B cached on GPU per job\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
             const int wgpu_macro = wgpu_macro_m > 0 ? wgpu_macro_m : 128;
             const int hash_mr = cp_pp_hash_tile_h();
@@ -1411,9 +1431,8 @@ int main(int argc, char** argv)
                                                       : "period GEMM + batched jackpot");
             }
             if(!g_cpu_matrix_gen){
-                printf("[mode] zero-B: ~%.0f MiB host A + zero B^T; ~1.5 GiB VRAM "
-                       "(A_sig + noisy A/B, no d_Bt_sig)\n",
-                       host_mib);
+                printf("[mode] zero-B: no host A/B (proofs from device sub-roots); ~1.5 GiB VRAM "
+                       "(A_sig + noisy A/B, no d_Bt_sig)\n");
             }
         } else if(cutlass_fused){
             printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
@@ -1446,7 +1465,17 @@ int main(int argc, char** argv)
 #endif
         printf("[mode] hash_tiles=%dx%d (%d total)\n",
                row_parts, col_parts, row_parts * col_parts);
-        printf("[mode] host~%.0f MiB (signal A+B)\n", host_mib);
+        {
+            const double a_mib = cp_worker_supports_share_witness()
+                    ? 0.0 : (double)g_m_active * K_DIM / (1024.0 * 1024.0);
+            const double bt_mib = cp_worker_needs_host_bt()
+                    ? (double)g_n_active * K_DIM / (1024.0 * 1024.0) : 0.0;
+            if(a_mib + bt_mib > 0.0)
+                printf("[mode] host~%.0f MiB (signal%s%s)\n", a_mib + bt_mib,
+                       a_mib > 0.0 ? " A" : "", bt_mib > 0.0 ? " B^T" : "");
+            else
+                printf("[mode] host signal: none (device witness proofs)\n");
+        }
         printf("[mode] matrix gen: %s\n",
                (g_cpu_matrix_gen || cp_worker_prefers_host_matrices())
                    ? "host BLAKE3 + noise"

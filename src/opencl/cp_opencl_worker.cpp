@@ -3,6 +3,8 @@
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
+#include "cp_proof.h"
+#include "cp_share_witness.h"
 #include "cp_state.h"
 #include "cp_util.h"
 #include "case33_gemm_ocl.hpp"
@@ -619,5 +621,50 @@ extern "C" int cp_opencl_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_B
         fprintf(stderr, "[ocl] failed to read A_sig for proof\n");
         return -1;
     }
+    return 0;
+}
+
+extern "C" int cp_opencl_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
+                                                    CpShareWitness **out) {
+    (void)t_cols;
+    if (!out) {
+        return -1;
+    }
+    *out = nullptr;
+    const int num_subroots = g_gemm.a_witness_subroots();
+    if (!g_zero_b.ready || g_zero_b.use_cpu_prep || num_subroots < 0) {
+        return -1;
+    }
+    const int m = g_zero_b.m;
+
+    CpShareWitness *w = static_cast<CpShareWitness *>(calloc(1, sizeof(CpShareWitness)));
+    if (!w) {
+        return -1;
+    }
+    w->tile_layout = tile_layout;
+
+    const int nb = cp_proof_witness_blocks(tile_layout, 0, t_rows, m, K_DIM, w->a_block_idx,
+                                           CP_WITNESS_MAX_BLOCKS);
+    if (nb <= 0) {
+        fprintf(stderr, "[ocl] share witness: no A blocks for t_rows=%d layout=%d\n", t_rows,
+                tile_layout);
+        cp_share_witness_free(w);
+        return -1;
+    }
+    w->a_num_blocks = static_cast<size_t>(nb);
+    w->a_blocks = static_cast<uint8_t *>(calloc(static_cast<size_t>(nb), CP_WITNESS_BLOCK_BYTES));
+    if (num_subroots > 0) {
+        w->a_subroots = static_cast<uint8_t *>(malloc(static_cast<size_t>(num_subroots) * 32));
+        w->a_num_subroots = static_cast<size_t>(num_subroots);
+    }
+    if (!w->a_blocks || (num_subroots > 0 && !w->a_subroots) ||
+        !g_gemm.read_A_witness(w->a_block_idx, nb, CP_WITNESS_BLOCK_BYTES, w->a_blocks,
+                               w->a_subroots, w->a_root)) {
+        fprintf(stderr, "[ocl] share witness: failed to read A witness\n");
+        cp_share_witness_free(w);
+        return -1;
+    }
+    /* B^T is all-zero: bt_subroots stays NULL and the proof uses host-cached zero sub-roots. */
+    *out = w;
     return 0;
 }

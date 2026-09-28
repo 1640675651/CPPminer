@@ -19,13 +19,23 @@ void cp_mine_init_host_buffers(void)
 {
     size_t szAp = (size_t)g_m_active * K_DIM;
     size_t szBpT = (size_t)g_n_active * K_DIM;
-    /* Zero once at launch: CPU/OpenCL zero-B keeps B^T as committed zeros; CPU sparse A
-     * pokes assume the rest of A stays in [-64, 63]. Do not re-zero per job/attempt. */
-    h_Ap_global = (int8_t *)calloc(1, szAp);
-    h_BpT_global = (int8_t *)calloc(1, szBpT);
-    if (!h_Ap_global || !h_BpT_global) {
-        fprintf(stderr, "OOM host matrices\n");
-        exit(1);
+    /* Zero once at launch: OpenCL/oneDNN/wgpu zero-B keep B^T as committed zeros; CPU sparse A
+     * pokes assume the rest of A stays in [-64, 63]. Do not re-zero per job/attempt.
+     * Share-witness backends prove from device sub-roots and need neither buffer; CPU proves
+     * its all-zero B^T without one. */
+    if (!cp_worker_supports_share_witness()) {
+        h_Ap_global = (int8_t *)calloc(1, szAp);
+        if (!h_Ap_global) {
+            fprintf(stderr, "OOM host matrices\n");
+            exit(1);
+        }
+    }
+    if (cp_worker_needs_host_bt()) {
+        h_BpT_global = (int8_t *)calloc(1, szBpT);
+        if (!h_BpT_global) {
+            fprintf(stderr, "OOM host matrices\n");
+            exit(1);
+        }
     }
     if (!g_share_queue) {
         /* Depth 1: single host A/B handoff slot (no snapshot memcpy). */
@@ -108,6 +118,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     int zero_b_gpu = 0;
     int handoff_bt = 0;
     int defer_host_reclaim = 0;
+    int share_witness = 0;
 
     {
         FILE *hf = fopen(hdr_path, "wb");
@@ -149,13 +160,14 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         zero_b_gpu = cp_worker_worker_handles_matrix_prep() && !g_cpu_matrix_gen;
         /* CPU/OpenCL/CUDA zero-B: shared zero B^T, hand off A only.
          * --cpu-gen / host matrices still hand off both signal mats. */
-        handoff_bt = host_matrices || !zero_b_gpu;
+        handoff_bt = (host_matrices || !zero_b_gpu) && cp_worker_needs_host_bt();
         /* Defer reclaim + D2H on share when signal mats live on device between attempts
          * (CUDA / OpenCL GPU-prep). CPU always has correct A on host and must reclaim
          * before the next attempt (proof handoff otherwise leaves h_Ap NULL -> rc=-2).
          * OpenCL/CUDA gate fetch_share_signals on this flag — do not clear it for them. */
         defer_host_reclaim =
                 !cp_worker_prefers_host_matrices() && !host_matrices && !g_cpu_matrix_gen;
+        share_witness = cp_worker_supports_share_witness() && !host_matrices;
     }
 
     for (;;) {
@@ -190,7 +202,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         /* Reclaim host matrices when this attempt will write them (CPU / host-gen).
          * GPU prep defers reclaim until a share hit so scanning can continue while
          * proof holds the single A buffer. */
-        if (g_share_queue && !defer_host_reclaim) {
+        if (g_share_queue && !defer_host_reclaim && !share_witness) {
             cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
                                            handoff_bt ? &h_BpT_global : NULL);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
@@ -323,6 +335,39 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 interval_sec = 1e-3;
             }
             const uint64_t tiles_since_prev = tiles_scanned_total - tiles_at_prev_share;
+
+            if (share_witness) {
+                CpShareWitness *witness = NULL;
+                if (cp_worker_fetch_share_witness(t_rows, t_cols, cp_worker_proof_tile_layout(),
+                                                  &witness) != 0) {
+                    fprintf(stderr, "[plain] failed to fetch share witness nonce=%llu\n",
+                            (unsigned long long)nonce);
+                    cp_fee_note_tiles(scan_tiles);
+                    nonce++;
+                    continue;
+                }
+                const CpShareHit hit = {nonce, t_rows, t_cols, tiles_since_prev, interval_sec, 0};
+                if (cp_share_queue_enqueue_witness(g_share_queue, &hit, header, hlen, job_id,
+                                                   target_hex, &witness) != 0) {
+                    cp_share_witness_free(witness);
+                    fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
+                            (unsigned long long)nonce);
+                } else {
+                    tiles_at_prev_share = tiles_scanned_total;
+                    t_prev_share = now_hit;
+                    if (g_mock) {
+                        printf("[mock] first share enqueued (nonce=%llu); waiting for proof/verify\n",
+                               (unsigned long long)nonce);
+                        fflush(stdout);
+                        cp_fee_note_tiles(scan_tiles);
+                        rc = CP_JOB_NONE;
+                        goto job_done;
+                    }
+                }
+                cp_fee_note_tiles(scan_tiles);
+                nonce++;
+                continue;
+            }
 
             if (g_share_queue) {
                 cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,

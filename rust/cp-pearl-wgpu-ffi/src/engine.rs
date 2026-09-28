@@ -68,6 +68,14 @@ const PREP_WGSL_RAW: &str =
 const GEMM_WGSL_RAW: &str =
     include_str!("../../../src/pearl/wgpu/kernels/pearl_gemm_xor.wgsl");
 
+fn buf_range(buffer: &wgpu::Buffer, offset: u64, size: u64) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer,
+        offset,
+        size: wgpu::BufferSize::new(size),
+    })
+}
+
 fn inject(src: &str, marker: &str, code: &str) -> String {
     assert!(src.contains(marker), "shader marker {marker} missing");
     src.replacen(marker, code, 1)
@@ -184,6 +192,10 @@ struct PearlPrepackBParams {
     has_signal: i32,
     wg_x: i32,
     g_begin: i32,
+    jm_base: i32,
+    _pad0: i32,
+    _pad1: i32,
+    _pad2: i32,
 }
 
 #[repr(C)]
@@ -196,7 +208,7 @@ struct PearlPrepackAParams {
     macro_rows: i32,
     wg_x: i32,
     g_begin: i32,
-    _pad1: i32,
+    im_base: i32,
 }
 
 #[repr(C)]
@@ -205,7 +217,7 @@ struct PearlMerkleChunkParams {
     raw_len: u32,
     pad_len: u32,
     num_chunks: i32,
-    _pad: i32,
+    bid_begin: i32,
 }
 
 #[repr(C)]
@@ -240,7 +252,11 @@ struct PearlScanParams {
     micro_m_count: i32,
     wg_x: i32,
     batch_count: i32,
+    a_im_base: i32,
+    b_jm_base: i32,
     _pad2: i32,
+    _pad3: i32,
+    _pad4: i32,
 }
 
 /// Split a 1D workgroup count into a 2D grid within the wgpu/Vulkan limit (65535 per dim).
@@ -432,6 +448,8 @@ pub struct PearlEngine {
     job: Option<JobBuffers>,
     device_type: wgpu::DeviceType,
     max_wg_submit: u32,
+    /// max_storage_buffer_binding_size: a_pre / b_pre / a_sig are bound in windows below this.
+    max_binding: u64,
     tile: TileConfig,
 }
 
@@ -531,6 +549,13 @@ impl PearlEngine {
             tile.hash_nr(),
             m = tile.macro_mn
         );
+        let max_binding = (limits.max_storage_buffer_binding_size as u64) & !255;
+        if max_binding < (1 << 30) {
+            eprintln!(
+                "[pearl-wgpu] storage binding limit {} MiB: large buffers are bound in windows",
+                max_binding >> 20
+            );
+        }
 
         let prep_src = prep_wgsl(&tile);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -660,6 +685,7 @@ impl PearlEngine {
             job: None,
             device_type: info.device_type,
             max_wg_submit,
+            max_binding,
             tile,
         })
     }
@@ -794,6 +820,26 @@ impl PearlEngine {
         }
     }
 
+    /// Bytes of one macro row of a_pre (or column of b_pre) over all k-blocks; also the a_sig
+    /// bytes of one macro row (MACRO rows x K).
+    fn panel_bytes(&self) -> u64 {
+        let job = self.job.as_ref().unwrap();
+        job.blocks_k as u64 * self.tile.kb_block_bytes()
+    }
+
+    /// Whole panels that fit in one binding.
+    fn panels_per_binding(&self) -> i32 {
+        (self.max_binding / self.panel_bytes()).clamp(1, i32::MAX as u64) as i32
+    }
+
+    /// Workgroup cap so a chunk of consecutive workgroups (`per_panel` per macro row/column)
+    /// touches at most panels_per_binding() panels.
+    fn panel_chunk_cap(&self, per_panel: u32) -> u32 {
+        let w = self.panels_per_binding() as u32;
+        let cap = if w >= 2 { (w - 1) * per_panel } else { per_panel };
+        cap.min(self.max_wg_submit)
+    }
+
     /// Dispatch `total` logical workgroups in chunks of `max_wg_submit` (2D grid each chunk).
     fn dispatch_chunked(
         &self,
@@ -923,8 +969,13 @@ impl PearlEngine {
         };
         let blocks_k = self.job.as_ref().unwrap().blocks_k;
         let macro_cols = self.job.as_ref().unwrap().macro_cols;
-        self.dispatch_chunked(total_wg, |g_begin, wg_x, wg_y, wg_x_i| {
+        let per_col = (self.tile.macro_mn / PREP_GROUP * blocks_k) as u32;
+        let panel = self.panel_bytes();
+        let cap = self.panel_chunk_cap(per_col);
+        self.dispatch_chunked_cap(total_wg, cap, |g_begin, wg_x, wg_y, wg_x_i| {
             let job = self.job.as_ref().unwrap();
+            let jm_lo = g_begin / per_col;
+            let jm_hi = ((g_begin + wg_x * wg_y - 1) / per_col).min(macro_cols as u32 - 1);
             self.write_uniform(
                 &job.u_pre_b,
                 &PearlPrepackBParams {
@@ -936,6 +987,10 @@ impl PearlEngine {
                     has_signal: 0,
                     wg_x: wg_x_i,
                     g_begin: g_begin as i32,
+                    jm_base: jm_lo as i32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 },
             );
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -948,7 +1003,11 @@ impl PearlEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: job.b_pre.as_entire_binding(),
+                        resource: buf_range(
+                            &job.b_pre,
+                            jm_lo as u64 * panel,
+                            (jm_hi - jm_lo + 1) as u64 * panel,
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
@@ -998,9 +1057,11 @@ impl PearlEngine {
         // Pack 4 s8 / WI 鈫?workgroups cover ceil(total/4) threads; chunk for TDR.
         let num_words = ((total + 3) / 4) as u32;
         let num_wg_total = ((num_words + 255) / 256).max(1);
-        self.dispatch_chunked(num_wg_total, |wg_begin, wg_x, wg_y, wg_x_i| {
+        let cap = self.max_wg_submit.min((self.max_binding / 1024).max(1) as u32);
+        self.dispatch_chunked_cap(num_wg_total, cap, |wg_begin, wg_x, wg_y, wg_x_i| {
             let job = self.job.as_ref().unwrap();
             let word_begin = (wg_begin * 256) as i32;
+            let words = (wg_x * wg_y * 256).min(num_words - wg_begin * 256);
             self.write_uniform(
                 &job.u_gen,
                 &PearlGenRandomParams {
@@ -1023,7 +1084,7 @@ impl PearlEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: job.a_sig.as_entire_binding(),
+                        resource: buf_range(&job.a_sig, word_begin as u64 * 4, words as u64 * 4),
                     },
                 ],
             });
@@ -1071,16 +1132,23 @@ impl PearlEngine {
         self.queue.write_buffer(&job.job_key, 0, job_key);
         let num_subroots = (num_chunks + 255) / 256;
 
-        self.write_uniform(
-            &job.u_chunk,
-            &PearlMerkleChunkParams {
-                raw_len: raw_len as u32,
-                pad_len: pad_len as u32,
-                num_chunks,
-                _pad: 0,
-            },
-        );
-        {
+        // One workgroup hashes 256 chunks (256 KiB of a_sig); bind a_sig per dispatch window.
+        const BLOCK_BYTES: u64 = 256 * B3_CHUNK;
+        let a_sig_bytes = raw_len.next_multiple_of(4);
+        let blocks_per_dispatch = (self.max_binding / BLOCK_BYTES).clamp(1, i32::MAX as u64) as i32;
+        for bid_begin in (0..num_subroots).step_by(blocks_per_dispatch as usize) {
+            let blocks = blocks_per_dispatch.min(num_subroots - bid_begin);
+            let mat_off = bid_begin as u64 * BLOCK_BYTES;
+            let mat_len = (blocks as u64 * BLOCK_BYTES).min(a_sig_bytes - mat_off);
+            self.write_uniform(
+                &job.u_chunk,
+                &PearlMerkleChunkParams {
+                    raw_len: raw_len as u32,
+                    pad_len: pad_len as u32,
+                    num_chunks,
+                    bid_begin,
+                },
+            );
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("bg_chunk"),
                 layout: &self.pipelines.keyed_chunk.get_bind_group_layout(0),
@@ -1091,7 +1159,7 @@ impl PearlEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 16,
-                        resource: job.a_sig.as_entire_binding(),
+                        resource: buf_range(&job.a_sig, mat_off, mat_len),
                     },
                     wgpu::BindGroupEntry {
                         binding: 17,
@@ -1113,7 +1181,7 @@ impl PearlEngine {
                 });
                 pass.set_pipeline(&self.pipelines.keyed_chunk);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(num_subroots as u32, 1, 1);
+                pass.dispatch_workgroups(blocks as u32, 1, 1);
             }
             self.submit_and_wait(enc)?;
         }
@@ -1274,9 +1342,14 @@ impl PearlEngine {
             ((job.m / PREP_GROUP) as u32, job.blocks_k, job.macro_rows)
         };
         // Each WG covers all blocks_k k-blocks, so scale the TDR cap down accordingly.
-        let cap = self.max_wg_submit / (blocks_k.max(1) as u32);
+        let per_row = (self.tile.macro_mn / PREP_GROUP) as u32;
+        let panel = self.panel_bytes();
+        let cap = (self.max_wg_submit / (blocks_k.max(1) as u32)).min(self.panel_chunk_cap(per_row));
         self.dispatch_chunked_cap(total_wg, cap, |g_begin, wg_x, wg_y, wg_x_i| {
             let job = self.job.as_ref().unwrap();
+            let im_lo = g_begin / per_row;
+            let im_hi = ((g_begin + wg_x * wg_y - 1) / per_row).min(macro_rows as u32 - 1);
+            let (win_off, win_len) = (im_lo as u64 * panel, (im_hi - im_lo + 1) as u64 * panel);
             self.write_uniform(
                 &job.u_pre_a,
                 &PearlPrepackAParams {
@@ -1287,7 +1360,7 @@ impl PearlEngine {
                     macro_rows,
                     wg_x: wg_x_i,
                     g_begin: g_begin as i32,
-                    _pad1: 0,
+                    im_base: im_lo as i32,
                 },
             );
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1300,7 +1373,7 @@ impl PearlEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 11,
-                        resource: job.a_pre.as_entire_binding(),
+                        resource: buf_range(&job.a_pre, win_off, win_len),
                     },
                     wgpu::BindGroupEntry {
                         binding: 12,
@@ -1312,7 +1385,8 @@ impl PearlEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 14,
-                        resource: job.a_sig.as_entire_binding(),
+                        // MACRO rows x K bytes of a_sig per macro row == panel bytes of a_pre.
+                        resource: buf_range(&job.a_sig, win_off, win_len),
                     },
                 ],
             });
@@ -1365,12 +1439,31 @@ impl PearlEngine {
 
         let mut tiles_scanned = 0u64;
         let macro_blocks = job.macro_blocks;
+        let rows = job.macro_rows;
+        let panel = self.panel_bytes();
+        let window = self.panels_per_binding();
+        // Macro blocks run column-major (im = mb % macro_rows): (im_lo, im_count, jm_lo, jm_count).
+        let span = |mb0: i32, cnt: i32| {
+            let (j0, j1) = (mb0 / rows, (mb0 + cnt - 1) / rows);
+            if j0 == j1 {
+                (mb0 % rows, cnt, j0, 1)
+            } else {
+                (0, rows, j0, j1 - j0 + 1)
+            }
+        };
 
-        for mb0 in (0..macro_blocks).step_by(macro_batch as usize) {
+        let mut mb0 = 0;
+        while mb0 < macro_blocks {
             if cancel() {
                 return Ok(ScanOutcome::Cancelled);
             }
-            let batch_count = (macro_batch).min(macro_blocks - mb0);
+            let mut batch_count = (macro_batch).min(macro_blocks - mb0);
+            let (_, im_n, _, jm_n) = span(mb0, batch_count);
+            if im_n > window || jm_n > window {
+                // Stay inside one macro column and at most `window` rows of a_pre.
+                batch_count = batch_count.min(rows - mb0 % rows).min(window);
+            }
+            let (im_lo, im_n, jm_lo, jm_n) = span(mb0, batch_count);
             let (wg_x, wg_y, wg_x_i) = dispatch_2d(batch_count as u32);
 
             self.write_uniform(
@@ -1387,7 +1480,11 @@ impl PearlEngine {
                     micro_m_count: self.tile.macro_mn / self.tile.mr,
                     wg_x: wg_x_i,
                     batch_count,
+                    a_im_base: im_lo,
+                    b_jm_base: jm_lo,
                     _pad2: 0,
+                    _pad3: 0,
+                    _pad4: 0,
                 },
             );
 
@@ -1397,11 +1494,11 @@ impl PearlEngine {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: job.a_pre.as_entire_binding(),
+                        resource: buf_range(&job.a_pre, im_lo as u64 * panel, im_n as u64 * panel),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: job.b_pre.as_entire_binding(),
+                        resource: buf_range(&job.b_pre, jm_lo as u64 * panel, jm_n as u64 * panel),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -1465,6 +1562,7 @@ impl PearlEngine {
                     tiles_scanned,
                 });
             }
+            mb0 += batch_count;
         }
 
         Ok(ScanOutcome::Exhausted { tiles_scanned })

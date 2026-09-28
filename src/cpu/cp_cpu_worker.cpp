@@ -35,7 +35,7 @@ static std::vector<int8_t> g_A_noisy;
 static Case33GemmXor g_gemm;
 static Case33Isa g_isa_pref = Case33Isa::Auto;
 static Case33SseTile g_sse_tile = Case33SseTile::R4C8;
-static CpPrepackMode g_prepack_mode = CP_PREPACK_SEPARATE;
+static CpPrepackMode g_prepack_mode = CP_PREPACK_FUSED;
 
 static void apply_prepack_mode_to_gemm(void)
 {
@@ -278,8 +278,7 @@ extern "C" void cp_cpu_worker_init(void)
     printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
     printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
     printf("[cpu] SIMD ISA: %s\n", simd_isa_label(g_gemm.isa_used(), g_gemm.sse_tile()));
-    if(g_prepack_mode != CP_PREPACK_SEPARATE)
-        printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
+    printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
     fflush(stdout);
 }
 

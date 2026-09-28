@@ -31,6 +31,41 @@ int cp_proof_build(
     return -1;
 }
 
+int cp_proof_witness_blocks(int tile_layout, int is_bt, int anchor, int rows, int k,
+                            uint32_t* out_idx, size_t cap)
+{
+    (void)tile_layout; (void)is_bt; (void)anchor; (void)rows; (void)k;
+    (void)out_idx; (void)cap;
+    return -1;
+}
+
+int cp_proof_build_witness(
+    const uint8_t* header,
+    size_t header_len,
+    const uint8_t* mining_config,
+    size_t config_len,
+    const CpMatrixWitness* a,
+    const CpMatrixWitness* bt,
+    int m,
+    int n,
+    int k,
+    int rank,
+    int t_rows,
+    int t_cols,
+    int tile_layout,
+    char* out_b64,
+    size_t out_cap,
+    char* err,
+    size_t err_cap)
+{
+    (void)header; (void)header_len; (void)mining_config; (void)config_len;
+    (void)a; (void)bt; (void)m; (void)n; (void)k; (void)rank;
+    (void)t_rows; (void)t_cols; (void)tile_layout; (void)out_b64; (void)out_cap;
+    if(err && err_cap)
+        snprintf(err, err_cap, "cp_proof_ffi not linked (build rust/cp-proof-ffi)");
+    return -1;
+}
+
 int cp_proof_verify(
     const uint8_t* header,
     size_t header_len,

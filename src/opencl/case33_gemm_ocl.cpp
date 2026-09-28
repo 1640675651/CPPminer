@@ -565,6 +565,16 @@ bool Case33GemmOcl::read_A_sig(int8_t *h_A_sig) {
     return prep_.read_A_sig(h_A_sig, static_cast<size_t>(M_) * static_cast<size_t>(K_));
 }
 
+bool Case33GemmOcl::read_A_witness(const uint32_t *block_idx, int num_blocks,
+                                   size_t block_bytes, uint8_t *blocks_out,
+                                   uint8_t *subroots_out, uint8_t root_out[32]) const {
+    if (M_ <= 0 || K_ <= 0) {
+        return false;
+    }
+    return prep_.read_A_witness(static_cast<size_t>(M_) * static_cast<size_t>(K_), block_idx,
+                                num_blocks, block_bytes, blocks_out, subroots_out, root_out);
+}
+
 bool Case33GemmOcl::prepare_attempt_a(const int8_t *a_rowmajor) {
     if (!available_ || !a_rowmajor || !a_buf_) {
         return false;

@@ -85,6 +85,10 @@ Case33OclPrep::~Case33OclPrep() {
         clReleaseMemObject(d_merkle_roots_);
         d_merkle_roots_ = nullptr;
     }
+    if (d_a_subroots_) {
+        clReleaseMemObject(d_a_subroots_);
+        d_a_subroots_ = nullptr;
+    }
     if (d_noisy_scratch_) {
         clReleaseMemObject(d_noisy_scratch_);
         d_noisy_scratch_ = nullptr;
@@ -296,11 +300,16 @@ bool Case33OclPrep::ensure_buffers(int m, int n, int k) {
         if (d_merkle_roots_) {
             clReleaseMemObject(d_merkle_roots_);
         }
+        if (d_a_subroots_) {
+            clReleaseMemObject(d_a_subroots_);
+        }
         d_merkle_roots_ = ocl_->alloc_buffer(merkle_need, CL_MEM_READ_WRITE);
+        d_a_subroots_ = ocl_->alloc_buffer(merkle_need, CL_MEM_READ_WRITE);
         merkle_cap_ = merkle_need;
+        a_witness_valid_ = false;
     }
     n_cap_ = n;
-    return d_A_sig_ && d_merkle_roots_;
+    return d_A_sig_ && d_merkle_roots_ && d_a_subroots_;
 }
 
 bool Case33OclPrep::ensure_noisy_scratch(size_t bytes) {
@@ -568,11 +577,27 @@ bool Case33OclPrep::merkle_finish_root_(int num_subroots) {
     return err == CL_SUCCESS;
 }
 
+bool Case33OclPrep::hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
+                                   uint8_t out[32]) {
+    a_witness_valid_ = false;
+    if (!matrix_keyed_hash_(d_A_sig_, raw_len, pad_len, job_key, out, d_a_subroots_,
+                            &a_num_subroots_)) {
+        return false;
+    }
+    memcpy(a_root_, out, 32);
+    a_witness_valid_ = true;
+    return true;
+}
+
 bool Case33OclPrep::matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_len,
-                                       const uint8_t job_key[32], uint8_t out[32]) {
+                                       const uint8_t job_key[32], uint8_t out[32],
+                                       cl_mem subroots_out, int *num_subroots_out) {
     const int num_chunks = static_cast<int>(pad_len / 1024);
     if (num_chunks <= 0) {
         return false;
+    }
+    if (num_subroots_out) {
+        *num_subroots_out = 0;
     }
 
     if (num_chunks == 1) {
@@ -611,6 +636,16 @@ bool Case33OclPrep::matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_
                                  nullptr);
     if (err != CL_SUCCESS) {
         return false;
+    }
+    if (subroots_out) {
+        err = clEnqueueCopyBuffer(ocl_->queue, d_merkle_roots_, subroots_out, 0, 0,
+                                  static_cast<size_t>(num_subroots) * 32, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            return false;
+        }
+        if (num_subroots_out) {
+            *num_subroots_out = num_subroots;
+        }
     }
     if (!merkle_finish_root_(num_subroots)) {
         return false;
@@ -722,7 +757,7 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!matrix_keyed_hash_(d_A_sig_, raw_a, pad_a, job_key, hash_a)) {
+    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
         return false;
     }
 
@@ -773,7 +808,7 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!matrix_keyed_hash_(d_A_sig_, raw_a, pad_a, job_key, hash_a)) {
+    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
         return false;
     }
 
@@ -864,7 +899,7 @@ bool Case33OclPrep::prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, 
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!matrix_keyed_hash_(d_A_sig_, raw_a, pad_a, job_key, hash_a)) {
+    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
         return false;
     }
 
@@ -929,6 +964,34 @@ bool Case33OclPrep::read_A_sig(int8_t *h_A_sig, size_t bytes) const {
         return false;
     }
     return ocl_->read_buffer(d_A_sig_, h_A_sig, bytes);
+}
+
+bool Case33OclPrep::read_A_witness(size_t sz_a, const uint32_t *block_idx, int num_blocks,
+                                   size_t block_bytes, uint8_t *blocks_out,
+                                   uint8_t *subroots_out, uint8_t root_out[32]) const {
+    if (!a_witness_valid_ || !d_A_sig_ || (num_blocks > 0 && (!block_idx || !blocks_out))) {
+        return false;
+    }
+    for (int i = 0; i < num_blocks; ++i) {
+        const size_t off = static_cast<size_t>(block_idx[i]) * block_bytes;
+        if (off >= sz_a) {
+            continue;
+        }
+        const size_t len = (sz_a - off < block_bytes) ? sz_a - off : block_bytes;
+        if (!ocl_->read_buffer(d_A_sig_, blocks_out + static_cast<size_t>(i) * block_bytes, len,
+                               off)) {
+            return false;
+        }
+    }
+    if (a_num_subroots_ > 0) {
+        if (!subroots_out ||
+            !ocl_->read_buffer(d_a_subroots_, subroots_out,
+                               static_cast<size_t>(a_num_subroots_) * 32)) {
+            return false;
+        }
+    }
+    memcpy(root_out, a_root_, 32);
+    return true;
 }
 
 bool Case33OclPrep::align_gen_random(cl_mem dst, uint64_t rng_seed, int matrix_tag,

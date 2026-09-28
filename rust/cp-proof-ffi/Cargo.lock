@@ -264,6 +264,7 @@ dependencies = [
  "blake3",
  "pearl-blake3",
  "primitive-types 0.12.2",
+ "rayon",
  "serde",
  "zk-pow",
 ]

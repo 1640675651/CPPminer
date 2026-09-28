@@ -34,8 +34,8 @@ Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix gene
 | Backend | Signal A / B^T source | Proof on share |
 |---------|------------------------|----------------|
 | **CUDA** (default) | Zero signal `B^T`; GPU random A per attempt; B-side noise cached per job | D2H `d_A_sig` only; host `h_BpT_global` stays zeros |
-| **CPU** (default) | Zero signal `B^T`; sparse random A per attempt (`pearl_perturb_random_a_one_per_col` — one write per column from **CSPRNG**, not header/nonce) | `h_BpT_global = 0`, sparse `h_Ap_global` |
-| **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | D2H `d_A_sig_` on share |
+| **CPU** (default) | Zero signal `B^T`; sparse random A per attempt (`pearl_perturb_random_a_one_per_col` — one write per column from **CSPRNG**, not header/nonce) | No host B^T (`cp_proof_build(bt = NULL)`, zero-B sub-roots cached per job), sparse `h_Ap_global` |
+| **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | `cp_proof_build_witness`: D2H A sub-roots + tile blocks of `d_A_sig_`; B^T from zero sub-roots cached per job; no host A/B matrices |
 
 The zk-pow reference miner (`third_party/zk-pow/src/ffi/mine.rs`) also uses independent random A/B per attempt. `pearl_generate_ab()` is a **CPminer CPU convenience**, not a protocol rule.
 
@@ -211,8 +211,9 @@ Proofs commit the actual signal strips via Merkle (`cp_proof_build` takes `a` an
 
 | Path | Fix B = 0, regen only A? | Notes |
 |------|--------------------------|-------|
-| **CUDA** (`gpu_prepare_job_b` + `gpu_prepare_attempt_a`) | **Yes** — no `d_Bt_sig`; noise-only into `d_BpT` once/job; random A per nonce | Proof uses host zero `h_BpT_global`; D2H A only |
+| **CUDA** (`gpu_prepare_job_b` + `gpu_prepare_attempt_a`) | **Yes** — no `d_Bt_sig`; noise-only into `d_BpT` once/job; random A per nonce | Proof via `cp_proof_build_witness`: A sub-roots + tile blocks, zero-B sub-roots per job; no host A/B matrices |
 | **CPU** (`cp_cpu_worker`, default) | **Yes** — `cp_cpu_worker_begin_job` caches noisy B; per attempt sparse A poke + A-noise only | `cp_worker_worker_handles_matrix_prep()` skips host gen in `cp_mine` |
+| **OpenCL** (`cp_opencl_worker`, GPU prep and `--cpu-gen`) | **Yes** — noisy B once/job; random A per nonce | GPU prep: witness proof like CUDA; `--cpu-gen`: host A only, `bt = NULL` |
 | **CUDA `--cpu-gen`** | **No** — legacy `pearl_generate_ab` host path in `cp_mine` | Full A/B from `ab_seed` |
 | **Pool verify** | **Yes** — recomputes noise from proof strips + `job_key`, not from header nonce | Same as any other miner-chosen B |
 
@@ -340,7 +341,7 @@ The pool already holds `header` from `mining.notify`. It parses the proof, recon
                  ▼
            noisy A, B^T  ──► GEMM scan ──► hit (t_rows, t_cols)
                  │
-                 │  on share (CUDA: copy d_A_sig/d_Bt_sig)
+                 │  on share (CUDA/OpenCL: A sub-roots + tile blocks; CPU/--cpu-gen: host A)
                  ▼
     cp_proof_build(signal A, B^T, t_rows, t_cols, header, mining_cfg)
                  │

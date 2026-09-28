@@ -554,6 +554,20 @@ int case33_test_fused_prepack_impl(int M, int N, int K, int rank) {
     if (fused_a != ref_a || fused_b != ref_b) {
         return 1;
     }
+
+    /* Same tile XOR as the separate path, including fused B compensation sums. */
+    Case33GemmXor sep;
+    sep.set_int8_mode(Case32Int8Mode::FastU8S8);
+    sep.set_prepack_mode(Case33PrepackMode::Separate);
+    if (!sep.prepare_job_b(M, N, K, &noisy_b, nullptr, nullptr, rank) ||
+        !sep.prepare_attempt_a(&noisy_a, nullptr, nullptr, rank)) {
+        return 4;
+    }
+    sep.run();
+    gemm.run();
+    if (sep.tile_xor().empty() || gemm.tile_xor() != sep.tile_xor()) {
+        return 5;
+    }
     return 0;
 }
 

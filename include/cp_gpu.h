@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "cp_share_witness.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +51,10 @@ int cp_gpu_mine_attempt(
 
 /* Device → host signal A/B after a share (for deferred handoff). */
 int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
+
+/* Zero-B share proof inputs: A sub-roots + the blocks covering the tile rows, cached zero-B
+ * sub-roots. Allocates *out (cp_share_witness_free). Call before the next attempt. */
+int cp_gpu_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareWitness** out);
 
 #ifdef __cplusplus
 }

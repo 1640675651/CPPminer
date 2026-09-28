@@ -59,6 +59,9 @@ struct Case33GemmOcl {
                              const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                              int salted, uint8_t a_key_out[32]);
     bool read_A_sig(int8_t *h_A_sig);
+    int a_witness_subroots() const { return prep_.a_witness_subroots(); }
+    bool read_A_witness(const uint32_t *block_idx, int num_blocks, size_t block_bytes,
+                        uint8_t *blocks_out, uint8_t *subroots_out, uint8_t root_out[32]) const;
 
     bool prepare_attempt_a(const int8_t *a_rowmajor);
 
