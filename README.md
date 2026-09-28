@@ -170,9 +170,10 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
 | `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **58** (jackpot curve); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
-| `--prepack MODE` | CPU: `separate` (default), `reuse`, or `fused` matrix prepack |
+| `--prepack MODE` | CPU: `fused` (default), `reuse`, or `separate` matrix prepack |
 | `--simd ISA` | CPU: `auto` (default), `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar` |
 | `--simd-test` | Compare every available CPU SIMD kernel against scalar and exit |
+| `--prepack-test` | Check CPU fused and reuse prepack against separate at m=n=8192 (prepacked bytes + full tile XOR) and exit |
 
 ### OpenCL options
 

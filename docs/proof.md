@@ -34,7 +34,7 @@ Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix gene
 | Backend | Signal A / B^T source | Proof on share |
 |---------|------------------------|----------------|
 | **CUDA** (default) | Zero signal `B^T`; GPU random A per attempt; B-side noise cached per job | D2H `d_A_sig` only; host `h_BpT_global` stays zeros |
-| **CPU** (default) | Zero signal `B^T`; sparse random A per attempt (`pearl_perturb_random_a_one_per_col` — one write per column from **CSPRNG**, not header/nonce) | `h_BpT_global = 0`, sparse `h_Ap_global` |
+| **CPU** (default) | Zero signal `B^T`; sparse random A per attempt (`pearl_perturb_random_a_one_per_col` — one write per column from **CSPRNG**, not header/nonce) | No host B^T (`cp_proof_build(bt = NULL)`, zero-B sub-roots cached per job), sparse `h_Ap_global` |
 | **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | D2H `d_A_sig_` on share |
 
 The zk-pow reference miner (`third_party/zk-pow/src/ffi/mine.rs`) also uses independent random A/B per attempt. `pearl_generate_ab()` is a **CPminer CPU convenience**, not a protocol rule.

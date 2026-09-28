@@ -9,20 +9,33 @@ Each full matrix (signal or coalesced prepack) is:
 |------|------------:|--------:|
 | m × k or n × k | **512 MiB** | **32 MiB** |
 
-Host signal slots `h_Ap_global` / `h_BpT_global` are always allocated in `cp_mine_init_host_buffers()` (**1 GiB** production) for every backend.
+Host signal slots are allocated in `cp_mine_init_host_buffers()`: `h_Ap_global` (512 MiB) unless the backend proves from device witnesses (CUDA), and `h_BpT_global` (512 MiB) only when `cp_worker_needs_host_bt()` (OpenCL / oneDNN / wgpu / CUDA `--cpu-gen`). CPU proves its all-zero B^T with `cp_proof_build(bt = NULL)`, which caches zero-matrix sub-roots (64 KiB) per job.
+
+## Share proof memory (all backends)
+
+Proof building (`rust/cp-proof-ffi`) never copies a signal matrix; peak host RAM during a proof equals steady state plus well under 1 MiB.
+
+| Path | Input | Proof-thread scratch (production) |
+|------|-------|-----------------------------------|
+| Host matrix (`cp_proof_build`) | borrowed `h_Ap_global` / `h_BpT_global`, hashed in place | 2048 sub-roots per matrix (64 KiB each), proven leaf chunks, ≤ 256 KiB padded copy only if a matrix ends mid-block |
+| Zero B^T (`cp_proof_build`, `bt = NULL`) | nothing | 64 KiB zero sub-roots, cached per job (first share hashes 512 MiB of zeros, streamed) |
+| Device witness (`cp_proof_build_witness`, CUDA) | sub-roots + tile blocks from the GPU | ~0.3–0.8 MiB witness per share |
+| All | base64 output | up to 512 KiB (`PLAIN_PROOF_B64_MAX`) |
+
+Sub-roots are the CVs of aligned 256-chunk (256 KiB) subtrees, hashed in parallel with BLAKE3 SIMD. The rest of the Merkle path is rebuilt from them plus the blocks holding the proven rows. Production timing (A in place + zero B^T): ~30 ms on the first share of a job, ~16 ms after.
 
 ---
 
 # CPU zero-B path
 
-The default CPU worker caches **noisy B once per job** and rebuilds **noisy A each nonce**. Signal `B^T` stays zero; only `h_Ap_global` is randomized per attempt.
+The default CPU worker caches **noisy B once per job** and rebuilds **noisy A each nonce**. Signal `B^T` stays zero and has no host buffer; only `h_Ap_global` is randomized per attempt.
 
 ## Per-buffer sizes
 
 | Buffer | Bytes | Production |
 |--------|------:|-----------:|
 | Signal A (`h_Ap_global`) | m × k | 512 MiB |
-| Signal B^T (`h_BpT_global`, zero for zero-B) | n × k | 512 MiB |
+| Signal B^T | — | not allocated (zero; proof uses cached sub-roots) |
 | Noisy / scan A (`g_A_noisy`) | m × k | 512 MiB |
 | Noisy / scan B (`g_zero_b.B_noisy`) | n × k | 512 MiB |
 | Prepack A (`g_gemm.a_pre_`, separate mode only) | m × k | 512 MiB |
@@ -43,33 +56,31 @@ General formulas:
 
 | Mode | CLI | Steady matrix RAM | Brief peak |
 |------|-----|-------------------|------------|
-| **separate** (default) | `--prepack separate` | **~3 GiB** | ~3 GiB |
-| **reuse** | `--prepack reuse`, `--inplace-prepack` | **~2 GiB** | **~2.5 GiB** during prepack |
-| **fused** | `--prepack fused` | **~2 GiB** | **~2 GiB** (no full-matrix temp) |
+| **fused** (default) | `--prepack fused` | **~1.5 GiB** | **~1.5 GiB** (no full-matrix temp) |
+| **reuse** | `--prepack reuse`, `--inplace-prepack` | **~1.5 GiB** | **~2 GiB** during prepack |
+| **separate** | `--prepack separate` | **~2.5 GiB** | ~2.5 GiB |
 
 Steady-state breakdown (production):
 
-### separate (~3 GiB)
+### separate (~2.5 GiB)
 
 ```
 h_Ap_global          512 MiB   signal A (per nonce)
-h_BpT_global         512 MiB   signal B^T = 0
 g_zero_b.B_noisy     512 MiB   row-major noisy B (kept after prepack)
 g_A_noisy            512 MiB   row-major noisy A (per nonce)
 g_gemm.b_pre_        512 MiB   B scan / prepack layout
 g_gemm.a_pre_        512 MiB   A scan / prepack layout
 b_comp_ms_             8 MiB
 ─────────────────────────────
-total               ~3072 MiB
+total               ~2568 MiB
 ```
 
 GEMM reads `a_pre_` and `b_pre_`; row-major copies in `g_*_noisy` are redundant but still allocated.
 
-### reuse (~2 GiB steady, ~2.5 GiB peak)
+### reuse (~1.5 GiB steady, ~2 GiB peak)
 
 ```
 h_Ap_global          512 MiB
-h_BpT_global         512 MiB
 g_zero_b.B_noisy     512 MiB   B scan (after prepack+swap)
 g_A_noisy            512 MiB   A scan (after prepack+swap)
 b_comp_ms_             8 MiB
@@ -79,7 +90,7 @@ Flow: build row-major noisy → prepack into a **temporary** vector the same siz
 
 While prepack runs, source (row-major) and destination (temp) coexist → **+512 MiB** for that matrix for a few milliseconds (once per job for B, once per nonce for A).
 
-### fused (~2 GiB steady and peak)
+### fused (~1.5 GiB steady and peak)
 
 Same steady buffers as **reuse**, but noise injection and panel prepack are combined:
 
@@ -89,7 +100,7 @@ Same steady buffers as **reuse**, but noise injection and panel prepack are comb
 
 No full-matrix temporary. Extra memory is OpenMP thread-local stripes plus a **~128 KiB** permutation-pairs table per fused build.
 
-**Recommended** for production mining when RAM is tight.
+**Default** and recommended for production mining.
 
 ## Transient allocations (all CPU modes)
 
@@ -99,20 +110,23 @@ No full-matrix temporary. Extra memory is OpenMP thread-local stripes plus a **~
 | Job start (non-fused) | `pearl_build_noisy_b` perm pairs | ~32 KiB heap |
 | Each nonce (non-fused A) | `pearl_build_noisy_a` perm pairs | ~32 KiB heap |
 | Fused prepack | perm pairs in `Case33GemmXor` | ~128 KiB |
-| Share found | proof buffer | up to 512 KiB (`PLAIN_PROOF_B64_MAX`) |
+| Share found | proof: A sub-roots + leaf chunks (A hashed in place, no copy) + base64 | < 1 MiB |
+| First share of a job | zero-B^T sub-roots (hash 512 MiB of zeros, streamed) | 64 KiB, cached for the job |
+
+Peak host RAM therefore equals the steady-state figures above; a share does not add a matrix-sized allocation.
 
 `pearl_commitment_seeds` (full A+B keyed digest) is **not** run on the zero-B CPU fast path; A noise seed comes from `pearl_a_noise_seed_from_a`.
 
 ## CPU quick reference
 
 ```text
-# lowest steady RAM (~2 GiB matrices + 1 GiB signal)
-cppminer.exe --backend cpu --prepack fused ...
+# default: lowest steady RAM (~1 GiB scan matrices + 512 MiB signal A)
+cppminer.exe --backend cpu ...
 
 # legacy / debug (simplest, highest RAM)
 cppminer.exe --backend cpu --prepack separate ...
 
-# middle ground (2 GiB steady, brief 2.5 GiB spikes)
+# middle ground (1.5 GiB steady, brief 2 GiB spikes)
 cppminer.exe --backend cpu --prepack reuse ...
 ```
 
@@ -229,7 +243,7 @@ On share, both A and B^T may be handed off (`handoff_bt=1`); reclaim runs every 
 | GPU prep | Hand off **A only**; proof uses zero `h_BpT_global` for B |
 | `--cpu-gen` | Hand off **A and B^T** |
 | Copy | **None** — pointer move; mining waits if the next hit arrives before proof returns the buffer |
-| Proof scratch | up to **512 KiB** `PLAIN_PROOF_B64_MAX` on the proof thread |
+| Proof scratch | < 1 MiB on the proof thread (A and B^T hashed in place; see *Share proof memory*) |
 
 Peak host matrix RAM does **not** double during proof on the GPU-prep path.
 
@@ -244,7 +258,7 @@ Peak host matrix RAM does **not** double during proof on the GPU-prep path.
 
 **~1.5 GiB VRAM** for the three full matrices (plus small noise/seed/jackpot scratch). `--cpu-gen` still allocates `d_Bt_sig` as H2D staging.
 
-Flow: job → `gpu_prepare_job_b` (noise-only into `d_BpT`); each nonce → random A + hash + A-side noise into `d_Ap`. Share D2H copies A only; host `h_BpT_global` stays launch zeros.
+Flow: job → `gpu_prepare_job_b` (noise-only into `d_BpT`, zero-B^T sub-roots kept on host); each nonce → random A + hash + A-side noise into `d_Ap`, A sub-roots saved on device. Share D2H copies only A's sub-roots (64 KiB) and the ≤ 8 blocks holding the tile rows; no host A/B buffers are allocated. `--cpu-gen` uses the host-matrix path instead.
 
 ## OpenCL quick reference
 

@@ -753,6 +753,15 @@ extern "C" int cp_worker_supports_share_witness(void)
     return 0;
 }
 
+extern "C" int cp_worker_needs_host_bt(void)
+{
+    /* The CPU worker builds noisy B from the zero-B seed and never writes signal B^T,
+     * even with --cpu-gen. */
+    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+        return 0;
+    return !cp_worker_supports_share_witness();
+}
+
 extern "C" int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
                                              CpShareWitness** out)
 {

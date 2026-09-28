@@ -137,6 +137,9 @@ int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
 /* Non-zero when shares are proven from device Merkle sub-roots (cp_worker_fetch_share_witness)
  * instead of host signal matrices; the miner then allocates no host A/B buffers. */
 int cp_worker_supports_share_witness(void);
+/* Non-zero when the miner must keep a host signal B^T (h_BpT_global). Zero when B^T is always
+ * all-zero and proofs pass bt=NULL to cp_proof_build, or when shares use device witnesses. */
+int cp_worker_needs_host_bt(void);
 /* After a hit, before the next attempt. Allocates *out (cp_share_witness_free). */
 int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareWitness** out);
 

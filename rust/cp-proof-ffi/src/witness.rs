@@ -5,10 +5,13 @@
 //! raw bytes of the blocks holding the proven rows are enough to rebuild the exact
 //! `MerkleProof` that `MerkleTree::get_multileaf_proof` would produce from the whole matrix.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use blake3::hazmat::HasherExt;
 use blake3::{CHUNK_LEN, OUT_LEN};
 use pearl_blake3::{padded_chunk_len, Blake3Hasher, MerkleProof, MerkleTree};
+use rayon::prelude::*;
 
 type Digest = [u8; OUT_LEN];
 
@@ -209,6 +212,85 @@ pub fn build_matrix_proof_witness(
     };
     check_root(&proof, witness.expected_root)?;
     Ok(proof)
+}
+
+/// CV of the aligned subtree covering block `b` (`bytes` = its chunk-padded contents).
+fn subtree_cv(key: &Digest, b: usize, bytes: &[u8]) -> Digest {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.set_input_offset((b * BLOCK_BYTES) as u64);
+    hasher.update(bytes);
+    hasher.finalize_non_root()
+}
+
+/// Block `b` of `data` zero-padded to the chunk boundary: borrowed when it lies fully inside
+/// `data`, otherwise a copy of at most `BLOCK_BYTES`.
+fn padded_block(data: &[u8], b: usize) -> Cow<'_, [u8]> {
+    let start = b * BLOCK_BYTES;
+    let end = (start + BLOCK_BYTES).min(padded_chunk_len(data.len()));
+    if end <= data.len() {
+        Cow::Borrowed(&data[start..end])
+    } else {
+        let mut block = data[start.min(data.len())..].to_vec();
+        block.resize(end - start, 0);
+        Cow::Owned(block)
+    }
+}
+
+/// Sub-roots of a row-major matrix, hashed in place (the GPU chunk-roots kernel's output).
+pub fn matrix_subroots(data: &[u8], key: Digest) -> Vec<Digest> {
+    let num_blocks = padded_chunk_len(data.len()).div_ceil(BLOCK_BYTES);
+    (0..num_blocks)
+        .into_par_iter()
+        .map(|b| subtree_cv(&key, b, &padded_block(data, b)))
+        .collect()
+}
+
+/// Sub-roots of an all-zero `rows x cols` matrix, hashed block by block without materializing it.
+pub fn zero_subroots(rows: usize, cols: usize, key: Digest) -> Vec<Digest> {
+    let pad_len = padded_chunk_len(rows * cols);
+    let zero_block = vec![0u8; BLOCK_BYTES];
+    (0..pad_len.div_ceil(BLOCK_BYTES))
+        .into_par_iter()
+        .map(|b| {
+            let len = (pad_len - b * BLOCK_BYTES).min(BLOCK_BYTES);
+            subtree_cv(&key, b, &zero_block[..len])
+        })
+        .collect()
+}
+
+/// Multi-leaf proof over a full host matrix without copying it: sub-roots are hashed in
+/// place and only the blocks holding the proven rows are read again.
+pub fn build_matrix_proof_in_place(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    key: Digest,
+    row_indices: &[usize],
+) -> Result<MerkleProof, String> {
+    if data.len() != rows * cols {
+        return Err(format!("matrix is {} bytes, need {}", data.len(), rows * cols));
+    }
+    if row_indices.iter().any(|&r| r >= rows) {
+        return Err(format!("proof row index out of range (rows={rows})"));
+    }
+    let blocks: Vec<(usize, Cow<'_, [u8]>)> = needed_blocks(rows, cols, row_indices)
+        .into_iter()
+        .map(|b| {
+            let mut block = padded_block(data, b);
+            if block.len() < BLOCK_BYTES {
+                block.to_mut().resize(BLOCK_BYTES, 0);
+            }
+            (b, block)
+        })
+        .collect();
+    let num_blocks = padded_chunk_len(data.len()).div_ceil(BLOCK_BYTES);
+    let subroots = if num_blocks > 1 { matrix_subroots(data, key) } else { Vec::new() };
+    let witness = MatrixWitness {
+        subroots: &subroots,
+        blocks: Some(blocks.iter().map(|(b, d)| (*b, d.as_ref())).collect()),
+        expected_root: None,
+    };
+    build_matrix_proof_witness(rows, cols, key, row_indices, &witness)
 }
 
 /// Sub-roots of a full matrix, as the GPU chunk-roots kernel emits them.
