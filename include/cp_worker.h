@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "cp_share_witness.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -108,6 +110,8 @@ void cp_worker_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_
 
 /* Default tile layout for proof build (matches CP_TILE_LAYOUT_* in cp_proof.h). */
 int cp_worker_default_tile_layout(void);
+/* Layout proofs are built with: default, or CUTLASS when --cutlass-fused. */
+int cp_worker_proof_tile_layout(void);
 
 /*
  * One matrix attempt: prepare noisy A/B (host or device), scan for jackpot.
@@ -129,6 +133,12 @@ int cp_worker_mine_attempt(
 
 /* Device → host signal matrices after a share (no-op for CPU / already-host paths). */
 int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
+
+/* Non-zero when shares are proven from device Merkle sub-roots (cp_worker_fetch_share_witness)
+ * instead of host signal matrices; the miner then allocates no host A/B buffers. */
+int cp_worker_supports_share_witness(void);
+/* After a hit, before the next attempt. Allocates *out (cp_share_witness_free). */
+int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareWitness** out);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 #include "cp_worker.h"
 #include "cp_noise.h"
 #include "cp_proof.h"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <stdio.h>
@@ -648,6 +649,11 @@ extern "C" int cp_worker_default_tile_layout(void)
     return CP_TILE_LAYOUT_SCATTERED;
 }
 
+extern "C" int cp_worker_proof_tile_layout(void)
+{
+    return g_cutlass_fused ? CP_TILE_LAYOUT_CUTLASS : cp_worker_default_tile_layout();
+}
+
 extern "C" int cp_worker_mine_attempt(
     const uint8_t* ab_seed, int ab_seed_len,
     const uint8_t job_key[32],
@@ -736,4 +742,27 @@ extern "C" int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
         fprintf(stderr, "[worker] fetch_share_signals: no backend\n");
         return -1;
     }
+}
+
+extern "C" int cp_worker_supports_share_witness(void)
+{
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return !g_cpu_matrix_gen;
+#endif
+    return 0;
+}
+
+extern "C" int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
+                                             CpShareWitness** out)
+{
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return cp_cuda_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
+#endif
+    (void)t_rows;
+    (void)t_cols;
+    (void)tile_layout;
+    if(out) *out = NULL;
+    return -1;
 }

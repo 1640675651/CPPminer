@@ -8,6 +8,7 @@
 - Quantus wgpu backend via quantus-miner GpuEngine FFI (DONE)
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl (DONE)
 - Pearl wgpu backend (DONE)
+- Reduce host memory usage, Per-hit D2H 512 MiB -> ~0.3-0.8 MiB, no 2x512 MiB host A/B buffers. See proof.md (CUDA DONE, OpenCL, OneDNN, Wgpu TODO)
 - Configurable matrix size (TODO)
 
 ### Pearl wgpu

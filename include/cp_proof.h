@@ -44,6 +44,46 @@ int cp_proof_build(
     char* err,
     size_t err_cap);
 
+/* Proof inputs from device Merkle hashing instead of a host copy of the whole matrix.
+ * The device keyed-hash folds every CP_WITNESS_BLOCK_CHUNKS chunks into one 32-byte sub-root. */
+#define CP_WITNESS_BLOCK_CHUNKS 256
+#define CP_WITNESS_BLOCK_BYTES  (CP_WITNESS_BLOCK_CHUNKS * 1024)
+#define CP_WITNESS_MAX_BLOCKS   8
+
+typedef struct CpMatrixWitness {
+    const uint8_t* subroots;   /* num_subroots * 32 bytes (unused if the matrix is one block) */
+    size_t num_subroots;
+    const uint8_t* blocks;     /* num_blocks * CP_WITNESS_BLOCK_BYTES, zero-padded; NULL = all-zero matrix */
+    const uint32_t* block_idx; /* block index of each entry in blocks */
+    size_t num_blocks;
+    const uint8_t* root;       /* optional: 32-byte root the device committed to (checked) */
+} CpMatrixWitness;
+
+/* Blocks a proof reads: is_bt=0 → A rows from t_rows (rows=m); is_bt=1 → B^T rows from t_cols
+ * (rows=n). Writes sorted indices to out_idx; returns count, or -1 on error. */
+int cp_proof_witness_blocks(int tile_layout, int is_bt, int anchor, int rows, int k,
+                            uint32_t* out_idx, size_t cap);
+
+/* Same output as cp_proof_build, built from witnesses. */
+int cp_proof_build_witness(
+    const uint8_t* header,
+    size_t header_len,
+    const uint8_t* mining_config,
+    size_t config_len,
+    const CpMatrixWitness* a,
+    const CpMatrixWitness* bt,
+    int m,
+    int n,
+    int k,
+    int rank,
+    int t_rows,
+    int t_cols,
+    int tile_layout,
+    char* out_b64,
+    size_t out_cap,
+    char* err,
+    size_t err_cap);
+
 /* Verify plain_proof base64 against pool share target (32-byte BE U256, unscaled).
  * cert_version: 1/2 = legacy noise seeds, 3 = salted (V3). Returns 0 on ok. */
 int cp_proof_verify(

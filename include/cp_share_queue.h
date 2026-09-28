@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cp_share_witness.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -55,6 +57,14 @@ int cp_share_queue_last_outcome(const CpShareQueue *q);
 int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit, const uint8_t *header,
                                int hlen, const char *job_id, const char *target_hex,
                                int8_t **a_io, size_t sz_a, int8_t **bt_io, size_t sz_bt);
+
+/*
+ * Hands off a device-derived proof witness instead of host matrices (hit->handoff_bt ignored).
+ * Takes ownership of *witness_io and sets it to NULL on success.
+ */
+int cp_share_queue_enqueue_witness(CpShareQueue *q, const CpShareHit *hit, const uint8_t *header,
+                                   int hlen, const char *job_id, const char *target_hex,
+                                   CpShareWitness **witness_io);
 
 /*
  * Waits until any loaned matrices are returned, then restores them into *a_io / *bt_io
