@@ -1383,7 +1383,7 @@ int main(int argc, char** argv)
             printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
                    batch_size, batch_size * tiles_per_macro);
-            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+            printf("[mode] noisy B cached on GPU per job\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_WGPU && cp_worker_algo() == 0){
             const int wgpu_macro = wgpu_macro_m > 0 ? wgpu_macro_m : 128;
             const int hash_mr = cp_pp_hash_tile_h();

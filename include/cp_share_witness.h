@@ -12,7 +12,8 @@ extern "C" {
 
 /* Host-owned proof inputs for one share (malloc'd; release with cp_share_witness_free).
  * Signal A: device sub-roots + the blocks covering the tile rows.
- * Signal B^T: all-zero, so only its sub-roots; blocks are synthesized by the proof builder. */
+ * Signal B^T: all-zero, so only its sub-roots; blocks are synthesized by the proof builder.
+ * bt_num_subroots = 0 means the proof builder derives the zero sub-roots itself (bt_root unused). */
 typedef struct CpShareWitness {
     int tile_layout;
     uint8_t a_root[32];

@@ -65,7 +65,8 @@ typedef struct CpMatrixWitness {
 int cp_proof_witness_blocks(int tile_layout, int is_bt, int anchor, int rows, int k,
                             uint32_t* out_idx, size_t cap);
 
-/* Same output as cp_proof_build, built from witnesses. */
+/* Same output as cp_proof_build, built from witnesses. A B^T witness with blocks = NULL and
+ * num_subroots = 0 is proven as an all-zero matrix from host-cached zero sub-roots. */
 int cp_proof_build_witness(
     const uint8_t* header,
     size_t header_len,

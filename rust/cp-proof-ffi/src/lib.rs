@@ -258,8 +258,15 @@ fn build_plain_proof_witness_b64(
     let (key, a_rows, bt_rows) =
         proof_rows(header, mining_config, k, rank, t_rows, t_cols, layout)?;
     let a_proof = build_matrix_proof_witness(m, k, key, &a_rows, a).map_err(|e| format!("A: {e}"))?;
-    let bt_proof =
-        build_matrix_proof_witness(n, k, key, &bt_rows, bt).map_err(|e| format!("B^T: {e}"))?;
+    let bt_proof = if bt.blocks.is_none() && bt.subroots.is_empty() {
+        let p = build_zero_matrix_proof(n, k, key, &bt_rows).map_err(|e| format!("B^T: {e}"))?;
+        if matches!(bt.expected_root, Some(r) if r != p.proof.root) {
+            return Err("B^T: zero-matrix root does not match device commitment".into());
+        }
+        p.proof
+    } else {
+        build_matrix_proof_witness(n, k, key, &bt_rows, bt).map_err(|e| format!("B^T: {e}"))?
+    };
 
     encode_plain_proof(&PlainProof {
         m,
@@ -939,6 +946,19 @@ mod tests {
         )
         .expect("witness proof");
         assert_eq!(got, reference);
+
+        if zero_bt {
+            let bt_empty = MatrixWitness {
+                subroots: &[],
+                blocks: None,
+                expected_root: Some(bt_root),
+            };
+            let got = build_plain_proof_witness_b64(
+                &header, &config, &a_w, &bt_empty, m, n, k, 128, t_rows, t_cols, layout,
+            )
+            .expect("witness proof, host zero B^T");
+            assert_eq!(got, reference);
+        }
     }
 
     #[test]

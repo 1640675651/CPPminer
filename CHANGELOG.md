@@ -8,7 +8,7 @@
 - Quantus wgpu backend via quantus-miner GpuEngine FFI
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl
 - Pearl wgpu backend
-- Reduce host memory usage (CPU, CUDA DONE, OpenCL, OneDNN, Wgpu TODO)
+- Reduce host memory usage (CPU, CUDA, OpenCL DONE, OneDNN, Wgpu TODO)
 - Configurable matrix size (TODO)
 
 ### Pearl wgpu
@@ -21,8 +21,8 @@
 - Bind a_pre / b_pre / a_sig in windows under `max_storage_buffer_binding_size` (512 MiB buffers vs 256 MiB on Mali); scan batches split only where a macro column exceeds the limit
 
 ### Host memory reduction
-- GPU backend: per-hit D2H 512 MiB -> ~0.3-0.8 MiB, no 2x512 MiB host A/B buffers. See proof.md (CUDA DONE, OpenCL, OneDNN, Wgpu TODO)
-- CPU backend: drop the 512 MiB all-zero host B^T buffer; proofs use zero-matrix Merkle sub-roots cached per job
+- GPU backend: per-hit D2H 512 MiB -> ~0.3-0.8 MiB, no 2x512 MiB host A/B buffers. See proof.md (CUDA, OpenCL DONE, OneDNN, Wgpu TODO)
+- CPU and OpenCL `--cpu-gen`: drop the 512 MiB all-zero host B^T buffer; proofs use zero-matrix Merkle sub-roots cached per job
 - CPU `--prepack fused` is now the default (~1.5 GiB steady vs ~2.5 GiB for separate)
 - Host-matrix proofs hash A/B^T in place: transient per-share peak ~1.5 GiB -> < 1 MiB (no flatten/pad/MerkleTree copies of the 512 MiB matrix)
 

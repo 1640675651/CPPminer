@@ -49,6 +49,14 @@ struct Case33OclPrep {
 
     bool read_A_sig(int8_t *h_A_sig, size_t bytes) const;
 
+    /* Share witness for the last GPU-hashed signal A: sub-roots captured during the keyed hash
+     * (a_witness_subroots() of them; 0 when A fits in one 256-chunk subtree, -1 when no GPU hash
+     * has run) plus the requested blocks, zero-padded past sz_a. */
+    int a_witness_subroots() const { return a_witness_valid_ ? a_num_subroots_ : -1; }
+    bool read_A_witness(size_t sz_a, const uint32_t *block_idx, int num_blocks,
+                        size_t block_bytes, uint8_t *blocks_out, uint8_t *subroots_out,
+                        uint8_t root_out[32]) const;
+
     cl_mem noisy_scratch_buffer() const { return d_noisy_scratch_; }
 
     /* OpenCL --align-test helpers (GPU vs CPU reference). */
@@ -69,7 +77,10 @@ private:
     bool create_kernels_();
     void release_kernels_();
     bool matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_len,
-                            const uint8_t job_key[32], uint8_t out[32]);
+                            const uint8_t job_key[32], uint8_t out[32],
+                            cl_mem subroots_out = nullptr, int *num_subroots_out = nullptr);
+    bool hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
+                        uint8_t out[32]);
     bool merkle_finish_root_(int num_subroots);
     bool build_perm_pairs_(int is_b, int K);
     bool noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, int K, int out_lda, int is_b,
@@ -109,6 +120,10 @@ private:
     cl_mem d_noise_seed_ = nullptr;
     cl_mem d_pairs_ = nullptr;
     cl_mem d_merkle_roots_ = nullptr;
+    cl_mem d_a_subroots_ = nullptr;
+    int a_num_subroots_ = 0;
+    uint8_t a_root_[32] = {};
+    bool a_witness_valid_ = false;
     cl_mem d_noisy_scratch_ = nullptr;
     size_t noisy_scratch_cap_ = 0;
 };

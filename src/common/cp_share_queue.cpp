@@ -214,8 +214,8 @@ static int build_snapshot_proof(const ShareSnapshot *snap, const CpShareJobCtx &
     if (w) {
         const CpMatrixWitness a = {w->a_subroots, w->a_num_subroots, w->a_blocks,
                                    w->a_block_idx, w->a_num_blocks, w->a_root};
-        const CpMatrixWitness bt = {w->bt_subroots, w->bt_num_subroots, nullptr,
-                                    nullptr, 0, w->bt_root};
+        const CpMatrixWitness bt = {w->bt_subroots, w->bt_num_subroots, nullptr, nullptr, 0,
+                                    w->bt_num_subroots ? w->bt_root : nullptr};
         return cp_proof_build_witness(snap->header, (size_t)snap->header_len,
                                       mining_cfg_for_layout(w->tile_layout), 52, &a, &bt,
                                       job_ctx.m, job_ctx.n, K_DIM, R_RANK, snap->t_rows,

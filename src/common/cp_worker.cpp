@@ -750,14 +750,19 @@ extern "C" int cp_worker_supports_share_witness(void)
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         return !g_cpu_matrix_gen;
 #endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        return !g_cpu_matrix_gen;
+#endif
     return 0;
 }
 
 extern "C" int cp_worker_needs_host_bt(void)
 {
-    /* The CPU worker builds noisy B from the zero-B seed and never writes signal B^T,
-     * even with --cpu-gen. */
-    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+    /* The CPU and OpenCL workers build noisy B from the zero-B seed and never write signal
+     * B^T, even with --cpu-gen. */
+    const int backend = cp_worker_backend_id();
+    if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL)
         return 0;
     return !cp_worker_supports_share_witness();
 }
@@ -768,6 +773,10 @@ extern "C" int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_la
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         return cp_cuda_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        return cp_opencl_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
 #endif
     (void)t_rows;
     (void)t_cols;
