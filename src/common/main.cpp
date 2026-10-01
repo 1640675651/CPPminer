@@ -19,10 +19,11 @@
 #include "cp_qpow_opencl_worker.h"
 #endif
 
-#include "qpow/poseidon2.hpp"
+#include "qpow/miner.hpp"
 
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "gemm/case33_gemm_xor.hpp"
+#include "cp_cpu_affinity.h"
 #endif
 
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -166,8 +167,11 @@ static void print_usage(void)
            CP_MOCK_DIFF_QUANTUS_DEFAULT);
     printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), avxvnni, avx2, ssse3,\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avxvnni, avx2, ssse3,\n");
     printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
+    printf("                       quantus: hybrid = scalar + avx2 split across SMT siblings,\n");
+    printf("                       auto = best available (currently hybrid), avx2 = all\n");
+    printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
     printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
     printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
@@ -439,6 +443,7 @@ int main(int argc, char** argv)
             else if(!strcmp(env, "dotprod")) simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(env, "neon")) simd_isa = CP_SIMD_NEON;
             else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
+            else if(!strcmp(env, "hybrid")) simd_isa = CP_SIMD_HYBRID;
             else if(!strcmp(env, "auto")) simd_isa = CP_SIMD_AUTO;
             else {
                 fprintf(stderr, "unknown CP_SIMD/CASE33_ISA value %s\n", env);
@@ -802,9 +807,11 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(isa, "scalar"))
                 simd_isa = CP_SIMD_SCALAR;
+            else if(!strcmp(isa, "hybrid"))
+                simd_isa = CP_SIMD_HYBRID;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|hybrid|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }
@@ -953,6 +960,16 @@ int main(int argc, char** argv)
                     "--algo quantus does not support this --backend "
                     "(supported in this build: %s)\n", qb);
             return 1;
+        }
+        if(simd_test){
+            /* Quantus has scalar and AVX2 Poseidon2 kernels; compare them and exit. */
+            const int field_fail = qpow::test_avx2_field();
+            const int parity_fail = qpow::test_avx2_hash_parity();
+            printf("[qpow] AVX2 Poseidon2 vs scalar: field ops %s, hash parity %s (%s)\n",
+                   field_fail == 0 ? "passed" : "failed",
+                   parity_fail == 0 ? "passed" : "failed",
+                   qpow::cpu_has_avx2() ? "avx2 available" : "no avx2: scalar only");
+            return (field_fail == 0 && parity_fail == 0) ? 0 : 1;
         }
         if(!pool_specified && !g_mock && !list_devices){
             fprintf(stderr, "--pool required for --algo quantus (no default host)\n");
@@ -1236,6 +1253,18 @@ int main(int argc, char** argv)
             }
         }
 #endif
+        if(cp_worker_backend_id() == CP_BACKEND_CPU){
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+            /* Pin the OpenMP pool physical cores first, then SMT siblings, so
+             * the --simd auto scalar/AVX2 split pairs one of each per core. */
+            if(cp_cpu_affinity_init() == 0)
+                cp_cpu_affinity_bind_openmp_pool();
+            printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
+            fflush(stdout);
+#endif
+            if(cp_qpow_set_simd_isa(simd_isa) != 0)
+                return 1;
+        }
         int qrc;
         if(g_mock){
             qrc = cp_qpow_mine_mock(worker_global);

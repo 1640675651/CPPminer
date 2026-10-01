@@ -11,33 +11,42 @@
 namespace qpow {
 namespace {
 
+// AVX2_ATTR: non-inlined functions that may use AVX2. AVX2_INL: helpers that are
+// always inlined into them, so the 12-vector state can stay in registers and no
+// per-call xmm6-xmm15 save/restore (Windows ABI) or state reload is paid per round.
 #if defined(__GNUC__) || defined(__clang__)
 #define AVX2_ATTR __attribute__((target("avx2")))
+#define AVX2_INL __attribute__((target("avx2"), always_inline)) inline
+#elif defined(_MSC_VER)
+#define AVX2_ATTR
+#define AVX2_INL __forceinline
 #else
 #define AVX2_ATTR
+#define AVX2_INL inline
 #endif
 
-AVX2_ATTR inline __m256i u64_lt(__m256i a, __m256i b) {
+AVX2_INL __m256i u64_lt(__m256i a, __m256i b) {
     const __m256i k = _mm256_set1_epi64x((long long)0x8000000000000000ull);
     return _mm256_cmpgt_epi64(_mm256_xor_si256(b, k), _mm256_xor_si256(a, k));
 }
 
-AVX2_ATTR inline __m256i avx_add(__m256i a, __m256i b) {
+// Field add on non-canonical lanes: +EPS on carry, rare second +EPS. The second
+// wrap can only follow a first one (without it s1 == s0 and the compare is
+// false), so it needs no conjunction with the first carry mask.
+AVX2_INL __m256i avx_add(__m256i a, __m256i b) {
     const __m256i eps = _mm256_set1_epi64x((long long)EPS64);
     __m256i s0 = _mm256_add_epi64(a, b);
-    __m256i c1 = u64_lt(s0, a);
-    __m256i s1 = _mm256_add_epi64(s0, _mm256_and_si256(c1, eps));
-    __m256i c2 = _mm256_and_si256(c1, u64_lt(s1, s0));
-    return _mm256_add_epi64(s1, _mm256_and_si256(c2, eps));
+    __m256i s1 = _mm256_add_epi64(s0, _mm256_and_si256(u64_lt(s0, a), eps));
+    return _mm256_add_epi64(s1, _mm256_and_si256(u64_lt(s1, s0), eps));
 }
 
-AVX2_ATTR inline __m256i avx_canon(__m256i a) {
+AVX2_INL __m256i avx_canon(__m256i a) {
     const __m256i p = _mm256_set1_epi64x((long long)P64);
     __m256i ge = _mm256_or_si256(u64_lt(p, a), _mm256_cmpeq_epi64(a, p));
     return _mm256_sub_epi64(a, _mm256_and_si256(ge, p));
 }
 
-AVX2_ATTR inline __m256i avx_reduce(__m256i lo, __m256i hi) {
+AVX2_INL __m256i avx_reduce(__m256i lo, __m256i hi) {
     const __m256i eps = _mm256_set1_epi64x((long long)EPS64);
     __m256i hi_hi = _mm256_srli_epi64(hi, 32);
     __m256i hi_lo = _mm256_and_si256(hi, eps);
@@ -48,30 +57,36 @@ AVX2_ATTR inline __m256i avx_reduce(__m256i lo, __m256i hi) {
     return _mm256_add_epi64(t2, _mm256_and_si256(u64_lt(t2, t0), eps));
 }
 
-AVX2_ATTR inline __m256i avx_mul(__m256i a, __m256i b) {
+// 64x64 -> 128 per lane from four 32x32 products. The cross terms are split
+// into 32-bit halves before they are summed, so no partial sum can carry:
+// mid < 3*2^32, and hh + three values below 2^32 still fits in 64 bits. This
+// avoids the two unsigned-compare carry checks (each 2 xor + a port-5-only
+// vpcmpgtq) that a 64-bit cross-term sum needs.
+AVX2_INL __m256i avx_mul(__m256i a, __m256i b) {
+    const __m256i m32 = _mm256_set1_epi64x((long long)EPS64);
     __m256i a_hi = _mm256_srli_epi64(a, 32);
     __m256i b_hi = _mm256_srli_epi64(b, 32);
     __m256i ll = _mm256_mul_epu32(a, b);
     __m256i lh = _mm256_mul_epu32(a, b_hi);
     __m256i hl = _mm256_mul_epu32(a_hi, b);
     __m256i hh = _mm256_mul_epu32(a_hi, b_hi);
-    __m256i mid = _mm256_add_epi64(lh, hl);
-    __m256i mid_c = _mm256_srli_epi64(u64_lt(mid, lh), 63);
-    __m256i lo = _mm256_add_epi64(ll, _mm256_slli_epi64(mid, 32));
-    __m256i lo_c = _mm256_srli_epi64(u64_lt(lo, ll), 63);
-    __m256i hi = _mm256_add_epi64(hh, _mm256_srli_epi64(mid, 32));
-    hi = _mm256_add_epi64(hi, _mm256_slli_epi64(mid_c, 32));
-    hi = _mm256_add_epi64(hi, lo_c);
+    __m256i mid = _mm256_add_epi64(
+        _mm256_add_epi64(_mm256_srli_epi64(ll, 32), _mm256_and_si256(lh, m32)),
+        _mm256_and_si256(hl, m32));
+    __m256i lo = _mm256_or_si256(_mm256_and_si256(ll, m32), _mm256_slli_epi64(mid, 32));
+    __m256i hi = _mm256_add_epi64(
+        _mm256_add_epi64(hh, _mm256_srli_epi64(lh, 32)),
+        _mm256_add_epi64(_mm256_srli_epi64(hl, 32), _mm256_srli_epi64(mid, 32)));
     return avx_reduce(lo, hi);
 }
 
-AVX2_ATTR inline __m256i avx_sbox(__m256i x) {
+AVX2_INL __m256i avx_sbox(__m256i x) {
     __m256i x2 = avx_mul(x, x);
     __m256i x4 = avx_mul(x2, x2);
     return avx_mul(avx_mul(x4, x2), x);
 }
 
-AVX2_ATTR void avx_ext(__m256i s[WIDTH]) {
+AVX2_INL void avx_ext(__m256i s[WIDTH]) {
     for (int chunk = 0; chunk < 3; chunk++) {
         int o = chunk * 4;
         __m256i x0 = s[o], x1 = s[o + 1], x2 = s[o + 2], x3 = s[o + 3];
@@ -85,14 +100,35 @@ AVX2_ATTR void avx_ext(__m256i s[WIDTH]) {
         s[o] = avx_add(t01123, t01);
         s[o + 2] = avx_add(t01233, t23);
     }
-    __m256i sums[4];
-    for (int k = 0; k < 4; k++) sums[k] = avx_add(avx_add(s[k], s[k + 4]), s[k + 8]);
-    for (int i = 0; i < WIDTH; i++) s[i] = avx_add(s[i], sums[i % 4]);
+    // Unrolled so the four column sums stay in registers (no indexed stack array).
+    __m256i sum0 = avx_add(avx_add(s[0], s[4]), s[8]);
+    __m256i sum1 = avx_add(avx_add(s[1], s[5]), s[9]);
+    __m256i sum2 = avx_add(avx_add(s[2], s[6]), s[10]);
+    __m256i sum3 = avx_add(avx_add(s[3], s[7]), s[11]);
+    s[0] = avx_add(s[0], sum0);
+    s[1] = avx_add(s[1], sum1);
+    s[2] = avx_add(s[2], sum2);
+    s[3] = avx_add(s[3], sum3);
+    s[4] = avx_add(s[4], sum0);
+    s[5] = avx_add(s[5], sum1);
+    s[6] = avx_add(s[6], sum2);
+    s[7] = avx_add(s[7], sum3);
+    s[8] = avx_add(s[8], sum0);
+    s[9] = avx_add(s[9], sum1);
+    s[10] = avx_add(s[10], sum2);
+    s[11] = avx_add(s[11], sum3);
 }
 
-AVX2_ATTR void avx_int(__m256i s[WIDTH]) {
-    __m256i sum = s[0];
-    for (int i = 1; i < WIDTH; i++) sum = avx_add(sum, s[i]);
+AVX2_INL void avx_int(__m256i s[WIDTH]) {
+    // Tree-shaped sum: 4 dependent adds deep instead of 11. The internal round is
+    // a serial chain (S-box -> sum -> multiply-add -> next S-box), so depth matters.
+    __m256i t01 = avx_add(s[0], s[1]);
+    __m256i t23 = avx_add(s[2], s[3]);
+    __m256i t45 = avx_add(s[4], s[5]);
+    __m256i t67 = avx_add(s[6], s[7]);
+    __m256i t89 = avx_add(s[8], s[9]);
+    __m256i tab = avx_add(s[10], s[11]);
+    __m256i sum = avx_add(avx_add(avx_add(t01, t23), avx_add(t45, t67)), avx_add(t89, tab));
     for (int i = 0; i < WIDTH; i++)
         s[i] = avx_add(avx_mul(s[i], _mm256_set1_epi64x((long long)MDS_DIAG[i])), sum);
 }

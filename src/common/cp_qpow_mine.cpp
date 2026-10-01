@@ -7,6 +7,7 @@
 #include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
+#include "cp_platform.h"
 #include "cp_worker.h"
 #include "qpow/miner.hpp"
 #include <atomic>
@@ -15,6 +16,10 @@
 #include <mutex>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -28,10 +33,95 @@
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_qpow_opencl_worker.h"
 #endif
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+#include "cp_cpu_affinity.h"
+#endif
 /* Fee reconnect quantum: ~40s at 0.25 MH/s per thread. */
 static const uint64_t k_qpow_fee_hashes_per_unit = 10000000ull;
 static const uint64_t k_search_chunk = 8192ull;
 static const uint64_t k_gpu_search_chunk_default = 1000000ull;
+
+static CpSimdIsa g_qpow_simd = CP_SIMD_AUTO;
+static std::atomic<int> g_qpow_simd_map_logged{0};
+
+/* Logical CPU the calling thread is running on right now, or -1 if unknown. */
+static int qpow_current_cpu(void)
+{
+#if defined(_WIN32)
+    return (int)GetCurrentProcessorNumber();
+#elif defined(__linux__)
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+
+/* One-time log of which logical CPUs the scalar and AVX2 workers landed on, so
+ * the SMT pairing behind --simd auto can be checked from the console. */
+static void qpow_log_simd_map(const std::vector<int>& cpu_of, int n_avx2)
+{
+    if(g_qpow_simd_map_logged.exchange(1)) return;
+    const int n = (int)cpu_of.size();
+    char line[512];
+    int pos = 0;
+    for(int pass = 0; pass < 2 && pos < (int)sizeof(line) - 32; pass++){
+        const bool avx = pass == 1;
+        if(avx && n_avx2 == 0) break;
+        if(!avx && n_avx2 == n) continue;
+        pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%s%s on cpus",
+                        pos ? "; " : "", avx ? "avx2" : "scalar");
+        bool first = true;
+        for(int tid = 0; tid < n && pos < (int)sizeof(line) - 8; tid++){
+            const bool is_avx = tid >= n - n_avx2;
+            if(is_avx != avx) continue;
+            pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%s%d",
+                            first ? " " : ",", cpu_of[(size_t)tid]);
+            first = false;
+        }
+    }
+    printf("[qpow] simd map: %s\n", line);
+    fflush(stdout);
+}
+
+extern "C" int cp_qpow_set_simd_isa(CpSimdIsa isa)
+{
+    g_qpow_simd = isa;
+    if((isa == CP_SIMD_AVX2 || isa == CP_SIMD_AVXVNNI) && !qpow::cpu_has_avx2()){
+        fprintf(stderr, "[qpow] --simd avx2 requested but this CPU has no AVX2\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Number of threads (the highest OpenMP ids) that run the AVX2 Poseidon2 path. */
+static int qpow_avx2_thread_count(int nthreads)
+{
+    if(!qpow::cpu_has_avx2()) return 0;
+    switch(g_qpow_simd){
+    case CP_SIMD_AVX2:
+    case CP_SIMD_AVXVNNI:
+        return nthreads;
+    case CP_SIMD_AUTO:   /* best available: hybrid today; an AVX-512 kernel may
+                          * change what auto picks, hybrid stays as defined. */
+    case CP_SIMD_HYBRID: {
+        /* Per thread the scalar path is slightly faster, but a scalar worker and
+         * an AVX2 worker sharing a physical core run on mostly different
+         * execution ports and together out-hash two of either kind by ~15%
+         * (measured on Alder Lake P-cores). Workers are pinned physical cores
+         * first, then SMT siblings, so thread ids >= physical count are the
+         * siblings: give those AVX2. Without SMT (or topology) stay scalar. */
+        int phys = 0;
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+        phys = cp_cpu_affinity_physical_cores();
+#endif
+        if(phys <= 0) phys = (nthreads + 1) / 2;
+        return nthreads > phys ? nthreads - phys : 0;
+    }
+    default:
+        /* scalar, ssse3, neon, dotprod: Poseidon2 has no kernel for these. */
+        return 0;
+    }
+}
 
 static uint64_t qpow_gpu_search_chunk(void)
 {
@@ -405,8 +495,14 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
                         const char* worker_name)
 {
     const int nthreads = resolve_thread_count();
-    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d threads=%d%s\n",
-           job->job_id, job->difficulty, job->extranonce_len, nthreads,
+    const int n_avx2 = qpow_avx2_thread_count(nthreads);
+    char simd_desc[48];
+    if(n_avx2 == 0) snprintf(simd_desc, sizeof(simd_desc), "scalar");
+    else if(n_avx2 == nthreads) snprintf(simd_desc, sizeof(simd_desc), "avx2");
+    else snprintf(simd_desc, sizeof(simd_desc), "%d scalar + %d avx2",
+                  nthreads - n_avx2, n_avx2);
+    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d threads=%d simd=%s%s\n",
+           job->job_id, job->difficulty, job->extranonce_len, nthreads, simd_desc,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     uint8_t base[CP_QPOW_NONCE_BYTES];
@@ -418,6 +514,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
     std::mutex fee_mx;
     auto t0 = std::chrono::steady_clock::now();
     auto t_log = t0;
+    std::vector<int> cpu_of((size_t)nthreads, -1);
     cp_job_mine_begin(job->job_key);
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
@@ -428,6 +525,20 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
 #else
         const int tid = 0;
 #endif
+        const qpow::Isa isa =
+            tid >= nthreads - n_avx2 ? qpow::Isa::Avx2 : qpow::Isa::Scalar;
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+        /* Bind here rather than trusting the pre-pinned pool: with --threads
+         * below the pool size the runtime may run this team on other threads. */
+        (void)cp_cpu_affinity_bind_thread(tid);
+#endif
+        if(!g_qpow_simd_map_logged.load(std::memory_order_relaxed)){
+            cpu_of[(size_t)tid] = qpow_current_cpu();
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+            if(tid == 0) qpow_log_simd_map(cpu_of, n_avx2);
+        }
         uint8_t cur[CP_QPOW_NONCE_BYTES];
         memcpy(cur, base, CP_QPOW_NONCE_BYTES);
         stamp_thread_id(cur, job->extranonce_len, tid);
@@ -438,7 +549,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
                 break;
             }
             qpow::SearchResult r = qpow::search_range(
-                job->mining_hash, cur, k_search_chunk, job->target, qpow::Isa::Auto);
+                job->mining_hash, cur, k_search_chunk, job->target, isa);
             total_hashes.fetch_add(r.hashes, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(fee_mx);

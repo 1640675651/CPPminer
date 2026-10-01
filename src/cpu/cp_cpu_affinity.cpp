@@ -424,3 +424,18 @@ extern "C" void cp_cpu_affinity_bind_openmp_pool(void) {
 extern "C" const char *cp_cpu_affinity_summary(void) {
     return g_summary;
 }
+
+extern "C" int cp_cpu_affinity_physical_cores(void) {
+    if (affinity_disabled() || g_cpu_order.empty()) {
+        return 0;
+    }
+    return g_physical_cores;
+}
+
+extern "C" int cp_cpu_affinity_bind_thread(int tid) {
+    if (affinity_disabled() || g_cpu_order.empty() || tid < 0) {
+        return -1;
+    }
+    const CpuSlot &slot = g_cpu_order[static_cast<size_t>(tid) % g_cpu_order.size()];
+    return bind_current_thread(slot) ? 0 : -1;
+}

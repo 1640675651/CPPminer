@@ -251,6 +251,7 @@ extern "C" int cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
         g_isa_pref = Case33Isa::DotProd;
         break;
     case CP_SIMD_AUTO:
+    case CP_SIMD_HYBRID: /* quantus-only split; the GEMM path has no hybrid mode */
     default:
         g_isa_pref = Case33Isa::Auto;
         break;
