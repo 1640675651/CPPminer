@@ -1,16 +1,19 @@
 #include "cp_qpow_pool.h"
 
 #include "cp_job_ctrl.h"
+#include "cp_json_text.hpp"
 #include "cp_pool.h"
 #include "cp_util.h"
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int g_qpow_active = 0;
+static std::atomic<int> g_qpow_active{0};
 static char g_session_id[80] = {0};
 static std::mutex g_pending_mx;
 static CpQpowJob g_pending;
@@ -31,7 +34,7 @@ static void queue_pending(const CpQpowJob* job)
 
 void cp_qpow_pool_set_active(int on)
 {
-    g_qpow_active = on ? 1 : 0;
+    g_qpow_active.store(on ? 1 : 0);
 }
 
 void cp_qpow_pool_clear(void)
@@ -60,21 +63,18 @@ const char* cp_qpow_pool_session_id(void)
 int cp_qpow_pool_send_login(int msg_id, const char* login, const char* worker,
                             const char* agent)
 {
-    const char* w = (worker && worker[0]) ? worker : "";
-    char ident[384];
-    if(w[0])
-        snprintf(ident, sizeof(ident), "%s.%s", login ? login : "", w);
-    else
-        snprintf(ident, sizeof(ident), "%s", login ? login : "");
-    char msg[768];
-    snprintf(msg, sizeof(msg),
-             "{\"id\":%d,\"method\":\"login\",\"params\":{"
-             "\"login\":\"%s\",\"pass\":\"%s\",\"agent\":\"%s\"}}",
-             msg_id, ident, w[0] ? w : "x",
-             agent ? agent : "cppminer/1.0");
+    const std::string w = worker ? worker : "";
+    const std::string ident = std::string(login ? login : "") +
+                              (w.empty() ? "" : "." + w);
+    const std::string msg =
+        "{\"id\":" + std::to_string(msg_id) +
+        ",\"method\":\"login\",\"params\":{\"login\":\"" +
+        cp_json_escape(ident.c_str()) + "\",\"pass\":\"" +
+        cp_json_escape(w.empty() ? "x" : w.c_str()) + "\",\"agent\":\"" +
+        cp_json_escape(agent ? agent : "cppminer/1.0") + "\"}}";
     printf("[net] Quantus login (login=wallet.worker, pass=worker)\n");
     fflush(stdout);
-    return cp_send_json(cp_pool_socket(), msg);
+    return cp_send_json(cp_pool_socket(), msg.c_str());
 }
 
 int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
@@ -82,18 +82,14 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
 {
     char nonce_hex[CP_QPOW_NONCE_BYTES * 2 + 1];
     cp_bin_to_hex(nonce, CP_QPOW_NONCE_BYTES, nonce_hex);
-    char msg[512];
-    int nw = snprintf(msg, sizeof(msg),
-                      "{\"id\":%d,\"method\":\"submit\",\"params\":{"
-                      "\"id\":\"%s\",\"job_id\":\"%s\",\"nonce\":\"%s\"}}",
-                      msg_id, g_session_id, job_id ? job_id : "", nonce_hex);
-    if(nw < 0 || (size_t)nw >= sizeof(msg)){
-        fprintf(stderr, "[net] quantus submit JSON too large\n");
-        return 0;
-    }
-    printf("[net] quantus submit job=%s nonce=%.16s...\n", job_id, nonce_hex);
+    const std::string msg =
+        "{\"id\":" + std::to_string(msg_id) +
+        ",\"method\":\"submit\",\"params\":{\"id\":\"" +
+        cp_json_escape(g_session_id) + "\",\"job_id\":\"" +
+        cp_json_escape(job_id) + "\",\"nonce\":\"" + nonce_hex + "\"}}";
+    printf("[net] quantus submit job=%s nonce=%.16s...\n", job_id ? job_id : "", nonce_hex);
     fflush(stdout);
-    int ok = cp_send_json(sock, msg);
+    int ok = cp_send_json(sock, msg.c_str());
     if(ok) cp_pool_set_submit_inflight(1);
     return ok;
 }
@@ -159,7 +155,7 @@ int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int ses
 
 int cp_qpow_pool_on_line(const char* line)
 {
-    if(!g_qpow_active || !line) return 0;
+    if(!g_qpow_active.load() || !line) return 0;
 
     /* Job notification (and login-embedded jobs are handled by main). */
     const int is_job_method =

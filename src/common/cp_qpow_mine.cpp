@@ -111,7 +111,8 @@ static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
     if(en > 0) memcpy(start, job->extranonce, (size_t)en);
     /* Mock: keep nonce deterministic (zeros + thread stamp only). */
     if(g_mock) return;
-    /* Reserve 4 bytes after extranonce for OpenMP thread id (high half). */
+    /* Leave room after extranonce for a thread stamp; a 32-byte extranonce
+     * moves that stamp into the low half of the nonce. */
     int salt_off = en + 4;
     if(salt_off > 32) salt_off = 32;
     uint8_t salt[32];
@@ -175,11 +176,28 @@ static void stamp_thread_id(uint8_t nonce[CP_QPOW_NONCE_BYTES], int extranonce_l
 {
     int off = extranonce_len;
     if(off < 0) off = 0;
-    if(off + 4 > 32) return; /* stay in high half so midstate is stable per thread */
+    /* Extranonce may fill all 32 high bytes. Place the thread stamp after it
+     * even then, or every CPU thread would search the same nonce range. */
+    if(off > CP_QPOW_NONCE_BYTES - 4) return;
     nonce[off + 0] = (uint8_t)((tid >> 24) & 0xff);
     nonce[off + 1] = (uint8_t)((tid >> 16) & 0xff);
     nonce[off + 2] = (uint8_t)((tid >> 8) & 0xff);
     nonce[off + 3] = (uint8_t)(tid & 0xff);
+}
+
+int cp_qpow_nonce_thread_selftest(void)
+{
+    for(int en = 0; en <= CP_QPOW_EXTRANONCE_MAX; ++en){
+        uint8_t a[CP_QPOW_NONCE_BYTES] = {};
+        uint8_t b[CP_QPOW_NONCE_BYTES] = {};
+        memset(a, 0x5a, (size_t)en);
+        memset(b, 0x5a, (size_t)en);
+        stamp_thread_id(a, en, 0);
+        stamp_thread_id(b, en, 1);
+        if(memcmp(a, b, sizeof(a)) == 0 || memcmp(a, b, (size_t)en) != 0)
+            return 1;
+    }
+    return 0;
 }
 static int resolve_thread_count(void)
 {

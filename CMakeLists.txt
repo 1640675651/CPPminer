@@ -32,6 +32,19 @@ endif()
 project(cppminer LANGUAGES ${_cp_langs})
 
 set(CMAKE_CXX_STANDARD 17)
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cp_pool_protocol_test
+        tests/cp_pool_protocol_test.cpp
+        src/common/cp_json_frame.cpp
+        src/common/cp_util.cpp
+        src/common/cp_state.cpp)
+    target_include_directories(cp_pool_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(WIN32)
+        target_link_libraries(cp_pool_protocol_test PRIVATE bcrypt ws2_32)
+    endif()
+    add_test(NAME cp_pool_protocol COMMAND cp_pool_protocol_test)
+endif()
 if(CP_ENABLE_CUDA)
     set(CMAKE_CUDA_STANDARD 17)
 endif()
@@ -39,6 +52,7 @@ endif()
 set(CP_COMMON_SOURCES
     src/common/main.cpp
     src/common/cp_util.cpp
+    src/common/cp_json_frame.cpp
     src/common/cp_pool.cpp
     src/common/cp_job_ctrl.cpp
     src/common/cp_mine.cpp
@@ -543,7 +557,11 @@ if(CP_ENABLE_WGPU)
     set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
     set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/third_party/quantus-miner/crates/engine-gpu/Cargo.toml)
     if(WIN32)
-        set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+        if(MSVC)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+        else()
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dll.a)
+        endif()
         set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll)
         set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.lib)
     else()
@@ -655,7 +673,11 @@ if(CP_ENABLE_WGPU)
     set(CP_PEARL_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-pearl-wgpu-ffi)
     set(CP_PEARL_WGPU_FFI_MANIFEST ${CP_PEARL_WGPU_FFI_DIR}/Cargo.toml)
     if(WIN32)
-        set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll.lib)
+        if(MSVC)
+            set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll.lib)
+        else()
+            set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.dll.a)
+        endif()
         set(_cp_pearl_wgpu_dll ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll)
     else()
         set(_cp_pearl_wgpu_so ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.so)

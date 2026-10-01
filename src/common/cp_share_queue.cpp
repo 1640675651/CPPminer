@@ -10,6 +10,7 @@
 #include "cp_util.h"
 #include "cp_worker.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -130,7 +131,7 @@ struct CpShareQueueImpl {
     int8_t *returned_bt = nullptr;
     CpShareJobCtx job_ctx{};
     char job_key[320]{};
-    int last_outcome = CP_SHARE_OUTCOME_NONE;
+    std::atomic<int> last_outcome{CP_SHARE_OUTCOME_NONE};
 
     void worker_main();
     void process_snapshot(ShareSnapshot *snap);
@@ -231,7 +232,7 @@ static int build_snapshot_proof(const ShareSnapshot *snap, const CpShareJobCtx &
 }
 
 void CpShareQueueImpl::set_outcome(int outcome) {
-    last_outcome = outcome;
+    last_outcome.store(outcome);
 }
 
 void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
@@ -261,7 +262,9 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     char errbuf[512];
     errbuf[0] = 0;
+    const double proof_started = cp_now_sec();
     const int prc = build_snapshot_proof(snap, job_ctx, b64, errbuf, sizeof(errbuf));
+    const double proof_build_sec = cp_now_sec() - proof_started;
     if (prc != 0) {
         printf("[plain] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
                errbuf[0] ? errbuf : "unknown");
@@ -303,7 +306,9 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
+    double proof_verify_sec = 0.0;
     if (g_plain_verify && snap->target_hex[0]) {
+        const double verify_started = cp_now_sec();
         if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path,
                               job_ctx.cert_version) != 0) {
             printf("[plain] verify failed (nonce=%llu cert_version=%u)\n",
@@ -315,10 +320,14 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
             share_snapshot_delete(snap);
             return;
         }
+        proof_verify_sec = cp_now_sec() - verify_started;
         printf("[plain] verify OK (nonce=%llu cert_version=%u)\n",
                (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
         fflush(stdout);
     }
+
+    printf("[plain] proof timing: build=%.3fs verify=%.3fs\n",
+           proof_build_sec, proof_verify_sec);
 
     double hs = cp_pp_mac_rate_from_tiles(snap->tiles_since_prev, snap->interval_sec);
     if (snap->interval_sec < 1e-3) {
@@ -447,7 +456,7 @@ extern "C" void cp_share_queue_begin_job(CpShareQueue *q, const CpShareJobCtx *c
     strncpy(q->impl.job_key, job_key, sizeof(q->impl.job_key) - 1);
     q->impl.job_key[sizeof(q->impl.job_key) - 1] = '\0';
     q->impl.job_active = true;
-    q->impl.last_outcome = CP_SHARE_OUTCOME_NONE;
+    q->impl.last_outcome.store(CP_SHARE_OUTCOME_NONE);
 }
 
 extern "C" void cp_share_queue_end_job(CpShareQueue *q) {
@@ -465,7 +474,7 @@ extern "C" int cp_share_queue_last_outcome(const CpShareQueue *q) {
     if (!q) {
         return CP_SHARE_OUTCOME_NONE;
     }
-    return q->impl.last_outcome;
+    return q->impl.last_outcome.load();
 }
 
 extern "C" void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io) {
