@@ -3,6 +3,7 @@
 #include "cp_config.h"
 #include "cp_cpu_affinity.h"
 #include "cp_jackpot.hpp"
+#include "cp_state.h"
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
 #include "cp_util.h"
@@ -17,6 +18,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -274,7 +279,24 @@ extern "C" void cp_cpu_worker_init(void)
         fprintf(stderr, "[cpu] %s\n", g_gemm.simd_error());
         return;
     }
-    if(cp_cpu_affinity_init() == 0)
+    /* Topology first (thread count depends on it), then the team size, then the
+     * pins; the bind pass sizes the pool it pins from the team size set here. */
+    const int affinity_ok = (cp_cpu_affinity_init(g_cpu_smt) == 0);
+#ifdef _OPENMP
+    {
+        /* --threads N wins; otherwise respect an explicit OMP_NUM_THREADS; else
+         * default to one thread per physical core (SMT siblings share the FMA
+         * ports the int8 GEMM saturates, so they add nothing), or per logical
+         * CPU with --smt. If the topology is unknown keep the runtime default. */
+        int n = g_cpu_threads;
+        const char* env_threads = getenv("OMP_NUM_THREADS");
+        if(n <= 0 && !(env_threads && *env_threads))
+            n = g_cpu_smt ? cp_cpu_affinity_logical_cpus() : cp_cpu_affinity_physical_cores();
+        if(n > 0)
+            omp_set_num_threads(n);
+    }
+#endif
+    if(affinity_ok)
         cp_cpu_affinity_bind_openmp_pool();
     printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
     printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");

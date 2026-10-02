@@ -175,7 +175,11 @@ static void print_usage(void)
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
     printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
-    printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
+    printf("  --threads N          OpenMP threads for the CPU backend (pearl and quantus).\n");
+    printf("                       Default: pearl = one per physical core, quantus = all\n");
+    printf("                       HW threads; OMP_NUM_THREADS overrides the default\n");
+    printf("  --smt                pearl CPU: also use SMT siblings (one thread per logical\n");
+    printf("                       CPU, pinned per CPU); default pins one thread per core\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -890,8 +894,12 @@ int main(int argc, char** argv)
             print_usage();
             return 0;
         } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
-            g_qpow_threads = atoi(argv[++i]);
-            if(g_qpow_threads < 0) g_qpow_threads = 0;
+            int n = atoi(argv[++i]);
+            if(n < 0) n = 0;
+            g_qpow_threads = n;
+            g_cpu_threads = n;
+        } else if(!strcmp(argv[i], "--smt")){
+            g_cpu_smt = 1;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             const char* login =
                 "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"
@@ -1272,9 +1280,10 @@ int main(int argc, char** argv)
 #endif
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
-            /* Pin the OpenMP pool physical cores first, then SMT siblings, so
-             * the --simd auto scalar/AVX2 split pairs one of each per core. */
-            if(cp_cpu_affinity_init() == 0)
+            /* Pin the OpenMP pool physical cores first, then SMT siblings (one
+             * thread per logical CPU), so the --simd auto scalar/AVX2 split pairs
+             * one of each per core. */
+            if(cp_cpu_affinity_init(1) == 0)
                 cp_cpu_affinity_bind_openmp_pool();
             printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
             fflush(stdout);
