@@ -59,7 +59,7 @@ rows and columns stay in vector registers at one time.
 | AVX512-VNNI | `case33_gemm_xor_avx512vnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 (ymm), or two vertically adjacent 8x16 tiles as one 16x16 zmm block | EVEX `vpdpbusd`; 32 registers so no spills. The zmm pair shares each B broadcast across both tiles; `CP_AVX512_PAIR=0` forces the ymm single-tile form. Exact s8s8 mode always uses the ymm form (no `vpsignb` in AVX-512) |
 | I8MM | `case33_gemm_xor_i8mm.cpp` | Exact signed 2x8 by 8x2 byte matrix multiply `int8 * int8 -> int32` (32 MAC per instruction) | Two 8x8 register tiles, accumulators kept across all KR panels | Uses `vmmlaq_s32` (`smmla`); two packed 4-k groups are interleaved with `vzip1q_s32`/`vzip2q_s32` into the 2x8 operands; optional ARMv8.6 extension |
 | DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | Two 8x8 register tiles, accumulators kept across all KR panels | Uses `vdotq_laneq_s32` (B column selected by lane, 2 loads per 8 cols x 4 k); optional ARMv8.2 extension |
-| NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | Two 8x8 register tiles | Uses `vmlal_s16`; baseline AArch64 NEON only |
+| NEON | `case33_gemm_xor_neon.cpp` | Exact `int8 * int8 -> int16` (two products per lane), pairwise-added into `int32` | Four 8x4 register tiles, accumulators kept across all KR panels | Uses `vmull_s8`/`vmlal_s8` + `vpadalq_s16`; relies on the Pearl operand range [-127, 126] so two products fit `int16`; baseline AArch64 NEON only |
 
 The ARM paths compute columns `0..7` and `8..15` as separate register tiles.
 Each half uses 16 vector accumulators: one four-lane `int32` accumulator for
