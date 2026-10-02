@@ -417,6 +417,10 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
+#ifdef CASE32_REQD_WG
+/* Host passes the exact launch local size when one macro block fits a work-group. */
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,

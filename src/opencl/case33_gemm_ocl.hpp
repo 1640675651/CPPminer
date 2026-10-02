@@ -152,6 +152,7 @@ private:
     bool use_cpm_int_ = false;
 
     bool use_lds_ = false;
+    int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
