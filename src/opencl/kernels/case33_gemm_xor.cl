@@ -92,6 +92,13 @@
 #ifndef CASE32_USE_LDS
 #define CASE32_USE_LDS 0
 #endif
+/* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
+#ifndef SWZ_IM
+#define SWZ_IM 8
+#endif
+#ifndef SWZ_JM
+#define SWZ_JM 4
+#endif
 #ifndef CASE32_CPM_INT
 #define CASE32_CPM_INT 0
 #endif
@@ -417,8 +424,28 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
     const int mb = mb_begin + (int)get_group_id(0);
-    const int jm = mb / macro_rows;
-    const int im = mb % macro_rows;
+    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+       walk every im for one jm: each resident work-group streams its own A strip
+       from DRAM and A is never reused from L2 (the whole of A is re-read once per
+       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+       all addressing derive from (im, jm). Falls back to the linear map when the
+       macro grid is not divisible (uniform branch). */
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
 
     const int tr0 = im * MICRO_M;
     const int tc0 = jm * MICRO_N;
