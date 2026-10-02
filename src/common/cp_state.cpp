@@ -1,6 +1,5 @@
 #include "cp_state.h"
 
-int g_dev_dims = 0;
 int g_cutlass_fused = 0;
 int g_m_active = M_DIM;
 int g_n_active = N_DIM;

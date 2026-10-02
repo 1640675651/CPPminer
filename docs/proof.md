@@ -2,7 +2,7 @@
 
 This document describes how CPminer derives **pearl noise** for mining scans and what data is required to build a **plain_proof** share. It mirrors the reference logic in `src/common/cp_noise.c` and `rust/cp-proof-ffi` (zk-pow–compatible).
 
-Production dimensions (unless `--dev`): `m = n = 131072`, `k = 4096`, `rank r = 256`.
+Production dimensions (unless `--m`/`--n`): `m = n = 131072`, `k = 4096`, `rank r = 256`.
 
 ---
 

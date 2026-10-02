@@ -1,11 +1,11 @@
 # Memory footprint
 
 Production dimensions (`cp_config.h`): **m = n = 131072**, **k = 4096**, **r = 128**.  
-Dev (`--dev`): **m = n = 8192**.
+`--m` / `--n` scale m and n in units of 1024; the small column below is `--m 8 --n 8` (**m = n = 8192**).
 
 Each full matrix (signal or coalesced prepack) is:
 
-| Size | Production | `--dev` |
+| Size | Production | `--m 8 --n 8` |
 |------|------------:|--------:|
 | m × k or n × k | **512 MiB** | **32 MiB** |
 
@@ -293,7 +293,7 @@ cppminer.exe --backend opencl ...
 cppminer.exe --backend opencl --cpu-gen ...
 
 # small matrices for bring-up
-cppminer.exe --backend opencl --dev ...
+cppminer.exe --backend opencl --m 8 --n 8 ...
 ```
 
 ## Code map (OpenCL)

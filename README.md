@@ -155,8 +155,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
 | `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
-| `--dev` | Use 8192×8192 matrices for testing |
-| `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
+| `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) || `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |

@@ -111,7 +111,9 @@ static void print_usage(void)
     printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
 #endif
-    printf("  --dev                m=n=8192 for testing\n");
+    printf("  --m N, --n N         matrix rows/cols in units of %d (default %d; each <= %d,\n",
+           CP_MATRIX_UNIT, M_DIM / CP_MATRIX_UNIT, CP_MATRIX_UNITS_MAX);
+    printf("                       m*n <= %d)\n", CP_MATRIX_AREA_MAX);
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("  --no-period-gemm     per-tile scan instead of period GEMM (CUDA debug)\n");
     printf("  --batch-size N       launch batch: Pearl col/macro panel (default %d);\n",
@@ -144,8 +146,7 @@ static void print_usage(void)
 #endif
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
-    printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
-           M_DIM);
+    printf("  --align-test-prod    include checks at the --m/--n size (~1 GiB RAM at default, slow)\n");
     printf("  --profile-scan [N]   time GEMM vs jackpot per period batch (default N=10)\n");
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -420,6 +421,8 @@ int main(int argc, char** argv)
     int align_test = 0;
     int align_test_prod = 0;
     int no_period_gemm = 0;
+    int m_units = 0; /* --m / --n, 0 = production default */
+    int n_units = 0;
     int batch_size = CP_PERIOD_BATCH_DEFAULT;
     int batch_size_set = 0;
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
@@ -724,8 +727,19 @@ int main(int argc, char** argv)
                 return 1;
             }
 #endif
-        } else if(!strcmp(argv[i], "--dev")){
-            g_dev_dims = 1;
+        } else if(!strcmp(argv[i], "--m") || !strncmp(argv[i], "--m=", 4) ||
+                  !strcmp(argv[i], "--n") || !strncmp(argv[i], "--n=", 4)){
+            const int is_m = argv[i][2] == 'm';
+            const char* v = argv[i][3] == '=' ? argv[i] + 4 : (i + 1 < argc ? argv[++i] : NULL);
+            char* end = NULL;
+            const long units = v ? strtol(v, &end, 10) : 0;
+            if(!v || end == v || *end || units < 1 || units > CP_MATRIX_UNITS_MAX){
+                fprintf(stderr, "%s requires 1..%d (units of %d)\n", is_m ? "--m" : "--n",
+                        CP_MATRIX_UNITS_MAX, CP_MATRIX_UNIT);
+                return 1;
+            }
+            if(is_m) m_units = (int)units;
+            else n_units = (int)units;
         } else if(!strcmp(argv[i], "--no-period-gemm")){
             no_period_gemm = 1;
         } else if(!strncmp(argv[i], "--batch-size", 12)){
@@ -950,6 +964,18 @@ int main(int argc, char** argv)
         }
     }
 
+    {
+        if(!m_units) m_units = M_DIM / CP_MATRIX_UNIT;
+        if(!n_units) n_units = N_DIM / CP_MATRIX_UNIT;
+        if(m_units * n_units > CP_MATRIX_AREA_MAX){
+            fprintf(stderr, "--m %d --n %d too large: m*n must be <= %d (in units of %d^2)\n",
+                    m_units, n_units, CP_MATRIX_AREA_MAX, CP_MATRIX_UNIT);
+            return 1;
+        }
+        g_m_active = m_units * CP_MATRIX_UNIT;
+        g_n_active = n_units * CP_MATRIX_UNIT;
+    }
+
     if(algo_sel == CP_ALGO_QUANTUS){
         if(backend_sel == CP_BACKEND_NONE)
             backend_sel = CP_BACKEND_CPU;
@@ -1105,12 +1131,10 @@ int main(int argc, char** argv)
         g_cutlass_fused = cutlass_fused;
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
-            const int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
-            const int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
-            if(g_dev_dims){
-                printf("[align-test-prod] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
-            }
-            if(pearl_run_alignment_tests_prod(pm, pm, K_DIM) != 0) return 1;
+            const int pm = g_m_active;
+            const int pn = g_n_active;
+            printf("[align-test-prod] m=%d n=%d\n", pm, pn);
+            if(pearl_run_alignment_tests_prod(pm, pn, K_DIM) != 0) return 1;
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
             if(bid == CP_BACKEND_CUDA &&
                cp_gpu_run_alignment_tests(devs[0], pm, pn) != 0) return 1;
@@ -1143,12 +1167,8 @@ int main(int argc, char** argv)
         cp_worker_set_step_major_ap(step_major_ap);
         cp_worker_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
-        int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
-        int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
-        if(g_dev_dims){
-            printf("[profile-scan] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
-        }
-        return cp_gpu_run_scan_profile(devs[0], pm, pn, 2, profile_runs) != 0;
+        printf("[profile-scan] m=%d n=%d\n", g_m_active, g_n_active);
+        return cp_gpu_run_scan_profile(devs[0], g_m_active, g_n_active, 2, profile_runs) != 0;
     }
 #else
     (void)profile_scan;
@@ -1162,13 +1182,10 @@ int main(int argc, char** argv)
             return 1;
         }
         if(!ndev){ devs[0] = 0; ndev = 1; }
-        int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
-        int pn = g_dev_dims ? DEV_N_DIM : N_DIM;
-        if(g_dev_dims){
-            printf("[profile-prep] DEV m=n=%d (omit --dev for production)\n", DEV_M_DIM);
-        }
+        printf("[profile-prep] m=%d n=%d\n", g_m_active, g_n_active);
         const int warmup = profile_prep_runs > 1 ? 1 : 0;
-        return cp_opencl_run_prep_profile(devs[0], pm, pn, warmup, profile_prep_runs) != 0;
+        return cp_opencl_run_prep_profile(devs[0], g_m_active, g_n_active, warmup,
+                                          profile_prep_runs) != 0;
     }
 #else
     (void)profile_prep;
@@ -1343,11 +1360,13 @@ int main(int argc, char** argv)
     }
     if(prepack_test){
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
-        const int rc_reuse = case33_test_inplace_prepack(DEV_M_DIM, DEV_M_DIM, K_DIM);
-        printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", DEV_M_DIM,
+        const int rc_reuse = case33_test_inplace_prepack(CP_PREPACK_TEST_DIM, CP_PREPACK_TEST_DIM,
+                                                         K_DIM);
+        printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
                rc_reuse == 0 ? "passed" : "failed", rc_reuse);
-        const int rc_fused = case33_test_fused_prepack(DEV_M_DIM, DEV_M_DIM, K_DIM, R_RANK);
-        printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", DEV_M_DIM,
+        const int rc_fused = case33_test_fused_prepack(CP_PREPACK_TEST_DIM, CP_PREPACK_TEST_DIM,
+                                                       K_DIM, R_RANK);
+        printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
                rc_fused == 0 ? "passed" : "failed", rc_fused);
         return (rc_reuse == 0 && rc_fused == 0) ? 0 : 1;
 #else
@@ -1361,16 +1380,6 @@ int main(int argc, char** argv)
             fprintf(stderr, "CUTLASS fused path requires period GEMM (omit --no-period-gemm)\n");
             return 1;
         }
-    }
-
-    if(g_dev_dims){
-        g_m_active = DEV_M_DIM;
-        g_n_active = DEV_N_DIM;
-        printf("[mode] DEV m=n=%d (omit --dev for production m=n=%d)\n",
-               DEV_M_DIM, M_DIM);
-    } else {
-        g_m_active = M_DIM;
-        g_n_active = N_DIM;
     }
 
     cp_init_workdir();
@@ -1391,9 +1400,9 @@ int main(int argc, char** argv)
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
             : "BzMiner periodic scattered 8x16";
         printf("[mode] backend=%s\n", cp_worker_backend_name());
-        printf("[mode] plain_proof m=%d n=%d k=%d r=%d%s\n",
+        printf("[mode] plain_proof m=%d n=%d k=%d r=%d (--m %d --n %d)\n",
                g_m_active, g_n_active, K_DIM, R_RANK,
-               g_dev_dims ? " (dev)" : " (production)");
+               g_m_active / CP_MATRIX_UNIT, g_n_active / CP_MATRIX_UNIT);
         printf("[mode] tile layout: %s\n", tile_layout_name);
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
             /* Host signal is A only: zero B^T is proven without a host buffer. */

@@ -77,7 +77,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
     cp_job_mine_begin(job_key);
 
-    const char *tmp = g_dev_dims ? "pp_dev" : "pp_prod";
+    const char *tmp = "pp";
     char hdr_path[512], proof_path[512];
 #ifdef _WIN32
     snprintf(hdr_path, sizeof(hdr_path), "%s\\%s_header.bin", g_workdir, tmp);

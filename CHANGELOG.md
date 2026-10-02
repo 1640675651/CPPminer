@@ -10,7 +10,7 @@
 - Pearl wgpu backend
 - Reduce host memory usage (CPU, CUDA, OpenCL, OneDNN, Wgpu)
 - MinGW and MSYS2 support (thanks to @danifest751)
-- Configurable matrix size (TODO)
+- Configurable matrix size: `--m` / `--n` in units of 1024 (default 128x128)
 
 ### Pearl wgpu
 - vec4<u32> A/B panel loads in the GEMM shader

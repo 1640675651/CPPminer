@@ -19,3 +19,5 @@ internal/
 *.dll
 pp_dev_*
 pp_prod_*
+pp_header.bin
+pp_proof.b64

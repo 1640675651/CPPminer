@@ -32,8 +32,13 @@
 
 #define PLAIN_PROOF_B64_MAX (512 * 1024)
 
-#define DEV_M_DIM 8192
-#define DEV_N_DIM 8192
+#define CP_PREPACK_TEST_DIM 8192 /* m = n for --prepack-test */
+
+/* --m / --n are in units of CP_MATRIX_UNIT rows (a multiple of every backend tile/macro size).
+ * Caps keep m*K and the hash-tile count (rows/tile * cols/tile) within int range. */
+#define CP_MATRIX_UNIT        1024
+#define CP_MATRIX_UNITS_MAX   256
+#define CP_MATRIX_AREA_MAX    (128 * 128) /* max m_units * n_units */
 
 #define MAX_GPUS 16
 
@@ -55,7 +60,7 @@
 #define CP_JOB_CANCELLED (-1)
 
 /* Offline --mock defaults (different difficulty definitions per algo).
- * Pearl: cp_target_from_difficulty jackpot curve (~few–tens of seconds on --dev).
+ * Pearl: cp_target_from_difficulty jackpot curve (~few–tens of seconds at --m 8 --n 8).
  * Quantus: Bitcoin-style U512::MAX / D (~1e6 hashes expected). */
 #define CP_MOCK_DIFF_PEARL_DEFAULT    58.0
 #define CP_MOCK_DIFF_QUANTUS_DEFAULT  1000000.0
