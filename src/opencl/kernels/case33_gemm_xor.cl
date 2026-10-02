@@ -334,6 +334,56 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
 #endif
 }
 
+/* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
+   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
+   KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
+   load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
+   dwordx4 even for compilers that do not infer alignment through vload4(char*). */
+#if (MR % 4) == 0 && (NR % 4) == 0 && RANK == 4
+#define CASE32_VEC_LOADS 1
+#else
+#define CASE32_VEC_LOADS 0
+#endif
+
+inline void case32_load_a_pack(__private int *a_pack, __global const char *a_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *a_v = (__global const uint4 *)a_kg;
+    #pragma unroll
+    for (int i = 0; i < MR / 4; ++i) {
+        const uint4 v = a_v[i];
+        a_pack[4 * i + 0] = as_int(v.s0);
+        a_pack[4 * i + 1] = as_int(v.s1);
+        a_pack[4 * i + 2] = as_int(v.s2);
+        a_pack[4 * i + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+    }
+#endif
+}
+
+inline void case32_load_b_pack(__private int *b_pack, __global const char *b_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *b_v = (__global const uint4 *)b_kg;
+    #pragma unroll
+    for (int j = 0; j < NR / 4; ++j) {
+        const uint4 v = b_v[j];
+        b_pack[4 * j + 0] = as_int(v.s0);
+        b_pack[4 * j + 1] = as_int(v.s1);
+        b_pack[4 * j + 2] = as_int(v.s2);
+        b_pack[4 * j + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+    }
+#endif
+}
+
 #if CASE32_USE_LDS
 /* Case 3.4: all WIs cooperatively copy A/B kg-strips into SLM (coalesced 16B). */
 inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int nbytes,
@@ -481,15 +531,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
             int a_pack[MR];
             int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
@@ -507,19 +550,12 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg = a_tile + (size_t)kg * (size_t)KG_BYTES_A;
-            int a_pack[MR];
-            int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
             __global const char *b_kg =
                     b_tile + (size_t)kg * (size_t)KG_SLICE_B;
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
