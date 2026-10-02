@@ -168,8 +168,8 @@ static void print_usage(void)
            CP_MOCK_DIFF_QUANTUS_DEFAULT);
     printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avxvnni, avx2, ssse3,\n");
-    printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avx512vnni, avxvnni,\n");
+    printf("                       avx2, ssse3, dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("                       quantus: hybrid = scalar + avx2 split across SMT siblings,\n");
     printf("                       auto = best available (currently hybrid), avx2 = all\n");
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
@@ -438,7 +438,10 @@ int main(int argc, char** argv)
         const char* env = getenv("CP_SIMD");
         if(!env) env = getenv("CASE33_ISA");
         if(env){
-            if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
+            if(!strcmp(env, "avx512vnni") || !strcmp(env, "avx512-vnni") ||
+               !strcmp(env, "avx512"))
+                simd_isa = CP_SIMD_AVX512VNNI;
+            else if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
                 simd_isa = CP_SIMD_AVXVNNI;
             else if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
@@ -808,6 +811,9 @@ int main(int argc, char** argv)
             const char* isa = argv[++i];
             if(!strcmp(isa, "auto"))
                 simd_isa = CP_SIMD_AUTO;
+            else if(!strcmp(isa, "avx512vnni") || !strcmp(isa, "avx512-vnni") ||
+                    !strcmp(isa, "avx512"))
+                simd_isa = CP_SIMD_AVX512VNNI;
             else if(!strcmp(isa, "avxvnni") || !strcmp(isa, "vnni") ||
                     !strcmp(isa, "avx-vnni"))
                 simd_isa = CP_SIMD_AVXVNNI;
@@ -825,7 +831,7 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_HYBRID;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|hybrid|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }

@@ -73,6 +73,16 @@ Case33CpuFeatures case33_detect_cpu_features() {
             if ((xcr & 0x6) == 0x6) {
                 cpuid_ex(7, 0, r);
                 features.avx2 = (r[1] & (1 << 5)) != 0;
+                /* AVX512-VNNI: CPUID.(7,0): EBX[16] F, EBX[30] BW, EBX[31] VL, ECX[11] VNNI;
+                 * OS must enable XCR0 bits 5-7 (opmask, ZMM_Hi256, Hi16_ZMM) too. */
+                {
+                    const bool f = (r[1] & (1 << 16)) != 0;
+                    const bool bw = (r[1] & (1 << 30)) != 0;
+                    const bool vl = (r[1] & (1u << 31)) != 0;
+                    const bool vnni = (r[2] & (1 << 11)) != 0;
+                    features.avx512_vnni =
+                            features.avx2 && f && bw && vl && vnni && (xcr & 0xE6) == 0xE6;
+                }
                 /* AVX-VNNI: CPUID.(EAX=7,ECX=1):EAX[4]; needs AVX2 OS support. */
                 if (features.avx2 && r[0] >= 1) {
                     cpuid_ex(7, 1, r);
