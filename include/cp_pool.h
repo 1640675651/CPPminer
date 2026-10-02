@@ -14,8 +14,15 @@ int cp_pool_connect(const char* host, int port);
 void cp_pool_disconnect(void);
 int cp_pool_socket(void);
 
+/* mining.authorize with wallet/worker/agent (LuckyPool), plus "password"
+ * (custom difficulty "d=N" on Kryptex) and "type":"v2" (Kryptex gzip stratum
+ * offer). Resets g_pool_proof_gzip; the reader sets it from the response. */
 int cp_pool_send_authorize(int msg_id, const char* wallet,
-                           const char* worker, const char* agent);
+                           const char* worker, const char* agent,
+                           const char* password);
+/* Reader-side: pool line with the pending authorize id → parse "type":"v2".
+ * Returns 1 if the line was the authorize response (handled). */
+int cp_pool_on_authorize_response(const char* line);
 int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
                                     const char* plain_b64, double hs);
 

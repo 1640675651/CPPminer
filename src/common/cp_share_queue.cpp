@@ -341,11 +341,38 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
     fflush(stdout);
 
+    /* Kryptex stratum v2: the authorize response said "type":"v2", so the proof goes
+     * gzip-compressed (base64 of the gzip stream in the same plain_proof field).
+     * Dry-run/mock also compress, to report what gzip buys on this backend. */
+    char *gz_b64 = nullptr;
+    if (g_pool_proof_gzip || g_dry_run) {
+        gz_b64 = (char *)malloc(PLAIN_PROOF_B64_MAX);
+        if (gz_b64) {
+            errbuf[0] = 0;
+            const double gz_started = cp_now_sec();
+            if (cp_proof_gzip_b64(b64, gz_b64, PLAIN_PROOF_B64_MAX, errbuf, sizeof(errbuf)) != 0) {
+                printf("[plain] proof gzip failed (nonce=%llu): %s%s\n",
+                       (unsigned long long)snap->nonce, errbuf[0] ? errbuf : "unknown",
+                       g_pool_proof_gzip ? " - submitting plain base64" : "");
+                free(gz_b64);
+                gz_b64 = nullptr;
+            } else {
+                printf("[plain] proof gzip: %d -> %zu chars (%.1fx, %.3fs)%s\n", bn,
+                       strlen(gz_b64), (double)bn / (double)(strlen(gz_b64) ? strlen(gz_b64) : 1),
+                       cp_now_sec() - gz_started,
+                       g_pool_proof_gzip ? "" : " (not submitted compressed: pool is not v2)");
+            }
+            fflush(stdout);
+        }
+    }
+    const char *submit_b64 = (g_pool_proof_gzip && gz_b64) ? gz_b64 : b64;
+
     if (g_dry_run) {
         printf("[plain] dry-run: proof saved to %s (nonce=%llu)\n", job_ctx.proof_path,
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_OK);
+        free(gz_b64);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -354,6 +381,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     if (!job_ctx.msg_id) {
         set_outcome(CP_SHARE_OUTCOME_OK);
+        free(gz_b64);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -361,10 +389,11 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     const int submit_id = (*job_ctx.msg_id)++;
-    if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, b64, hs)) {
+    if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, submit_b64, hs)) {
         printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
+        free(gz_b64);
         free(b64);
         return_snapshot_matrices(snap);
         share_snapshot_delete(snap);
@@ -372,11 +401,13 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     cp_pool_set_submit_inflight(1);
-    printf("[net] plain_proof submit sent (nonce=%llu)\n", (unsigned long long)snap->nonce);
+    printf("[net] plain_proof submit sent (nonce=%llu%s)\n", (unsigned long long)snap->nonce,
+           submit_b64 == gz_b64 ? ", gzip" : "");
     cp_pool_log_share_submit_outcome();
     fflush(stdout);
 
     set_outcome(CP_SHARE_OUTCOME_OK);
+    free(gz_b64);
     free(b64);
     return_snapshot_matrices(snap);
     share_snapshot_delete(snap);
