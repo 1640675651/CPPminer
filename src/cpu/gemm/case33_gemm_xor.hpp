@@ -21,6 +21,7 @@ enum class Case33Isa {
     Avx512Bw, /* prefer base AVX-512 (F+BW, zmm vpmaddubsw); fall back if unavailable */
     Avx2,    /* prefer AVX2 maddubs; fall back if unavailable */
     Sse,     /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    I8mm,    /* force AArch64 I8MM (smmla) path */
     DotProd, /* force AArch64 DotProd path */
     Neon,    /* force AArch64 Advanced SIMD path */
     Scalar,  /* force scalar reference ukernel */

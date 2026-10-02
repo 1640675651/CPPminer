@@ -177,6 +177,7 @@ if(CP_ENABLE_CPU)
         src/cpu/gemm/case33_cpu_features.cpp
         src/cpu/gemm/case33_gemm_xor_neon.cpp
         src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+        src/cpu/gemm/case33_gemm_xor_i8mm.cpp
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         list(APPEND CP_SOURCES
@@ -191,9 +192,12 @@ if(CP_ENABLE_CPU)
         if(MSVC)
             set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:armv8.2")
+            # MSVC has no I8MM switch / intrinsics gate; the TU compiles to a no-op stub.
         else()
             set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
                 PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_i8mm.cpp
+                PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
         endif()
     endif()
     add_compile_definitions(CP_ENABLE_CPU=1)

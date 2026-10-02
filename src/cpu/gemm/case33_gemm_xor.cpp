@@ -1,6 +1,7 @@
 #include "case33_gemm_xor.hpp"
 #include "case33_cpu_features.hpp"
 #include "case33_gemm_xor_dotprod.hpp"
+#include "case33_gemm_xor_i8mm.hpp"
 #include "case33_gemm_xor_neon.hpp"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
@@ -53,6 +54,12 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
     const bool avx512_bw = CASE33_X86 && features.avx512_bw;
     const bool avx2 = CASE33_X86 && features.avx2;
     const bool ssse3 = CASE33_X86 && features.ssse3;
+    /* The I8MM TU is only compiled with intrinsics on GCC/clang (-march=...+i8mm). */
+#if defined(_MSC_VER) && !defined(__clang__)
+    const bool i8mm = false;
+#else
+    const bool i8mm = case33_is_aarch64_build() && features.i8mm;
+#endif
     const bool dotprod = case33_is_aarch64_build() && features.dotprod;
     const bool neon = case33_is_aarch64_build() && features.neon;
     switch (pref) {
@@ -71,6 +78,9 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
     case Case33Isa::Sse:
         if (ssse3) { *out = Case33Isa::Sse; return true; }
         break;
+    case Case33Isa::I8mm:
+        if (i8mm) { *out = Case33Isa::I8mm; return true; }
+        break;
     case Case33Isa::DotProd:
         if (dotprod) { *out = Case33Isa::DotProd; return true; }
         break;
@@ -87,6 +97,7 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
         else if (avx512_bw) *out = Case33Isa::Avx512Bw;
         else if (avx2) *out = Case33Isa::Avx2;
         else if (ssse3) *out = Case33Isa::Sse;
+        else if (i8mm) *out = Case33Isa::I8mm;
         else if (dotprod) *out = Case33Isa::DotProd;
         else if (neon) *out = Case33Isa::Neon;
         else *out = Case33Isa::Scalar;
@@ -329,6 +340,12 @@ void micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int bloc
         return;
     }
 #endif
+    if (isa == Case33Isa::I8mm) {
+        case33_i8mm_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
+                                            num_milestones, spatial_tile_id, tile_count,
+                                            xor_after_milestone, tile_xor_out);
+        return;
+    }
     if (isa == Case33Isa::DotProd) {
         case33_dotprod_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
                                                num_milestones, spatial_tile_id, tile_count,
@@ -702,13 +719,14 @@ int case33_test_simd_parity() {
 
         const char *mode_name = mode == Case32Int8Mode::FastU8S8 ? "u8s8" : "exact s8s8";
         for (Case33Isa isa : {Case33Isa::Sse, Case33Isa::Avx2, Case33Isa::AvxVnni,
-                               Case33Isa::Avx512Vnni, Case33Isa::Avx512Bw,
+                               Case33Isa::Avx512Vnni, Case33Isa::Avx512Bw, Case33Isa::I8mm,
                                Case33Isa::DotProd, Case33Isa::Neon}) {
             const char *isa_name = isa == Case33Isa::Sse          ? "SSSE3"
                                    : isa == Case33Isa::Avx2       ? "AVX2"
                                    : isa == Case33Isa::AvxVnni    ? "AVX-VNNI"
                                    : isa == Case33Isa::Avx512Vnni ? "AVX512-VNNI"
                                    : isa == Case33Isa::Avx512Bw   ? "AVX512-BW"
+                                   : isa == Case33Isa::I8mm       ? "I8MM"
                                    : isa == Case33Isa::DotProd    ? "DotProd"
                                                                   : "NEON";
             Case33GemmXor candidate;
@@ -796,6 +814,10 @@ void Case33GemmXor::update_backend_label_() {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
                       "ukernel %s %dx%d 2D-par fused-K %s+XOR, SSSE3 %s/8x16tile KR=%d%s",
                       par, kMacroM, kMacroN, dot, sse_tile_name(sse_tile_), kKR, prepack);
+    } else if (isa_used_ == Case33Isa::I8mm) {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, I8MM smmla 8x16 KR=%d%s",
+                      par, kMacroM, kMacroN, kKR, prepack);
     } else if (isa_used_ == Case33Isa::DotProd) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
                       "ukernel %s %dx%d 2D-par fused-K exact s8s8+XOR, DotProd 8x16 KR=%d%s",
