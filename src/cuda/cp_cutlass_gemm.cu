@@ -69,9 +69,30 @@ int cp_cutlass_mma_kind(int dev)
 
 const char* cp_cutlass_mma_kind_name(int kind)
 {
-  return kind == CP_CUTLASS_MMA_TENSOROP
-             ? "tensorop 128x128x64 / 32x64x64 / mma.m8n8k16.s8"
-             : "simt dp4a 128x128x32 / 32x64x32";
+  static char name[2][96];
+  const int k = (kind == CP_CUTLASS_MMA_TENSOROP) ? 1 : 0;
+  if (name[k][0] == '\0') {
+    if (k) {
+      using T = cp_cutlass::Gemm128x128TensorOp;
+      snprintf(name[1], sizeof(name[1]),
+               "tensorop %dx%dx%d / %dx%dx%d / mma.m8n8k16.s8 (%d thr)",
+               T::GemmKernel::ThreadblockShape::kM,
+               T::GemmKernel::ThreadblockShape::kN,
+               T::GemmKernel::ThreadblockShape::kK, cp_cutlass::TensorOpWarpShape::kM,
+               cp_cutlass::TensorOpWarpShape::kN, cp_cutlass::TensorOpWarpShape::kK,
+               T::GemmKernel::kThreadCount);
+    } else {
+      using T = cp_cutlass::Gemm128x128RowMajor;
+      snprintf(name[0], sizeof(name[0]), "simt dp4a %dx%dx%d / %dx%dx%d (%d thr)",
+               T::GemmKernel::ThreadblockShape::kM,
+               T::GemmKernel::ThreadblockShape::kN,
+               T::GemmKernel::ThreadblockShape::kK,
+               T::MmaPipelined::Operator::Shape::kM,
+               T::MmaPipelined::Operator::Shape::kN,
+               T::MmaPipelined::Operator::Shape::kK, T::GemmKernel::kThreadCount);
+    }
+  }
+  return name[k];
 }
 
 size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)

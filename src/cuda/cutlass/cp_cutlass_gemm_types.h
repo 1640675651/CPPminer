@@ -139,7 +139,7 @@ using Gemm128x128RowMajor = GemmTypesCase10<
  * 32x64x64 warps (8 warps = 256 threads, one hash tile per thread after the
  * reduce-scatter), 2-stage MmaPipelined, 16-byte A/B accesses, milestone every
  * 2 K-tiles. */
-using TensorOpWarpShape = cutlass::gemm::GemmShape<32, 64, 64>;
+using TensorOpWarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
 using Gemm128x128TensorOp = GemmTypesCase10<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
     cutlass::gemm::GemmShape<128, 128, 64>, TensorOpWarpShape,
