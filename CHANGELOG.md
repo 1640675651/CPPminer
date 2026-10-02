@@ -11,6 +11,7 @@
 - Reduce host memory usage (CPU, CUDA, OpenCL, OneDNN, Wgpu)
 - MinGW and MSYS2 support (thanks to @danifest751)
 - Configurable matrix size: `--m` / `--n` in units of 1024 (default 128x128)
+- Kryptex "Pearl stratum gzip protocol" (v2): `mining.authorize` offers `"type":"v2"`; when the pool's response carries `"type":"v2"` the `plain_proof` is submitted as base64 of the gzip stream (flate2/miniz_oxide in `cp-proof-ffi`, `cp_proof_gzip_b64`). Pools that do not answer `type v2` (LuckyPool) keep plain proofs. `--pool-pass STR` sets the authorize `password` (Kryptex custom difficulty `d=N`); on a kryptex host the wallet is also sent as `WALLET.worker`
 
 ### Pearl wgpu
 - vec4<u32> A/B panel loads in the GEMM shader
