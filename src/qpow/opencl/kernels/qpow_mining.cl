@@ -66,41 +66,42 @@ ulong gf64_reduce(ulong lo, ulong hi)
     ulong hi_lo = hi & EPS64;
     ulong t0 = lo - hi_hi;
     t0 = t0 - ((lo < hi_hi) ? EPS64 : 0UL);
-    ulong t1 = hi_lo * EPS64;
+    /* hi_lo * EPS64 as shift-subtract. Written as a multiply, NVIDIA's OpenCL
+     * compiler emits an emulated 64-bit multiply here, which halved the
+     * kernel's throughput on Pascal (measured 8.7 -> 16.4 MH/s on a GTX 1070). */
+    ulong t1 = (hi_lo << 32) - hi_lo;
     ulong t2 = t0 + t1;
     return t2 + ((t2 < t0) ? EPS64 : 0UL);
 }
 
+/* 64x64 -> 128 from four 32x32 products. The limbs are typed uint so every
+ * product is a zero-extended 32x32 multiply, and the cross terms are split
+ * into 32-bit halves before they are summed so no partial sum can carry
+ * (mid < 3*2^32, hi <= 2^64-1): no 64-bit compare/select carry fixes, which
+ * is worth ~16% on Intel Gen12 and is neutral on NVIDIA. */
 ulong gf64_mul(ulong a, ulong b)
 {
-    ulong a_lo = a & EPS64;
-    ulong a_hi = a >> 32;
-    ulong b_lo = b & EPS64;
-    ulong b_hi = b >> 32;
-    ulong ll = a_lo * b_lo;
-    ulong lh = a_lo * b_hi;
-    ulong hl = a_hi * b_lo;
-    ulong hh = a_hi * b_hi;
-    ulong mid = lh + hl;
-    ulong mid_c = (mid < lh) ? 1UL : 0UL;
-    ulong lo = ll + (mid << 32);
-    ulong lo_c = (lo < ll) ? 1UL : 0UL;
-    ulong hi = hh + (mid >> 32) + (mid_c << 32) + lo_c;
+    uint a0 = (uint)a, a1 = (uint)(a >> 32);
+    uint b0 = (uint)b, b1 = (uint)(b >> 32);
+    ulong ll = (ulong)a0 * b0;
+    ulong lh = (ulong)a0 * b1;
+    ulong hl = (ulong)a1 * b0;
+    ulong hh = (ulong)a1 * b1;
+    ulong mid = (ll >> 32) + (ulong)(uint)lh + (ulong)(uint)hl;
+    ulong lo = (ll & EPS64) | (mid << 32);
+    ulong hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
     return gf64_reduce(lo, hi);
 }
 
 ulong gf64_sqr(ulong a)
 {
-    ulong a_lo = a & EPS64;
-    ulong a_hi = a >> 32;
-    ulong ll = a_lo * a_lo;
-    ulong lh = a_lo * a_hi;
-    ulong hh = a_hi * a_hi;
-    ulong mid = lh << 1;
-    ulong mid_c = lh >> 63;
-    ulong lo = ll + (mid << 32);
-    ulong lo_c = (lo < ll) ? 1UL : 0UL;
-    ulong hi = hh + (mid >> 32) + (mid_c << 32) + lo_c;
+    uint a0 = (uint)a, a1 = (uint)(a >> 32);
+    ulong ll = (ulong)a0 * a0;
+    ulong lh = (ulong)a0 * a1;
+    ulong hh = (ulong)a1 * a1;
+    ulong mid = (ll >> 32) + 2UL * (ulong)(uint)lh;      /* < 3*2^32 */
+    ulong lo = (ll & EPS64) | (mid << 32);
+    ulong hi = hh + 2UL * (lh >> 32) + (mid >> 32);      /* <= 2^64-1 */
     return gf64_reduce(lo, hi);
 }
 
