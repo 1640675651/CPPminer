@@ -9,6 +9,7 @@
 #include "cp_util.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -33,6 +34,9 @@ static std::condition_variable g_inbox_cv;
 static char net_buf[65536];
 static int net_pos = 0;
 static char json_msg[65536];
+/* id of the mining.authorize awaiting its response (-1 = none). */
+static std::atomic<int> g_auth_msg_id{-1};
+static char g_pool_host[256] = {0};
 
 static int tcp_connect(const char* host, int port)
 {
@@ -145,6 +149,9 @@ static void pool_dispatch_line(const char* line)
         return;
     }
 
+    if(cp_pool_on_authorize_response(line))
+        return;
+
     if(strstr(line, "result") || strstr(line, "error")){
         if(g_submit_inflight.load())
             printf("[pool] submit response: %s\n", line);
@@ -239,6 +246,8 @@ static void pool_net_reader_thread(void)
 
 int cp_pool_connect(const char* host, int port)
 {
+    strncpy(g_pool_host, host ? host : "", sizeof(g_pool_host) - 1);
+    g_pool_host[sizeof(g_pool_host) - 1] = 0;
     tcp_sock = tcp_connect(host, port);
     return tcp_sock >= 0;
 }
@@ -257,16 +266,69 @@ int cp_pool_socket(void)
     return tcp_sock;
 }
 
-int cp_pool_send_authorize(int msg_id, const char* wallet,
-                           const char* worker, const char* agent)
+/* Kryptex identifies the worker as "WALLET.worker" in the wallet string
+ * (gist maxmalysh/eaaf4332…); LuckyPool uses the separate "worker" field.
+ * Both are sent: on a kryptex host the wallet gets ".worker" appended unless
+ * it already carries a dot. */
+static int pool_host_contains_ci(const char* needle)
 {
+    std::string h = g_pool_host, n = needle;
+    for(char& c : h) c = (char)tolower((unsigned char)c);
+    for(char& c : n) c = (char)tolower((unsigned char)c);
+    return h.find(n) != std::string::npos;
+}
+
+static std::string authorize_wallet_string(const char* wallet, const char* worker)
+{
+    std::string w = wallet ? wallet : "";
+    if(worker && *worker && w.find('.') == std::string::npos &&
+       pool_host_contains_ci("kryptex"))
+        w += std::string(".") + worker;
+    return w;
+}
+
+int cp_pool_send_authorize(int msg_id, const char* wallet,
+                           const char* worker, const char* agent,
+                           const char* password)
+{
+    /* Strictly response-driven: assume plain proofs until this authorize's
+     * response says "type":"v2" (re-evaluated on every authorize, including
+     * the dev-fee wallet switch). */
+    g_pool_proof_gzip = 0;
+    g_auth_msg_id.store(msg_id);
     const std::string msg =
         "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(msg_id) +
         ",\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
-        cp_json_escape(wallet) + "\",\"worker\":\"" + cp_json_escape(worker) +
-        "\",\"agent\":\"" + cp_json_escape(agent) + "\"}}";
-    printf("[net] LuckyPool authorize (wallet/worker/agent)\n"); fflush(stdout);
+        cp_json_escape(authorize_wallet_string(wallet, worker).c_str()) +
+        "\",\"worker\":\"" + cp_json_escape(worker) +
+        "\",\"agent\":\"" + cp_json_escape(agent) +
+        "\",\"password\":\"" + cp_json_escape(password ? password : "x") +
+        "\",\"type\":\"v2\"}}";
+    printf("[net] authorize (wallet/worker/agent/password, offering type v2 gzip proofs)\n");
+    printf("[net] >> %s\n", msg.c_str());
+    fflush(stdout);
     return cp_send_json(tcp_sock, msg.c_str());
+}
+
+int cp_pool_on_authorize_response(const char* line)
+{
+    const int want = g_auth_msg_id.load();
+    if(want < 0 || !line) return 0;
+    if(!strstr(line, "\"result\"") && !strstr(line, "\"error\"")) return 0;
+    if(strstr(line, "\"method\"")) return 0;
+    const double id = cp_json_num(line, "id");
+    if(id != (double)want) return 0;
+    g_auth_msg_id.store(-1);
+
+    char type[16];
+    const int v2 = cp_json_str(line, "type", type, (int)sizeof(type)) &&
+                   strcmp(type, "v2") == 0;
+    g_pool_proof_gzip = v2;
+    printf("[pool] authorize response: %s\n", line);
+    printf("[pool] proof encoding: %s\n",
+           v2 ? "gzip (pool answered type v2)" : "plain base64 (no type v2 in response)");
+    fflush(stdout);
+    return 1;
 }
 
 int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,

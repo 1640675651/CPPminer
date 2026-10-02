@@ -21,6 +21,13 @@ extern int8_t* h_BpT_global;
 extern char wallet_global[256];
 extern char worker_global[64];
 extern char agent_global[64];
+/* mining.authorize "password" (--pool-pass). Kryptex reads a custom share
+ * difficulty from it ("d=2097152"); default "x". */
+extern char pool_pass_global[128];
+/* Nonzero after the pool's mining.authorize response carried "type":"v2"
+ * (Kryptex gzip stratum): plain_proof must then be submitted gzip-compressed.
+ * Reset to 0 on every authorize; set only from the response. */
+extern int g_pool_proof_gzip;
 extern int g_dry_run;
 extern int g_plain_verify;
 extern int g_mock;
