@@ -770,15 +770,21 @@ extern "C" int cp_worker_supports_share_witness(void)
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         return cp_onednn_worker_gpu_prep_ready();
 #endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    /* Pearl wgpu always generates and hashes A on the GPU (it ignores --cpu-gen). */
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        return 1;
+#endif
     return 0;
 }
 
 extern "C" int cp_worker_needs_host_bt(void)
 {
-    /* The CPU, OpenCL and oneDNN workers build noisy B from the zero-B seed and never write
-     * signal B^T, even with --cpu-gen. */
+    /* The CPU, OpenCL, oneDNN and wgpu workers build noisy B from the zero-B seed and never
+     * write signal B^T, even with --cpu-gen. */
     const int backend = cp_worker_backend_id();
-    if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL || backend == CP_BACKEND_ONEDNN)
+    if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL || backend == CP_BACKEND_ONEDNN ||
+       backend == CP_BACKEND_WGPU)
         return 0;
     return !cp_worker_supports_share_witness();
 }
@@ -797,6 +803,10 @@ extern "C" int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_la
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         return cp_onednn_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
+#endif
+#if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
+    if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0)
+        return cp_pearl_wgpu_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
 #endif
     (void)t_rows;
     (void)t_cols;

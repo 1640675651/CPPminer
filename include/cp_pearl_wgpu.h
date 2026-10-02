@@ -56,6 +56,14 @@ int cp_pearl_wgpu_scan(
 /* Download A signal matrix: M*K packed s8 bytes. */
 int cp_pearl_wgpu_download_a_sig(int8_t* out, size_t elems);
 
+/* Sub-roots saved by the last prep_a_signal (0 if A is one chunk), or -1 if none. */
+int cp_pearl_wgpu_a_witness_subroots(void);
+
+/* Share witness for the last hashed A: num_blocks blocks of block_bytes (must be
+ * CP_WITNESS_BLOCK_BYTES, zero-padded past M*K), the saved sub-roots, and the 32-byte root. */
+int cp_pearl_wgpu_read_a_witness(const uint32_t* block_idx, int num_blocks, size_t block_bytes,
+                                 uint8_t* blocks_out, uint8_t* subroots_out, uint8_t* root_out);
+
 #ifdef __cplusplus
 }
 #endif

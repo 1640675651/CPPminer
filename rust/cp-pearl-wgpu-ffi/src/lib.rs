@@ -295,3 +295,66 @@ pub unsafe extern "C" fn cp_pearl_wgpu_download_a_sig(out: *mut i8, elems: usize
         }
     }
 }
+
+/// Sub-roots saved by the last prep_a_signal (0 if A is one chunk), or -1 if none.
+#[no_mangle]
+pub unsafe extern "C" fn cp_pearl_wgpu_a_witness_subroots() -> c_int {
+    let slot = engine_slot().lock();
+    slot.as_ref()
+        .and_then(|eng| eng.a_witness_subroots())
+        .unwrap_or(-1)
+}
+
+/// Share witness for the last hashed A. `blocks_out` holds num_blocks * block_bytes bytes,
+/// `subroots_out` holds cp_pearl_wgpu_a_witness_subroots() * 32 bytes (may be NULL if 0).
+#[no_mangle]
+pub unsafe extern "C" fn cp_pearl_wgpu_read_a_witness(
+    block_idx: *const u32,
+    num_blocks: c_int,
+    block_bytes: usize,
+    blocks_out: *mut u8,
+    subroots_out: *mut u8,
+    root_out: *mut u8,
+) -> c_int {
+    if num_blocks < 0
+        || (num_blocks > 0 && (block_idx.is_null() || blocks_out.is_null()))
+        || root_out.is_null()
+        || block_bytes as u64 != engine::WITNESS_BLOCK_BYTES
+    {
+        eprintln!("[pearl-wgpu] read_a_witness: bad args");
+        return -1;
+    }
+    let slot = engine_slot().lock();
+    let Some(eng) = slot.as_ref() else {
+        eprintln!("[pearl-wgpu] read_a_witness: not initialized");
+        return -1;
+    };
+    let nsub = eng.a_witness_subroots().unwrap_or(0).max(0) as usize;
+    if nsub > 0 && subroots_out.is_null() {
+        eprintln!("[pearl-wgpu] read_a_witness: null subroots_out");
+        return -1;
+    }
+    let nb = num_blocks as usize;
+    let idx: &[u32] = if nb > 0 { slice::from_raw_parts(block_idx, nb) } else { &[] };
+    let blocks: &mut [u8] = if nb > 0 {
+        slice::from_raw_parts_mut(blocks_out, nb * block_bytes)
+    } else {
+        &mut []
+    };
+    let subroots: &mut [u8] = if nsub > 0 {
+        slice::from_raw_parts_mut(subroots_out, nsub * 32)
+    } else {
+        &mut []
+    };
+    let mut root = [0u8; 32];
+    match eng.read_a_witness(idx, blocks, subroots, &mut root) {
+        Ok(()) => {
+            std::ptr::copy_nonoverlapping(root.as_ptr(), root_out, 32);
+            0
+        }
+        Err(e) => {
+            eprintln!("[pearl-wgpu] read_a_witness failed: {e}");
+            -1
+        }
+    }
+}

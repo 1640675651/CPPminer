@@ -8,6 +8,8 @@ const R_RANK: i32 = 128;
 const BLOCKS_K: i32 = 32;
 const NUM_MILESTONES: i32 = 32;
 const B3_CHUNK: u64 = 1024;
+/// One keyed-hash sub-root covers 256 chunks (CP_WITNESS_BLOCK_BYTES).
+pub const WITNESS_BLOCK_BYTES: u64 = 256 * B3_CHUNK;
 /// Prepack row/column group (pearl_prep.wgsl MR/NR), independent of the GEMM register tile.
 const PREP_GROUP: i32 = 8;
 
@@ -415,6 +417,11 @@ struct JobBuffers {
     noise_seed: wgpu::Buffer,
     job_key: wgpu::Buffer,
     merkle_roots: wgpu::Buffer,
+    /// Sub-roots of the last hashed A, copied out before the root reduction overwrites them.
+    a_subroots: wgpu::Buffer,
+    a_num_subroots: i32,
+    a_root: [u8; 32],
+    a_witness_valid: bool,
     a_key8: wgpu::Buffer,
     bound: wgpu::Buffer,
     found_flag: wgpu::Buffer,
@@ -446,7 +453,6 @@ pub struct PearlEngine {
     queue: wgpu::Queue,
     pipelines: Pipelines,
     job: Option<JobBuffers>,
-    device_type: wgpu::DeviceType,
     max_wg_submit: u32,
     /// max_storage_buffer_binding_size: a_pre / b_pre / a_sig are bound in windows below this.
     max_binding: u64,
@@ -683,7 +689,6 @@ impl PearlEngine {
                 gemm_xor,
             },
             job: None,
-            device_type: info.device_type,
             max_wg_submit,
             max_binding,
             tile,
@@ -753,11 +758,8 @@ impl PearlEngine {
         let num_subroots = (num_chunks + 255) / 256;
         let merkle_bytes = (num_subroots.max(1) as u64) * 32;
 
-        let staging_size = a_sig_bytes
-            .max(32)
-            .max(4)
-            .max(merkle_bytes)
-            .next_multiple_of(256);
+        // Host-visible readback: one witness block, all sub-roots, or a small result.
+        let staging_size = WITNESS_BLOCK_BYTES.max(merkle_bytes).next_multiple_of(256);
 
         let device = &self.device;
         let job = JobBuffers {
@@ -769,6 +771,10 @@ impl PearlEngine {
             noise_seed: Self::mk_storage(device, 32, "noise_seed", wgpu::BufferUsages::empty()),
             job_key: Self::mk_storage(device, 32, "job_key", wgpu::BufferUsages::empty()),
             merkle_roots: Self::mk_storage(device, merkle_bytes.max(32), "merkle_roots", wgpu::BufferUsages::empty()),
+            a_subroots: Self::mk_storage(device, merkle_bytes.max(32), "a_subroots", wgpu::BufferUsages::empty()),
+            a_num_subroots: 0,
+            a_root: [0u8; 32],
+            a_witness_valid: false,
             a_key8: Self::mk_storage(device, 32, "a_key8", wgpu::BufferUsages::empty()),
             bound: Self::mk_storage(device, 32, "bound", wgpu::BufferUsages::empty()),
             found_flag: Self::mk_storage(device, 4, "found_flag", wgpu::BufferUsages::empty()),
@@ -840,16 +846,7 @@ impl PearlEngine {
         cap.min(self.max_wg_submit)
     }
 
-    /// Dispatch `total` logical workgroups in chunks of `max_wg_submit` (2D grid each chunk).
-    fn dispatch_chunked(
-        &self,
-        total: u32,
-        write_and_encode: impl FnMut(u32 /*g_begin*/, u32 /*wg_x*/, u32 /*wg_y*/, i32 /*wg_x_i*/) -> Result<(), String>,
-    ) -> Result<(), String> {
-        self.dispatch_chunked_cap(total, self.max_wg_submit, write_and_encode)
-    }
-
-    /// Like `dispatch_chunked`, with an explicit per-submit workgroup cap.
+    /// Dispatch `total` logical workgroups in chunks of at most `cap` (2D grid each chunk).
     fn dispatch_chunked_cap(
         &self,
         total: u32,
@@ -868,11 +865,18 @@ impl PearlEngine {
     }
 
     fn read_bytes(&self, src: &wgpu::Buffer, size: u64) -> Result<Vec<u8>, String> {
+        self.read_bytes_at(src, 0, size)
+    }
+
+    /// `offset` must be a multiple of 4; at most `staging_size` bytes per call.
+    fn read_bytes_at(&self, src: &wgpu::Buffer, offset: u64, size: u64) -> Result<Vec<u8>, String> {
         let job = self.job.as_ref().ok_or("no job")?;
-        if size > job.staging_size {
+        let copy_size = size.max(4).next_multiple_of(4);
+        if copy_size > job.staging_size || offset + copy_size > src.size() {
             return Err(format!(
-                "read size {size} exceeds staging {}",
-                job.staging_size
+                "read {size} bytes at {offset} exceeds staging {} or source {}",
+                job.staging_size,
+                src.size()
             ));
         }
         let mut encoder = self
@@ -880,10 +884,10 @@ impl PearlEngine {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pearl-read"),
             });
-        encoder.copy_buffer_to_buffer(src, 0, &job.staging, 0, size.max(4));
+        encoder.copy_buffer_to_buffer(src, offset, &job.staging, 0, copy_size);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = job.staging.slice(..size.max(4));
+        let slice = job.staging.slice(..copy_size);
         let status = std::sync::Arc::new(AtomicU8::new(0));
         let status2 = status.clone();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -1104,14 +1108,21 @@ impl PearlEngine {
         })?;
 
         {
-            let job = self.job.as_ref().unwrap();
+            let job = self.job.as_mut().unwrap();
+            job.a_witness_valid = false;
             self.queue.write_buffer(&job.job_key, 0, job_key);
         }
-        self.matrix_keyed_hash(job_key, hash_a_out)?;
+        let num_subroots = self.matrix_keyed_hash(job_key, hash_a_out)?;
+        let job = self.job.as_mut().unwrap();
+        job.a_num_subroots = num_subroots;
+        job.a_root = *hash_a_out;
+        job.a_witness_valid = true;
         Ok(())
     }
 
-    fn matrix_keyed_hash(&self, job_key: &[u8; 32], out: &mut [u8; 32]) -> Result<(), String> {
+    /// Hashes a_sig into `out`; returns how many sub-roots were saved to `a_subroots`
+    /// (0 when A is a single chunk and hashed on the host).
+    fn matrix_keyed_hash(&self, job_key: &[u8; 32], out: &mut [u8; 32]) -> Result<i32, String> {
         let job = self.job.as_ref().ok_or("no job")?;
         let raw_len = (job.m as u64) * (job.k as u64);
         let pad_len = (raw_len + B3_CHUNK - 1) / B3_CHUNK * B3_CHUNK;
@@ -1126,7 +1137,7 @@ impl PearlEngine {
             let mut tmp = vec![0u8; pad_len as usize];
             tmp[..raw_len as usize].copy_from_slice(&bytes[..raw_len as usize]);
             *out = blake3_digest(&tmp, Some(job_key));
-            return Ok(());
+            return Ok(0);
         }
 
         self.queue.write_buffer(&job.job_key, 0, job_key);
@@ -1186,10 +1197,16 @@ impl PearlEngine {
             self.submit_and_wait(enc)?;
         }
 
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("save_a_subroots"),
+        });
+        enc.copy_buffer_to_buffer(&job.merkle_roots, 0, &job.a_subroots, 0, num_subroots as u64 * 32);
+        self.queue.submit(Some(enc.finish()));
+
         self.merkle_finish_root(num_subroots)?;
         let root_bytes = self.read_bytes(&job.merkle_roots, 32)?;
         out.copy_from_slice(&root_bytes);
-        Ok(())
+        Ok(num_subroots)
     }
 
     fn merkle_finish_root(&self, num_subroots: i32) -> Result<(), String> {
@@ -1574,10 +1591,63 @@ impl PearlEngine {
         if out.len() < need {
             return Err(format!("out len {} < {}", out.len(), need));
         }
-        let bytes = self.read_bytes(&job.a_sig, need as u64)?;
-        for i in 0..need {
-            out[i] = bytes[i] as i8;
+        let step = job.staging_size as usize;
+        let mut off = 0usize;
+        while off < need {
+            let len = step.min(need - off);
+            let bytes = self.read_bytes_at(&job.a_sig, off as u64, len as u64)?;
+            for (dst, &src) in out[off..off + len].iter_mut().zip(&bytes[..len]) {
+                *dst = src as i8;
+            }
+            off += len;
         }
+        Ok(())
+    }
+
+    /// Sub-roots saved by the last `prep_a_signal`, or None before any A was hashed.
+    pub fn a_witness_subroots(&self) -> Option<i32> {
+        let job = self.job.as_ref()?;
+        job.a_witness_valid.then_some(job.a_num_subroots)
+    }
+
+    /// Share witness for the last hashed A: the listed WITNESS_BLOCK_BYTES blocks (zero-padded
+    /// past M*K) into `blocks_out`, the saved sub-roots into `subroots_out`, and the root.
+    pub fn read_a_witness(
+        &self,
+        block_idx: &[u32],
+        blocks_out: &mut [u8],
+        subroots_out: &mut [u8],
+        root_out: &mut [u8; 32],
+    ) -> Result<(), String> {
+        let job = self.job.as_ref().ok_or("begin_job not called")?;
+        if !job.a_witness_valid {
+            return Err("no hashed A".into());
+        }
+        let block = WITNESS_BLOCK_BYTES as usize;
+        if blocks_out.len() < block_idx.len() * block {
+            return Err("blocks_out too small".into());
+        }
+        let sz_a = (job.m as u64) * (job.k as u64);
+        for (i, &b) in block_idx.iter().enumerate() {
+            let off = b as u64 * WITNESS_BLOCK_BYTES;
+            let dst = &mut blocks_out[i * block..(i + 1) * block];
+            dst.fill(0);
+            if off >= sz_a {
+                continue;
+            }
+            let len = (sz_a - off).min(WITNESS_BLOCK_BYTES) as usize;
+            let bytes = self.read_bytes_at(&job.a_sig, off, len as u64)?;
+            dst[..len].copy_from_slice(&bytes[..len]);
+        }
+        let sub_bytes = job.a_num_subroots as usize * 32;
+        if sub_bytes > 0 {
+            if subroots_out.len() < sub_bytes {
+                return Err("subroots_out too small".into());
+            }
+            let bytes = self.read_bytes(&job.a_subroots, sub_bytes as u64)?;
+            subroots_out[..sub_bytes].copy_from_slice(&bytes[..sub_bytes]);
+        }
+        *root_out = job.a_root;
         Ok(())
     }
 }

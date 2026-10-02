@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "cp_share_witness.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +32,9 @@ int cp_pearl_wgpu_worker_mine_attempt(
         uint64_t *out_tiles_scanned);
 
 int cp_pearl_wgpu_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig);
+/* Share witness (A sub-roots + covering blocks; B^T all-zero). Allocates *out. */
+int cp_pearl_wgpu_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
+                                            CpShareWitness **out);
 
 #ifdef __cplusplus
 }

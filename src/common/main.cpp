@@ -1425,7 +1425,7 @@ int main(int argc, char** argv)
                    hash_mr, hash_w, wgpu_macro, wgpu_macro);
             printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
                    batch_size, batch_size * (wgpu_macro / hash_mr) * (wgpu_macro / hash_w));
-            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+            printf("[mode] noisy B cached on GPU per job\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
             const double panel_tiles =

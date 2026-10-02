@@ -9,7 +9,7 @@ Each full matrix (signal or coalesced prepack) is:
 |------|------------:|--------:|
 | m × k or n × k | **512 MiB** | **32 MiB** |
 
-Host signal slots are allocated in `cp_mine_init_host_buffers()`: `h_Ap_global` (512 MiB) unless the backend proves from device witnesses (CUDA / OpenCL / oneDNN GPU prep), and `h_BpT_global` (512 MiB) only when `cp_worker_needs_host_bt()` (wgpu / CUDA `--cpu-gen`). CPU, OpenCL and oneDNN prove their all-zero B^T without a host matrix (`cp_proof_build(bt = NULL)`, or a B^T witness with no sub-roots), which caches zero-matrix sub-roots (64 KiB) per job.
+Host signal slots are allocated in `cp_mine_init_host_buffers()`: `h_Ap_global` (512 MiB) unless the backend proves from device witnesses (CUDA / OpenCL / oneDNN GPU prep, wgpu), and `h_BpT_global` (512 MiB) only when `cp_worker_needs_host_bt()` (CUDA `--cpu-gen`). CPU, OpenCL, oneDNN and wgpu prove their all-zero B^T without a host matrix (`cp_proof_build(bt = NULL)`, or a B^T witness with no sub-roots), which caches zero-matrix sub-roots (64 KiB) per job.
 
 ## Share proof memory (all backends)
 
@@ -19,7 +19,7 @@ Proof building (`rust/cp-proof-ffi`) never copies a signal matrix; peak host RAM
 |------|-------|-----------------------------------|
 | Host matrix (`cp_proof_build`) | borrowed `h_Ap_global` / `h_BpT_global`, hashed in place | 2048 sub-roots per matrix (64 KiB each), proven leaf chunks, ≤ 256 KiB padded copy only if a matrix ends mid-block |
 | Zero B^T (`cp_proof_build` with `bt = NULL`, or an empty B^T witness) | nothing | 64 KiB zero sub-roots, cached per job (first share hashes 512 MiB of zeros, streamed) |
-| Device witness (`cp_proof_build_witness`, CUDA / OpenCL / oneDNN) | A sub-roots + tile blocks from the GPU | ~0.3–0.8 MiB witness per share |
+| Device witness (`cp_proof_build_witness`, CUDA / OpenCL / oneDNN / wgpu) | A sub-roots + tile blocks from the GPU | ~0.3–0.8 MiB witness per share |
 | All | base64 output | up to 512 KiB (`PLAIN_PROOF_B64_MAX`) |
 
 Sub-roots are the CVs of aligned 256-chunk (256 KiB) subtrees, hashed in parallel with BLAKE3 SIMD. The rest of the Merkle path is rebuilt from them plus the blocks holding the proven rows. Production timing (A in place + zero B^T): ~30 ms on the first share of a job, ~16 ms after.
@@ -256,6 +256,19 @@ oneDNN reuses `Case33OclPrep` for matrix prep, so its GPU-prep path keeps A's su
 | **Host fallback** (prep kernels failed) | `h_Ap_global` (512 MiB) + `a_host_` / `b_host_` upload staging + `g_zero_b.B_noisy` | Host A hashed in place, `bt = NULL` |
 
 No `h_BpT_global` is allocated in either mode.
+
+# wgpu zero-B path (Pearl)
+
+The wgpu worker always generates and hashes A on the GPU (`--cpu-gen` is ignored), and B^T is always zero.
+
+| Buffer | Production | Notes |
+|--------|-----------:|-------|
+| `a_pre` / `b_pre` / `a_sig` (device) | 3 × 512 MiB | scan A, scan B (job), signal A |
+| `merkle_roots` / `a_subroots` (device) | 2 × 64 KiB | keyed-hash scratch; A sub-roots saved before the root reduction |
+| `staging` (`MAP_READ`, host-visible) | 256 KiB | one witness block or all sub-roots per readback (was sized to all of A, 512 MiB) |
+| Host signal A / B^T | none | share proof from `CpShareWitness` (A sub-roots + ≤ 8 blocks), B^T from cached zero sub-roots |
+
+`cp_pearl_wgpu_download_a_sig` still works for debugging; it reads A through the small staging buffer in 256 KiB pieces.
 
 # CUDA zero-B path (default)
 
