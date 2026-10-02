@@ -65,7 +65,7 @@ inline void d_b3_g(uint *s, int a, int b, int c, int d, uint x, uint y) {
     s[b] = d_b3_rotr32(s[b] ^ s[c], 7);
 }
 
-inline void d_b3_round(uint s[16], const uint m[16], int round) {
+inline void d_b3_round(uint *s, const uint *m, int round) {
     d_b3_g(s, 0, 4, 8, 12, m[D_B3_MSG_SCHEDULE[round][0]], m[D_B3_MSG_SCHEDULE[round][1]]);
     d_b3_g(s, 1, 5, 9, 13, m[D_B3_MSG_SCHEDULE[round][2]], m[D_B3_MSG_SCHEDULE[round][3]]);
     d_b3_g(s, 2, 6, 10, 14, m[D_B3_MSG_SCHEDULE[round][4]], m[D_B3_MSG_SCHEDULE[round][5]]);
@@ -76,7 +76,7 @@ inline void d_b3_round(uint s[16], const uint m[16], int round) {
     d_b3_g(s, 3, 4, 9, 14, m[D_B3_MSG_SCHEDULE[round][14]], m[D_B3_MSG_SCHEDULE[round][15]]);
 }
 
-inline void d_b3_compress_pre(uint s[16], const uint cv[8], const uchar block[D_B3_BLOCK],
+inline void d_b3_compress_pre(uint *s, const uint *cv, const uchar *block,
                               uchar block_len, ulong counter, uchar flags) {
     uint m[16];
     for (int i = 0; i < 16; i++) {
@@ -103,7 +103,7 @@ inline void d_b3_compress_pre(uint s[16], const uint cv[8], const uchar block[D_
     }
 }
 
-inline void d_b3_compress_in_place(uint cv[8], const uchar block[D_B3_BLOCK], uchar block_len,
+inline void d_b3_compress_in_place(uint *cv, const uchar *block, uchar block_len,
                                    ulong counter, uchar flags) {
     uint s[16];
     d_b3_compress_pre(s, cv, block, block_len, counter, flags);
@@ -117,13 +117,13 @@ inline void d_b3_compress_in_place(uint cv[8], const uchar block[D_B3_BLOCK], uc
     cv[7] = s[7] ^ s[15];
 }
 
-inline void d_b3_key_words_priv(const uchar key[32], uint kw[8]) {
+inline void d_b3_key_words_priv(const uchar *key, uint *kw) {
     for (int i = 0; i < 8; i++) {
         kw[i] = d_b3_load32_priv(key + 4 * i);
     }
 }
 
-inline void d_b3_key_words_g(__global const uchar *key, uint kw[8]) {
+inline void d_b3_key_words_g(__global const uchar *key, uint *kw) {
     for (int i = 0; i < 8; i++) {
         kw[i] = d_b3_load32_g(key + 4 * i);
     }
@@ -177,7 +177,7 @@ typedef struct {
     uchar flags;
 } d_b3_chunk_state;
 
-inline void d_b3_chunk_init(d_b3_chunk_state *st, const uint key[8], uchar flags) {
+inline void d_b3_chunk_init(d_b3_chunk_state *st, const uint *key, uchar flags) {
     for (int i = 0; i < 8; i++) {
         st->cv[i] = key[i];
     }
@@ -227,8 +227,8 @@ inline void d_b3_chunk_update(d_b3_chunk_state *st, const uchar *input, ulong in
     st->buf_len = (uchar)(st->buf_len + input_len);
 }
 
-inline void d_b3_compress_xof(const uint cv[8], const uchar block[D_B3_BLOCK], uchar block_len,
-                              ulong counter, uchar flags, uchar out[64]) {
+inline void d_b3_compress_xof(const uint *cv, const uchar *block, uchar block_len,
+                              ulong counter, uchar flags, uchar *out) {
     uint s[16];
     d_b3_compress_pre(s, cv, block, block_len, counter, flags);
     d_b3_store32_priv(out + 0, s[0] ^ s[8]);
@@ -249,7 +249,7 @@ inline void d_b3_compress_xof(const uint cv[8], const uchar block[D_B3_BLOCK], u
     d_b3_store32_priv(out + 60, s[15] ^ cv[7]);
 }
 
-inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar out[32]) {
+inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar *out) {
     uchar f = (uchar)(st->flags | D_B3_CHUNK_END | D_B3_ROOT);
     if (st->blocks_compressed == 0) {
         f = (uchar)(f | D_B3_CHUNK_START);
@@ -261,7 +261,7 @@ inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar out[32]) {
     }
 }
 
-inline void d_keyed_digest_priv(const uchar *data, int len, const uchar key[32], uchar out[32]) {
+inline void d_keyed_digest_priv(const uchar *data, int len, const uchar *key, uchar *out) {
     uint kw[8];
     d_b3_key_words_priv(key, kw);
     d_b3_chunk_state st;
@@ -270,14 +270,14 @@ inline void d_keyed_digest_priv(const uchar *data, int len, const uchar key[32],
     d_b3_chunk_root_out(&st, out);
 }
 
-inline void d_copy_label_priv(int is_b, uchar key[32]) {
+inline void d_copy_label_priv(int is_b, uchar *key) {
     for (int i = 0; i < 32; i++) {
         key[i] = is_b ? CP_SEED_LABEL_B[i] : CP_SEED_LABEL_A[i];
     }
 }
 
-inline void d_get_random_hash_priv(int index, const uchar seed[32], const uchar key[32],
-                                   int prepend_index, uchar out[32]) {
+inline void d_get_random_hash_priv(int index, const uchar *seed, const uchar *key,
+                                   int prepend_index, uchar *out) {
     uchar msg[64];
     for (int i = 0; i < 64; i++) {
         msg[i] = 0;
