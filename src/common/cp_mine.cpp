@@ -162,11 +162,12 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
          * --cpu-gen / host matrices still hand off both signal mats. */
         handoff_bt = (host_matrices || !zero_b_gpu) && cp_worker_needs_host_bt();
         /* Defer reclaim + D2H on share when signal mats live on device between attempts
-         * (CUDA / OpenCL GPU-prep). CPU always has correct A on host and must reclaim
-         * before the next attempt (proof handoff otherwise leaves h_Ap NULL -> rc=-2).
+         * (CUDA / OpenCL GPU-prep). CPU and the oneDNN host fallback write A on the host
+         * every attempt and must reclaim before the next one (proof handoff otherwise
+         * leaves h_Ap NULL -> rc=-2).
          * OpenCL/CUDA gate fetch_share_signals on this flag — do not clear it for them. */
         defer_host_reclaim =
-                !cp_worker_prefers_host_matrices() && !host_matrices && !g_cpu_matrix_gen;
+                !cp_worker_writes_host_signal_a() && !host_matrices && !g_cpu_matrix_gen;
         share_witness = cp_worker_supports_share_witness() && !host_matrices;
     }
 

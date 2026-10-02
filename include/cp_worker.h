@@ -105,6 +105,10 @@ int cp_worker_set_simd_isa(CpSimdIsa isa);
 /* Prefer host matrix path when non-zero (CPU backend always uses host matrices). */
 int cp_worker_prefers_host_matrices(void);
 
+/* Non-zero when the worker writes signal A into h_Ap_global every attempt (CPU, oneDNN host
+ * fallback), so the host slot must be reclaimed before each attempt rather than on a share. */
+int cp_worker_writes_host_signal_a(void);
+
 /* Worker generates noisy matrices internally (CPU zero-B). */
 int cp_worker_worker_handles_matrix_prep(void);
 void cp_worker_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version);

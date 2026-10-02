@@ -214,6 +214,7 @@ Proofs commit the actual signal strips via Merkle (`cp_proof_build` takes `a` an
 | **CUDA** (`gpu_prepare_job_b` + `gpu_prepare_attempt_a`) | **Yes** — no `d_Bt_sig`; noise-only into `d_BpT` once/job; random A per nonce | Proof via `cp_proof_build_witness`: A sub-roots + tile blocks, zero-B sub-roots per job; no host A/B matrices |
 | **CPU** (`cp_cpu_worker`, default) | **Yes** — `cp_cpu_worker_begin_job` caches noisy B; per attempt sparse A poke + A-noise only | `cp_worker_worker_handles_matrix_prep()` skips host gen in `cp_mine` |
 | **OpenCL** (`cp_opencl_worker`, GPU prep and `--cpu-gen`) | **Yes** — noisy B once/job; random A per nonce | GPU prep: witness proof like CUDA; `--cpu-gen`: host A only, `bt = NULL` |
+| **oneDNN** (`cp_onednn_worker`) | **Yes** — same as OpenCL (shared `Case33OclPrep`) | GPU prep: witness proof; host fallback (prep kernels failed): host A only, `bt = NULL` |
 | **CUDA `--cpu-gen`** | **No** — legacy `pearl_generate_ab` host path in `cp_mine` | Full A/B from `ab_seed` |
 | **Pool verify** | **Yes** — recomputes noise from proof strips + `job_key`, not from header nonce | Same as any other miner-chosen B |
 

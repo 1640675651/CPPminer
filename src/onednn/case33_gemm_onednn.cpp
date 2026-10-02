@@ -625,6 +625,16 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
                                        lda_, a_row_major_, salted, a_key_out);
 }
 
+bool Case33GemmOnednn::read_A_witness(const uint32_t *block_idx, int num_blocks,
+                                      size_t block_bytes, uint8_t *blocks_out,
+                                      uint8_t *subroots_out, uint8_t root_out[32]) const {
+    if (!prep_ready_ || M_ <= 0 || K_ <= 0) {
+        return false;
+    }
+    return prep_.read_A_witness(static_cast<size_t>(M_) * static_cast<size_t>(K_), block_idx,
+                                num_blocks, block_bytes, blocks_out, subroots_out, root_out);
+}
+
 bool Case33GemmOnednn::read_A_sig(int8_t *h_A_sig) {
     if (!h_A_sig || M_ <= 0 || K_ <= 0) {
         return false;

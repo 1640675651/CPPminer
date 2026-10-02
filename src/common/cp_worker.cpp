@@ -559,6 +559,17 @@ extern "C" int cp_worker_prefers_host_matrices(void)
     return cp_worker_backend_id() == CP_BACKEND_CPU;
 }
 
+extern "C" int cp_worker_writes_host_signal_a(void)
+{
+    if(cp_worker_backend_id() == CP_BACKEND_CPU)
+        return 1;
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        return !cp_onednn_worker_gpu_prep_ready();
+#endif
+    return 0;
+}
+
 extern "C" int cp_worker_worker_handles_matrix_prep(void)
 {
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
@@ -754,15 +765,20 @@ extern "C" int cp_worker_supports_share_witness(void)
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return !g_cpu_matrix_gen;
 #endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    /* oneDNN ignores --cpu-gen; it falls back to host prep only if the prep kernels fail. */
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        return cp_onednn_worker_gpu_prep_ready();
+#endif
     return 0;
 }
 
 extern "C" int cp_worker_needs_host_bt(void)
 {
-    /* The CPU and OpenCL workers build noisy B from the zero-B seed and never write signal
-     * B^T, even with --cpu-gen. */
+    /* The CPU, OpenCL and oneDNN workers build noisy B from the zero-B seed and never write
+     * signal B^T, even with --cpu-gen. */
     const int backend = cp_worker_backend_id();
-    if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL)
+    if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL || backend == CP_BACKEND_ONEDNN)
         return 0;
     return !cp_worker_supports_share_witness();
 }
@@ -777,6 +793,10 @@ extern "C" int cp_worker_fetch_share_witness(int t_rows, int t_cols, int tile_la
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return cp_opencl_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        return cp_onednn_worker_fetch_share_witness(t_rows, t_cols, tile_layout, out);
 #endif
     (void)t_rows;
     (void)t_cols;

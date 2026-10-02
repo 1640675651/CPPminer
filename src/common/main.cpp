@@ -1447,8 +1447,7 @@ int main(int argc, char** argv)
                     const char *env_layout = getenv("CASE5_GEMM_LAYOUT");
                     layout_msg = (env_layout && env_layout[0]) ? env_layout : "TN";
                 }
-                printf("[mode] host signal ~%.0f MiB; device layout %s on Intel GPU\n",
-                       host_mib, layout_msg);
+                printf("[mode] device layout %s on Intel GPU\n", layout_msg);
             }
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){

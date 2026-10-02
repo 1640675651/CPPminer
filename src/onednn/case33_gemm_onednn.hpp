@@ -29,6 +29,9 @@ struct Case33GemmOnednn {
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
                              const uint8_t b_noise_seed[32], int salted, uint8_t a_key_out[32]);
     bool read_A_sig(int8_t *h_A_sig);
+    int a_witness_subroots() const { return prep_ready_ ? prep_.a_witness_subroots() : -1; }
+    bool read_A_witness(const uint32_t *block_idx, int num_blocks, size_t block_bytes,
+                        uint8_t *blocks_out, uint8_t *subroots_out, uint8_t root_out[32]) const;
 
     bool available() const { return available_; }
 

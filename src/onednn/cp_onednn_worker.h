@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "cp_share_witness.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,6 +29,11 @@ int cp_onednn_worker_mine_attempt(
         uint64_t *out_tiles_scanned);
 
 int cp_onednn_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig);
+/* 1 when A is generated and hashed on the device (prep kernels built); decided at init. */
+int cp_onednn_worker_gpu_prep_ready(void);
+/* GPU-prep share witness (A sub-roots + covering blocks; B^T all-zero). Allocates *out. */
+int cp_onednn_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
+                                         CpShareWitness **out);
 
 int cp_onednn_hash_tile_mr(void);
 int cp_onednn_hash_tile_w(void);
