@@ -1,12 +1,16 @@
 // Case 10: ONE continuous main loop with XOR at milestone boundaries.
 // Uses MmaMilestone::inline_operator() (skip residue-first, in-order K).
 // CPminer: jackpot fold in the XOR callback; optional tile-xor store.
+// HashTilePolicy_ (hash_tile_policy.h) maps the accumulator fragment onto the
+// 256 virtual SIMT hash tiles of the 128x128 CTA so SIMT and tensor-op
+// instantiations emit identical per-tile words (proof layout unchanged).
 #pragma once
 
 #include "cp_cutlass_jackpot.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
+#include "hash_tile_policy.h"
 #include "mma_milestone.h"
 
 namespace cutlass {
@@ -14,7 +18,8 @@ namespace gemm {
 namespace kernel {
 
 template <typename MmaMilestone_, typename Epilogue_,
-          typename ThreadblockSwizzle_>
+          typename ThreadblockSwizzle_,
+          typename HashTilePolicy_ = cp_cutlass::HashTileSimt>
 struct InlineXorKernel {
 public:
   using Mma = MmaMilestone_;
@@ -22,6 +27,8 @@ public:
   using Epilogue = Epilogue_;
   using EpilogueVisitor = typename Epilogue::Visitor;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
+  using HashTilePolicy = HashTilePolicy_;
+  static int const kTilesPerThread = HashTilePolicy::kTilesPerThread;
 
   /* Traits expected by FusedMilestoneGemmOp / layout asserts. */
   static bool const kPersistentAccumAcrossMilestones = true;
@@ -45,6 +52,10 @@ public:
   using ThreadblockShape = typename Mma::Shape;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
+  /* Hash tiles per CTA: always the 256 of the SIMT lane map (proof format). */
+  static int const kHashTilesPerCta = kThreadCount * kTilesPerThread;
+  static_assert(kHashTilesPerCta == MmaLaneTile128x128::kThreadsPerCta,
+                "hash-tile policy must cover the 256 SIMT lane tiles per CTA");
 
   using ElementAccumulator = typename Mma::ElementC;
   using ElementSum = typename EpilogueVisitor::ElementSum;
@@ -153,7 +164,7 @@ public:
       int const K = args.problem_size.k();
       tile_cols = N / ThreadblockShape::kN;
       milestone_stride = static_cast<size_t>(M / ThreadblockShape::kM) *
-                         static_cast<size_t>(tile_cols) * kThreadCount;
+                         static_cast<size_t>(tile_cols) * kHashTilesPerCta;
       if (args.epilogue_visitor.milestone_stride > 0)
         milestone_stride =
             static_cast<size_t>(args.epilogue_visitor.milestone_stride);
@@ -233,24 +244,31 @@ public:
     typename Mma::FragmentC accum;
     accum.clear();
 
-    uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS];
-    for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i)
-      jackpot_words[i] = 0u;
+    /* One fold state per hash tile this thread ends up owning. */
+    uint32_t jackpot_words[kTilesPerThread][CP_CUTLASS_JACKPOT_WORDS];
+    CUTLASS_PRAGMA_UNROLL
+    for (int t = 0; t < kTilesPerThread; ++t)
+      for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i)
+        jackpot_words[t][i] = 0u;
 
     Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
 
     mma.inline_operator(
         params.gemm_k_iterations, accum, iterA, iterB, accum,
-        [&](int ms_idx, uint32_t xv) {
-          if (params.jackpot.enabled)
-            cp_cutlass_jackpot_fold_step(jackpot_words, ms_idx, xv);
-          if (params.ptr_Sum != nullptr) {
-            size_t off =
-                static_cast<size_t>(ms_idx) * params.milestone_stride +
-                (static_cast<size_t>(cta_r) * tile_cols + cta_c) * kThreadCount +
-                thread_idx;
-            params.ptr_Sum[off] = xv;
-          }
+        [&](int ms_idx, typename Mma::FragmentC const &acc) {
+          HashTilePolicy::milestone_xor(acc, lane_idx, [&](int t, uint32_t xv) {
+            if (params.jackpot.enabled)
+              cp_cutlass_jackpot_fold_step(jackpot_words[t], ms_idx, xv);
+            if (params.ptr_Sum != nullptr) {
+              int const vt = HashTilePolicy::virtual_thread(warp_idx, lane_idx, t);
+              size_t off =
+                  static_cast<size_t>(ms_idx) * params.milestone_stride +
+                  (static_cast<size_t>(cta_r) * tile_cols + cta_c) *
+                      kHashTilesPerCta +
+                  vt;
+              params.ptr_Sum[off] = xv;
+            }
+          });
         });
 
     if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
@@ -258,10 +276,14 @@ public:
         *params.jackpot.ptr_found == 0) {
       const int row_period_eff = params.jackpot.row_period0 + tbo.m();
       const int col_period_eff = params.jackpot.col_period0 + tbo.n();
-      cp_cutlass_jackpot_try(
-          jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
-          row_period_eff, col_period_eff, thread_idx, params.jackpot.ptr_found,
-          params.jackpot.ptr_out_t_rows, params.jackpot.ptr_out_t_cols);
+      CUTLASS_PRAGMA_UNROLL
+      for (int t = 0; t < kTilesPerThread; ++t) {
+        int const vt = HashTilePolicy::virtual_thread(warp_idx, lane_idx, t);
+        cp_cutlass_jackpot_try(
+            jackpot_words[t], params.jackpot.ptr_a_key8, params.jackpot.bound,
+            row_period_eff, col_period_eff, vt, params.jackpot.ptr_found,
+            params.jackpot.ptr_out_t_rows, params.jackpot.ptr_out_t_cols);
+      }
     }
 
     (void)N;
