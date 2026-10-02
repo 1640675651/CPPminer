@@ -302,11 +302,17 @@ bool OpenClContext::init(const OclDeviceInfo &pick) {
         return false;
     }
 
+    /* Nothing reads CL_PROFILING_COMMAND_* events, so keep the queue plain: with
+       profiling enabled the runtime timestamps every command. CP_OCL_QUEUE_PROFILING=1
+       turns it back on for ad-hoc event timing. */
+    const char *prof_env = std::getenv("CP_OCL_QUEUE_PROFILING");
+    const bool profiling = prof_env && prof_env[0] && prof_env[0] != '0';
+    const cl_command_queue_properties qprops = profiling ? CL_QUEUE_PROFILING_ENABLE : 0;
 #ifdef CL_VERSION_2_0
-    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, qprops, 0};
     queue = clCreateCommandQueueWithProperties(context, device, props, &err);
 #else
-    queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
+    queue = clCreateCommandQueue(context, device, qprops, &err);
 #endif
     if (!queue || err != CL_SUCCESS) {
         log_cl_error("clCreateCommandQueue", err);

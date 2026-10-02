@@ -270,6 +270,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DCASE32_WI_ROWMAJOR=" +
                       std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
+        if (reqd_wg_size_ > 0) {
+            build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+        }
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (scalar) {
             build_opts += " -DCASE32_NO_DPI=1";
@@ -337,6 +340,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
+                if (reqd_wg_size_ > 0) {
+                    build_opts2 += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+                }
                 if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
                     return adopt_kernel(label);
                 }
@@ -364,6 +370,15 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
 
     const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
                                ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+
+    /* One macro block per work-group whenever the device allows it (run_macro_batch_
+       then launches with local = kMacroWorkItems); tell the compiler the exact size via
+       reqd_work_group_size. Larger-than-device shapes keep the sliced launch and no
+       attribute. */
+    reqd_wg_size_ = 0;
+    if (static_cast<size_t>(case32::kMacroWorkItems) <= ocl_.max_work_group_size) {
+        reqd_wg_size_ = case32::kMacroWorkItems;
+    }
 
     std::vector<Case32OclDotBackend> candidates;
     if (issue_mode_ == 1) {
@@ -623,7 +638,14 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     }
 
     int slice_m = micro_m;
-    if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
+    if (reqd_wg_size_ > 0) {
+        /* Compiled with reqd_work_group_size(kMacroWorkItems): launch exactly that. */
+        if (reqd_wg_size_ != case32::kMacroWorkItems) {
+            std::fprintf(stderr, "[ocl] reqd work-group size %d != macro work-items %d\n",
+                         reqd_wg_size_, case32::kMacroWorkItems);
+            return false;
+        }
+    } else if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
         slice_m = static_cast<int>(max_wg / static_cast<size_t>(micro_n));
         if (slice_m < 1) {
             slice_m = 1;
