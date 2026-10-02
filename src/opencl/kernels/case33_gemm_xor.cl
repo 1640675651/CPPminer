@@ -92,6 +92,23 @@
 #ifndef CASE32_USE_LDS
 #define CASE32_USE_LDS 0
 #endif
+/* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
+   KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
+   -DCASE32_PIPELINE=0 restores the plain load-then-dot loop. */
+#ifndef CASE32_PIPELINE
+#define CASE32_PIPELINE 1
+#endif
+#if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
+#undef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+/* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
+#ifndef SWZ_IM
+#define SWZ_IM 8
+#endif
+#ifndef SWZ_JM
+#define SWZ_JM 4
+#endif
 #ifndef CASE32_CPM_INT
 #define CASE32_CPM_INT 0
 #endif
@@ -334,6 +351,56 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
 #endif
 }
 
+/* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
+   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
+   KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
+   load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
+   dwordx4 even for compilers that do not infer alignment through vload4(char*). */
+#if (MR % 4) == 0 && (NR % 4) == 0 && RANK == 4
+#define CASE32_VEC_LOADS 1
+#else
+#define CASE32_VEC_LOADS 0
+#endif
+
+inline void case32_load_a_pack(__private int *a_pack, __global const char *a_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *a_v = (__global const uint4 *)a_kg;
+    #pragma unroll
+    for (int i = 0; i < MR / 4; ++i) {
+        const uint4 v = a_v[i];
+        a_pack[4 * i + 0] = as_int(v.s0);
+        a_pack[4 * i + 1] = as_int(v.s1);
+        a_pack[4 * i + 2] = as_int(v.s2);
+        a_pack[4 * i + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+    }
+#endif
+}
+
+inline void case32_load_b_pack(__private int *b_pack, __global const char *b_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *b_v = (__global const uint4 *)b_kg;
+    #pragma unroll
+    for (int j = 0; j < NR / 4; ++j) {
+        const uint4 v = b_v[j];
+        b_pack[4 * j + 0] = as_int(v.s0);
+        b_pack[4 * j + 1] = as_int(v.s1);
+        b_pack[4 * j + 2] = as_int(v.s2);
+        b_pack[4 * j + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+    }
+#endif
+}
+
 #if CASE32_USE_LDS
 /* Case 3.4: all WIs cooperatively copy A/B kg-strips into SLM (coalesced 16B). */
 inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int nbytes,
@@ -350,6 +417,10 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
+#ifdef CASE32_REQD_WG
+/* Host passes the exact launch local size when one macro block fits a work-group. */
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -367,8 +438,28 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
     const int mb = mb_begin + (int)get_group_id(0);
-    const int jm = mb / macro_rows;
-    const int im = mb % macro_rows;
+    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+       walk every im for one jm: each resident work-group streams its own A strip
+       from DRAM and A is never reused from L2 (the whole of A is re-read once per
+       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+       all addressing derive from (im, jm). Falls back to the linear map when the
+       macro grid is not divisible (uniform branch). */
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
 
     const int tr0 = im * MICRO_M;
     const int tc0 = jm * MICRO_N;
@@ -414,6 +505,27 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         }
 #if !CASE32_PACKED_DOT
         cpm_vec cpm[CPM_NVEC];
+#endif
+#if CASE32_PIPELINE
+        /* Software pipeline (register double buffer). In the coalesced layout a WI's
+           operands for k-group (kb, kg) sit at a_run + (kb*KGROUPS + kg)*MACRO_KG_STRIP_A
+           (same for B), i.e. the whole K walk is one flat stride, so the prefetch runs
+           across kb boundaries and never drains. Buffer 0 holds the k-group being
+           consumed; the loop is unrolled x2 so buffers alternate without copies. */
+        __global const char *a_run =
+                a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)tr * (size_t)KG_BYTES_A;
+        __global const char *b_run =
+                b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)tc * (size_t)KG_SLICE_B;
+        const int kg_last = blocks_k * KGROUPS - 1;
+        int kg_flat = 0;
+        int a_p0[MR];
+        int b_p0[NR];
+        int a_p1[MR];
+        int b_p1[NR];
+        case32_load_a_pack(a_p0, a_run);
+        case32_load_b_pack(b_p0, b_run);
 #endif
         int ms = 0;
         for (int kb = 0; kb < blocks_k; ++kb) {
@@ -470,6 +582,30 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             }
             barrier(CLK_LOCAL_MEM_FENCE);
         }
+#elif CASE32_PIPELINE
+        (void)a_kb_base;
+        (void)b_kb_base;
+        for (int kg = 0; kg < KGROUPS; kg += 2) {
+            /* kg+1 always exists (KGROUPS even); kg+2 may be the next kb's first
+               k-group, clamp at the very end (re-reads the last k-group, harmless). */
+            const int kg_n1 = kg_flat + 1;
+            const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
+            case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
+#else
+            case32_accum_kgroup(acc, cpm, a_p0, b_p0);
+#endif
+            case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
+#else
+            case32_accum_kgroup(acc, cpm, a_p1, b_p1);
+#endif
+            kg_flat += 2;
+        }
 #else
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg =
@@ -481,15 +617,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
             int a_pack[MR];
             int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
@@ -507,19 +636,12 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg = a_tile + (size_t)kg * (size_t)KG_BYTES_A;
-            int a_pack[MR];
-            int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
             __global const char *b_kg =
                     b_tile + (size_t)kg * (size_t)KG_SLICE_B;
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else

@@ -270,6 +270,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DCASE32_WI_ROWMAJOR=" +
                       std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
+        if (reqd_wg_size_ > 0) {
+            build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+        }
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (scalar) {
             build_opts += " -DCASE32_NO_DPI=1";
@@ -337,6 +340,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
+                if (reqd_wg_size_ > 0) {
+                    build_opts2 += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+                }
                 if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
                     return adopt_kernel(label);
                 }
@@ -364,6 +370,15 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
 
     const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
                                ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+
+    /* One macro block per work-group whenever the device allows it (run_macro_batch_
+       then launches with local = kMacroWorkItems); tell the compiler the exact size via
+       reqd_work_group_size. Larger-than-device shapes keep the sliced launch and no
+       attribute. */
+    reqd_wg_size_ = 0;
+    if (static_cast<size_t>(case32::kMacroWorkItems) <= ocl_.max_work_group_size) {
+        reqd_wg_size_ = case32::kMacroWorkItems;
+    }
 
     std::vector<Case32OclDotBackend> candidates;
     if (issue_mode_ == 1) {
@@ -623,7 +638,14 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     }
 
     int slice_m = micro_m;
-    if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
+    if (reqd_wg_size_ > 0) {
+        /* Compiled with reqd_work_group_size(kMacroWorkItems): launch exactly that. */
+        if (reqd_wg_size_ != case32::kMacroWorkItems) {
+            std::fprintf(stderr, "[ocl] reqd work-group size %d != macro work-items %d\n",
+                         reqd_wg_size_, case32::kMacroWorkItems);
+            return false;
+        }
+    } else if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
         slice_m = static_cast<int>(max_wg / static_cast<size_t>(micro_n));
         if (slice_m < 1) {
             slice_m = 1;
@@ -724,8 +746,47 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
     uint64_t tiles_scanned = 0;
     int found = 0;
 
-    for (int mb0 = 0; mb0 < macro_blocks_ && !found; mb0 += macro_batch_) {
+    /* Keep two launches in flight. Per batch: enqueue the kernel, enqueue a
+       non-blocking read of found_flag (event), then wait for the previous
+       batch's read and inspect it. The GPU therefore always has the next batch
+       queued while the host checks the last one; the old clFinish + blocking
+       read left it idle for one host round trip per launch. A batch launched
+       after a hit is harmless: the kernel early-outs on found_flag and
+       t_rows/t_cols are latched by the first atomic winner. */
+    cl_event read_ev[2] = {nullptr, nullptr};
+    int found_slot[2] = {0, 0};
+    int batch_in_slot[2] = {0, 0};
+    int slot = 0;
+    int prev_slot = -1;
+    const uint64_t tiles_per_macro = case32::hash_tiles_per_macro();
+
+    auto drain = [&]() {
+        /* found_slot lives on this stack frame: every pending read must land before
+           we return, on all paths. */
+        clFinish(ocl_.queue);
+        for (cl_event &ev : read_ev) {
+            if (ev) {
+                clReleaseEvent(ev);
+                ev = nullptr;
+            }
+        }
+    };
+    auto account = [&](int s) {
+        tiles_scanned += static_cast<uint64_t>(batch_in_slot[s]) * tiles_per_macro;
+        if (out_tiles_scanned) {
+            *out_tiles_scanned = tiles_scanned;
+        }
+        if (on_progress) {
+            on_progress(tiles_scanned);
+        }
+        if (found_slot[s]) {
+            found = 1;
+        }
+    };
+
+    for (int mb0 = 0; mb0 < macro_blocks_; mb0 += macro_batch_) {
         if (should_cancel && should_cancel()) {
+            drain();
             return false;
         }
         int batch_count = macro_batch_;
@@ -733,21 +794,48 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
             batch_count = macro_blocks_ - mb0;
         }
         if (!run_macro_batch_(mb0, batch_count)) {
+            drain();
             return false;
         }
-        clFinish(ocl_.queue);
+        found_slot[slot] = 0;
+        batch_in_slot[slot] = batch_count;
+        const cl_int err = clEnqueueReadBuffer(ocl_.queue, found_buf_, CL_FALSE, 0, sizeof(int),
+                                               &found_slot[slot], 0, nullptr, &read_ev[slot]);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clEnqueueReadBuffer(found) failed: %s\n",
+                         OpenClContext::error_string(err).c_str());
+            drain();
+            return false;
+        }
+        clFlush(ocl_.queue);
 
-        if (!ocl_.read_buffer(found_buf_, &found, sizeof(int))) {
+        if (prev_slot >= 0) {
+            if (clWaitForEvents(1, &read_ev[prev_slot]) != CL_SUCCESS) {
+                drain();
+                return false;
+            }
+            clReleaseEvent(read_ev[prev_slot]);
+            read_ev[prev_slot] = nullptr;
+            account(prev_slot);
+            if (found) {
+                break;
+            }
+        }
+        prev_slot = slot;
+        slot ^= 1;
+    }
+
+    if (!found && prev_slot >= 0 && read_ev[prev_slot]) {
+        /* Last batch still in flight. */
+        if (clWaitForEvents(1, &read_ev[prev_slot]) != CL_SUCCESS) {
+            drain();
             return false;
         }
-        tiles_scanned += static_cast<uint64_t>(batch_count) * case32::hash_tiles_per_macro();
-        if (out_tiles_scanned) {
-            *out_tiles_scanned = tiles_scanned;
-        }
-        if (on_progress) {
-            on_progress(tiles_scanned);
-        }
+        clReleaseEvent(read_ev[prev_slot]);
+        read_ev[prev_slot] = nullptr;
+        account(prev_slot);
     }
+    drain();
 
     if (found) {
         int t_rows = -1;
