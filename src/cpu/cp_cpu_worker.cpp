@@ -285,9 +285,12 @@ extern "C" void cp_cpu_worker_init(void)
 #ifdef _OPENMP
     {
         /* --threads N wins; otherwise respect an explicit OMP_NUM_THREADS; else
-         * default to one thread per physical core (SMT siblings share the FMA
-         * ports the int8 GEMM saturates, so they add nothing), or per logical
-         * CPU with --smt. If the topology is unknown keep the runtime default. */
+         * default to one thread per logical CPU, or per physical core with
+         * --no-smt. Measured on a Zen4 8C/16T at 8192^2: AVX2 is indifferent to
+         * SMT (~875 GMAC/s either way, the kernel saturates the multiply
+         * ports), AVX512-VNNI gains ~30% (1.2 -> 1.6 TMAC/s) from the second
+         * thread hiding dpbusd and load latency. If the topology is unknown
+         * keep the runtime default. */
         int n = g_cpu_threads;
         const char* env_threads = getenv("OMP_NUM_THREADS");
         if(n <= 0 && !(env_threads && *env_threads))

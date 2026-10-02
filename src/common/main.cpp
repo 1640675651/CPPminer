@@ -176,10 +176,10 @@ static void print_usage(void)
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
     printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
     printf("  --threads N          OpenMP threads for the CPU backend (pearl and quantus).\n");
-    printf("                       Default: pearl = one per physical core, quantus = all\n");
-    printf("                       HW threads; OMP_NUM_THREADS overrides the default\n");
-    printf("  --smt                pearl CPU: also use SMT siblings (one thread per logical\n");
-    printf("                       CPU, pinned per CPU); default pins one thread per core\n");
+    printf("                       Default: all HW threads; OMP_NUM_THREADS overrides it\n");
+    printf("  --smt | --no-smt     pearl CPU: one pinned thread per logical CPU (default)\n");
+    printf("                       or one per physical core (SMT off; AVX2 gains nothing\n");
+    printf("                       from SMT, AVX512-VNNI gains ~30%% on Zen4)\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -900,6 +900,8 @@ int main(int argc, char** argv)
             g_cpu_threads = n;
         } else if(!strcmp(argv[i], "--smt")){
             g_cpu_smt = 1;
+        } else if(!strcmp(argv[i], "--no-smt")){
+            g_cpu_smt = 0;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             const char* login =
                 "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"

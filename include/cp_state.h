@@ -36,10 +36,11 @@ extern int g_cpu_matrix_gen;
 extern int g_max_nonce;
 /* Quantus OpenMP thread count; <=0 means omp_get_max_threads(). Set by --threads. */
 extern int g_qpow_threads;
-/* Pearl CPU OpenMP thread count; 0 = auto (one per physical core, or per logical
- * CPU with --smt; OMP_NUM_THREADS wins over auto). Set by --threads. */
+/* Pearl CPU OpenMP thread count; 0 = auto (one per logical CPU, or per physical
+ * core with --no-smt; OMP_NUM_THREADS wins over auto). Set by --threads. */
 extern int g_cpu_threads;
-/* Nonzero (--smt): Pearl CPU uses SMT siblings too, one thread per logical CPU. */
+/* Nonzero (default, --smt): Pearl CPU uses SMT siblings too, one thread per
+ * logical CPU. --no-smt: one thread per physical core. */
 extern int g_cpu_smt;
 
 /* Resolve cert version: forced CLI, else notify (1..3), else g_cert_version. */
