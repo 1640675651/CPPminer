@@ -8,7 +8,18 @@
 extern "C" {
 #endif
 
-/* Returns 0 if CUTLASS fused GEMM can run on the current device. */
+/* Warp-level MMA selection for the fused Case-10 kernel (--cuda-mma). */
+#define CP_CUTLASS_MMA_AUTO     0  /* tensorop on sm_75+, simt otherwise */
+#define CP_CUTLASS_MMA_SIMT     1  /* dp4a SIMT (Pascal path) */
+#define CP_CUTLASS_MMA_TENSOROP 2  /* int8 tensor cores (mma.sync.m8n8k16) */
+
+void cp_cutlass_set_mma_mode(int mode);
+int cp_cutlass_mma_mode(void);
+/* Kernel actually used on this device under the current mode (SIMT/TENSOROP). */
+int cp_cutlass_mma_kind(int dev);
+const char* cp_cutlass_mma_kind_name(int kind);
+
+/* Returns nonzero if the fused GEMM selected by the MMA mode can run on dev. */
 int cp_cutlass_device_ok(int dev);
 
 /* Fused GEMM + in-register milestone XOR for one period batch panel.
