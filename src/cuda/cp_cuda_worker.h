@@ -19,6 +19,7 @@ void cp_cuda_worker_set_row_period_batch(int batch);
 void cp_cuda_worker_set_col_period_batch(int batch);
 void cp_cuda_worker_set_step_major_ap(int on);
 void cp_cuda_worker_set_cutlass_fused(int on);
+void cp_cuda_worker_set_cuda_mma(int mode);
 void cp_cuda_worker_begin_job(const uint8_t job_key[32], int m, int n,
                               uint32_t cert_version);
 int cp_cuda_worker_handles_matrix_prep(void);
