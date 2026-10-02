@@ -518,8 +518,11 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     add_dependencies(cppminer cp_proof_ffi_build)
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
-elseif(EXISTS ${_cp_proof_lib})
+elseif(EXISTS ${_cp_proof_lib} AND NOT CMAKE_CROSSCOMPILING)
     # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
+    # Not when cross-compiling: the archive in target/release/ was built for
+    # the host, and lld only reports "archive member is neither ET_REL nor
+    # LLVM bitcode" at link time.
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
 else()
