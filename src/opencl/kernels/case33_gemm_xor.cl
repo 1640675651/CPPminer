@@ -92,6 +92,16 @@
 #ifndef CASE32_USE_LDS
 #define CASE32_USE_LDS 0
 #endif
+/* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
+   KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
+   -DCASE32_PIPELINE=0 restores the plain load-then-dot loop. */
+#ifndef CASE32_PIPELINE
+#define CASE32_PIPELINE 1
+#endif
+#if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
+#undef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
 /* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
 #ifndef SWZ_IM
 #define SWZ_IM 8
@@ -492,6 +502,27 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #if !CASE32_PACKED_DOT
         cpm_vec cpm[CPM_NVEC];
 #endif
+#if CASE32_PIPELINE
+        /* Software pipeline (register double buffer). In the coalesced layout a WI's
+           operands for k-group (kb, kg) sit at a_run + (kb*KGROUPS + kg)*MACRO_KG_STRIP_A
+           (same for B), i.e. the whole K walk is one flat stride, so the prefetch runs
+           across kb boundaries and never drains. Buffer 0 holds the k-group being
+           consumed; the loop is unrolled x2 so buffers alternate without copies. */
+        __global const char *a_run =
+                a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)tr * (size_t)KG_BYTES_A;
+        __global const char *b_run =
+                b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)tc * (size_t)KG_SLICE_B;
+        const int kg_last = blocks_k * KGROUPS - 1;
+        int kg_flat = 0;
+        int a_p0[MR];
+        int b_p0[NR];
+        int a_p1[MR];
+        int b_p1[NR];
+        case32_load_a_pack(a_p0, a_run);
+        case32_load_b_pack(b_p0, b_run);
+#endif
         int ms = 0;
         for (int kb = 0; kb < blocks_k; ++kb) {
 #if !CASE32_PACKED_DOT
@@ -546,6 +577,30 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 }
             }
             barrier(CLK_LOCAL_MEM_FENCE);
+        }
+#elif CASE32_PIPELINE
+        (void)a_kb_base;
+        (void)b_kb_base;
+        for (int kg = 0; kg < KGROUPS; kg += 2) {
+            /* kg+1 always exists (KGROUPS even); kg+2 may be the next kb's first
+               k-group, clamp at the very end (re-reads the last k-group, harmless). */
+            const int kg_n1 = kg_flat + 1;
+            const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
+            case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
+#else
+            case32_accum_kgroup(acc, cpm, a_p0, b_p0);
+#endif
+            case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
+#else
+            case32_accum_kgroup(acc, cpm, a_p1, b_p1);
+#endif
+            kg_flat += 2;
         }
 #else
         for (int kg = 0; kg < KGROUPS; ++kg) {
