@@ -637,10 +637,110 @@ pub unsafe extern "C" fn cp_proof_verify(
     }
 }
 
+/// gzip a base64 plain_proof for the Kryptex stratum v2 ("type":"v2") submit path:
+/// base64-decode `in_b64`, gzip the raw bincode bytes (standard gzip stream, zlib wbits 31),
+/// base64-encode the gzip stream into `out_b64`. Returns 0 on success, -1 on error.
+fn gzip_b64(in_b64: &str, level: u32) -> Result<String, String> {
+    use std::io::Write;
+    let raw = STANDARD
+        .decode(in_b64.trim())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(raw.len() / 2 + 64),
+        flate2::Compression::new(level),
+    );
+    enc.write_all(&raw).map_err(|e| format!("gzip: {e}"))?;
+    let gz = enc.finish().map_err(|e| format!("gzip finish: {e}"))?;
+    Ok(STANDARD.encode(gz))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cp_proof_gzip_b64(
+    in_b64: *const u8,
+    out_b64: *mut u8,
+    out_cap: usize,
+    err: *mut u8,
+    err_cap: usize,
+) -> i32 {
+    let err_slice = if err.is_null() || err_cap == 0 {
+        None
+    } else {
+        Some(std::slice::from_raw_parts_mut(err, err_cap))
+    };
+    let fail = |msg: String| {
+        write_err(err_slice, &msg);
+        -1
+    };
+    if in_b64.is_null() || out_b64.is_null() || out_cap == 0 {
+        return fail("null pointer".into());
+    }
+    let input = match std::ffi::CStr::from_ptr(in_b64 as *const std::os::raw::c_char).to_str() {
+        Ok(s) => s,
+        Err(e) => return fail(format!("in_b64 is not UTF-8: {e}")),
+    };
+    let gz_b64 = match gzip_b64(input, flate2::Compression::default().level()) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    if gz_b64.len() >= out_cap {
+        return fail(format!(
+            "out_b64 too small: need {} bytes, cap {}",
+            gz_b64.len() + 1,
+            out_cap
+        ));
+    }
+    let out = std::slice::from_raw_parts_mut(out_b64, out_cap);
+    out[..gz_b64.len()].copy_from_slice(gz_b64.as_bytes());
+    out[gz_b64.len()] = 0;
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pearl_blake3::{pad_to_chunk_boundary, MerkleTree};
+
+    #[test]
+    fn gzip_b64_round_trip_is_a_gzip_stream() {
+        use std::io::Read;
+        // Repetitive payload like a sparse A row + zero B^T strip.
+        let mut raw = vec![0u8; 8192];
+        raw[17] = 5;
+        raw[4000] = 0xF3;
+        let in_b64 = STANDARD.encode(&raw);
+        let gz_b64 = gzip_b64(&in_b64, 6).unwrap();
+        let gz = STANDARD.decode(&gz_b64).unwrap();
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+        assert_eq!(gz[2], 8, "deflate method");
+        assert!(gz.len() < raw.len() / 20, "gzip did not compress: {} -> {}", raw.len(), gz.len());
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut back).unwrap();
+        assert_eq!(back, raw);
+
+        // C entry point: NUL-terminated in, bounded out, error on short buffer.
+        let cin = std::ffi::CString::new(in_b64.clone()).unwrap();
+        let mut out = vec![0u8; gz_b64.len() + 1];
+        let mut err = vec![0u8; 128];
+        let rc = unsafe {
+            cp_proof_gzip_b64(cin.as_ptr() as *const u8, out.as_mut_ptr(), out.len(),
+                              err.as_mut_ptr(), err.len())
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(&out[..gz_b64.len()], gz_b64.as_bytes());
+        assert_eq!(out[gz_b64.len()], 0);
+        let rc = unsafe {
+            cp_proof_gzip_b64(cin.as_ptr() as *const u8, out.as_mut_ptr(), 8,
+                              err.as_mut_ptr(), err.len())
+        };
+        assert_eq!(rc, -1);
+        assert!(err.starts_with(b"out_b64 too small"));
+        let rc = unsafe {
+            cp_proof_gzip_b64(b"not*base64\0".as_ptr(), out.as_mut_ptr(), out.len(),
+                              err.as_mut_ptr(), err.len())
+        };
+        assert_eq!(rc, -1);
+        assert!(err.starts_with(b"base64 decode"));
+    }
 
     /// Stock pearl-blake3 full-tree proof: the reference every in-place / witness proof must match.
     fn reference_matrix_proof(

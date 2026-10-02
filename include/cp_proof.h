@@ -86,6 +86,17 @@ int cp_proof_build_witness(
     char* err,
     size_t err_cap);
 
+/* Kryptex stratum v2 ("type":"v2" in the authorize response): gzip a plain_proof.
+ * base64-decodes in_b64, gzips the raw bincode bytes (standard gzip stream = zlib
+ * wbits 31, default level) and base64-encodes the gzip stream into out_b64.
+ * Returns 0 on ok, -1 on error (err filled). */
+int cp_proof_gzip_b64(
+    const char* in_b64,
+    char* out_b64,
+    size_t out_cap,
+    char* err,
+    size_t err_cap);
+
 /* Verify plain_proof base64 against pool share target (32-byte BE U256, unscaled).
  * cert_version: 1/2 = legacy noise seeds, 3 = salted (V3). Returns 0 on ok. */
 int cp_proof_verify(
