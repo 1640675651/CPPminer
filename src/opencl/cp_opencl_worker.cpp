@@ -84,6 +84,12 @@ bool ocl_device_is_amd(const OclDeviceInfo &dev) {
            string_contains_ci(dev.device_name.c_str(), "gfx");
 }
 
+bool ocl_device_is_qualcomm(const OclDeviceInfo &dev) {
+    return string_contains_ci(dev.vendor_name.c_str(), "qualcomm") ||
+           string_contains_ci(dev.platform_name.c_str(), "qualcomm") ||
+           string_contains_ci(dev.device_name.c_str(), "adreno");
+}
+
 } /* namespace */
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n, int cpu_prep) {
@@ -288,8 +294,8 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
     int tile_mr = 4;
     int tile_nr = 8;
     const char *source = "default 4x8";
-    const int macro_m = g_macro_m;
-    const int macro_n = g_macro_n;
+    int macro_m = g_macro_m;
+    int macro_n = g_macro_n;
 
     if (g_tile_mr > 0 && g_tile_nr > 0) {
         if (!case32::configure(g_tile_mr, g_tile_nr, macro_m, macro_n)) {
@@ -314,6 +320,19 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
                 tile_nr = 16;
                 tile_mr = PP_HASH_H;
                 source = "AMD GPU auto 8x16";
+            } else if (ocl_device_is_qualcomm(dev)) {
+                /* Adreno spills the 4x8 and 8x8 register tiles to private
+                 * memory (CL_KERNEL_PRIVATE_MEM_SIZE 512-880 B/WI) and runs
+                 * at ~15 GMAC/s; the 4x4 tile stays in registers. Measured on
+                 * an Adreno 830: 4x4/64x64 ~700 GMAC/s, 4x4/128x128 ~620,
+                 * 4x8 ~15, 8x8 ~15. The hash tile stays 4x8. */
+                tile_mr = 4;
+                tile_nr = 4;
+                if (macro_m <= 0 && macro_n <= 0) {
+                    macro_m = 64;
+                    macro_n = 64;
+                }
+                source = "Adreno auto 4x4";
             }
         }
         if (!case32::configure(tile_mr, tile_nr, macro_m, macro_n)) {
