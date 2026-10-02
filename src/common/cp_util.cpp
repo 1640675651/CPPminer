@@ -369,9 +369,18 @@ int cp_pp_hash_tile_w(void)
 
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
 {
+    /* Pool share target from a stratum difficulty. This is the UNSCALED pool
+     * target: the per-tile jackpot bound is derived from it later by
+     * cp_scale_jackpot_target (x h*w*(k/r)*PENALTY_BASE_RANK, matching the
+     * pool's adjust_target). A pool cannot know the miner's hash-tile shape
+     * when it sets the difficulty, so this conversion must not depend on the
+     * active tile either: use the canonical PP_HASH_H x PP_HASH_W constants.
+     * Using cp_active_hash_h/w here scaled the target by h*w a second time,
+     * making the per-tile bound proportional to (h*w)^2 and the share rate
+     * proportional to h*w (4x8 found 1/4 of the 8x16 shares per attempt). */
     memset(tgt, 0, 8 * sizeof(uint32_t));
     long double exp_val = 256.0L - (long double)difficulty
-        + log2l((long double)(R_RANK * cp_active_hash_h() * cp_active_hash_w()));
+        + log2l((long double)(R_RANK * PP_HASH_H * PP_HASH_W));
     if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val > 0.0L){
