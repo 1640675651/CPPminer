@@ -6,6 +6,7 @@
 - OneDNN backend now supports Xe-HPG GPU with XMX cores with tuned performance
 - AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected) (thanks @danifest751)
 - ARM i8mm kernel (thanks @danifest751)
+- Kryptex "Pearl stratum gzip protocol" (v2): `mining.authorize` offers `"type":"v2"`; when the pool's response carries `"type":"v2"` the `plain_proof` is submitted as base64 of the gzip stream. Pools that do not answer `type v2` (LuckyPool) keep plain proofs. `--pool-pass STR` sets the authorize `password` (Kryptex custom difficulty `d=N`); on a kryptex host the wallet is also sent as `WALLET.worker` (thanks @danifest751)
 
 ### Fix & Enhancements
 - NEON DotProd and basic NEON kernel rewrite, reduce instruction count (thanks @danifest751)

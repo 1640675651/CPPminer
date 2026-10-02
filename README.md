@@ -126,7 +126,8 @@ cppminer --backend opencl --devices 0 --mock
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`).
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
-| `--worker` | Worker name (default `rig01`) |
+| `--worker` | Worker name (default `rig01`). On a `kryptex` pool host the wallet is sent as `WALLET.worker` as well |
+| `--pool-pass STR` | `mining.authorize` password (default `x`). Kryptex reads a custom share difficulty from it: `--pool-pass d=2097152` (their default; `d = hashrate_H/s * target_share_seconds / 4294967296`) |
 | `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
 | `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
@@ -307,6 +308,18 @@ Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
 Copy-Item -Recurse pearl\zk-pow       third_party\zk-pow
 Copy-Item -Recurse pearl\plonky2      third_party\plonky2
 ```
+
+## Kryptex gzip stratum (v2)
+
+Kryptex's "Pearl stratum gzip protocol" ([spec](https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe)) is response-driven:
+
+- `mining.authorize` always carries `"password"` (`--pool-pass`, default `x`) and `"type":"v2"`. On a `kryptex` host the `wallet` is sent as `WALLET.worker`; the separate `worker`/`agent` fields (LuckyPool) are sent too.
+- If the pool answers `{"error":null,"id":1,"result":true,"type":"v2"}` the miner logs `[pool] proof encoding: gzip` and every `mining.submit` carries `plain_proof` = base64 of the **gzip** stream (zlib wbits 31) of the bincode proof (`cp_proof_gzip_b64` in `rust/cp-proof-ffi`, pure-Rust miniz_oxide). `[plain] proof gzip: N -> M chars` shows the saving per share.
+- A response without `"type":"v2"` (LuckyPool) keeps plain base64 proofs. The flag is re-evaluated on every authorize (dev-fee wallet switch included).
+- Custom share difficulty: `--pool-pass d=2097152` (Kryptex default; `d = hashrate_H/s * target_share_seconds / 4294967296`).
+
+gzip helps most when the committed matrices are repetitive: the CPU backend's sparse random A (one write per column) and the all-zero B^T compress ~61x (134764 -> 2200 base64 chars); the GPU backends' dense random A rows only 2.2-3.3x (about 40 KB per proof).
+
 ## Dev Fee
 
 A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
