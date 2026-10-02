@@ -5,8 +5,10 @@
 
 #if defined(_MSC_VER)
 #define CASE33_FORCEINLINE __forceinline
+#define CASE33_NOINLINE __declspec(noinline)
 #else
 #define CASE33_FORCEINLINE inline __attribute__((always_inline))
+#define CASE33_NOINLINE __attribute__((noinline))
 #endif
 
 namespace {
@@ -19,58 +21,146 @@ constexpr int kPanelB = kKR * kNR;
 constexpr int kColsPerGroup = 8;
 constexpr int kRank = 4;
 constexpr int kKGroups = kKR / kRank;
+constexpr int kKGroupBytes = kColsPerGroup * kRank; /* 32 B of A rows / B cols per k-group */
+constexpr int kKUnroll = 4;
 
-CASE33_FORCEINLINE __m256i rank4_maddubs(__m256i acc, __m256i ua, __m256i sb,
-                                         __m256i ones16) {
+static_assert(kMR == 8 && kNR == 2 * kColsPerGroup, "AVX2 ukernel assumes an 8x16 tile");
+static_assert(kKGroups % kKUnroll == 0, "k-group loop is unrolled by kKUnroll");
+
+/* Register budget (16 ymm).
+ *
+ * Accumulating the whole 8x16 tile at once needs 16 int32 accumulators plus
+ * the A vector, the vpmaddwd ones constant and broadcast/pair temporaries
+ * (19+ live values), so GCC kept the accumulators on the stack and every
+ * k-step became a load-op + store per accumulator (108 vmovdqu %ymm,(%rsp)
+ * in the hot loop). Instead each KR=128 panel is swept twice over all 32
+ * k-groups: columns 0-7 first, then columns 8-15. One sweep keeps 8
+ * accumulators + A + ones + 2-3 temporaries (~12 live) and stays entirely in
+ * registers; A (1 KiB per panel) is re-read from L1 on the second sweep.
+ * int32 wrap-around addition is associative, so every tile cell sums exactly
+ * the same products and the milestone XOR is bit-identical to the single
+ * sweep. */
+struct Acc8 {
+    __m256i c0, c1, c2, c3, c4, c5, c6, c7;
+};
+
+CASE33_FORCEINLINE void zero_acc8(Acc8 &acc) {
+    const __m256i z = _mm256_setzero_si256();
+    acc.c0 = z;
+    acc.c1 = z;
+    acc.c2 = z;
+    acc.c3 = z;
+    acc.c4 = z;
+    acc.c5 = z;
+    acc.c6 = z;
+    acc.c7 = z;
+}
+
+/* Pin a value to a ymm register at this point in the dependency chain.
+ * Without it GCC's -ftree-reassoc rewrites the unrolled acc += p0; acc += p1;
+ * ... chain as acc + ((p0 + p1) + ...), making every product of the unrolled
+ * body live at once (32 ymm) and spilling them all to the stack. The empty asm
+ * is free (no instruction) and keeps the chain acc -> add -> add -> ... */
+CASE33_FORCEINLINE __m256i pin_reg(__m256i v) {
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__("" : "+x"(v));
+#endif
+    return v;
+}
+
+CASE33_FORCEINLINE __m256i rank4_maddubs(__m256i acc, __m256i ua, __m256i sb) {
     const __m256i pair16 = _mm256_maddubs_epi16(ua, sb);
-    return _mm256_add_epi32(acc, _mm256_madd_epi16(pair16, ones16));
+    /* Constant; the compiler materialises it once per sweep. */
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    return pin_reg(_mm256_add_epi32(acc, _mm256_madd_epi16(pair16, ones16)));
 }
 
-CASE33_FORCEINLINE __m256i broadcast_rank4_b(int32_t packed_b4) {
-    return _mm256_broadcastd_epi32(_mm_cvtsi32_si128(packed_b4));
+/* Column c's rank-4 B bytes broadcast to all 8 lanes (folds into vpbroadcastd mem). */
+CASE33_FORCEINLINE __m256i broadcast_rank4_b(const int32_t *bp) {
+    return _mm256_broadcastd_epi32(_mm_cvtsi32_si128(*bp));
 }
 
-CASE33_FORCEINLINE void rank4_kgroup_update8_fast(__m256i acc[kColsPerGroup], const __m256i ua,
-                                                  const int32_t *bp, __m256i ones16) {
-    const __m256i b0 = broadcast_rank4_b(bp[0]);
-    const __m256i b1 = broadcast_rank4_b(bp[1]);
-    const __m256i b2 = broadcast_rank4_b(bp[2]);
-    const __m256i b3 = broadcast_rank4_b(bp[3]);
-    const __m256i b4 = broadcast_rank4_b(bp[4]);
-    const __m256i b5 = broadcast_rank4_b(bp[5]);
-    const __m256i b6 = broadcast_rank4_b(bp[6]);
-    const __m256i b7 = broadcast_rank4_b(bp[7]);
-
-    acc[0] = rank4_maddubs(acc[0], ua, b0, ones16);
-    acc[1] = rank4_maddubs(acc[1], ua, b1, ones16);
-    acc[2] = rank4_maddubs(acc[2], ua, b2, ones16);
-    acc[3] = rank4_maddubs(acc[3], ua, b3, ones16);
-    acc[4] = rank4_maddubs(acc[4], ua, b4, ones16);
-    acc[5] = rank4_maddubs(acc[5], ua, b5, ones16);
-    acc[6] = rank4_maddubs(acc[6], ua, b6, ones16);
-    acc[7] = rank4_maddubs(acc[7], ua, b7, ones16);
+/* One rank-4 k-group for an 8x8 half: acc.c[j] += A(8 rows x 4 k) . B(col j, 4 k).
+ * Fast path: A is u8 (compensated via b_comp), B is s8.
+ * Exact path: |A| as u8 against sign(B, A) so each product keeps its sign. */
+template <bool kExact>
+CASE33_FORCEINLINE void kgroup_update8(Acc8 &acc, const int8_t *a, const int32_t *bp) {
+    const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a));
+    if constexpr (kExact) {
+        const __m256i abs_a = _mm256_sign_epi8(va, va);
+        acc.c0 = rank4_maddubs(acc.c0, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 0), va));
+        acc.c1 = rank4_maddubs(acc.c1, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 1), va));
+        acc.c2 = rank4_maddubs(acc.c2, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 2), va));
+        acc.c3 = rank4_maddubs(acc.c3, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 3), va));
+        acc.c4 = rank4_maddubs(acc.c4, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 4), va));
+        acc.c5 = rank4_maddubs(acc.c5, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 5), va));
+        acc.c6 = rank4_maddubs(acc.c6, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 6), va));
+        acc.c7 = rank4_maddubs(acc.c7, abs_a, _mm256_sign_epi8(broadcast_rank4_b(bp + 7), va));
+    } else {
+        acc.c0 = rank4_maddubs(acc.c0, va, broadcast_rank4_b(bp + 0));
+        acc.c1 = rank4_maddubs(acc.c1, va, broadcast_rank4_b(bp + 1));
+        acc.c2 = rank4_maddubs(acc.c2, va, broadcast_rank4_b(bp + 2));
+        acc.c3 = rank4_maddubs(acc.c3, va, broadcast_rank4_b(bp + 3));
+        acc.c4 = rank4_maddubs(acc.c4, va, broadcast_rank4_b(bp + 4));
+        acc.c5 = rank4_maddubs(acc.c5, va, broadcast_rank4_b(bp + 5));
+        acc.c6 = rank4_maddubs(acc.c6, va, broadcast_rank4_b(bp + 6));
+        acc.c7 = rank4_maddubs(acc.c7, va, broadcast_rank4_b(bp + 7));
+    }
 }
 
-CASE33_FORCEINLINE void rank4_kgroup_update8_exact(__m256i acc[kColsPerGroup], const __m256i abs_a,
-                                                   const __m256i va, const int32_t *bp,
-                                                   __m256i ones16) {
-    const __m256i b0 = broadcast_rank4_b(bp[0]);
-    const __m256i b1 = broadcast_rank4_b(bp[1]);
-    const __m256i b2 = broadcast_rank4_b(bp[2]);
-    const __m256i b3 = broadcast_rank4_b(bp[3]);
-    const __m256i b4 = broadcast_rank4_b(bp[4]);
-    const __m256i b5 = broadcast_rank4_b(bp[5]);
-    const __m256i b6 = broadcast_rank4_b(bp[6]);
-    const __m256i b7 = broadcast_rank4_b(bp[7]);
+CASE33_FORCEINLINE __m256i xor_acc8(const Acc8 &acc) {
+    __m256i x = _mm256_xor_si256(acc.c0, acc.c1);
+    x = _mm256_xor_si256(x, acc.c2);
+    x = _mm256_xor_si256(x, acc.c3);
+    x = _mm256_xor_si256(x, acc.c4);
+    x = _mm256_xor_si256(x, acc.c5);
+    x = _mm256_xor_si256(x, acc.c6);
+    x = _mm256_xor_si256(x, acc.c7);
+    return x;
+}
 
-    acc[0] = rank4_maddubs(acc[0], abs_a, _mm256_sign_epi8(b0, va), ones16);
-    acc[1] = rank4_maddubs(acc[1], abs_a, _mm256_sign_epi8(b1, va), ones16);
-    acc[2] = rank4_maddubs(acc[2], abs_a, _mm256_sign_epi8(b2, va), ones16);
-    acc[3] = rank4_maddubs(acc[3], abs_a, _mm256_sign_epi8(b3, va), ones16);
-    acc[4] = rank4_maddubs(acc[4], abs_a, _mm256_sign_epi8(b4, va), ones16);
-    acc[5] = rank4_maddubs(acc[5], abs_a, _mm256_sign_epi8(b5, va), ones16);
-    acc[6] = rank4_maddubs(acc[6], abs_a, _mm256_sign_epi8(b6, va), ones16);
-    acc[7] = rank4_maddubs(acc[7], abs_a, _mm256_sign_epi8(b7, va), ones16);
+/* Fold this milestone's FastU8S8 column compensation (8 consecutive columns) into
+ * the live register accs. */
+CASE33_FORCEINLINE void apply_b_comp_acc8(Acc8 &acc, const int32_t *comp8) {
+    acc.c0 = _mm256_add_epi32(acc.c0, _mm256_set1_epi32(comp8[0]));
+    acc.c1 = _mm256_add_epi32(acc.c1, _mm256_set1_epi32(comp8[1]));
+    acc.c2 = _mm256_add_epi32(acc.c2, _mm256_set1_epi32(comp8[2]));
+    acc.c3 = _mm256_add_epi32(acc.c3, _mm256_set1_epi32(comp8[3]));
+    acc.c4 = _mm256_add_epi32(acc.c4, _mm256_set1_epi32(comp8[4]));
+    acc.c5 = _mm256_add_epi32(acc.c5, _mm256_set1_epi32(comp8[5]));
+    acc.c6 = _mm256_add_epi32(acc.c6, _mm256_set1_epi32(comp8[6]));
+    acc.c7 = _mm256_add_epi32(acc.c7, _mm256_set1_epi32(comp8[7]));
+}
+
+/* Sweep all k-groups of one KR panel for one 8-column half, then fold this
+ * milestone's FastU8S8 column compensation (comp8: 8 consecutive columns, may be
+ * null) into the accumulators and return their 8-lane XOR fold.
+ *
+ * Deliberately NOT inlined: as an out-of-line function nothing but these 8
+ * accumulators, A, ones16 and a few temporaries is live inside the k-loop, so
+ * the register allocator has no live-through values (the other half's
+ * accumulators) competing for the 16 ymm registers. Inlined, GCC kept 2-3 of
+ * the other half's accumulators in registers and round-tripped 2-3 of ours
+ * through the stack on every unrolled iteration. The call + 8 loads + 8 stores
+ * per 256 vpmaddubsw is noise. */
+template <bool kExact>
+CASE33_NOINLINE __m256i half_panel_kgroups(Acc8 *acc_io, const int8_t *a_tile,
+                                           const int8_t *b_half, const int32_t *comp8) {
+    Acc8 acc = *acc_io;
+    for (int kg = 0; kg < kKGroups; kg += kKUnroll) {
+        const int8_t *a = a_tile + static_cast<size_t>(kg) * kKGroupBytes;
+        const int32_t *bp =
+                reinterpret_cast<const int32_t *>(b_half + static_cast<size_t>(kg) * kKGroupBytes);
+        kgroup_update8<kExact>(acc, a, bp);
+        kgroup_update8<kExact>(acc, a + kKGroupBytes, bp + kColsPerGroup);
+        kgroup_update8<kExact>(acc, a + 2 * kKGroupBytes, bp + 2 * kColsPerGroup);
+        kgroup_update8<kExact>(acc, a + 3 * kKGroupBytes, bp + 3 * kColsPerGroup);
+    }
+    if (comp8) {
+        apply_b_comp_acc8(acc, comp8);
+    }
+    *acc_io = acc;
+    return xor_acc8(acc);
 }
 
 CASE33_FORCEINLINE uint32_t reduce_xor_epi32(__m256i v) {
@@ -81,129 +171,35 @@ CASE33_FORCEINLINE uint32_t reduce_xor_epi32(__m256i v) {
     return static_cast<uint32_t>(_mm_cvtsi128_si32(x));
 }
 
-/* XOR-fold all 8x16 cumulative C cells held in register accs. */
-CASE33_FORCEINLINE uint32_t xor_micro_acc(const __m256i acc0[kColsPerGroup],
-                                          const __m256i acc1[kColsPerGroup]) {
-    __m256i x = _mm256_setzero_si256();
-    for (int c = 0; c < kColsPerGroup; ++c) {
-        x = _mm256_xor_si256(x, acc0[c]);
-        x = _mm256_xor_si256(x, acc1[c]);
-    }
-    return reduce_xor_epi32(x);
-}
+template <bool kExact>
+CASE33_FORCEINLINE void avx2_fused_k_sweep(const int8_t *a_base, const int8_t *b_base,
+                                           int blocks_k, int N, int global_col0,
+                                           size_t spatial_tile_id, size_t tile_count,
+                                           const int32_t *b_comp_ms, bool xor_after_milestone,
+                                           uint32_t *tile_xor_out) {
+    Acc8 lo; /* tile columns 0-7 */
+    Acc8 hi; /* tile columns 8-15 */
+    zero_acc8(lo);
+    zero_acc8(hi);
 
-/* Fold this milestone's FastU8S8 column compensation into the live register accs. */
-CASE33_FORCEINLINE void apply_b_comp_to_acc(__m256i acc0[kColsPerGroup],
-                                            __m256i acc1[kColsPerGroup],
-                                            const int32_t *b_comp_slice, int global_col0) {
-    for (int c = 0; c < kColsPerGroup; ++c) {
-        acc0[c] = _mm256_add_epi32(
-                acc0[c], _mm256_set1_epi32(b_comp_slice[global_col0 + c]));
-        acc1[c] = _mm256_add_epi32(
-                acc1[c],
-                _mm256_set1_epi32(b_comp_slice[global_col0 + kColsPerGroup + c]));
-    }
-}
-
-template <typename UpdateFn>
-CASE33_FORCEINLINE void avx2_micro_gemm_kgroups(__m256i acc0[kColsPerGroup],
-                                                __m256i acc1[kColsPerGroup],
-                                                const int8_t *a_tile, const int8_t *b_jg0,
-                                                const int8_t *b_jg1, UpdateFn update) {
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    int kg = 0;
-    for (; kg + 1 < kKGroups; kg += 2) {
-        const __m256i va0 =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg * 32));
-        const int32_t *bp0_0 =
-                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg) * 32);
-        const int32_t *bp1_0 =
-                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg) * 32);
-        update(acc0, va0, bp0_0, ones16);
-        update(acc1, va0, bp1_0, ones16);
-
-        const int kg1 = kg + 1;
-        const __m256i va1 =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg1 * 32));
-        const int32_t *bp0_1 =
-                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg1) * 32);
-        const int32_t *bp1_1 =
-                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg1) * 32);
-        update(acc0, va1, bp0_1, ones16);
-        update(acc1, va1, bp1_1, ones16);
-    }
-    for (; kg < kKGroups; ++kg) {
-        const __m256i va =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_tile + kg * 32));
-        const int32_t *bp0 =
-                reinterpret_cast<const int32_t *>(b_jg0 + static_cast<size_t>(kg) * 32);
-        const int32_t *bp1 =
-                reinterpret_cast<const int32_t *>(b_jg1 + static_cast<size_t>(kg) * 32);
-        update(acc0, va, bp0, ones16);
-        update(acc1, va, bp1, ones16);
-    }
-}
-
-CASE33_FORCEINLINE void zero_micro_acc(__m256i acc0[kColsPerGroup],
-                                       __m256i acc1[kColsPerGroup]) {
-    for (int col = 0; col < kColsPerGroup; ++col) {
-        acc0[col] = _mm256_setzero_si256();
-        acc1[col] = _mm256_setzero_si256();
-    }
-}
-
-void avx2_micro_gemm_xor_fused_k_impl(const int8_t *a_base, const int8_t *b_base, int blocks_k,
-                                      int blocks_per_milestone, int num_milestones, int N,
-                                      int global_col0, size_t spatial_tile_id, size_t tile_count,
-                                      const int32_t *b_comp_ms, bool use_fast_u8s8,
-                                      bool xor_after_milestone, uint32_t *tile_xor_out) {
-    __m256i acc0[kColsPerGroup];
-    __m256i acc1[kColsPerGroup];
-    zero_micro_acc(acc0, acc1);
-    (void)blocks_per_milestone;
-
-    int ms = 0;
-    const auto milestone_epilogue = [&](const int32_t *b_comp_slice) {
-        if (b_comp_slice) {
-            apply_b_comp_to_acc(acc0, acc1, b_comp_slice, global_col0);
-        }
+    /* One milestone per KR panel (blocks_per_milestone == 1), so ms == kb. */
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
+        const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
+        const int32_t *comp =
+                b_comp_ms ? b_comp_ms + static_cast<size_t>(kb) * static_cast<size_t>(N) +
+                                    static_cast<size_t>(global_col0)
+                          : nullptr;
+        const __m256i x_lo = half_panel_kgroups<kExact>(&lo, a_tile, b_tile, comp);
+        const __m256i x_hi = half_panel_kgroups<kExact>(
+                &hi, a_tile, b_tile + static_cast<size_t>(kKGroups) * kKGroupBytes,
+                comp ? comp + kColsPerGroup : nullptr);
         if (xor_after_milestone) {
-            tile_xor_out[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
-                    xor_micro_acc(acc0, acc1);
-        }
-        ++ms;
-    };
-
-    if (use_fast_u8s8) {
-        const auto update_fast = [](__m256i acc[kColsPerGroup], const __m256i ua,
-                                    const int32_t *bp, const __m256i ones16) {
-            rank4_kgroup_update8_fast(acc, ua, bp, ones16);
-        };
-        for (int kb = 0; kb < blocks_k; ++kb) {
-            const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
-            const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
-            avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
-                                    b_tile + static_cast<size_t>(kKGroups) * 32, update_fast);
-            const int32_t *b_comp_slice =
-                    b_comp_ms ? b_comp_ms + static_cast<size_t>(ms) * static_cast<size_t>(N)
-                              : nullptr;
-            milestone_epilogue(b_comp_slice);
-        }
-    } else {
-        const auto update_exact = [](__m256i acc[kColsPerGroup], const __m256i va,
-                                     const int32_t *bp, const __m256i ones16) {
-            const __m256i abs_a = _mm256_sign_epi8(va, va);
-            rank4_kgroup_update8_exact(acc, abs_a, va, bp, ones16);
-        };
-        for (int kb = 0; kb < blocks_k; ++kb) {
-            const int8_t *a_tile = a_base + static_cast<size_t>(kb) * kPanelA;
-            const int8_t *b_tile = b_base + static_cast<size_t>(kb) * kPanelB;
-            avx2_micro_gemm_kgroups(acc0, acc1, a_tile, b_tile,
-                                    b_tile + static_cast<size_t>(kKGroups) * 32, update_exact);
-            milestone_epilogue(nullptr);
+            /* XOR-fold of all 8x16 cumulative C cells after this milestone. */
+            tile_xor_out[static_cast<size_t>(kb) * tile_count + spatial_tile_id] =
+                    reduce_xor_epi32(_mm256_xor_si256(x_lo, x_hi));
         }
     }
-    (void)num_milestones;
 }
 
 } // namespace
@@ -213,8 +209,14 @@ void case33_avx2_micro_gemm_xor_fused_k(
         int num_milestones, int N, int global_col0, size_t spatial_tile_id, size_t tile_count,
         const int32_t *b_comp_ms, bool use_fast_u8s8, bool xor_after_milestone,
         uint32_t *tile_xor_out) {
-    avx2_micro_gemm_xor_fused_k_impl(a_base, b_base, blocks_k, blocks_per_milestone,
-                                     num_milestones, N, global_col0, spatial_tile_id,
-                                     tile_count, b_comp_ms, use_fast_u8s8,
-                                     xor_after_milestone, tile_xor_out);
+    (void)blocks_per_milestone;
+    (void)num_milestones;
+    if (use_fast_u8s8) {
+        avx2_fused_k_sweep<false>(a_base, b_base, blocks_k, N, global_col0, spatial_tile_id,
+                                  tile_count, b_comp_ms, xor_after_milestone, tile_xor_out);
+    } else {
+        /* Exact s8s8 needs no column compensation. */
+        avx2_fused_k_sweep<true>(a_base, b_base, blocks_k, N, global_col0, spatial_tile_id,
+                                 tile_count, nullptr, xor_after_milestone, tile_xor_out);
+    }
 }
