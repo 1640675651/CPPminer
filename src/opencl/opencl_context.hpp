@@ -80,6 +80,9 @@ struct OpenClContext {
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
+
+private:
+    static void dump_program_binary_(cl_program prog);
 };
 
 std::string read_text_file(const char *path);
