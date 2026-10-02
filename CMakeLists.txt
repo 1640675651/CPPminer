@@ -794,6 +794,19 @@ else()
         set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
         set(OpenMP_omp_LIBRARY "${OpenMP_ROOT}/lib/libomp.dylib" CACHE FILEPATH "" FORCE)
     endif()
+    if(MINGW)
+        # FindOpenMP picks libgomp.dll.a, an import library, which keeps the
+        # exe bound to libgomp-1.dll even under -static (see the MINGW block
+        # below). Point it at the static archive instead.
+        get_filename_component(_cp_gcc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        find_library(_cp_gomp_static NAMES libgomp.a
+            HINTS "${_cp_gcc_bin}/../lib")
+        unset(_cp_gcc_bin)
+        if(_cp_gomp_static)
+            set(OpenMP_gomp_LIBRARY "${_cp_gomp_static}" CACHE FILEPATH "" FORCE)
+        endif()
+        unset(_cp_gomp_static)
+    endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(cppminer PRIVATE OpenMP::OpenMP_CXX)
@@ -819,6 +832,17 @@ endif()
 
 if(WIN32)
     target_link_libraries(cppminer PRIVATE ws2_32)
+endif()
+
+if(MINGW)
+    # Embed libstdc++, libgcc, libwinpthread and libgomp. A MinGW exe that
+    # imports libstdc++-6.dll takes the first one on PATH, and other
+    # toolchains ship their own (Git for Windows' /mingw64/bin, for one).
+    # A DLL from a different GCC has a different std::locale/ios layout, and
+    # the first iostream use then crashes in std::locale::operator=. The
+    # OpenCL worker hit exactly that while reading its kernel source. The
+    # import libraries (OpenCL, ws2_32, ...) are archives and still link.
+    target_link_options(cppminer PRIVATE -static)
 endif()
 
 if(CP_STATIC_LIBCXX AND NOT MSVC)
