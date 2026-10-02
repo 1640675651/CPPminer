@@ -215,10 +215,12 @@ ensure_cutlass() {
 
 # ── Auto-detect CUDA root ────────────────────────────────────────────────────
 find_cuda_root() {
+    # CUDA_HOME first so an explicit choice wins; ":-" keeps `set -u` quiet
+    # when it is not exported (the usual case outside CUDA docker images).
     local candidates=(
+        "${CUDA_HOME:-}"
         "/usr/local/cuda"
         "/usr/local/cuda-"*
-        "${CUDA_HOME}"
     )
     local c
     for c in "${candidates[@]}"; do
