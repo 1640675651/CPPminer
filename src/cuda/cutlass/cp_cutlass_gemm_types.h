@@ -124,11 +124,16 @@ struct GemmTypesCase9
       /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
 
-/* SIMT dp4a (Pascal and anything without usable int8 tensor cores). */
+/* SIMT dp4a (Pascal and anything without usable int8 tensor cores).
+ * Alignment 4 = one dp4a int8x4 access. Note that CUTLASS's DP4A DefaultMma
+ * specialization never forwards kAlignmentA/B (PredicatedTileIterator2dThreadTile
+ * has no alignment parameter), so this documents the real access width but
+ * does not change code generation (verified: identical SASS). */
 using Gemm128x128RowMajor = GemmTypesCase10<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
     cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2>;
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
+    /*Alignment=*/4>;
 
 /* Turing+ int8 tensor cores (IMMA, mma.sync.m8n8k16.s8): 128x128x64 CTA,
  * 32x64x64 warps (8 warps = 256 threads, one hash tile per thread after the
