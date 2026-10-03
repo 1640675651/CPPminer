@@ -70,8 +70,10 @@ struct OpenClContext {
     bool probe_build(const char *source, const char *build_options = "");
 
     /* probe_build() then build_program_from_source/file if the probe survives. */
-    bool safe_build_program_from_source(const char *source, const char *build_options = "");
-    bool safe_build_program_from_file(const char *cl_path, const char *build_options = "");
+    bool safe_build_program_from_source(const char *source, const char *build_options = "",
+                                        bool quiet = false);
+    bool safe_build_program_from_file(const char *cl_path, const char *build_options = "",
+                                      bool quiet = false);
 
     cl_kernel create_kernel(const char *name) const;
 

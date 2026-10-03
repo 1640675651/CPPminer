@@ -405,8 +405,20 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             return false;
         }
 
-        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
+        /* Auto mode probes the AMD dot builtins first; on GPUs/drivers without them
+           (Polaris, older drivers) the failure is expected, so report one line instead
+           of the compiler log. CP_OCL_BUILD_LOG=1 shows the full log. */
+        const char *show_log = std::getenv("CP_OCL_BUILD_LOG");
+        const bool probe_quiet = (use_sudot || use_builtin || use_asm) &&
+                                 dot_policy_ == Case32OclDotPolicy::Auto &&
+                                 !(show_log && show_log[0] && std::atoi(show_log) != 0);
+        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str(), probe_quiet)) {
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
+            if (probe_quiet) {
+                std::printf("[ocl] %s: not supported by this GPU/driver, trying the next "
+                            "kernel\n", label);
+                std::fflush(stdout);
+            }
             return false;
         }
         return adopt_kernel(label);

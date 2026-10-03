@@ -15,7 +15,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -346,6 +355,43 @@ extern "C" int cp_opencl_worker_list_devices(void) {
     return OpenClContext::list_devices(g_platform_filter);
 }
 
+/* One miner per OpenCL device. Two processes scanning the same GPU only split it and
+   can run a 4 GB card out of memory (easy to do by opening a start script twice). The
+   lock is per session (Windows Local\\ mutex) or per machine (/tmp flock) and goes
+   away with the process. CP_ALLOW_SHARED_GPU=1 skips it. */
+static bool ocl_lock_device(int platform_filter, int device_index) {
+    static bool held = false;
+    const char *allow = std::getenv("CP_ALLOW_SHARED_GPU");
+    if (held || (allow && allow[0] && std::atoi(allow) != 0)) {
+        return true;
+    }
+    const std::string tag = "cppminer-ocl-p" + std::to_string(platform_filter) + "-d" +
+                            std::to_string(device_index);
+#ifdef _WIN32
+    const std::string name = "Local\\" + tag;
+    HANDLE h = CreateMutexA(nullptr, TRUE, name.c_str());
+    if (h && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h);
+        return false;
+    }
+    /* Keep the handle open for the life of the process. */
+    held = true;
+    return true;
+#else
+    const std::string path = "/tmp/" + tag + ".lock";
+    const int fd = open(path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        return true;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return false;
+    }
+    held = true; /* fd stays open, the lock lives as long as the process */
+    return true;
+#endif
+}
+
 extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     if (devices && ndev > 0) {
         g_device_index = devices[0];
@@ -356,6 +402,15 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
         }
     } else {
         g_device_index = 0;
+    }
+
+    if (!ocl_lock_device(g_platform_filter, g_device_index)) {
+        fprintf(stderr,
+                "[ocl] another cppminer is already mining on OpenCL device %d; close it "
+                "first (CP_ALLOW_SHARED_GPU=1 to allow two)\n",
+                g_device_index);
+        g_context_ready = 0;
+        return;
     }
 
     const std::string kernel_path = cp_ocl_resolve_kernel_path();

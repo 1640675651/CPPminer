@@ -442,21 +442,21 @@ bool OpenClContext::probe_build(const char * /*source*/, const char * /*build_op
 #endif
 
 bool OpenClContext::safe_build_program_from_source(const char *source,
-                                                   const char *build_options) {
+                                                   const char *build_options, bool quiet) {
     if (!probe_build(source, build_options)) {
         return false;
     }
-    return build_program_from_source(source, build_options);
+    return build_program_from_source(source, build_options, quiet);
 }
 
 bool OpenClContext::safe_build_program_from_file(const char *cl_path,
-                                                 const char *build_options) {
+                                                 const char *build_options, bool quiet) {
     const std::string source = read_text_file(cl_path);
     if (source.empty()) {
         std::fprintf(stderr, "Failed to read OpenCL source: %s\n", cl_path);
         return false;
     }
-    return safe_build_program_from_source(source.c_str(), build_options);
+    return safe_build_program_from_source(source.c_str(), build_options, quiet);
 }
 
 cl_kernel OpenClContext::create_kernel(const char *name) const {
