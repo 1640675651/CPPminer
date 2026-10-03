@@ -518,6 +518,16 @@ extern "C" void cp_worker_set_cutlass_fused(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_cuda_mma(int mode)
+{
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        cp_cuda_worker_set_cuda_mma(mode);
+#else
+    (void)mode;
+#endif
+}
+
 extern "C" void cp_worker_set_onednn_fused_jackpot(int on)
 {
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
