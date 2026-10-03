@@ -6,6 +6,8 @@
 // HashTilePolicy_ (hash_tile_policy.h) maps the accumulator fragment onto the
 // 256 virtual SIMT hash tiles of the 128x128 CTA so SIMT and tensor-op
 // instantiations emit identical per-tile words (proof layout unchanged).
+// Threadblocks larger than 128x128 run as kVirtM x kVirtN virtual 128x128
+// CTAs (HashTilePolicy::virtual_cta).
 #pragma once
 
 #include "cp_cutlass_jackpot.cuh"
@@ -57,10 +59,22 @@ public:
   using ThreadblockShape = typename Mma::Shape;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
-  /* Hash tiles per CTA: always the 256 of the SIMT lane map (proof format). */
-  static int const kHashTilesPerCta = kThreadCount * kTilesPerThread;
-  static_assert(kHashTilesPerCta == MmaLaneTile128x128::kThreadsPerCta,
-                "hash-tile policy must cover the 256 SIMT lane tiles per CTA");
+  /* A threadblock is kVirtM x kVirtN virtual 128x128 CTAs of the proof
+   * format (1 x 1 for the 128x128 kernels). All hash-tile indexing below --
+   * tile-xor dump offsets, jackpot row/col period, t_rows/t_cols -- is in
+   * virtual-CTA units, so a 256x128 or 128x256 threadblock emits exactly the
+   * words and hits the 128x128 kernel would for the same C cells. */
+  static int const kVirtM = HashTilePolicy::kVirtM;
+  static int const kVirtN = HashTilePolicy::kVirtN;
+  static_assert(ThreadblockShape::kM == 128 * kVirtM &&
+                    ThreadblockShape::kN == 128 * kVirtN,
+                "threadblock must be kVirtM x kVirtN virtual 128x128 CTAs");
+  /* Hash tiles per (virtual) CTA: always the 256 of the SIMT lane map. */
+  static int const kHashTilesPerCta = MmaLaneTile128x128::kThreadsPerCta;
+  static_assert(kThreadCount * kTilesPerThread ==
+                    kHashTilesPerCta * kVirtM * kVirtN,
+                "hash-tile policy must cover the 256 SIMT lane tiles of every "
+                "virtual CTA");
 
   using ElementAccumulator = typename Mma::ElementC;
   using ElementSum = typename EpilogueVisitor::ElementSum;
@@ -167,9 +181,11 @@ public:
       int const M = args.problem_size.m();
       int const N = args.problem_size.n();
       int const K = args.problem_size.k();
-      tile_cols = N / ThreadblockShape::kN;
-      milestone_stride = static_cast<size_t>(M / ThreadblockShape::kM) *
-                         static_cast<size_t>(tile_cols) * kHashTilesPerCta;
+      /* Virtual 128x128 CTA columns / words per milestone. */
+      tile_cols = N / (ThreadblockShape::kN / kVirtN);
+      milestone_stride =
+          static_cast<size_t>(M / (ThreadblockShape::kM / kVirtM)) *
+          static_cast<size_t>(tile_cols) * kHashTilesPerCta;
       if (args.epilogue_visitor.milestone_stride > 0)
         milestone_stride =
             static_cast<size_t>(args.epilogue_visitor.milestone_stride);
@@ -234,8 +250,12 @@ public:
     int const M = params.problem_size.m();
     int const N = params.problem_size.n();
     int const K = params.problem_size.k();
-    int const cta_r = tbo.m();
-    int const cta_c = tbo.n();
+    /* Virtual 128x128 CTA of this warp (warp-uniform). */
+    int vm = 0;
+    int vn = 0;
+    HashTilePolicy::virtual_cta(warp_idx, vm, vn);
+    int const cta_r = tbo.m() * kVirtM + vm;
+    int const cta_c = tbo.n() * kVirtN + vn;
     int const tile_cols = params.tile_cols;
 
     MatrixCoord offA(threadblock_offset.row(), 0);
@@ -279,8 +299,8 @@ public:
     if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
         params.jackpot.ptr_a_key8 != nullptr &&
         *params.jackpot.ptr_found == 0) {
-      const int row_period_eff = params.jackpot.row_period0 + tbo.m();
-      const int col_period_eff = params.jackpot.col_period0 + tbo.n();
+      const int row_period_eff = params.jackpot.row_period0 + cta_r;
+      const int col_period_eff = params.jackpot.col_period0 + cta_c;
       CUTLASS_PRAGMA_UNROLL
       for (int t = 0; t < kTilesPerThread; ++t) {
         int const vt = HashTilePolicy::virtual_thread(warp_idx, lane_idx, t);

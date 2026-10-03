@@ -30,6 +30,21 @@ static_assert(Gemm128x128TensorOp::GemmKernel::ThreadblockShape::kM ==
                       CP_CUTLASS_CTA_N,
               "tensor-op CTA must match the proof period size");
 
+/* Larger threadblocks = two virtual 128x128 CTAs of 256 hash tiles each. */
+static_assert(Gemm256x128TensorOp80::GemmKernel::kVirtM == 2 &&
+                  Gemm256x128TensorOp80::GemmKernel::kVirtN == 1 &&
+                  Gemm128x256TensorOp80::GemmKernel::kVirtM == 1 &&
+                  Gemm128x256TensorOp80::GemmKernel::kVirtN == 2 &&
+                  Gemm256x128TensorOp::GemmKernel::kVirtM == 2 &&
+                  Gemm128x256TensorOp::GemmKernel::kVirtN == 2,
+              "256-wide threadblocks must map onto 2 virtual 128x128 CTAs");
+static_assert(Gemm256x128TensorOp80::GemmKernel::kHashTilesPerCta == 256 &&
+                  Gemm128x256TensorOp::GemmKernel::kHashTilesPerCta == 256,
+              "virtual CTAs keep the 256 SIMT hash tiles");
+static_assert(Gemm256x128TensorOp80::kItersPerMilestone * 64 == R_RANK &&
+                  Gemm256x128TensorOp::kItersPerMilestone * 64 == R_RANK,
+              "milestone must span R_RANK");
+
 static_assert(Gemm128x128StepMajor::GemmKernel::kThreadCount == 256,
               "CUTLASS Case 9 step-major requires 256 threads per CTA");
 static_assert(Gemm128x128StepMajor::GemmKernel::kMilestoneMajorStorage,

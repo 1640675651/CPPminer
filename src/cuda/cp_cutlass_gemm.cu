@@ -6,6 +6,8 @@
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define CP_CUTLASS_CHECK(status)                                               \
   do {                                                                         \
@@ -27,8 +29,73 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128TensorOp80>
     g_fused_tensorop80;
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128TensorOpMs>
     g_fused_tensorop_ms;
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm256x128TensorOp>
+    g_fused_tensorop_256x128;
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256TensorOp>
+    g_fused_tensorop_128x256;
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm256x128TensorOp80>
+    g_fused_tensorop80_256x128;
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256TensorOp80>
+    g_fused_tensorop80_128x256;
 
 static int g_mma_mode = CP_CUTLASS_MMA_AUTO;
+static int g_tb = -1; /* -1: not yet read from CP_CUDA_TB */
+
+int cp_cutlass_tb_parse(const char* s)
+{
+  if (s == nullptr)
+    return -1;
+  if (!strcmp(s, "128x128"))
+    return CP_CUTLASS_TB_128x128;
+  if (!strcmp(s, "256x128"))
+    return CP_CUTLASS_TB_256x128;
+  if (!strcmp(s, "128x256"))
+    return CP_CUTLASS_TB_128x256;
+  return -1;
+}
+
+const char* cp_cutlass_tb_name(int tb)
+{
+  switch (tb) {
+  case CP_CUTLASS_TB_256x128: return "256x128";
+  case CP_CUTLASS_TB_128x256: return "128x256";
+  default: return "128x128";
+  }
+}
+
+void cp_cutlass_set_tb(int tb)
+{
+  g_tb = (tb >= 0 && tb < CP_CUTLASS_TB_COUNT) ? tb : CP_CUTLASS_TB_128x128;
+}
+
+int cp_cutlass_tb(void)
+{
+  if (g_tb < 0) {
+    const char* env = getenv("CP_CUDA_TB");
+    int tb = CP_CUTLASS_TB_128x128;
+    if (env != nullptr && env[0] != '\0') {
+      tb = cp_cutlass_tb_parse(env);
+      if (tb < 0) {
+        fprintf(stderr,
+                "[cutlass] CP_CUDA_TB=%s invalid (128x128|256x128|128x256), "
+                "using 128x128\n",
+                env);
+        tb = CP_CUTLASS_TB_128x128;
+      }
+    }
+    g_tb = tb;
+  }
+  return g_tb;
+}
+
+int cp_cutlass_kind_has_tb(int kind, int tb)
+{
+  if (tb == CP_CUTLASS_TB_128x128)
+    return 1;
+  if (tb != CP_CUTLASS_TB_256x128 && tb != CP_CUTLASS_TB_128x256)
+    return 0;
+  return kind == CP_CUTLASS_MMA_TENSOROP || kind == CP_CUTLASS_MMA_TENSOROP80;
+}
 
 void cp_cutlass_set_mma_mode(int mode)
 {
@@ -147,28 +214,50 @@ static void format_tensorop_name(char* buf, size_t len, const char* tag,
 
 const char* cp_cutlass_mma_kind_name(int kind)
 {
-  static char name[CP_CUTLASS_MMA_KINDS][128];
+  return cp_cutlass_variant_name(kind, cp_cutlass_tb());
+}
+
+const char* cp_cutlass_variant_name(int kind, int tb)
+{
+  static char name[CP_CUTLASS_MMA_KINDS][CP_CUTLASS_TB_COUNT][128];
   if (kind < 0 || kind >= CP_CUTLASS_MMA_KINDS)
     kind = CP_CUTLASS_MMA_SIMT;
-  char* buf = name[kind];
+  if (!cp_cutlass_kind_has_tb(kind, tb))
+    tb = CP_CUTLASS_TB_128x128;
+  char* buf = name[kind][tb];
+  const size_t len = sizeof(name[0][0]);
   if (buf[0] != '\0')
     return buf;
   switch (kind) {
   case CP_CUTLASS_MMA_TENSOROP:
-    format_tensorop_name<cp_cutlass::Gemm128x128TensorOp>(
-        buf, sizeof(name[0]), "tensorop", "mma.m8n8k16.s8");
+    if (tb == CP_CUTLASS_TB_256x128)
+      format_tensorop_name<cp_cutlass::Gemm256x128TensorOp>(
+          buf, len, "tensorop", "mma.m8n8k16.s8");
+    else if (tb == CP_CUTLASS_TB_128x256)
+      format_tensorop_name<cp_cutlass::Gemm128x256TensorOp>(
+          buf, len, "tensorop", "mma.m8n8k16.s8");
+    else
+      format_tensorop_name<cp_cutlass::Gemm128x128TensorOp>(
+          buf, len, "tensorop", "mma.m8n8k16.s8");
     break;
   case CP_CUTLASS_MMA_TENSOROP80:
-    format_tensorop_name<cp_cutlass::Gemm128x128TensorOp80>(
-        buf, sizeof(name[0]), "tensorop80", "mma.m16n8k32.s8");
+    if (tb == CP_CUTLASS_TB_256x128)
+      format_tensorop_name<cp_cutlass::Gemm256x128TensorOp80>(
+          buf, len, "tensorop80", "mma.m16n8k32.s8");
+    else if (tb == CP_CUTLASS_TB_128x256)
+      format_tensorop_name<cp_cutlass::Gemm128x256TensorOp80>(
+          buf, len, "tensorop80", "mma.m16n8k32.s8");
+    else
+      format_tensorop_name<cp_cutlass::Gemm128x128TensorOp80>(
+          buf, len, "tensorop80", "mma.m16n8k32.s8");
     break;
   case CP_CUTLASS_MMA_TENSOROP_MS:
     format_tensorop_name<cp_cutlass::Gemm128x128TensorOpMs>(
-        buf, sizeof(name[0]), "tensoropms", "mma.m8n8k16.s8");
+        buf, len, "tensoropms", "mma.m8n8k16.s8");
     break;
   default: {
     using T = cp_cutlass::Gemm128x128RowMajor;
-    snprintf(buf, sizeof(name[0]), "simt dp4a %dx%dx%d / %dx%dx%d (%d thr)",
+    snprintf(buf, len, "simt dp4a %dx%dx%d / %dx%dx%d (%d thr)",
              T::GemmKernel::ThreadblockShape::kM,
              T::GemmKernel::ThreadblockShape::kN,
              T::GemmKernel::ThreadblockShape::kK,
@@ -193,6 +282,7 @@ __device__ __forceinline__ uint32_t selftest_mix(uint32_t x)
   return x;
 }
 
+
 template <typename GemmTypesT>
 __global__ void HashPolicySelftestKernel(int32_t* d_c, uint32_t* d_words,
                                          int* d_count, uint32_t seed)
@@ -205,6 +295,7 @@ __global__ void HashPolicySelftestKernel(int32_t* d_c, uint32_t* d_words,
   using WarpCount = typename Mma::WarpCount;
   using WarpShape = typename Operator::Shape;
   constexpr int kLdc = GemmKernel::ThreadblockShape::kN;
+  constexpr int kTilesPerCta = MmaLaneTile128x128::kThreadsPerCta;
 
   const int warp_idx = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
@@ -224,45 +315,54 @@ __global__ void HashPolicySelftestKernel(int32_t* d_c, uint32_t* d_words,
       lane);
   iter_c.store(accum);
 
+  /* Words land at [virtual CTA vm*kVirtN+vn][virtual SIMT thread]. */
+  int vm = 0, vn = 0;
+  Policy::virtual_cta(warp_idx, vm, vn);
+  const int vcta = vm * GemmKernel::kVirtN + vn;
   Policy::milestone_xor(accum, lane, [&](int t, uint32_t xv) {
-    const int vt = Policy::virtual_thread(warp_idx, lane, t);
+    const int vt = vcta * kTilesPerCta + Policy::virtual_thread(warp_idx, lane, t);
     d_words[vt] = xv;
     atomicAdd(&d_count[vt], 1);
   });
 }
 
 template <typename GemmTypesT>
-static int hash_policy_selftest_t(int dev)
+static int hash_policy_selftest_t(int dev, int* out_tiles)
 {
-  constexpr int kM = GemmTypesT::GemmKernel::ThreadblockShape::kM;
-  constexpr int kN = GemmTypesT::GemmKernel::ThreadblockShape::kN;
-  constexpr int kTiles = MmaLaneTile128x128::kThreadsPerCta;
-  static_assert(kM == 128 && kN == 128, "self-test assumes 128x128 CTAs");
-  static int32_t h_c[kM * kN];
-  uint32_t h_words[kTiles];
-  int h_count[kTiles];
+  using GemmKernel = typename GemmTypesT::GemmKernel;
+  constexpr int kM = GemmKernel::ThreadblockShape::kM;
+  constexpr int kN = GemmKernel::ThreadblockShape::kN;
+  constexpr int kVirtM = GemmKernel::kVirtM;
+  constexpr int kVirtN = GemmKernel::kVirtN;
+  constexpr int kTilesPerCta = MmaLaneTile128x128::kThreadsPerCta;
+  constexpr int kTiles = kTilesPerCta * kVirtM * kVirtN;
+  static_assert(kM == 128 * kVirtM && kN == 128 * kVirtN,
+                "self-test: threadblock must be virtual 128x128 CTAs");
+  if (out_tiles)
+    *out_tiles = kTiles;
+  const size_t c_bytes = sizeof(int32_t) * kM * kN;
+  int32_t* h_c = static_cast<int32_t*>(malloc(c_bytes));
+  uint32_t* h_words = static_cast<uint32_t*>(malloc(sizeof(uint32_t) * kTiles));
+  int* h_count = static_cast<int*>(malloc(sizeof(int) * kTiles));
   int32_t* d_c = nullptr;
   uint32_t* d_words = nullptr;
   int* d_count = nullptr;
   int rc = -1;
-  if (cudaSetDevice(dev) != cudaSuccess)
-    return -1;
-  if (cudaMalloc(&d_c, sizeof(h_c)) == cudaSuccess &&
-      cudaMalloc(&d_words, sizeof(h_words)) == cudaSuccess &&
-      cudaMalloc(&d_count, sizeof(h_count)) == cudaSuccess &&
+  if (h_c && h_words && h_count && cudaSetDevice(dev) == cudaSuccess &&
+      cudaMalloc(&d_c, c_bytes) == cudaSuccess &&
+      cudaMalloc(&d_words, sizeof(uint32_t) * kTiles) == cudaSuccess &&
+      cudaMalloc(&d_count, sizeof(int) * kTiles) == cudaSuccess &&
       /* 0x5a fill: a cell the iterator does not write shows up as a hole. */
-      cudaMemset(d_c, 0x5a, sizeof(h_c)) == cudaSuccess &&
-      cudaMemset(d_words, 0, sizeof(h_words)) == cudaSuccess &&
-      cudaMemset(d_count, 0, sizeof(h_count)) == cudaSuccess) {
+      cudaMemset(d_c, 0x5a, c_bytes) == cudaSuccess &&
+      cudaMemset(d_words, 0, sizeof(uint32_t) * kTiles) == cudaSuccess &&
+      cudaMemset(d_count, 0, sizeof(int) * kTiles) == cudaSuccess) {
     HashPolicySelftestKernel<GemmTypesT>
-        <<<1, GemmTypesT::GemmKernel::kThreadCount>>>(d_c, d_words, d_count,
-                                                       0x9e3779b9u);
+        <<<1, GemmKernel::kThreadCount>>>(d_c, d_words, d_count, 0x9e3779b9u);
     if (cudaDeviceSynchronize() == cudaSuccess &&
-        cudaMemcpy(h_c, d_c, sizeof(h_c), cudaMemcpyDeviceToHost) ==
-            cudaSuccess &&
-        cudaMemcpy(h_words, d_words, sizeof(h_words),
+        cudaMemcpy(h_c, d_c, c_bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+        cudaMemcpy(h_words, d_words, sizeof(uint32_t) * kTiles,
                    cudaMemcpyDeviceToHost) == cudaSuccess &&
-        cudaMemcpy(h_count, d_count, sizeof(h_count),
+        cudaMemcpy(h_count, d_count, sizeof(int) * kTiles,
                    cudaMemcpyDeviceToHost) == cudaSuccess) {
       int bad = 0;
       for (int i = 0; i < kM * kN; ++i)
@@ -272,17 +372,23 @@ static int hash_policy_selftest_t(int dev)
         }
       static const int roffs[8] = {0, 1, 2, 3, 16, 17, 18, 19};
       static const int coffs[8] = {0, 1, 2, 3, 32, 33, 34, 35};
-      for (int vt = 0; vt < kTiles; ++vt) {
-        int row0 = 0, col0 = 0;
-        MmaLaneTile128x128::thread_block_origin(vt, row0, col0);
-        uint32_t ref = 0;
-        for (int r = 0; r < 8; ++r)
-          for (int c = 0; c < 8; ++c)
-            ref ^= static_cast<uint32_t>(
-                h_c[(row0 + roffs[r]) * kN + col0 + coffs[c]]);
-        if (h_count[vt] != 1 || h_words[vt] != ref)
-          bad++;
-      }
+      /* Reference: the 128x128 SIMT lane map applied to every virtual CTA. */
+      for (int vm = 0; vm < kVirtM; ++vm)
+        for (int vn = 0; vn < kVirtN; ++vn)
+          for (int vt = 0; vt < kTilesPerCta; ++vt) {
+            const int idx = (vm * kVirtN + vn) * kTilesPerCta + vt;
+            int row0 = 0, col0 = 0;
+            MmaLaneTile128x128::thread_block_origin(vt, row0, col0);
+            row0 += vm * 128;
+            col0 += vn * 128;
+            uint32_t ref = 0;
+            for (int r = 0; r < 8; ++r)
+              for (int c = 0; c < 8; ++c)
+                ref ^= static_cast<uint32_t>(
+                    h_c[(row0 + roffs[r]) * kN + col0 + coffs[c]]);
+            if (h_count[idx] != 1 || h_words[idx] != ref)
+              bad++;
+          }
       rc = bad;
     }
   }
@@ -291,22 +397,38 @@ static int hash_policy_selftest_t(int dev)
   cudaFree(d_c);
   cudaFree(d_words);
   cudaFree(d_count);
+  free(h_c);
+  free(h_words);
+  free(h_count);
   return rc;
 }
 
-int cp_cutlass_hash_policy_selftest(int dev, int kind)
+int cp_cutlass_hash_policy_selftest(int dev, int kind, int tb, int* out_tiles)
 {
+  if (out_tiles)
+    *out_tiles = MmaLaneTile128x128::kThreadsPerCta;
+  if (!cp_cutlass_kind_has_tb(kind, tb))
+    tb = CP_CUTLASS_TB_128x128;
   switch (kind) {
   case CP_CUTLASS_MMA_TENSOROP:
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp>(dev);
+    if (tb == CP_CUTLASS_TB_256x128)
+      return hash_policy_selftest_t<cp_cutlass::Gemm256x128TensorOp>(dev, out_tiles);
+    if (tb == CP_CUTLASS_TB_128x256)
+      return hash_policy_selftest_t<cp_cutlass::Gemm128x256TensorOp>(dev, out_tiles);
+    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp>(dev, out_tiles);
   case CP_CUTLASS_MMA_TENSOROP80:
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp80>(dev);
+    if (tb == CP_CUTLASS_TB_256x128)
+      return hash_policy_selftest_t<cp_cutlass::Gemm256x128TensorOp80>(dev, out_tiles);
+    if (tb == CP_CUTLASS_TB_128x256)
+      return hash_policy_selftest_t<cp_cutlass::Gemm128x256TensorOp80>(dev, out_tiles);
+    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp80>(dev, out_tiles);
   case CP_CUTLASS_MMA_TENSOROP_MS:
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOpMs>(dev);
+    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOpMs>(dev, out_tiles);
   default:
     return 0; /* SIMT: the accumulator fragment is the hash tile itself */
   }
 }
+
 
 size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)
 {
@@ -364,33 +486,59 @@ int cp_cutlass_period_batch(
     kind = cp_cutlass_mma_kind(dev);
   }
 
+  /* Threadblock tile: 256x128 needs an even number of 128-row periods in the
+   * batch, 128x256 an even number of 128-col periods; otherwise this launch
+   * uses the 128x128 kernel of the same kind (identical hash tiles). */
+  int tb = cp_cutlass_tb();
+  if (!cp_cutlass_kind_has_tb(kind, tb) || step_major)
+    tb = CP_CUTLASS_TB_128x128;
+  if ((tb == CP_CUTLASS_TB_256x128 && (row_batch_count % 2) != 0) ||
+      (tb == CP_CUTLASS_TB_128x256 && (col_batch_count % 2) != 0)) {
+    static bool warned = false;
+    if (!warned) {
+      fprintf(stderr,
+              "[cutlass] %s tile needs an even %s period batch (got %dx%d); "
+              "using 128x128 for such batches\n",
+              cp_cutlass_tb_name(tb),
+              tb == CP_CUTLASS_TB_256x128 ? "row" : "col", row_batch_count,
+              col_batch_count);
+      warned = true;
+    }
+    tb = CP_CUTLASS_TB_128x128;
+  }
+
+  int8_t* A = const_cast<int8_t*>(d_A);
+  int8_t* B = const_cast<int8_t*>(d_B);
+#define CP_RUN_FUSED(op)                                                       \
+  do {                                                                         \
+    CP_CUTLASS_CHECK((op).initialize(M, N_fat, K, m, n, A, B, d_tile_xor,      \
+                                     cta_cols, tile_count, jackpot));          \
+    st = (op)();                                                               \
+  } while (0)
+
   cutlass::Status st = cutlass::Status::kErrorInternal;
   if (step_major) {
-    CP_CUTLASS_CHECK(g_fused_step_major.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_step_major();
+    CP_RUN_FUSED(g_fused_step_major);
   } else if (kind == CP_CUTLASS_MMA_TENSOROP) {
-    CP_CUTLASS_CHECK(g_fused_tensorop.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_tensorop();
+    if (tb == CP_CUTLASS_TB_256x128)
+      CP_RUN_FUSED(g_fused_tensorop_256x128);
+    else if (tb == CP_CUTLASS_TB_128x256)
+      CP_RUN_FUSED(g_fused_tensorop_128x256);
+    else
+      CP_RUN_FUSED(g_fused_tensorop);
   } else if (kind == CP_CUTLASS_MMA_TENSOROP80) {
-    CP_CUTLASS_CHECK(g_fused_tensorop80.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_tensorop80();
+    if (tb == CP_CUTLASS_TB_256x128)
+      CP_RUN_FUSED(g_fused_tensorop80_256x128);
+    else if (tb == CP_CUTLASS_TB_128x256)
+      CP_RUN_FUSED(g_fused_tensorop80_128x256);
+    else
+      CP_RUN_FUSED(g_fused_tensorop80);
   } else if (kind == CP_CUTLASS_MMA_TENSOROP_MS) {
-    CP_CUTLASS_CHECK(g_fused_tensorop_ms.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_tensorop_ms();
+    CP_RUN_FUSED(g_fused_tensorop_ms);
   } else {
-    CP_CUTLASS_CHECK(g_fused_row_major.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_row_major();
+    CP_RUN_FUSED(g_fused_row_major);
   }
+#undef CP_RUN_FUSED
   if (st != cutlass::Status::kSuccess) {
     fprintf(stderr, "[cutlass] kernel launch failed status %d\n",
             static_cast<int>(st));
