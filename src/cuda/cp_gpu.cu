@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <thread>
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -76,6 +78,18 @@ typedef struct {
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
     size_t    tile_xor_cap;
+    /* CP_CUDA_OVERLAP: second A buffer set (GPU0 only) the next attempt is
+     * prepared into while the current one is scanned; swapped with
+     * d_A_sig/d_Ap/d_a_subroots when that attempt starts. */
+    int8_t*   d_Ap_next;
+    int8_t*   d_A_sig_next;
+    uint8_t*  d_a_subroots_next;
+    size_t    a_subroots_next_cap;
+    /* CP_CUDA_OVERLAP pipelined scan: pinned copy of d_found per in-flight
+     * batch slot and the event that marks it valid. */
+    int*      h_found_pipe;
+    cudaEvent_t found_ev[2];
+    int       found_pipe_ready;
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     cublasHandle_t cublas;
 #endif
@@ -107,11 +121,16 @@ static struct {
 } g_zero_b = {};
 
 /* Signal A commitment of the last prepared attempt (sub-roots stay in g0->d_a_subroots). */
-static struct {
+typedef struct {
     uint8_t root[32];
     int num_subroots;
     int valid;
-} g_attempt_a = {};
+} AttemptACommit;
+static AttemptACommit g_attempt_a = {};
+
+/* CP_CUDA_OVERLAP (defined with the attempt prep below). */
+static int gpu_overlap_enabled(void);
+static void gpu_overlap_shutdown(void);
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
 {
@@ -388,6 +407,11 @@ void cp_gpu_init(int* devs, int ndev)
         }
         fflush(stdout);
     }
+    if(gpu_overlap_enabled()){
+        printf("[gpu] CP_CUDA_OVERLAP=1: next attempt's A prepared on a second stream "
+               "during the scan; scan batches pipelined (event-based found check)\n");
+        fflush(stdout);
+    }
     sync_tile_config();
     sync_ap_layout();
 }
@@ -416,9 +440,24 @@ int cp_gpu_list_devices(void)
 
 void cp_gpu_shutdown(void)
 {
+    gpu_overlap_shutdown();
     for(int i = 0; i < g_ngpu; i++){
         GpuCtx* g = &g_gpus[i];
         CU_CHECK(cudaSetDevice(g->dev));
+        if(g->d_Ap_next) cudaFree(g->d_Ap_next);
+        if(g->d_A_sig_next) cudaFree(g->d_A_sig_next);
+        if(g->d_a_subroots_next) cudaFree(g->d_a_subroots_next);
+        g->d_Ap_next = nullptr;
+        g->d_A_sig_next = nullptr;
+        g->d_a_subroots_next = nullptr;
+        g->a_subroots_next_cap = 0;
+        if(g->found_pipe_ready){
+            cudaFreeHost(g->h_found_pipe);
+            cudaEventDestroy(g->found_ev[0]);
+            cudaEventDestroy(g->found_ev[1]);
+            g->h_found_pipe = nullptr;
+            g->found_pipe_ready = 0;
+        }
         if(g->d_Ap) cudaFree(g->d_Ap);
         if(g->d_BpT) cudaFree(g->d_BpT);
         if(g->d_A_sig) cudaFree(g->d_A_sig);
@@ -537,16 +576,16 @@ static void ensure_bt_sig(GpuCtx* g, size_t szBpT)
     }
 }
 
-static void gpu_noise_generate_a(GpuCtx* g, int m)
+static void gpu_noise_generate_a(GpuCtx* g, int m, cudaStream_t st = 0)
 {
     const int tpb = 256;
     const int tpr = R_RANK / 32;
     const int rows_per_block = tpb / tpr;
     const int perm_blocks = (K_DIM + CP_B3_LINES * tpb - 1) / (CP_B3_LINES * tpb);
 
-    cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb>>>(
+    cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb, 0, st>>>(
         0, m, R_RANK, g->d_seed_a, g->d_eal);
-    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
+    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb, 0, st>>>(
         0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
     CU_CHECK(cudaGetLastError());
 }
@@ -571,17 +610,21 @@ static void gpu_noise_generate(GpuCtx* g, int m, int n)
     gpu_noise_generate_b(g, n);
 }
 
-static void gpu_noise_apply_a(GpuCtx* g, int m)
+/* a_sig/ap default to the current buffers g->d_A_sig/g->d_Ap. */
+static void gpu_noise_apply_a(GpuCtx* g, int m, cudaStream_t st = 0,
+                              const int8_t* a_sig = NULL, int8_t* ap = NULL)
 {
     const int tpb = 256;
     const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
+    if(!a_sig) a_sig = g->d_A_sig;
+    if(!ap) ap = g->d_Ap;
 
     if(g_step_major_ap){
-        cp_apply_noise_a_kernel<<<m, tpb, smem>>>(
-            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
+        cp_apply_noise_a_kernel<<<m, tpb, smem, st>>>(
+            a_sig, g->d_eal, ap, m, K_DIM, R_RANK, g->d_e_ar);
     } else {
-        cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem>>>(
-            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
+        cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem, st>>>(
+            a_sig, g->d_eal, ap, m, K_DIM, R_RANK, g->d_e_ar);
     }
     CU_CHECK(cudaGetLastError());
 }
@@ -800,18 +843,18 @@ static void gpu_period_gemm_batch(
 }
 
 static void cp_gpu_merkle_finish_root(
-    const uint8_t* d_job_key, uint8_t* d_roots, int num_subroots)
+    const uint8_t* d_job_key, uint8_t* d_roots, int num_subroots, cudaStream_t st = 0)
 {
     const int smem = CP_MT_SMEM_BYTES;
     int num_mt_blocks = (num_subroots + CP_MT_THREADS - 1) / CP_MT_THREADS;
     if(num_mt_blocks == 1){
         cp_compute_blake_mt_kernel<CP_MT_THREADS, true>
-            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+            <<<1, CP_MT_THREADS, smem, st>>>(d_job_key, d_roots, num_subroots);
     }else{
         cp_compute_blake_mt_kernel<CP_MT_THREADS, false>
-            <<<num_mt_blocks, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+            <<<num_mt_blocks, CP_MT_THREADS, smem, st>>>(d_job_key, d_roots, num_subroots);
         cp_reduce_roots_kernel<CP_MT_THREADS>
-            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_mt_blocks);
+            <<<1, CP_MT_THREADS, smem, st>>>(d_job_key, d_roots, num_mt_blocks);
     }
     CU_CHECK(cudaGetLastError());
 }
@@ -1059,6 +1102,215 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
 
     (void)n;
     return cp_job_should_cancel() ? -1 : 0;
+}
+
+/* ---- CP_CUDA_OVERLAP=1: next-attempt A prep overlapped with the scan ------
+ *
+ * While attempt N is scanned (legacy default stream), a host thread prepares
+ * attempt N+1 -- random A, keyed Merkle hash + sub-roots, A noise seed, A
+ * noise -- on a cudaStreamNonBlocking stream into GPU0's second buffer set
+ * (d_A_sig_next / d_Ap_next / d_a_subroots_next, +2 x m*K bytes of VRAM).
+ * The thread is joined before cp_gpu_mine_attempt returns, so share witness /
+ * signal fetches after a hit (cp_gpu_fetch_share_*) still read attempt N's
+ * buffers; attempt N+1 then swaps the sets (buffers and g_attempt_a commit)
+ * instead of preparing A again. A prefetch is used only if job key, m, n,
+ * the job's B noise seed and the salt mode still match; otherwise the attempt
+ * prepares synchronously as before. The prep path issues no device-wide
+ * syncs: the only host waits are the 32-byte Merkle root (needed on the host
+ * to derive the A noise seed) and the end of the prep stream. */
+static int g_overlap = -1;
+
+static int gpu_overlap_enabled(void)
+{
+    if(g_overlap < 0){
+        const char* e = getenv("CP_CUDA_OVERLAP");
+        g_overlap = (e && atoi(e) > 0) ? 1 : 0;
+    }
+    return g_overlap;
+}
+
+typedef struct {
+    std::thread   th;
+    cudaStream_t  stream;     /* non-blocking prep stream (GPU0) */
+    uint8_t*      h_pin;      /* pinned: [0,32) job key, [32,64) root, [64,96) seed */
+    int           ready;      /* next buffers hold a complete attempt */
+    int           rc;
+    uint8_t       job_key[32];
+    uint8_t       b_noise_seed[32];
+    int           salted;
+    int           m;
+    int           n;
+    uint8_t       a_key[32];
+    AttemptACommit commit;
+    double        sec;
+    uint64_t      hits;
+    uint64_t      misses;
+} AttemptPrefetch;
+static AttemptPrefetch g_pf;
+
+/* Keyed Merkle root (+ sub-roots into d_subroots) of an A buffer on stream
+ * st. Same kernels as gpu_matrix_keyed_hash_ex; returns -1 for the
+ * single-chunk case (host digest), which the caller handles synchronously. */
+static int gpu_keyed_hash_a_stream(GpuCtx* g, cudaStream_t st, uint8_t* h_pin,
+                                   const int8_t* d_mat, size_t raw_len, size_t pad_len,
+                                   const uint8_t job_key[32], uint8_t* d_subroots,
+                                   int* out_num_subroots, uint8_t out[32])
+{
+    const int num_chunks = (int)(pad_len / 1024);
+    if(num_chunks <= 1) return -1;
+    memcpy(h_pin, job_key, 32);
+    CU_CHECK(cudaMemcpyAsync(g->d_job_key, h_pin, 32, cudaMemcpyHostToDevice, st));
+    const int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
+    cp_keyed_chunk_roots_kernel<<<num_subroots, CP_MT_THREADS, CP_MT_SMEM_BYTES, st>>>(
+        (const uint8_t*)d_mat, raw_len, pad_len, g->d_job_key,
+        g->d_merkle_roots, num_chunks);
+    CU_CHECK(cudaGetLastError());
+    CU_CHECK(cudaMemcpyAsync(d_subroots, g->d_merkle_roots, (size_t)num_subroots * 32,
+                             cudaMemcpyDeviceToDevice, st));
+    *out_num_subroots = num_subroots;
+    cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots, st);
+    CU_CHECK(cudaMemcpyAsync(h_pin + 32, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost, st));
+    CU_CHECK(cudaStreamSynchronize(st));
+    memcpy(out, h_pin + 32, 32);
+    return 0;
+}
+
+/* gpu_prepare_attempt_a on stream st into explicit buffers; no device-wide
+ * syncs. Returns 0 when the buffers and *commit hold a complete attempt. */
+static int gpu_prepare_attempt_a_stream(GpuCtx* g, cudaStream_t st, uint8_t* h_pin,
+                                        int8_t* d_a_sig, int8_t* d_ap, uint8_t* d_subroots,
+                                        AttemptACommit* commit, uint64_t rng_seed,
+                                        const uint8_t job_key[32],
+                                        const uint8_t b_noise_seed[32], int salted,
+                                        int m, uint8_t a_key_out[32])
+{
+    const size_t szAp = (size_t)m * K_DIM;
+    const size_t pad_a = (szAp + 1023) / 1024 * 1024;
+    const int tpb = 256;
+    const int total_a = m * K_DIM;
+    uint8_t hash_a[32];
+
+    commit->valid = 0;
+    cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb, 0, st>>>(
+        rng_seed, 0, total_a, d_a_sig);
+    CU_CHECK(cudaGetLastError());
+    if(gpu_keyed_hash_a_stream(g, st, h_pin, d_a_sig, szAp, pad_a, job_key, d_subroots,
+                               &commit->num_subroots, hash_a) != 0)
+        return -1;
+    memcpy(commit->root, hash_a, 32);
+
+    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, (uint32_t)m, salted, a_key_out);
+    memcpy(h_pin + 64, a_key_out, 32);
+    CU_CHECK(cudaMemcpyAsync(g->d_seed_a, h_pin + 64, 32, cudaMemcpyHostToDevice, st));
+    gpu_noise_generate_a(g, m, st);
+    gpu_noise_apply_a(g, m, st, d_a_sig, d_ap);
+    CU_CHECK(cudaStreamSynchronize(st));
+    commit->valid = 1;
+    return 0;
+}
+
+static void gpu_overlap_ensure(GpuCtx* g, int m)
+{
+    const size_t szAp = (size_t)m * K_DIM;
+    const size_t pad_a = (szAp + 1023) / 1024 * 1024;
+    const size_t chunks_a = pad_a / 1024;
+    const size_t a_sub_need = ((chunks_a + CP_MT_THREADS - 1) / CP_MT_THREADS) * 32;
+    CU_CHECK(cudaSetDevice(g->dev));
+    if(!g_pf.stream){
+        CU_CHECK(cudaStreamCreateWithFlags(&g_pf.stream, cudaStreamNonBlocking));
+        CU_CHECK(cudaHostAlloc((void**)&g_pf.h_pin, 128, cudaHostAllocDefault));
+    }
+    if(!g->d_Ap_next){
+        CU_CHECK(cudaMalloc(&g->d_Ap_next, szAp));
+        CU_CHECK(cudaMalloc(&g->d_A_sig_next, szAp));
+        printf("[gpu] CP_CUDA_OVERLAP: +%.0f MiB for the next attempt's A buffers\n",
+               2.0 * (double)szAp / (1024.0 * 1024.0));
+        fflush(stdout);
+    }
+    if(a_sub_need > g->a_subroots_next_cap){
+        if(g->d_a_subroots_next) cudaFree(g->d_a_subroots_next);
+        CU_CHECK(cudaMalloc(&g->d_a_subroots_next, a_sub_need));
+        g->a_subroots_next_cap = a_sub_need;
+    }
+}
+
+static void gpu_prefetch_join(void)
+{
+    if(g_pf.th.joinable())
+        g_pf.th.join();
+}
+
+/* Starts preparing the attempt after the current one into GPU0's next
+ * buffers (which hold the previous, already finished attempt). */
+static void gpu_prefetch_start(GpuCtx* g, const uint8_t job_key[32], int m, int n)
+{
+    gpu_prefetch_join();
+    gpu_overlap_ensure(g, m);
+    g_pf.ready = 0;
+    memcpy(g_pf.job_key, job_key, 32);
+    memcpy(g_pf.b_noise_seed, g_zero_b.b_noise_seed, 32);
+    g_pf.salted = g_salted;
+    g_pf.m = m;
+    g_pf.n = n;
+    const uint64_t seed = cp_gpu_fresh_rng_seed();
+    g_pf.th = std::thread([g, seed, m]() {
+        const double t0 = cp_now_sec();
+        cudaSetDevice(g->dev);
+        g_pf.rc = gpu_prepare_attempt_a_stream(
+            g, g_pf.stream, g_pf.h_pin, g->d_A_sig_next, g->d_Ap_next,
+            g->d_a_subroots_next, &g_pf.commit, seed, g_pf.job_key, g_pf.b_noise_seed,
+            g_pf.salted, m, g_pf.a_key);
+        g_pf.sec = cp_now_sec() - t0;
+        g_pf.ready = (g_pf.rc == 0);
+    });
+}
+
+/* Makes the prefetched attempt current (swaps GPU0's A buffer sets and the
+ * signal-A commitment) if it matches this attempt. Returns 1 on success. */
+static int gpu_prefetch_take(GpuCtx* g, const uint8_t job_key[32], int m, int n,
+                             uint8_t a_key_out[32])
+{
+    gpu_prefetch_join();
+    const int ok = g_pf.ready && g_pf.m == m && g_pf.n == n &&
+                   g_pf.salted == g_salted && g_zero_b.ready &&
+                   memcmp(g_pf.job_key, job_key, 32) == 0 &&
+                   memcmp(g_pf.b_noise_seed, g_zero_b.b_noise_seed, 32) == 0;
+    g_pf.ready = 0;
+    if(!ok){
+        g_pf.misses++;
+        return 0;
+    }
+    int8_t* t8;
+    t8 = g->d_Ap; g->d_Ap = g->d_Ap_next; g->d_Ap_next = t8;
+    t8 = g->d_A_sig; g->d_A_sig = g->d_A_sig_next; g->d_A_sig_next = t8;
+    uint8_t* tu = g->d_a_subroots; g->d_a_subroots = g->d_a_subroots_next;
+    g->d_a_subroots_next = tu;
+    size_t tc = g->a_subroots_cap; g->a_subroots_cap = g->a_subroots_next_cap;
+    g->a_subroots_next_cap = tc;
+    g_attempt_a = g_pf.commit;
+    memcpy(a_key_out, g_pf.a_key, 32);
+    g_pf.hits++;
+    if(g_pf.hits <= 2 || g_pf.hits % 64 == 0){
+        printf("[gpu-prep] overlap: attempt A prepared during the previous scan "
+               "(%.3fs on the prep stream; %llu used, %llu discarded)\n",
+               g_pf.sec, (unsigned long long)g_pf.hits, (unsigned long long)g_pf.misses);
+        fflush(stdout);
+    }
+    return 1;
+}
+
+static void gpu_overlap_shutdown(void)
+{
+    gpu_prefetch_join();
+    if(g_pf.stream){
+        cudaStreamDestroy(g_pf.stream);
+        g_pf.stream = NULL;
+    }
+    if(g_pf.h_pin){
+        cudaFreeHost(g_pf.h_pin);
+        g_pf.h_pin = NULL;
+    }
+    g_pf.ready = 0;
 }
 
 static int compare_digest(const char* label, const uint8_t a[32], const uint8_t b[32])
@@ -1910,6 +2162,143 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     return rc;
 }
 
+/* CP_CUDA_OVERLAP=1 scan loop: same batches, launch order and early exit as
+ * gpu_scan_device_period, but batch i+1 is enqueued before the host waits for
+ * batch i. After each batch the 4-byte found flag is copied (async, legacy
+ * stream) into a pinned slot and an event is recorded; the host waits on that
+ * event instead of cudaDeviceSynchronize (which would also wait for the next
+ * attempt's prep on the overlap stream). A hit in batch i is read while batch
+ * i+1 is queued: its CTAs see *found != 0 and return at entry, and found is
+ * only ever set by atomicCAS(0 -> 1), so t_rows/t_cols stay batch i's. Tiles
+ * are counted for waited batches only, as in the synchronous loop. */
+static void gpu_found_pipe_ensure(GpuCtx* g)
+{
+    if(g->found_pipe_ready) return;
+    CU_CHECK(cudaSetDevice(g->dev));
+    CU_CHECK(cudaHostAlloc((void**)&g->h_found_pipe, 2 * sizeof(int), cudaHostAllocDefault));
+    for(int s = 0; s < 2; s++)
+        CU_CHECK(cudaEventCreateWithFlags(&g->found_ev[s],
+                                          cudaEventDisableTiming | cudaEventBlockingSync));
+    g->found_pipe_ready = 1;
+}
+
+static int gpu_scan_device_period_pipelined(
+    const uint8_t* a_key, const uint32_t pool_tgt[8],
+    int m, int n,
+    int* out_t_rows, int* out_t_cols,
+    uint64_t* out_tiles_scanned)
+{
+    uint32_t bound[8];
+    cp_scale_jackpot_target(pool_tgt, bound);
+    (void)a_key;
+
+    const int row_periods = gpu_num_row_periods(m);
+    const int col_periods = gpu_num_col_periods(n);
+    const int row_parts = cp_pp_num_row_parts(m, g_contiguous);
+    const int col_parts = cp_pp_num_col_parts(n, g_contiguous);
+    const int total_tiles = row_parts * col_parts;
+    int found = 0;
+    int cancelled = 0;
+    uint64_t tiles_scanned = 0;
+    double scan_t0 = cp_now_sec();
+    int slot = 0;
+    int pending = 0;          /* a launched batch not yet waited for */
+    int pending_tiles = 0;
+
+    if(out_tiles_scanned) *out_tiles_scanned = 0;
+    for(int i = 0; i < g_ngpu; i++)
+        gpu_found_pipe_ensure(&g_gpus[i]);
+
+    printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
+           "(row_batch=%d col_batch=%d, %d hash tiles, pipelined), difficulty scaled by %llu\n",
+           row_periods, col_periods, g_row_period_batch, g_col_period_batch,
+           total_tiles,
+           (unsigned long long)cp_jackpot_scale_factor());
+    fflush(stdout);
+
+    /* Waits for the batch in slot s on every GPU and checks its found flag. */
+    auto wait_slot = [&](int s) {
+        for(int i = 0; i < g_ngpu; i++){
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            CU_CHECK(cudaEventSynchronize(g->found_ev[s]));
+            const int f = ((volatile int*)g->h_found_pipe)[s];
+            if(f && !found){
+                found = 1;
+                CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
+                printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
+                       g->dev, *out_t_rows, *out_t_cols);
+                fflush(stdout);
+            }
+        }
+    };
+
+    for(int rpi0 = 0; rpi0 < row_periods && !found && !cancelled; rpi0 += g_row_period_batch){
+        if(cp_job_should_cancel()){
+            cancelled = 1;
+            break;
+        }
+        int row_batch = g_row_period_batch;
+        if(rpi0 + row_batch > row_periods)
+            row_batch = row_periods - rpi0;
+
+        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
+            int col_batch = g_col_period_batch;
+            if(cpi0 + col_batch > col_periods)
+                col_batch = col_periods - cpi0;
+
+            const int batch_tiles = pp_batch_hash_tiles(row_batch, col_batch);
+
+            for(int i = 0; i < g_ngpu; i++){
+                GpuCtx* g = &g_gpus[i];
+                CU_CHECK(cudaSetDevice(g->dev));
+                gpu_period_gemm_batch(
+                    g, m, n, rpi0, cpi0, row_batch, col_batch, bound);
+                launch_jackpot_batch(
+                    g, row_batch, col_batch, rpi0, cpi0, m, n, bound);
+                CU_CHECK(cudaMemcpyAsync(&g->h_found_pipe[slot], g->d_found, sizeof(int),
+                                         cudaMemcpyDeviceToHost, 0));
+                CU_CHECK(cudaEventRecord(g->found_ev[slot], 0));
+            }
+
+            if(pending){
+                wait_slot(slot ^ 1);
+                tiles_scanned += (uint64_t)pending_tiles;
+            }
+            pending = 1;
+            pending_tiles = batch_tiles;
+            slot ^= 1;
+        }
+        if(rpi0 % 128 == 0 && !found){
+            double scan_sec = cp_now_sec() - scan_t0;
+            if(scan_sec < 1e-9) scan_sec = 1e-9;
+            double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
+            char mac_buf[32];
+            cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
+            printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%d (%.1f%%) %s\n",
+                   rpi0 + row_batch, row_periods,
+                   (unsigned long long)tiles_scanned, total_tiles,
+                   100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
+            fflush(stdout);
+        }
+    }
+    if(pending && !found){
+        /* Last batch (or the one in flight at cancel). */
+        wait_slot(slot ^ 1);
+        tiles_scanned += (uint64_t)pending_tiles;
+    }
+    /* After a hit one more batch may be in flight (it exits at entry):
+     * leave the legacy streams idle like the synchronous loop does. */
+    for(int i = 0; i < g_ngpu; i++){
+        CU_CHECK(cudaSetDevice(g_gpus[i].dev));
+        CU_CHECK(cudaStreamSynchronize(0));
+    }
+    if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+    if(cancelled && !found) return -1;
+    return found;
+}
+
 static int gpu_scan_device_period(
     const uint8_t* a_key, const uint32_t pool_tgt[8],
     int m, int n,
@@ -2003,9 +2392,14 @@ static int gpu_scan_device(
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned)
 {
-    if(g_period_gemm && !g_contiguous)
+    if(g_period_gemm && !g_contiguous){
+        if(gpu_overlap_enabled())
+            return gpu_scan_device_period_pipelined(a_key, pool_tgt, m, n,
+                                                    out_t_rows, out_t_cols,
+                                                    out_tiles_scanned);
         return gpu_scan_device_period(a_key, pool_tgt, m, n,
                                       out_t_rows, out_t_cols, out_tiles_scanned);
+    }
 
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
@@ -2138,6 +2532,7 @@ int cp_gpu_mine_attempt(
     uint8_t a_key_local[32];
     const uint8_t* scan_key = a_key;
     int zero = 0;
+    int overlap = 0;
 
     sync_tile_config();
     GpuCtx* g0 = &g_gpus[0];
@@ -2155,13 +2550,38 @@ int cp_gpu_mine_attempt(
             gpu_upload_rowmajor_noisy(g, h_A_noisy, h_B_noisy, m, n);
         }
     } else {
+        overlap = gpu_overlap_enabled();
+        if(overlap)
+            gpu_prefetch_join();
         if(!zero_b_cache_matches(job_key, m, n)){
             if(gpu_prepare_job_b(g0, job_key, m, n) != 0)
                 return -1;
         }
-        if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
-                                 a_key_local) != 0)
+        if(overlap){
+            /* Use the A prepared during the previous scan, else prepare it
+             * now on the overlap stream (no device-wide syncs). */
+            if(!gpu_prefetch_take(g0, job_key, m, n, a_key_local)){
+                const double t_prep = cp_now_sec();
+                gpu_overlap_ensure(g0, m);
+                g_attempt_a.valid = 0;
+                if(gpu_prepare_attempt_a_stream(
+                       g0, g_pf.stream, g_pf.h_pin, g0->d_A_sig, g0->d_Ap,
+                       g0->d_a_subroots, &g_attempt_a, cp_gpu_fresh_rng_seed(),
+                       job_key, g_zero_b.b_noise_seed, g_salted, m, a_key_local) != 0){
+                    if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
+                                             a_key_local) != 0)
+                        return -1;
+                } else {
+                    printf("[gpu-prep] attempt A (overlap stream, not prefetched) %.3fs\n",
+                           cp_now_sec() - t_prep);
+                    fflush(stdout);
+                }
+            }
+            if(cp_job_should_cancel()) return -1;
+        } else if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
+                                        a_key_local) != 0){
             return -1;
+        }
         scan_key = a_key_local;
         uint32_t a_key32[8];
         memcpy(a_key32, scan_key, 32);
@@ -2179,10 +2599,20 @@ int cp_gpu_mine_attempt(
         }
     }
 
+    /* Overlap: prepare the next attempt's A while this one is scanned. The
+     * prep reads none of the buffers the scan uses (d_Ap/d_BpT/d_a_key8/
+     * d_found) and writes only GPU0's next buffer set and prep scratch. */
+    if(overlap)
+        gpu_prefetch_start(g0, job_key, m, n);
+
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
     int found = gpu_scan_device(scan_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned);
     const double scan_sec = cp_now_sec() - scan_t0;
+    /* Hit handling (witness/signal fetch) reads this attempt's buffers and
+     * the next job may re-prepare B: no prep may still be running. */
+    if(overlap)
+        gpu_prefetch_join();
     /* Device→host download deferred to cp_gpu_fetch_share_signals after host buffer reclaim. */
     const uint64_t tiles_done = out_tiles_scanned ? *out_tiles_scanned : 0;
     cp_log_attempt_timing("gpu", prep_sec, scan_sec, tiles_done, 0.0);

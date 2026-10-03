@@ -136,6 +136,9 @@ static void print_usage(void)
     printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128 (default),\n");
     printf("                       256x128 or 128x256 (= 2 virtual 128x128 CTAs, same\n");
     printf("                       hash tiles); env CP_CUDA_TB sets the same\n");
+    printf("                       env CP_CUDA_OVERLAP=1: prepare the next attempt's A on\n");
+    printf("                       a second CUDA stream during the scan (+2 x m*4096 bytes\n");
+    printf("                       VRAM, 1 GiB at --m 128) and pipeline the scan batches\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
