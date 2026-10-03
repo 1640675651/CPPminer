@@ -13,20 +13,23 @@
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/layout/matrix.h"
 
+#include <type_traits>
+
 #include "epilogue_visitor_store_c.h"
 #include "epilogue_with_visitor_visit_batch.h"
 #include "gemm_inline_xor_kernel.h"
 #include "gemm_with_milestone_mainloop.h"
+#include "hash_tile_policy.h"
 #include "mma_milestone.h"
 
 namespace cp_cutlass {
 
 constexpr int kCtaM = 128;
 constexpr int kCtaN = 128;
-constexpr int kCtaK = 32;
+constexpr int kCtaK = 32; /* SIMT (dp4a) K-tile */
 
 static_assert(R_RANK % kCtaK == 0, "R_RANK must be a multiple of CTA K-tile");
-constexpr int kItersPerMs = R_RANK / kCtaK; /* 128/32 = 4 */
+constexpr int kItersPerMs = R_RANK / kCtaK; /* 128/32 = 4 (SIMT) */
 
 using ElementInput = int8_t;
 using ElementOutput = int32_t;
@@ -36,19 +39,34 @@ using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
 
+/* Alignment = A/B access granularity in elements (int8): Ap/BpT rows are
+ * K_DIM = 4096 bytes and CTA panels start at multiples of 128 rows, so any
+ * power of two up to 16 (one 128-bit access) holds. */
+/* EpilogueVectorLength: output-op vector width. The fused kernels never run
+ * the epilogue (only its types/SharedStorage are used), but the tensor-op
+ * DefaultEpilogueTensorOp only instantiates int32 -> int32 with width 4. */
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
-          typename WarpShape, typename InstructionShape, int Stages>
+          typename WarpShape, typename InstructionShape, int Stages,
+          int Alignment = 1, int EpilogueVectorLength = 1>
 struct GemmTypesCommon {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
-      ElementOutput, 1, ElementAccumulator, ElementCompute>;
+      ElementOutput, EpilogueVectorLength, ElementAccumulator, ElementCompute>;
+  /* Group 8 N-tiles per M step. With the default (1) a launch walks all 32
+   * M-tiles of the row batch for one N-tile before moving on, so the 32 A
+   * panels (16 MiB) are re-read from DRAM for every one of the 1024 N-tiles
+   * on parts with a small L2 (6 MiB on GA102/TU102): ~500 GB per attempt,
+   * which made the tensor-op kernels DRAM- and power-bound. Grouping cuts the
+   * A re-reads 8x. RTX 3090, 131072^2: m16n8k32 82-84 -> 99 TMAC/s, m8n8k16
+   * 87-90 -> 92; 4 and 16 measure the same as 8. Tile offsets come from
+   * the swizzle, so hash-tile coordinates are unaffected. */
   using ThreadblockSwizzle =
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
 
   using DefaultGemmKernel = typename cutlass::gemm::kernel::DefaultGemm<
-      ElementInput, LayoutA, 1, ElementInput, LayoutB, 1, ElementOutput,
-      LayoutC, ElementAccumulator, OpClassTag, ArchTag, ThreadblockShape,
-      WarpShape, InstructionShape, EpilogueOpT, ThreadblockSwizzle, Stages,
-      false, cutlass::arch::OpMultiplyAdd,
+      ElementInput, LayoutA, Alignment, ElementInput, LayoutB, Alignment,
+      ElementOutput, LayoutC, ElementAccumulator, OpClassTag, ArchTag,
+      ThreadblockShape, WarpShape, InstructionShape, EpilogueOpT,
+      ThreadblockSwizzle, Stages, false, cutlass::arch::OpMultiplyAdd,
       cutlass::gemm::SharedMemoryClearOption::kNone>::GemmKernel;
 
   using EpilogueVisitor =
@@ -63,20 +81,40 @@ struct GemmTypesCommon {
           EpilogueVisitor, typename DefaultGemmKernel::Epilogue, 1>::Epilogue;
 };
 
-/* Case 10: continuous pipeline, contiguous K (row-major Ap/BpT). */
+/* Case 10: continuous pipeline, contiguous K (row-major Ap/BpT).
+ * Milestone every R_RANK / ThreadblockShape::kK K-tiles. */
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
-          typename WarpShape, typename InstructionShape, int Stages>
+          typename WarpShape, typename InstructionShape, int Stages,
+          int Alignment = 1, typename HashTilePolicy = HashTileSimt,
+          int EpilogueVectorLength = 1>
 struct GemmTypesCase10
     : GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
-                      InstructionShape, Stages> {
+                      InstructionShape, Stages, Alignment, EpilogueVectorLength> {
   using Base = GemmTypesCommon<ArchTag, OpClassTag, ThreadblockShape, WarpShape,
-                               InstructionShape, Stages>;
+                               InstructionShape, Stages, Alignment,
+                               EpilogueVectorLength>;
+  static_assert(R_RANK % ThreadblockShape::kK == 0,
+                "R_RANK must be a multiple of the CTA K-tile");
+  static constexpr int kItersPerMilestone = R_RANK / ThreadblockShape::kK;
+  /* SIMT dp4a uses PredicatedTileIterator2dThreadTile (residue = last K-tile,
+   * visited first); tensor-op uses PredicatedTileIterator (residue first, at
+   * k = 0). See MmaMilestone. */
+  static constexpr bool kResidueTileIsLast =
+      std::is_same<OpClassTag, cutlass::arch::OpClassSimt>::value;
   using MmaPipelined = typename Base::DefaultGemmKernel::Mma;
-  using Mma =
-      cutlass::gemm::threadblock::MmaMilestone<MmaPipelined, kItersPerMs>;
+  using Mma = cutlass::gemm::threadblock::MmaMilestone<
+      MmaPipelined, kItersPerMilestone, kResidueTileIsLast>;
   using GemmKernel = cutlass::gemm::kernel::InlineXorKernel<
-      Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle>;
+      Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle,
+      HashTilePolicy>;
 };
+
+/* Tensor-op hash-tile policy for a given warp shape (threadblock 128x128). */
+template <typename WarpShape>
+using HashTileTensorOpFor =
+    HashTileTensorOp<WarpShape, cutlass::gemm::GemmShape<128 / WarpShape::kM,
+                                                         128 / WarpShape::kN, 1>,
+                     WarpShape::kM / 8, WarpShape::kN / 8>;
 
 /* Case 9: wind_down per milestone — required for step-major (non-contiguous K). */
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
@@ -94,10 +132,27 @@ struct GemmTypesCase9
       /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
 
+/* SIMT dp4a (Pascal and anything without usable int8 tensor cores).
+ * Alignment 4 = one dp4a int8x4 access. Note that CUTLASS's DP4A DefaultMma
+ * specialization never forwards kAlignmentA/B (PredicatedTileIterator2dThreadTile
+ * has no alignment parameter), so this documents the real access width but
+ * does not change code generation (verified: identical SASS). */
 using Gemm128x128RowMajor = GemmTypesCase10<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
     cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2>;
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
+    /*Alignment=*/4>;
+
+/* Turing+ int8 tensor cores (IMMA, mma.sync.m8n8k16.s8): 128x128x64 CTA,
+ * 32x64x64 warps (8 warps = 256 threads, one hash tile per thread after the
+ * reduce-scatter), 2-stage MmaPipelined, 16-byte A/B accesses, milestone every
+ * 2 K-tiles. */
+using TensorOpWarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+using Gemm128x128TensorOp = GemmTypesCase10<
+    cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
+    cutlass::gemm::GemmShape<128, 128, 64>, TensorOpWarpShape,
+    cutlass::gemm::GemmShape<8, 8, 16>, 2, 16,
+    HashTileTensorOpFor<TensorOpWarpShape>, 4>;
 
 using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
