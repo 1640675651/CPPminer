@@ -226,6 +226,8 @@ static int zero_b_prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
 
 extern "C" int cp_opencl_worker_handles_matrix_prep(void) { return 1; }
 
+extern "C" int cp_opencl_worker_is_ready(void) { return g_context_ready; }
+
 extern "C" void cp_opencl_worker_set_macro_batch(int batch) {
     if (batch < 1) {
         batch = 1;

@@ -199,6 +199,12 @@ extern "C" void cp_worker_init(int* devices, int ndev)
 extern "C" int cp_worker_is_ready(void)
 {
     switch(cp_worker_backend_id()){
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    case CP_BACKEND_OPENCL:
+        /* No device (driver crashed or missing) or another miner holds it: exit
+         * instead of staying on the pool and failing every job. */
+        return cp_opencl_worker_is_ready();
+#endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     case CP_BACKEND_ONEDNN:
         return cp_onednn_worker_is_ready();
