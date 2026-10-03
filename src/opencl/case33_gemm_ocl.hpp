@@ -80,6 +80,11 @@ struct Case33GemmOcl {
 
 
 
+    /* Correctness check: run the whole M x N GEMM with fuse_jackpot = 0 and read back
+       every milestone word as out[ms * tile_count + spatial_id] (the layout of
+       case32::reference_milestone_tile_xor). Needs prepare_job + prepare_attempt_a. */
+    bool compute_milestone_tile_xor(std::vector<uint32_t> *out);
+
     const char *backend() const { return backend_; }
 
     const char *device_name() const { return device_name_.c_str(); }
@@ -107,7 +112,7 @@ private:
 
     bool ensure_jackpot_bufs_();
 
-    bool run_macro_batch_(int mb_begin, int batch_count);
+    bool run_macro_batch_(int mb_begin, int batch_count, cl_mem tile_xor_out = nullptr);
 
 
 

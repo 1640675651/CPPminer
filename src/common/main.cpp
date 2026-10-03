@@ -1130,6 +1130,10 @@ int main(int argc, char** argv)
         pearl_set_cutlass_fused(cutlass_fused);
         g_cutlass_fused = cutlass_fused;
         if(pearl_run_alignment_tests() != 0) return 1;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        if(bid == CP_BACKEND_OPENCL &&
+           cp_opencl_run_gemm_align_test(devs[0]) != 0) return 1;
+#endif
         if(align_test_prod){
             const int pm = g_m_active;
             const int pn = g_n_active;

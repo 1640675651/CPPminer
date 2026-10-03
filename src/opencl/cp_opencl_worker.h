@@ -27,6 +27,9 @@ void cp_opencl_worker_set_issue_mode(int mode);
 void cp_opencl_worker_set_issue_broadcast(int on);
 /* Dot backend policy: 0=auto, 1=force-khr, 2=off, 3=sudot, 4=sdot4, 5=asm, 6=khr. */
 void cp_opencl_worker_set_dot_policy(int policy);
+/* Current GEMM build options (for test harnesses that build their own Case33GemmOcl). */
+void cp_opencl_worker_get_gemm_options(int *dot_policy, int *issue_mode, int *cpm_int,
+                                       int *use_lds, int *platform_filter);
 /* Broadcast cpm type: 0 = float (default), 1 = int32. Requires broadcast issue. */
 void cp_opencl_worker_set_cpm_int(int on);
 /* Stage A/B in __local (default off). */

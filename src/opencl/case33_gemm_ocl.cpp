@@ -617,14 +617,16 @@ bool Case33GemmOcl::ensure_jackpot_bufs_() {
     return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
 }
 
-bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
+bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count, cl_mem tile_xor_out) {
     if (batch_count < 1) {
         return false;
     }
 
     const int xor_after = 1;
     const int compact_xor = 0;
-    const int fuse_jackpot = 1;
+    /* tile_xor_out set: write every milestone word to tile_xor[ms * tile_count + tile]
+       (fuse_jackpot = 0) instead of folding them into the device jackpot. */
+    const int fuse_jackpot = tile_xor_out ? 0 : 1;
     const int tile_count_i = static_cast<int>(tile_count_);
 
     const int micro_m = case32::kHashPerMacroM;
@@ -655,7 +657,7 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
         }
     }
 
-    cl_mem tile_xor_dummy = dummy_buf_;
+    cl_mem tile_xor_dummy = tile_xor_out ? tile_xor_out : dummy_buf_;
 
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(kernel_, 0, sizeof(cl_mem), &a_buf_);
@@ -706,6 +708,30 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
         }
     }
     return true;
+}
+
+bool Case33GemmOcl::compute_milestone_tile_xor(std::vector<uint32_t> *out) {
+    if (!available_ || !out) {
+        return false;
+    }
+    const size_t words = static_cast<size_t>(num_milestones_) * tile_count_;
+    cl_mem buf = ocl_.alloc_buffer(words * sizeof(uint32_t), CL_MEM_READ_WRITE);
+    if (!buf) {
+        return false;
+    }
+    bool ok = true;
+    for (int mb0 = 0; ok && mb0 < macro_blocks_; mb0 += macro_batch_) {
+        const int batch_count =
+                (mb0 + macro_batch_ > macro_blocks_) ? (macro_blocks_ - mb0) : macro_batch_;
+        ok = run_macro_batch_(mb0, batch_count, buf);
+    }
+    if (ok) {
+        clFinish(ocl_.queue);
+        out->assign(words, 0u);
+        ok = ocl_.read_buffer(buf, out->data(), words * sizeof(uint32_t));
+    }
+    clReleaseMemObject(buf);
+    return ok;
 }
 
 bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t bound[8],

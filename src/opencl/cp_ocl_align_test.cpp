@@ -2,6 +2,7 @@
 
 #include "case32_layout.hpp"
 #include "case32_prepack.hpp"
+#include "case33_gemm_ocl.hpp"
 #include "case33_ocl_prep.hpp"
 #include "cp_config.h"
 #include "cp_noise.h"
@@ -367,4 +368,110 @@ done:
         fflush(stdout);
     }
     return rc;
+}
+
+extern "C" int cp_opencl_run_gemm_align_test(int device_index) {
+    /* 1024 x 512 = an 8 x 4 macro grid at 128x128, so the 8x4 super-tile swizzle path of
+       the kernel is exercised too; K is the protocol K (32 milestones). */
+    const int M = 1024;
+    const int N = 512;
+    const int K = K_DIM;
+
+    cp_opencl_configure_tile_for_worker(device_index);
+    int dot_policy = 0;
+    int issue_mode = 0;
+    int cpm_int = 0;
+    int use_lds = 0;
+    int platform_filter = -1;
+    cp_opencl_worker_get_gemm_options(&dot_policy, &issue_mode, &cpm_int, &use_lds,
+                                      &platform_filter);
+
+    printf("[align-test] OpenCL GEMM milestone words vs CPU: M=%d N=%d K=%d hash tile %dx%d\n",
+           M, N, K, case32::hash_tile_mr(), case32::hash_tile_nr());
+    fflush(stdout);
+
+    Case33GemmOcl gemm;
+    gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(dot_policy));
+    gemm.set_issue_mode(issue_mode);
+    gemm.set_cpm_int(cpm_int);
+    gemm.set_use_lds(use_lds);
+    if (!gemm.init_context(cp_ocl_resolve_kernel_path().c_str(), device_index, platform_filter,
+                           false)) {
+        fprintf(stderr, "[align-test] OpenCL GEMM init failed\n");
+        return -1;
+    }
+    printf("[align-test] GEMM kernel: %s\n", gemm.dpi_status());
+    fflush(stdout);
+
+    std::vector<int8_t> a(static_cast<size_t>(M) * static_cast<size_t>(K));
+    std::vector<int8_t> b(static_cast<size_t>(N) * static_cast<size_t>(K));
+    uint64_t s = 0x9E3779B97F4A7C15ULL;
+    auto next = [&]() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return static_cast<int8_t>(static_cast<uint8_t>(s >> 32));
+    };
+    for (int8_t &v : a) {
+        v = next();
+    }
+    for (int8_t &v : b) {
+        v = next();
+    }
+    /* Pin the int8 extremes into row 0 of A and column 0 of B (sign handling). */
+    for (int k = 0; k < K; ++k) {
+        a[static_cast<size_t>(k)] = static_cast<int8_t>((k & 1) ? 127 : -128);
+        b[static_cast<size_t>(k)] = static_cast<int8_t>((k & 2) ? -128 : 127);
+    }
+
+    if (!gemm.prepare_job(M, N, K, b.data()) || !gemm.prepare_attempt_a(a.data())) {
+        fprintf(stderr, "[align-test] OpenCL GEMM prepare failed\n");
+        return -1;
+    }
+    std::vector<uint32_t> gpu_words;
+    double t0 = cp_now_sec();
+    if (!gemm.compute_milestone_tile_xor(&gpu_words)) {
+        fprintf(stderr, "[align-test] OpenCL GEMM tile_xor run failed\n");
+        return -1;
+    }
+    const double t_gpu = cp_now_sec() - t0;
+
+    const int num_ms = K / R_RANK;
+    const int tile_cols = N / case32::hash_tile_nr();
+    const size_t tile_count =
+            static_cast<size_t>(M / case32::hash_tile_mr()) * static_cast<size_t>(tile_cols);
+    std::vector<uint32_t> cpu_words(static_cast<size_t>(num_ms) * tile_count, 0u);
+    t0 = cp_now_sec();
+    case32::reference_milestone_tile_xor(a.data(), b.data(), cpu_words.data(), M, N, K, num_ms,
+                                         R_RANK, tile_count);
+    const double t_cpu = cp_now_sec() - t0;
+
+    if (gpu_words.size() != cpu_words.size()) {
+        fprintf(stderr, "[align-test] GEMM word count mismatch\n");
+        return -1;
+    }
+    size_t bad = 0;
+    for (size_t i = 0; i < cpu_words.size(); ++i) {
+        if (gpu_words[i] != cpu_words[i]) {
+            if (bad < 8) {
+                const size_t ms = i / tile_count;
+                const size_t t = i % tile_count;
+                fprintf(stderr,
+                        "[align-test] milestone word mismatch ms=%zu tile=(%zu,%zu) gpu=%08x "
+                        "cpu=%08x\n",
+                        ms, t / static_cast<size_t>(tile_cols),
+                        t % static_cast<size_t>(tile_cols), gpu_words[i], cpu_words[i]);
+            }
+            ++bad;
+        }
+    }
+    if (bad) {
+        fprintf(stderr, "[align-test] OpenCL GEMM milestone words: FAIL (%zu/%zu differ)\n", bad,
+                cpu_words.size());
+        return -1;
+    }
+    printf("[align-test] OpenCL GEMM milestone words OK (%zu words, gpu %.2fs, cpu %.2fs)\n",
+           cpu_words.size(), t_gpu, t_cpu);
+    fflush(stdout);
+    return 0;
 }
