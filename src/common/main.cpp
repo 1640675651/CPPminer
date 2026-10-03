@@ -410,6 +410,21 @@ reconnect:
 
 int main(int argc, char** argv)
 {
+#ifdef __MINGW32__
+    /* MinGW/MSYS2 only: buffer stdout before anything prints.
+     *
+     * MinGW builds use the MinGW printf (__USE_MINGW_ANSI_STDIO=1), which
+     * emits each %-conversion as its own write to the stream. The MS CRT
+     * leaves a console stdout unbuffered, so every fragment of a status line
+     * becomes a separate WriteConsole and the log crawls out piece by piece.
+     * MSVC builds are not affected (the CRT printf writes a call at once) and
+     * other platforms keep their default buffering.
+     *
+     * On Win32, _IOLBF behaves as _IOFBF (full buffering), so prompt output
+     * relies on the fflush(stdout) that follows every log line. */
+    setvbuf(stdout, NULL, _IOLBF, 8192);
+#endif
+
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
     int pool_specified = 0;
@@ -1134,6 +1149,7 @@ int main(int argc, char** argv)
             const int pm = g_m_active;
             const int pn = g_n_active;
             printf("[align-test-prod] m=%d n=%d\n", pm, pn);
+            fflush(stdout);
             if(pearl_run_alignment_tests_prod(pm, pn, K_DIM) != 0) return 1;
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
             if(bid == CP_BACKEND_CUDA &&
@@ -1168,6 +1184,7 @@ int main(int argc, char** argv)
         cp_worker_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
         printf("[profile-scan] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         return cp_gpu_run_scan_profile(devs[0], g_m_active, g_n_active, 2, profile_runs) != 0;
     }
 #else
@@ -1183,6 +1200,7 @@ int main(int argc, char** argv)
         }
         if(!ndev){ devs[0] = 0; ndev = 1; }
         printf("[profile-prep] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         const int warmup = profile_prep_runs > 1 ? 1 : 0;
         return cp_opencl_run_prep_profile(devs[0], g_m_active, g_n_active, warmup,
                                           profile_prep_runs) != 0;
@@ -1364,6 +1382,7 @@ int main(int argc, char** argv)
                                                          K_DIM);
         printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
                rc_reuse == 0 ? "passed" : "failed", rc_reuse);
+        fflush(stdout);
         const int rc_fused = case33_test_fused_prepack(CP_PREPACK_TEST_DIM, CP_PREPACK_TEST_DIM,
                                                        K_DIM, R_RANK);
         printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
