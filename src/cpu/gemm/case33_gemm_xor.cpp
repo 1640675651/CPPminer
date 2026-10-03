@@ -348,10 +348,13 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
             static_cast<size_t>(blocks_k) * static_cast<size_t>(kPanelB);
     const int macro_blocks = macro_cols * macro_rows;
 
-    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~1k amortizes dispatch
-     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
+    /* Dynamic: rebalance across hybrid P/E cores. Chunk 1: one 128x128 macro is
+     * ~67M MAC (~1 ms/core), so per-chunk dispatch (an atomic add) is noise, while
+     * a large chunk starves the pool on small matrices (8k×8k = 4096 macros gave a
+     * single chunk, i.e. one thread did the whole scan) and leaves a multi-second
+     * tail at 128k×128k. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1024)
+#pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         const int jm = mb / macro_rows;
@@ -412,10 +415,11 @@ bool run_online_tile_scan(
     const int macro_blocks = macro_cols * macro_rows;
     std::atomic<int> stop{0};
 
-    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~4k amortizes dispatch
-     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
+    /* Dynamic, chunk 1: see run_hardcoded_macro_xor. With chunk 4096 an 8k×8k
+     * scan (exactly 4096 macros) ran on ONE thread (118 GMAC/s = one Zen4 core)
+     * and 16k×16k on four; the ~1 ms macro makes per-block dispatch free. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 4096)
+#pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         if (stop.load(std::memory_order_relaxed)) {
