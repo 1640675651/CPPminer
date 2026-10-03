@@ -190,7 +190,11 @@ struct HashTileTensorOp {
   }
 
 private:
-  /* One halving step: lanes with (lane & kMask) keep the upper half. */
+  /* One halving step: lanes with (lane & kMask) keep the upper half.
+   * 4 instructions per pair (SEL, SEL, SHFL, LOP3). A LOP3 bitwise mux with
+   * an all-ones/zeros lane mask instead of the SELs measured the same in SASS
+   * (sm_86: 437 instructions per milestone either way), so the plain form
+   * stays. */
   template <int kCount, int kMask>
   CUTLASS_DEVICE static void reduce_scatter_step(uint32_t *w, int lane) {
     constexpr int kHalf = kCount / 2;

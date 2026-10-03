@@ -278,23 +278,41 @@ public:
 
     Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
 
-    mma.inline_operator(
-        params.gemm_k_iterations, accum, iterA, iterB, accum,
-        [&](int ms_idx, typename Mma::FragmentC const &acc) {
-          HashTilePolicy::milestone_xor(acc, lane_idx, [&](int t, uint32_t xv) {
-            if (params.jackpot.enabled)
-              cp_cutlass_jackpot_fold_step(jackpot_words[t], ms_idx, xv);
-            if (params.ptr_Sum != nullptr) {
-              int const vt = HashTilePolicy::virtual_thread(warp_idx, lane_idx, t);
-              size_t off =
-                  static_cast<size_t>(ms_idx) * params.milestone_stride +
-                  (static_cast<size_t>(cta_r) * tile_cols + cta_c) *
-                      kHashTilesPerCta +
-                  vt;
-              params.ptr_Sum[off] = xv;
-            }
+    if (params.ptr_Sum == nullptr) {
+      /* Mining: the milestone callback is only the hash-tile XOR + jackpot
+       * fold. Folding unconditionally (the words are simply unused when the
+       * jackpot is disabled) keeps per-milestone predicate set-up and the
+       * dump address arithmetic out of the hot loop. */
+      mma.inline_operator(
+          params.gemm_k_iterations, accum, iterA, iterB, accum,
+          [&](int ms_idx, typename Mma::FragmentC const &acc) {
+            HashTilePolicy::milestone_xor(
+                acc, lane_idx, [&](int t, uint32_t xv) {
+                  cp_cutlass_jackpot_fold_step(jackpot_words[t], ms_idx, xv);
+                });
           });
-        });
+    } else {
+      /* Tile-xor dump (--align-test-prod): [milestone][virtual CTA][virtual
+       * SIMT thread]; the milestone-invariant part of the offset is hoisted. */
+      size_t dump_base[kTilesPerThread];
+      CUTLASS_PRAGMA_UNROLL
+      for (int t = 0; t < kTilesPerThread; ++t)
+        dump_base[t] =
+            (static_cast<size_t>(cta_r) * tile_cols + cta_c) * kHashTilesPerCta +
+            HashTilePolicy::virtual_thread(warp_idx, lane_idx, t);
+      mma.inline_operator(
+          params.gemm_k_iterations, accum, iterA, iterB, accum,
+          [&](int ms_idx, typename Mma::FragmentC const &acc) {
+            HashTilePolicy::milestone_xor(
+                acc, lane_idx, [&](int t, uint32_t xv) {
+                  if (params.jackpot.enabled)
+                    cp_cutlass_jackpot_fold_step(jackpot_words[t], ms_idx, xv);
+                  params.ptr_Sum[static_cast<size_t>(ms_idx) *
+                                     params.milestone_stride +
+                                 dump_base[t]] = xv;
+                });
+          });
+    }
 
     if (params.jackpot.enabled && params.jackpot.ptr_found != nullptr &&
         params.jackpot.ptr_a_key8 != nullptr &&
