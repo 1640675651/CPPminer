@@ -1,5 +1,7 @@
 // Case 10: ONE continuous main loop with XOR at milestone boundaries.
-// Uses MmaMilestone::inline_operator() (skip residue-first, in-order K).
+// Mma is MmaMilestone (2-stage MmaPipelined, mma_milestone.h) or
+// MmaMilestoneMultistage (cp.async, mma_milestone_multistage.h); both expose
+// inline_operator(total_iters, accum, iterA, iterB, src, cb) with in-order K.
 // CPminer: jackpot fold in the XOR callback; optional tile-xor store.
 // HashTilePolicy_ (hash_tile_policy.h) maps the accumulator fragment onto the
 // 256 virtual SIMT hash tiles of the 128x128 CTA so SIMT and tensor-op
@@ -23,7 +25,10 @@ template <typename MmaMilestone_, typename Epilogue_,
 struct InlineXorKernel {
 public:
   using Mma = MmaMilestone_;
-  using BaseMma = typename Mma::Base;
+  /* Global-memory iterator types (MmaMilestone forwards MmaPipelined's,
+   * MmaMilestoneMultistage MmaMultistage's). */
+  using IteratorA = typename Mma::IteratorA;
+  using IteratorB = typename Mma::IteratorB;
   using Epilogue = Epilogue_;
   using EpilogueVisitor = typename Epilogue::Visitor;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
@@ -37,12 +42,12 @@ public:
   static bool const kReuseMmaAcrossMilestones = true; /* continuous pipeline */
   static bool const kCase10Continuous = true;
 
-  using ElementA = typename BaseMma::IteratorA::Element;
-  using LayoutA = typename BaseMma::IteratorA::Layout;
+  using ElementA = typename IteratorA::Element;
+  using LayoutA = typename IteratorA::Layout;
   using TensorRefA = TensorRef<ElementA, LayoutA>;
 
-  using ElementB = typename BaseMma::IteratorB::Element;
-  using LayoutB = typename BaseMma::IteratorB::Layout;
+  using ElementB = typename IteratorB::Element;
+  using LayoutB = typename IteratorB::Layout;
   using TensorRefB = TensorRef<ElementB, LayoutB>;
 
   using ElementC = typename EpilogueVisitor::ElementOutput;
@@ -119,8 +124,8 @@ public:
     GemmCoord problem_size;
     GemmCoord grid_tiled_shape;
     int swizzle_log_tile;
-    typename BaseMma::IteratorA::Params params_A;
-    typename BaseMma::IteratorB::Params params_B;
+    typename IteratorA::Params params_A;
+    typename IteratorB::Params params_B;
     typename EpilogueVisitor::OutputTileIterator::Params params_C;
     typename EpilogueVisitor::OutputTileIterator::Params params_D;
     void *ptr_A;
@@ -236,9 +241,9 @@ public:
     MatrixCoord offA(threadblock_offset.row(), 0);
     MatrixCoord offB(0, threadblock_offset.column());
 
-    typename BaseMma::IteratorA iterA(params.params_A, ptr_A, {M, K},
+    IteratorA iterA(params.params_A, ptr_A, {M, K},
                                       thread_idx, offA);
-    typename BaseMma::IteratorB iterB(params.params_B, ptr_B, {K, N},
+    IteratorB iterB(params.params_B, ptr_B, {K, N},
                                       thread_idx, offB);
 
     typename Mma::FragmentC accum;
