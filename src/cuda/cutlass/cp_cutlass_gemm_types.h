@@ -194,6 +194,49 @@ using Gemm128x128TensorOp80 = GemmTypesCase10<
  * sm_75+ (synchronous copies below sm_80). Validates MmaMilestoneMultistage's
  * K schedule on Turing and separates pipeline from instruction gains on
  * Ampere/Ada (--cuda-mma tensoropms). */
+/* Larger threadblocks (CP_CUDA_TB / --cuda-tb): 256x128 and 128x256 with the
+ * same 64x64x64 warp tiles (8 warps, 256 threads), each running as two
+ * virtual 128x128 CTAs of the proof format (hash_tile_policy.h). Per K-tile a
+ * CTA stages (256 + 128) x 64 bytes for 256x128x64 MACs instead of
+ * (128 + 128) x 64 for 128x128x64: 25% less global/L2 -> smem traffic per
+ * MAC; the warp-level smem -> register traffic per MAC is unchanged.
+ * Sm80: 3 stages x 24 KiB = 72 KiB smem -> 1 CTA (8 warps) per SM, the same
+ * warp occupancy as 2 x 128x128. A K=32 threadblock (4 stages, 48 KiB) is not
+ * possible with mma.m16n8k32: the warp tile would need K=32, i.e. a single
+ * warp-level k-group, and the multistage pipeline (MmaMultistage) needs >= 2.
+ * Sm75 (2-stage MmaPipelined): 2 x 24 KiB = 48 KiB -> 1 CTA per SM (64 KiB
+ * on TU102), again 8 warps. Override with -DCP_SM80_STAGES_BIG=N. */
+#ifndef CP_SM80_STAGES_BIG
+#define CP_SM80_STAGES_BIG 3
+#endif
+using Shape256x128x64 = cutlass::gemm::GemmShape<256, 128, 64>;
+using Shape128x256x64 = cutlass::gemm::GemmShape<128, 256, 64>;
+
+using Gemm256x128TensorOp = GemmTypesCase10<
+    cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp, Shape256x128x64,
+    TensorOpWarpShape, TensorOpInstructionShape, 2, 16,
+    HashTileTensorOpFor<TensorOpWarpShape, TensorOpInstructionShape,
+                        Shape256x128x64>,
+    4>;
+using Gemm128x256TensorOp = GemmTypesCase10<
+    cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp, Shape128x256x64,
+    TensorOpWarpShape, TensorOpInstructionShape, 2, 16,
+    HashTileTensorOpFor<TensorOpWarpShape, TensorOpInstructionShape,
+                        Shape128x256x64>,
+    4>;
+using Gemm256x128TensorOp80 = GemmTypesCase10<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp, Shape256x128x64,
+    TensorOp80WarpShape, TensorOp80InstructionShape, CP_SM80_STAGES_BIG, 16,
+    HashTileTensorOpFor<TensorOp80WarpShape, TensorOp80InstructionShape,
+                        Shape256x128x64>,
+    4>;
+using Gemm128x256TensorOp80 = GemmTypesCase10<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp, Shape128x256x64,
+    TensorOp80WarpShape, TensorOp80InstructionShape, CP_SM80_STAGES_BIG, 16,
+    HashTileTensorOpFor<TensorOp80WarpShape, TensorOp80InstructionShape,
+                        Shape128x256x64>,
+    4>;
+
 using Gemm128x128TensorOpMs = GemmTypesCase10<
     cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
     cutlass::gemm::GemmShape<128, 128, 64>, TensorOpWarpShape,

@@ -1073,6 +1073,12 @@ static int compare_digest(const char* label, const uint8_t a[32], const uint8_t 
     return -1;
 }
 
+/* One fused-kernel variant of the --align-test-prod cross-check. */
+typedef struct {
+    int kind;
+    int tb;
+} CutlassVariant;
+
 int cp_gpu_run_alignment_tests(int dev, int m, int n)
 {
     int devs[1] = {dev};
@@ -1257,35 +1263,68 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     fflush(stdout);
 
     /* CUTLASS kernel cross-check: the per-hash-tile milestone XOR words
-     * ([step][cta][virtual SIMT tile]) feed the proof, so every kernel kind
-     * (simt, tensorop, tensoropms, tensorop80 where supported) must produce
-     * bit-identical dumps on the same noisy Ap/BpT panels, and hash tile 0
-     * must match a CPU prefix GEMM. */
+     * ([step][cta][virtual SIMT tile]) feed the proof, so every kernel
+     * variant -- kind (simt, tensorop, tensoropms, tensorop80 where supported)
+     * x threadblock tile (128x128, and 256x128 / 128x256 = two virtual
+     * 128x128 CTAs for tensorop/tensorop80) -- must produce bit-identical
+     * dumps on the same noisy Ap/BpT panels, and hash tile 0 must match a CPU
+     * prefix GEMM. */
     if(g_cutlass_fused && !g_step_major_ap){
         cudaDeviceProp prop;
         CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
-        const int rb = (m / CP_CUTLASS_CTA_M) < 2 ? (m / CP_CUTLASS_CTA_M) : 2;
-        const int cb = (n / CP_CUTLASS_CTA_N) < 3 ? (n / CP_CUTLASS_CTA_N) : 3;
-        static const int all_kinds[] = {CP_CUTLASS_MMA_SIMT, CP_CUTLASS_MMA_TENSOROP,
-                                        CP_CUTLASS_MMA_TENSOROP_MS, CP_CUTLASS_MMA_TENSOROP80};
-        enum { kMaxKinds = (int)(sizeof(all_kinds) / sizeof(all_kinds[0])) };
-        int kinds[kMaxKinds];
+        /* Batch at period (1,1): even in both dimensions so the 256x128 and
+         * 128x256 variants really run their large tiles (an odd batch would
+         * fall back to 128x128). 2x4 at the minimum --m/--n of 1024. */
+        int rb = m / CP_CUTLASS_CTA_M - 1;
+        int cb = n / CP_CUTLASS_CTA_N - 1;
+        if(rb > 2) rb = 2;
+        if(cb > 4) cb = 4;
+        rb &= ~1;
+        cb &= ~1;
+        static const CutlassVariant all_variants[] = {
+            {CP_CUTLASS_MMA_SIMT, CP_CUTLASS_TB_128x128},
+            {CP_CUTLASS_MMA_TENSOROP, CP_CUTLASS_TB_128x128},
+            {CP_CUTLASS_MMA_TENSOROP, CP_CUTLASS_TB_256x128},
+            {CP_CUTLASS_MMA_TENSOROP, CP_CUTLASS_TB_128x256},
+            {CP_CUTLASS_MMA_TENSOROP_MS, CP_CUTLASS_TB_128x128},
+            {CP_CUTLASS_MMA_TENSOROP80, CP_CUTLASS_TB_128x128},
+            {CP_CUTLASS_MMA_TENSOROP80, CP_CUTLASS_TB_256x128},
+            {CP_CUTLASS_MMA_TENSOROP80, CP_CUTLASS_TB_128x256},
+        };
+        enum { kMaxVariants = 8 };
+        static_assert(sizeof(all_variants) / sizeof(all_variants[0]) == kMaxVariants,
+                      "variant table size");
+        int kinds[kMaxVariants];
+        int tbs[kMaxVariants];
+        const char* vnames[kMaxVariants];
         int nk = 0;
-        for(int i = 0; i < kMaxKinds; i++){
-            if(cp_cutlass_kind_supported(g->dev, all_kinds[i]))
-                kinds[nk++] = all_kinds[i];
-            else
-                printf("[align-test-prod] sm_%d%d: CUTLASS %s not available, skipped\n",
-                       prop.major, prop.minor, cp_cutlass_mma_mode_name(all_kinds[i]));
+        for(int i = 0; i < kMaxVariants; i++){
+            const int kind = all_variants[i].kind;
+            const int tb = all_variants[i].tb;
+            if(cp_cutlass_kind_supported(g->dev, kind)){
+                kinds[nk] = kind;
+                tbs[nk] = tb;
+                vnames[nk] = cp_cutlass_variant_name(kind, tb);
+                nk++;
+            } else {
+                printf("[align-test-prod] sm_%d%d: CUTLASS %s %s not available, skipped\n",
+                       prop.major, prop.minor, cp_cutlass_mma_mode_name(kind),
+                       cp_cutlass_tb_name(tb));
+            }
         }
         int xrc = 0;
         /* Hash-tile policy vs CUTLASS's accumulator iterator (no MMA executed,
-         * so the m16n8k32 policy is checked even on sm_75). */
-        for(int i = 1; i < kMaxKinds && xrc == 0; i++){
-            const int bad = cp_cutlass_hash_policy_selftest(g->dev, all_kinds[i]);
-            printf("[align-test-prod] CUTLASS %s hash-tile policy vs IteratorC: %s",
-                   cp_cutlass_mma_mode_name(all_kinds[i]), bad == 0 ? "OK (256/256 tiles)\n" : "");
-            if(bad != 0){
+         * so the m16n8k32 policies are checked even on sm_75). */
+        for(int i = 1; i < kMaxVariants && xrc == 0; i++){
+            int ntiles = 0;
+            const int bad = cp_cutlass_hash_policy_selftest(
+                g->dev, all_variants[i].kind, all_variants[i].tb, &ntiles);
+            printf("[align-test-prod] CUTLASS %s %s hash-tile policy vs IteratorC: ",
+                   cp_cutlass_mma_mode_name(all_variants[i].kind),
+                   cp_cutlass_tb_name(all_variants[i].tb));
+            if(bad == 0){
+                printf("OK (%d/%d tiles)\n", ntiles, ntiles);
+            } else {
                 printf("%s %d\n", bad < 0 ? "CUDA error" : "bad tiles", bad);
                 xrc = -1;
             }
@@ -1297,13 +1336,15 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
             const size_t words = bytes / sizeof(uint32_t);
             const int num_steps = K_DIM / R_RANK;
             const int saved_mode = cp_cutlass_mma_mode();
+            const int saved_tb = cp_cutlass_tb();
             uint32_t* d_x = NULL;
-            uint32_t* h_x[kMaxKinds] = {NULL};
+            uint32_t* h_x[kMaxVariants] = {NULL};
             CU_CHECK(cudaMalloc(&d_x, bytes));
             for(int k = 0; k < nk && xrc == 0; k++){
                 h_x[k] = (uint32_t*)malloc(bytes);
                 if(!h_x[k]){ xrc = -1; break; }
                 cp_cutlass_set_mma_mode(kinds[k]);
+                cp_cutlass_set_tb(tbs[k]);
                 CU_CHECK(cudaMemset(d_x, 0, bytes));
                 t0 = cp_now_sec();
                 if(cp_cutlass_period_batch(g->dev, g->d_Ap, g->d_BpT, m, n,
@@ -1313,10 +1354,11 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                 }
                 CU_CHECK(cudaDeviceSynchronize());
                 printf("[align-test-prod] CUTLASS %s tile-xor dump %dx%d CTAs %.3fs\n",
-                       cp_cutlass_mma_kind_name(kinds[k]), rb, cb, cp_now_sec() - t0);
+                       vnames[k], rb, cb, cp_now_sec() - t0);
                 CU_CHECK(cudaMemcpy(h_x[k], d_x, bytes, cudaMemcpyDeviceToHost));
             }
             cp_cutlass_set_mma_mode(saved_mode);
+            cp_cutlass_set_tb(saved_tb);
             if(xrc == 0){
                 /* Independent CPU reference for hash tile 0 of CTA (0,0) of the
                  * batch (SIMT thread 0: rows {0..3,16..19}, cols {0..3,32..35}).
@@ -1327,7 +1369,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     static const int offs[8] = {0, 1, 2, 3, 16, 17, 18, 19};
                     static const int coffs[8] = {0, 1, 2, 3, 32, 33, 34, 35};
                     int32_t acc[64];
-                    int ref_bad[kMaxKinds] = {0};
+                    int ref_bad[kMaxVariants] = {0};
                     for(int i = 0; i < 8; i++){
                         CU_CHECK(cudaMemcpy(h_ar + (size_t)i * K_DIM,
                                             g->d_Ap + ((size_t)1 * CP_CUTLASS_CTA_M + offs[i]) * K_DIM,
@@ -1353,7 +1395,8 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     free(h_ar);
                     printf("[align-test-prod] CUTLASS hash tile 0 vs CPU prefix GEMM:");
                     for(int k = 0; k < nk; k++){
-                        printf(" %s %d/%d", cp_cutlass_mma_mode_name(kinds[k]), ref_bad[k], num_steps);
+                        printf(" %s/%s %d/%d", cp_cutlass_mma_mode_name(kinds[k]),
+                               cp_cutlass_tb_name(tbs[k]), ref_bad[k], num_steps);
                         if(ref_bad[k]) xrc = -1;
                     }
                     printf(" steps differ\n");
@@ -1367,8 +1410,11 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     xrc = -1;
                 }
                 for(int k = 1; k < nk && nz; k++){
-                    const char* ka = cp_cutlass_mma_mode_name(kinds[0]);
-                    const char* kb = cp_cutlass_mma_mode_name(kinds[k]);
+                    char ka[48], kb[48];
+                    snprintf(ka, sizeof(ka), "%s/%s", cp_cutlass_mma_mode_name(kinds[0]),
+                             cp_cutlass_tb_name(tbs[0]));
+                    snprintf(kb, sizeof(kb), "%s/%s", cp_cutlass_mma_mode_name(kinds[k]),
+                             cp_cutlass_tb_name(tbs[k]));
                     size_t bad = 0, first = (size_t)-1;
                     for(size_t i = 0; i < words; i++)
                         if(h_x[0][i] != h_x[k][i]){ if(!bad) first = i; bad++; }
@@ -1401,7 +1447,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                 }
             }
             cudaFree(d_x);
-            for(int k = 0; k < kMaxKinds; k++)
+            for(int k = 0; k < kMaxVariants; k++)
                 free(h_x[k]);
         } else if(xrc == 0 && nk <= 1){
             printf("[align-test-prod] sm_%d%d: no int8 tensor cores, kernel cross-check skipped\n",

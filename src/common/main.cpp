@@ -133,6 +133,9 @@ static void print_usage(void)
     printf("                       (mma.m8n8k16, 2-stage), tensorop80 (mma.m16n8k32,\n");
     printf("                       multistage cp.async; sm_80+), tensoropms (multistage\n");
     printf("                       + m8n8k16; A/B and sm_75 validation)\n");
+    printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128 (default),\n");
+    printf("                       256x128 or 128x256 (= 2 virtual 128x128 CTAs, same\n");
+    printf("                       hash tiles); env CP_CUDA_TB sets the same\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
@@ -798,6 +801,18 @@ int main(int argc, char** argv)
                                 "or tensoropms\n");
                 return 1;
             }
+        } else if(!strcmp(argv[i], "--cuda-tb") && i + 1 < argc){
+            const char* v = argv[++i];
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+            const int tb = cp_cutlass_tb_parse(v);
+            if(tb < 0){
+                fprintf(stderr, "--cuda-tb requires 128x128, 256x128 or 128x256\n");
+                return 1;
+            }
+            cp_cutlass_set_tb(tb);
+#else
+            (void)v;
+#endif
         } else if(!strcmp(argv[i], "--fused-jackpot")){
             onednn_fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
