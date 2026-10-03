@@ -24,7 +24,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 
 - MSVC + **CMake** (Windows) or GCC/Clang + CMake (Linux/macOS)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
-- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX2/SSSE3/scalar and AArch64 DotProd/NEON/scalar (`--simd`)
+- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX512-VNNI/AVX-VNNI/AVX512-BW/AVX2/SSSE3/scalar and AArch64 DotProd/NEON/scalar (`--simd`)
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
@@ -170,7 +170,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **58** (jackpot curve); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `fused` (default), `reuse`, or `separate` matrix prepack |
-| `--simd ISA` | CPU: `auto` (default), `hybrid`, `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar`. Quantus: `hybrid` runs one scalar and one AVX2 Poseidon2 worker per physical core (SMT siblings); `auto` is the best available mode (currently `hybrid`; may select a wider kernel such as AVX-512 in the future); `avx2` forces AVX2 on every thread; any other value runs scalar. Pearl: `hybrid` is the same as `auto` |
+| `--simd ISA` | CPU: `auto` (default), `hybrid`, `avx512vnni`, `avxvnni`, `avx512` (base AVX512F+BW, `avx512bw` alias), `avx2`, `ssse3` (`sse` alias), `i8mm`, `dotprod`, `neon`, `scalar`. Quantus: `hybrid` runs one scalar and one AVX2 Poseidon2 worker per physical core (SMT siblings); `auto` is the best available mode (currently `hybrid`; may select a wider kernel such as AVX-512 in the future); `avx2` forces AVX2 on every thread; any other value runs scalar. Pearl: `hybrid` is the same as `auto` |
 | `--simd-test` | Compare every available CPU SIMD kernel against scalar and exit (Quantus: AVX2 Poseidon2 field ops and hash parity vs scalar) |
 | `--prepack-test` | Check CPU fused and reuse prepack against separate at m=n=8192 (prepacked bytes + full tile XOR) and exit |
 
