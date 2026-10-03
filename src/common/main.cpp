@@ -410,20 +410,20 @@ reconnect:
 
 int main(int argc, char** argv)
 {
-    /* Buffer stdout before anything prints.
+#ifdef __MINGW32__
+    /* MinGW/MSYS2 only: buffer stdout before anything prints.
      *
-     * MinGW/MSYS2 builds use the MinGW printf (__USE_MINGW_ANSI_STDIO=1),
-     * which emits each %-conversion as its own write to the stream. The MS
-     * CRT leaves a console stdout unbuffered, so every fragment of a status
-     * line becomes a separate WriteConsole and the log crawls out piece by
-     * piece. MSVC builds are not affected: the CRT printf writes a call at
-     * once.
+     * MinGW builds use the MinGW printf (__USE_MINGW_ANSI_STDIO=1), which
+     * emits each %-conversion as its own write to the stream. The MS CRT
+     * leaves a console stdout unbuffered, so every fragment of a status line
+     * becomes a separate WriteConsole and the log crawls out piece by piece.
+     * MSVC builds are not affected (the CRT printf writes a call at once) and
+     * other platforms keep their default buffering.
      *
      * On Win32, _IOLBF behaves as _IOFBF (full buffering), so prompt output
-     * relies on the fflush(stdout) that already follows every runtime log
-     * line. On Linux/macOS it adds line buffering when stdout is a pipe or
-     * file (nohup, tee, systemd), where glibc would otherwise buffer fully. */
+     * relies on the fflush(stdout) that follows every log line. */
     setvbuf(stdout, NULL, _IOLBF, 8192);
+#endif
 
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
