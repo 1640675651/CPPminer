@@ -1123,8 +1123,11 @@ static int g_overlap = -1;
 static int gpu_overlap_enabled(void)
 {
     if(g_overlap < 0){
+        /* On by default (CMP 50HX and RTX 3090: same or slightly better
+         * effective rate, align-test and mock verify pass); CP_CUDA_OVERLAP=0
+         * restores the serial prep + synchronous scan loop. */
         const char* e = getenv("CP_CUDA_OVERLAP");
-        g_overlap = (e && atoi(e) > 0) ? 1 : 0;
+        g_overlap = (e && e[0] != '\0') ? (atoi(e) > 0 ? 1 : 0) : 1;
     }
     return g_overlap;
 }

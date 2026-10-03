@@ -72,7 +72,19 @@ int cp_cutlass_tb(void)
 {
   if (g_tb < 0) {
     const char* env = getenv("CP_CUDA_TB");
+    /* Default by architecture, measured at 131072^2:
+     *  sm_75 (CMP 50HX, 225 W): 256x128 61.2 vs 128x128 56.9 TMAC/s — the
+     *    2-stage m8n8k16 kernel is bandwidth/power bound, the bigger tile cuts
+     *    global->shared traffic per MAC by 25%;
+     *  sm_86 (RTX 3090, 350 W): 128x128 97 vs 256x128 94-96 — with only one
+     *    256-thread CTA per SM latency hiding loses more than the traffic saves.
+     * sm_80+/89 follow sm_86 until measured otherwise. */
     int tb = CP_CUTLASS_TB_128x128;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+        major == 7)
+      tb = CP_CUTLASS_TB_256x128;
     if (env != nullptr && env[0] != '\0') {
       tb = cp_cutlass_tb_parse(env);
       if (tb < 0) {
