@@ -11,6 +11,7 @@
 - Reduce host memory usage (CPU, CUDA, OpenCL, OneDNN, Wgpu)
 - MinGW and MSYS2 support (thanks to @danifest751)
 - AVX512-VNNI CPU kernel (`--simd avx512vnni`, auto-selected on Zen4-class CPUs): ~2x the AVX2 kernel per core
+- Base AVX-512 CPU kernel (AVX512F + AVX512BW, no VNNI; `--simd avx512`, auto-selected on e.g. Skylake-X/SP)
 - Configurable matrix size: `--m` / `--n` in units of 1024 (default 128x128)
 
 ### Pearl wgpu

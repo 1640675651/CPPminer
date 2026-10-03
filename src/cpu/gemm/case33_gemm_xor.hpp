@@ -18,6 +18,7 @@ enum class Case33Isa {
     Auto,    /* architecture-specific best ISA, else scalar */
     Avx512Vnni, /* prefer AVX512-VNNI (EVEX vpdpbusd); fall back if unavailable */
     AvxVnni, /* prefer AVX-VNNI vpdpbusd; fall back if unavailable */
+    Avx512Bw, /* prefer base AVX-512 (F+BW, zmm vpmaddubsw); fall back if unavailable */
     Avx2,    /* prefer AVX2 maddubs; fall back if unavailable */
     Sse,     /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
     DotProd, /* force AArch64 DotProd path */
@@ -98,7 +99,8 @@ private:
     bool use_fast_u8s8_() const {
         return int8_mode_ == Case32Int8Mode::FastU8S8 &&
                (isa_used_ == Case33Isa::Avx512Vnni || isa_used_ == Case33Isa::AvxVnni ||
-                isa_used_ == Case33Isa::Avx2 || isa_used_ == Case33Isa::Sse);
+                isa_used_ == Case33Isa::Avx512Bw || isa_used_ == Case33Isa::Avx2 ||
+                isa_used_ == Case33Isa::Sse);
     }
     void update_backend_label_();
     bool fused_noisy_prepack_a_(const int8_t *a_signal, const uint8_t *a_noise_seed,

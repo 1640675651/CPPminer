@@ -6,6 +6,7 @@
 #if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
 #define CASE33_X86 1
 #include "case33_gemm_xor_avx512vnni.hpp"
+#include "case33_gemm_xor_avx512bw.hpp"
 #include "case33_gemm_xor_avxvnni.hpp"
 #include "case33_gemm_xor_avx2.hpp"
 #include "case33_gemm_xor_ssse3.hpp"
@@ -49,6 +50,7 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
     const Case33CpuFeatures features = case33_detect_cpu_features();
     const bool avx512_vnni = CASE33_X86 && features.avx512_vnni;
     const bool avx_vnni = CASE33_X86 && features.avx_vnni;
+    const bool avx512_bw = CASE33_X86 && features.avx512_bw;
     const bool avx2 = CASE33_X86 && features.avx2;
     const bool ssse3 = CASE33_X86 && features.ssse3;
     const bool dotprod = case33_is_aarch64_build() && features.dotprod;
@@ -59,6 +61,9 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
         break;
     case Case33Isa::AvxVnni:
         if (avx_vnni) { *out = Case33Isa::AvxVnni; return true; }
+        break;
+    case Case33Isa::Avx512Bw:
+        if (avx512_bw) { *out = Case33Isa::Avx512Bw; return true; }
         break;
     case Case33Isa::Avx2:
         if (avx2) { *out = Case33Isa::Avx2; return true; }
@@ -79,6 +84,7 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
     default:
         if (avx512_vnni) *out = Case33Isa::Avx512Vnni;
         else if (avx_vnni) *out = Case33Isa::AvxVnni;
+        else if (avx512_bw) *out = Case33Isa::Avx512Bw;
         else if (avx2) *out = Case33Isa::Avx2;
         else if (ssse3) *out = Case33Isa::Sse;
         else if (dotprod) *out = Case33Isa::DotProd;
@@ -306,7 +312,9 @@ void micro_gemm_xor_fused_k(const int8_t *a_base, const int8_t *b_base, int bloc
                                               xor_after_milestone, tile_xor_out);
         return;
     }
-    if (isa == Case33Isa::Avx2) {
+    /* AVX512-BW only has a two-tile (zmm 16x16) kernel; single tiles (pair disabled via
+     * CP_AVX512_PAIR=0, odd tail) run the AVX2 kernel, which every AVX512BW CPU supports. */
+    if (isa == Case33Isa::Avx2 || isa == Case33Isa::Avx512Bw) {
         case33_avx2_micro_gemm_xor_fused_k(a_base, b_base, blocks_k, blocks_per_milestone,
                                            num_milestones, N, global_col0, spatial_tile_id,
                                            tile_count, b_comp_ms, use_fast_u8s8,
@@ -349,11 +357,12 @@ void micro_gemm_xor_milestones(const int8_t *a_base, const int8_t *b_base, int b
                            use_fast_u8s8, isa, sse_tile, xor_after_milestone, tile_xor_out);
 }
 
-/* AVX512-VNNI can fuse two vertically adjacent 8x16 tiles into one 16x16 zmm block that
- * shares every B broadcast; tile geometry and milestone schedule are unchanged. */
+/* AVX512-VNNI and AVX512-BW can fuse two vertically adjacent 8x16 tiles into one 16x16 zmm
+ * block that shares every B broadcast; tile geometry and milestone schedule are unchanged. */
 bool micro_gemm_xor_pair_capable(Case33Isa isa) {
 #if CASE33_X86
-    return isa == Case33Isa::Avx512Vnni && case33_avx512vnni_pair_enabled();
+    return (isa == Case33Isa::Avx512Vnni || isa == Case33Isa::Avx512Bw) &&
+           case33_avx512vnni_pair_enabled();
 #else
     (void)isa;
     return false;
@@ -366,14 +375,22 @@ void micro_gemm_xor_milestones_pair(const int8_t *a_base0, const int8_t *a_base1
                                     int global_col0, size_t spatial_tile_id0,
                                     size_t spatial_tile_id1, size_t tile_count,
                                     const int32_t *b_comp_ms, bool use_fast_u8s8,
-                                    bool xor_after_milestone, uint32_t *tile_xor_out) {
+                                    Case33Isa isa, bool xor_after_milestone,
+                                    uint32_t *tile_xor_out) {
 #if CASE33_X86
+    if (isa == Case33Isa::Avx512Bw) {
+        case33_avx512bw_micro_gemm_xor_fused_k_x2(
+                a_base0, a_base1, b_base, blocks_k, blocks_per_milestone, num_milestones, N,
+                global_col0, spatial_tile_id0, spatial_tile_id1, tile_count, b_comp_ms,
+                use_fast_u8s8, xor_after_milestone, tile_xor_out);
+        return;
+    }
     case33_avx512vnni_micro_gemm_xor_fused_k_x2(
             a_base0, a_base1, b_base, blocks_k, blocks_per_milestone, num_milestones, N,
             global_col0, spatial_tile_id0, spatial_tile_id1, tile_count, b_comp_ms,
             use_fast_u8s8, xor_after_milestone, tile_xor_out);
 #else
-    (void)a_base0; (void)a_base1; (void)b_base; (void)blocks_k; (void)blocks_per_milestone;
+    (void)isa; (void)a_base0; (void)a_base1; (void)b_base; (void)blocks_k; (void)blocks_per_milestone;
     (void)num_milestones; (void)N; (void)global_col0; (void)spatial_tile_id0;
     (void)spatial_tile_id1; (void)tile_count; (void)b_comp_ms; (void)use_fast_u8s8;
     (void)xor_after_milestone; (void)tile_xor_out;
@@ -430,7 +447,7 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
                             a_base, a_base + a_tile_stride, b_base, blocks_k,
                             blocks_per_milestone, num_milestones, N, micro_col0,
                             spatial_tile_id, spatial_tile_id + static_cast<size_t>(tile_cols),
-                            tile_count, b_comp_ms, use_fast_u8s8, xor_after_milestone,
+                            tile_count, b_comp_ms, use_fast_u8s8, isa, xor_after_milestone,
                             out->data());
                     tr += 2;
                     continue;
@@ -525,7 +542,8 @@ bool run_online_tile_scan(
                             a_base, a_base + a_tile_stride, b_base, blocks_k,
                             blocks_per_milestone, num_milestones, N, micro_col0,
                             /*spatial_tile_id0=*/0, /*spatial_tile_id1=*/kNumMilestones,
-                            /*tile_count=*/1, b_comp_ms, use_fast_u8s8, true, milestone_xor2);
+                            /*tile_count=*/1, b_comp_ms, use_fast_u8s8, isa, true,
+                            milestone_xor2);
                     if (!on_tile(milestone_xor2, micro_row0, micro_col0) ||
                         !on_tile(milestone_xor2 + kNumMilestones, micro_row0 + kMR,
                                  micro_col0)) {
@@ -684,12 +702,13 @@ int case33_test_simd_parity() {
 
         const char *mode_name = mode == Case32Int8Mode::FastU8S8 ? "u8s8" : "exact s8s8";
         for (Case33Isa isa : {Case33Isa::Sse, Case33Isa::Avx2, Case33Isa::AvxVnni,
-                               Case33Isa::Avx512Vnni,
+                               Case33Isa::Avx512Vnni, Case33Isa::Avx512Bw,
                                Case33Isa::DotProd, Case33Isa::Neon}) {
             const char *isa_name = isa == Case33Isa::Sse          ? "SSSE3"
                                    : isa == Case33Isa::Avx2       ? "AVX2"
                                    : isa == Case33Isa::AvxVnni    ? "AVX-VNNI"
                                    : isa == Case33Isa::Avx512Vnni ? "AVX512-VNNI"
+                                   : isa == Case33Isa::Avx512Bw   ? "AVX512-BW"
                                    : isa == Case33Isa::DotProd    ? "DotProd"
                                                                   : "NEON";
             Case33GemmXor candidate;
@@ -703,8 +722,12 @@ int case33_test_simd_parity() {
             if (!candidate.init(kTestM, kTestN, K_DIM, a.data(), b.data())) return 1;
             candidate.run();
             const bool ok = candidate.tile_xor() == expected;
-            std::printf("[cpu] SIMD parity %-11s %-10s %s\n", isa_name, mode_name,
-                        ok ? "matches scalar" : "MISMATCH");
+            /* AVX512-BW has no vpsignb: exact s8s8 runs the AVX2 kernel per tile. */
+            const char *note = isa == Case33Isa::Avx512Bw && mode != Case32Int8Mode::FastU8S8
+                                       ? " (uses AVX2 path)"
+                                       : "";
+            std::printf("[cpu] SIMD parity %-11s %-10s %s%s\n", isa_name, mode_name,
+                        ok ? "matches scalar" : "MISMATCH", note);
             if (!ok) return 2;
         }
     }
@@ -756,6 +779,10 @@ void Case33GemmXor::update_backend_label_() {
     if (isa_used_ == Case33Isa::Avx512Vnni) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
                       "ukernel %s %dx%d 2D-par fused-K %s+XOR, AVX512-VNNI 8x16 KR=%d%s",
+                      par, kMacroM, kMacroN, dot, kKR, prepack);
+    } else if (isa_used_ == Case33Isa::Avx512Bw) {
+        std::snprintf(backend_buf_, sizeof(backend_buf_),
+                      "ukernel %s %dx%d 2D-par fused-K %s+XOR, AVX512-BW 16x16 (2x 8x16) KR=%d%s",
                       par, kMacroM, kMacroN, dot, kKR, prepack);
     } else if (isa_used_ == Case33Isa::AvxVnni) {
         std::snprintf(backend_buf_, sizeof(backend_buf_),
@@ -950,7 +977,7 @@ bool Case33GemmXor::prepare_job_b(int M, int N, int K, std::vector<int8_t> *b_bu
             return false;
         }
         const int8_t *b_row = b_buf->data();
-        if (!use_fast && (isa_used_ == Case33Isa::Avx512Vnni ||
+        if (!use_fast && (isa_used_ == Case33Isa::Avx512Vnni || isa_used_ == Case33Isa::Avx512Bw ||
                           isa_used_ == Case33Isa::AvxVnni || isa_used_ == Case33Isa::Avx2 ||
                           isa_used_ == Case33Isa::Sse)) {
             for (size_t i = 0, count = static_cast<size_t>(K_) * N_; i < count; ++i) {
