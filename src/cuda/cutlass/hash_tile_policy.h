@@ -15,6 +15,9 @@
 //                    per-lane partial XORs are regrouped per "virtual SIMT
 //                    thread" with a warp-shuffle reduce-scatter (XOR is
 //                    associative/commutative, so grouping order is irrelevant).
+//                    Also exact for mma.sync m16n8k32 (Sm80+): its warp
+//                    accumulator fragment has the identical register layout,
+//                    see HashTileTensorOpFor below.
 #pragma once
 
 #include "cutlass/cutlass.h"
@@ -167,5 +170,60 @@ private:
     }
   }
 };
+
+/* Policy for a 128x128 threadblock, warp tile WarpShape and mma.sync
+ * instruction InstructionShape (8x8x16 on Sm75, 16x8x32 on Sm80+).
+ *
+ * m16n8k32 s8 -> s32 accumulator (PTX ISA "mma.m16n8k32 C/D fragment";
+ * CUTLASS MmaTensorOpAccumulatorTileIterator<RowMajor>: kElementsPerAccess =
+ * N/4 = 2, kRowsPerTile = 8, kAccumulatorRows = M/8 = 2). Lane l holds 4
+ * int32 c0..c3 of the 16x8 instruction tile:
+ *
+ *            col:  0 1 | 2 3 | 4 5 | 6 7      c0,c1: row = l>>2,     col = 2*(l&3)+{0,1}
+ *      row  0 lane  0 0 | 1 1 | 2 2 | 3 3      c2,c3: row = (l>>2)+8, col = 2*(l&3)+{0,1}
+ *      ...                                     i.e. c_e: row = (l>>2) + 8*(e>>1),
+ *      row  7 lane 28 28| 29 29| 30 30| 31 31              col = 2*(l&3) + (e&1)
+ *      ---- upper 8x8 half (c0,c1) / lower 8x8 half (c2,c3) ----
+ *      row  8 lane  0 0 | 1 1 | 2 2 | 3 3
+ *      ...
+ *      row 15 lane 28 28| 29 29| 30 30| 31 31
+ *
+ * Each 8-row half is exactly an m8n8k16 accumulator tile (same lane -> (row,
+ * col) map, two consecutive columns per lane).
+ *
+ * Warp fragment order: MmaTensorOp::operator() writes instruction tile (m, n)
+ * to ptr_D[m + n * MmaIterations::kRow] (both the sm_75 and the sm_80
+ * serpentine loops only change the visiting order, not the slot), and the
+ * epilogue's IteratorC reads frag[kAccumulatorRows*kElementsPerAccess*(n*kRow
+ * + m) + row*kElementsPerAccess + col]. With R8 = WarpShape::kM / 8 8-row
+ * groups, the m16n8k32 element (m16, n, e) is
+ *     accum[4*(n*R8/2 + m16) + e]
+ *   = accum[2*(n*R8 + 2*m16 + (e>>1)) + (e&1)]
+ *   = accum[2*(n*R8 + m8) + i]          with m8 = 2*m16 + (e>>1), i = e&1,
+ * which is the m8n8k16 index of the cell in 8x8 tile (m8, n), element i --
+ * the formula HashTileTensorOp uses (e = 2*(ni*kRowIters + mi)). So for the
+ * same warp tile, cell (r, c) lives in the same lane and the same register
+ * slot under both instructions, and HashTileTensorOp (partials over the
+ * 8x8 tiles {4h+a, 4h+a+2} x {b, b+4}, reduce-scatter over lane masks 8,4,1)
+ * emits the identical virtual SIMT hash-tile words. cp_cutlass_hash_policy_
+ * selftest() checks this against CUTLASS's own IteratorC for every tensor-op
+ * instantiation (it uses no mma instruction, so it also runs on sm_75). */
+template <typename WarpShape, typename InstructionShape>
+struct HashTileTensorOpSelect {
+  static_assert(InstructionShape::kN == 8 &&
+                    (InstructionShape::kM == 8 || InstructionShape::kM == 16),
+                "hash-tile policy supports mma.sync m8n8k* and m16n8k*");
+  static_assert(WarpShape::kM % InstructionShape::kM == 0,
+                "warp tile M must be a multiple of the instruction M");
+  using type =
+      HashTileTensorOp<WarpShape,
+                       cutlass::gemm::GemmShape<128 / WarpShape::kM,
+                                                128 / WarpShape::kN, 1>,
+                       WarpShape::kM / 8, WarpShape::kN / 8>;
+};
+
+template <typename WarpShape, typename InstructionShape>
+using HashTileTensorOpFor =
+    typename HashTileTensorOpSelect<WarpShape, InstructionShape>::type;
 
 } // namespace cp_cutlass

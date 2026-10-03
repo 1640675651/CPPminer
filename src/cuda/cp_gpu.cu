@@ -357,9 +357,10 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaSetDevice(g->dev));
         if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
             fprintf(stderr,
-                    "[gpu] GPU%d: --cutlass-fused needs sm_61+ (dp4a) or sm_75+ for "
-                    "--cuda-mma tensorop\n",
-                    g->dev);
+                    "[gpu] GPU%d: --cutlass-fused --cuda-mma %s not supported here "
+                    "(simt needs sm_61+, tensorop/tensoropms sm_75+, tensorop80 sm_80+ "
+                    "and a binary built for an sm_80+ arch, e.g. --cuda-arch '75;86;89')\n",
+                    g->dev, cp_cutlass_mma_mode_name(cp_cutlass_mma_kind(g->dev)));
             exit(1);
         }
         CU_CHECK(cudaMalloc(&g->d_found, sizeof(int)));
