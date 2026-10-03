@@ -147,7 +147,7 @@ int amd_wmma_arch(const std::string &device_name) {
 
 /* Build ordered candidate list. issue_mode==1 (broadcast) is handled by caller. */
 std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, bool vendor_amd,
-                                                     bool has_khr) {
+                                                     bool has_khr, int wmma_arch) {
     using B = Case32OclDotBackend;
     std::vector<B> out;
 
@@ -190,10 +190,17 @@ std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, 
         return out;
     case Case32OclDotPolicy::Auto:
     default:
-        /* AMD: sudot4 (RDNA3) → sdot4 (GFX9/RDNA2) → KHR if advertised → scalar.
+        /* AMD: WMMA on gfx11 (RDNA3: ~1.7x sudot4 on a 780M, verified bit-exact) →
+         * sudot4 (RDNA3) → sdot4 (GFX9/RDNA2) → KHR if advertised → scalar.
+         * gfx12 WMMA stays opt-in (--ocl-dot wmma) until its lane layout is
+         * confirmed on hardware. WMMA refuses non-8x16 tiles / LDS staging, so
+         * those configurations fall through to sudot4.
          * Intel/NVIDIA/other: KHR if advertised → scalar.
          * Asm stays opt-in via PinAsm only. */
         if (vendor_amd) {
+            if (wmma_arch == 11) {
+                push_unique(B::Wmma);
+            }
             push_unique(B::Sudot4);
             push_unique(B::Sdot4);
         }
@@ -466,7 +473,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
         candidates = {Case32OclDotBackend::Scalar};
     } else {
-        candidates = select_dot_backends(dot_policy_, vendor_is_amd, ocl_.has_integer_dot_product);
+        candidates = select_dot_backends(dot_policy_, vendor_is_amd, ocl_.has_integer_dot_product,
+                                         vendor_is_amd ? amd_wmma_arch(ocl_.device_name) : 0);
     }
 
     bool built = false;
