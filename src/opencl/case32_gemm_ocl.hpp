@@ -14,6 +14,7 @@ enum class Case32OclDotBackend {
     KhrDpi,      // cl_khr_integer_dot_product when advertised
     KhrDpiForce, // force -cl-ext=+cl_khr_integer_dot_product
     Scalar,      // NO_DPI: broadcast cpm or packed scalar (via issue_mode)
+    Wmma,        // AMD matrix cores: wave32 WMMA iu8 16x16x16 (gfx11 / gfx12), opt-in
 };
 
 /* How to choose backends. Pin* tries that backend then Scalar. */
@@ -25,6 +26,7 @@ enum class Case32OclDotPolicy {
     PinSdot4,
     PinAsm,
     PinKhr,
+    PinWmma, // Wmma only (no fallback): refuses devices other than gfx11xx / gfx12xx
 };
 
 struct Case32GemmOcl {

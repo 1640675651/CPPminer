@@ -108,6 +108,8 @@ private:
 
     bool build_kernel_(const char *kernel_cl_path);
 
+    bool run_wmma_selftest_();
+
     bool setup_dims_(int M, int N, int K);
 
     bool ensure_jackpot_bufs_();
@@ -158,6 +160,8 @@ private:
 
     bool use_lds_ = false;
     int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
+    int wmma_arch_ = 0;       /* Wmma backend: 11 (gfx11) or 12 (gfx12) */
+    int wmma_g12_ksplit_ = 0; /* gfx12 A/B k mapping (CP_OCL_WMMA_G12_KSPLIT) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 

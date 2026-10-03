@@ -5,6 +5,7 @@
 #include "cp_config.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -80,6 +81,8 @@ const char *dot_backend_label(Case32OclDotBackend b, int issue_mode, bool cpm_in
         return "cl_khr_integer_dot_product";
     case Case32OclDotBackend::KhrDpiForce:
         return "force cl_khr_integer_dot_product";
+    case Case32OclDotBackend::Wmma:
+        return "WMMA __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32";
     case Case32OclDotBackend::Scalar:
         if (issue_mode == 1) {
             return cpm_int ? "broadcast int (cpm)" : "broadcast float (cpm)";
@@ -103,6 +106,8 @@ const char *dot_kind_short(Case32OclDotBackend b, int issue_mode, bool cpm_int) 
     case Case32OclDotBackend::KhrDpi:
     case Case32OclDotBackend::KhrDpiForce:
         return "dot_acc_sat";
+    case Case32OclDotBackend::Wmma:
+        return "wmma iu8";
     case Case32OclDotBackend::Scalar:
         if (issue_mode == 2) {
             return "packed scalar";
@@ -110,6 +115,34 @@ const char *dot_kind_short(Case32OclDotBackend b, int issue_mode, bool cpm_int) 
         return cpm_int ? "clblast cpm int" : "clblast cpm float";
     }
     return "clblast cpm";
+}
+
+/* WMMA generation from the AMD device name ("gfx1103", "gfx1201", ROCm may append
+   ":xnack-" etc.): 11 for gfx11xx (RDNA3), 12 for gfx12xx (RDNA4), else 0. */
+int amd_wmma_arch(const std::string &device_name) {
+    const size_t pos = device_name.find("gfx");
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    std::string digits;
+    for (size_t i = pos + 3; i < device_name.size(); ++i) {
+        const char c = device_name[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+            digits += c;
+        } else {
+            break;
+        }
+    }
+    if (digits.size() != 4) {
+        return 0;
+    }
+    if (digits.compare(0, 2, "11") == 0) {
+        return 11;
+    }
+    if (digits.compare(0, 2, "12") == 0) {
+        return 12;
+    }
+    return 0;
 }
 
 /* Build ordered candidate list. issue_mode==1 (broadcast) is handled by caller. */
@@ -151,6 +184,10 @@ std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, 
             push_unique(B::KhrDpi);
         }
         return finish_with_scalar();
+    case Case32OclDotPolicy::PinWmma:
+        /* No scalar fallback: a silent ~50x slower kernel would hide the failure. */
+        push_unique(B::Wmma);
+        return out;
     case Case32OclDotPolicy::Auto:
     default:
         /* AMD: sudot4 (RDNA3) → sdot4 (GFX9/RDNA2) → KHR if advertised → scalar.
@@ -255,7 +292,31 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                              backend == Case32OclDotBackend::KhrDpiForce;
         const bool force_ext = backend == Case32OclDotBackend::KhrDpiForce;
         const bool scalar = backend == Case32OclDotBackend::Scalar;
+        const bool use_wmma = backend == Case32OclDotBackend::Wmma;
         const char *label = dot_backend_label(backend, issue_mode_, use_cpm_int_);
+
+        if (use_wmma) {
+            wmma_arch_ = amd_wmma_arch(ocl_.device_name);
+            if (wmma_arch_ == 0) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_),
+                              "%s: refused on '%s' (needs gfx11xx or gfx12xx)", label,
+                              ocl_.device_name.c_str());
+                std::fprintf(stderr, "[ocl] %s\n", dpi_status_);
+                return false;
+            }
+            if (case32::kMR != 8 || case32::kNR != 16 || case32::hash_tile_nr() != 16 ||
+                use_lds_ || reqd_wg_size_ <= 0) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_),
+                              "%s: needs --ocl-tile 8x16, --ocl-lds off and a %d-WI work-group",
+                              label, case32::kMacroWorkItems);
+                std::fprintf(stderr, "[ocl] %s\n", dpi_status_);
+                return false;
+            }
+            wmma_g12_ksplit_ = 0;
+            if (const char *ks = std::getenv("CP_OCL_WMMA_G12_KSPLIT")) {
+                wmma_g12_ksplit_ = std::atoi(ks) ? 1 : 0;
+            }
+        }
 
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
@@ -285,7 +346,10 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         } else if (issue_mode_ == 2) {
             build_opts += " -DCASE32_FORCE_PACKED=1";
         }
-        if (use_sudot) {
+        if (use_wmma) {
+            build_opts += " -DCASE32_WMMA=" + std::to_string(wmma_arch_);
+            build_opts += " -DCASE32_WMMA_G12_KSPLIT=" + std::to_string(wmma_g12_ksplit_);
+        } else if (use_sudot) {
             build_opts += " -DCASE32_USE_BUILTIN_SUDOT4=1";
         } else if (use_asm) {
             build_opts += " -DCASE32_USE_ASM_DOT=1";
@@ -365,6 +429,18 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
         }
+        if (use_wmma) {
+            const char *st = std::getenv("CP_OCL_WMMA_SELFTEST");
+            if (st && st[0] && std::strcmp(st, "0") != 0 && !run_wmma_selftest_()) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: SELF-TEST FAILED", label);
+                return false;
+            }
+            char wl[96];
+            std::snprintf(wl, sizeof(wl), "%s (gfx%d layout%s)", label, wmma_arch_,
+                          wmma_arch_ == 12 ? (wmma_g12_ksplit_ ? ", ksplit=1" : ", ksplit=0")
+                                           : "");
+            return adopt_kernel(wl);
+        }
         return adopt_kernel(label);
     };
 
@@ -381,7 +457,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     }
 
     std::vector<Case32OclDotBackend> candidates;
-    if (issue_mode_ == 1) {
+    if (issue_mode_ == 1 && dot_policy_ != Case32OclDotPolicy::PinWmma) {
         /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
         candidates = {Case32OclDotBackend::Scalar};
     } else {
@@ -408,6 +484,130 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         std::fflush(stdout);
     }
     return built;
+}
+
+/* CP_OCL_WMMA_SELFTEST=1: one wave multiplies known 16x16 int8 matrices through the
+   kernel's own operand/accumulator layout helpers and compares with a scalar loop; it
+   also checks the milestone reduce-scatter and the hash-tile split of D. On gfx12 both
+   candidate A/B k mappings are tried, so one run tells which one the hardware uses. */
+bool Case33GemmOcl::run_wmma_selftest_() {
+    cl_kernel k = ocl_.create_kernel("case33_wmma_selftest");
+    if (!k) {
+        std::fprintf(stderr, "[ocl] WMMA self-test: kernel create failed\n");
+        return false;
+    }
+    int8_t a[256];
+    int8_t b[256];
+    int32_t c[256];
+    uint64_t s = 0x2545F4914F6CDD1DULL;
+    auto next = [&]() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return static_cast<uint32_t>(s >> 32);
+    };
+    for (int i = 0; i < 256; ++i) {
+        a[i] = static_cast<int8_t>(next());
+        b[i] = static_cast<int8_t>(next());
+        c[i] = static_cast<int32_t>(next() % 2000001u) - 1000000;
+    }
+    for (int i = 0; i < 16; ++i) { /* int8 extremes: row 0 of A, column 0 of B */
+        a[i] = static_cast<int8_t>((i & 1) ? 127 : -128);
+        b[i] = static_cast<int8_t>((i & 2) ? -128 : 127);
+    }
+    int32_t d_ref[256];
+    uint32_t top_ref = 0;
+    uint32_t bot_ref = 0;
+    for (int m = 0; m < 16; ++m) {
+        for (int n = 0; n < 16; ++n) {
+            int32_t acc = c[m * 16 + n];
+            for (int kk = 0; kk < 16; ++kk) {
+                acc += static_cast<int32_t>(a[m * 16 + kk]) * static_cast<int32_t>(b[n * 16 + kk]);
+            }
+            d_ref[m * 16 + n] = acc;
+            (m < 8 ? top_ref : bot_ref) ^= static_cast<uint32_t>(acc);
+        }
+    }
+    uint32_t rs_ref[32] = {};
+    for (uint32_t l = 0; l < 32; ++l) {
+        for (uint32_t t = 0; t < 32; ++t) {
+            rs_ref[t] ^= (l * 2654435761u + t * 2246822519u) ^ ((l + 1u) * (t + 3u));
+        }
+    }
+
+    cl_mem a_buf = ocl_.alloc_buffer(sizeof(a), CL_MEM_READ_ONLY);
+    cl_mem b_buf = ocl_.alloc_buffer(sizeof(b), CL_MEM_READ_ONLY);
+    cl_mem c_buf = ocl_.alloc_buffer(sizeof(c), CL_MEM_READ_ONLY);
+    cl_mem d_buf = ocl_.alloc_buffer(sizeof(d_ref), CL_MEM_READ_WRITE);
+    cl_mem w_buf = ocl_.alloc_buffer(34 * sizeof(uint32_t), CL_MEM_READ_WRITE);
+    bool pass_compiled = false;
+    bool io_ok = a_buf && b_buf && c_buf && d_buf && w_buf &&
+                 ocl_.write_buffer(a_buf, a, sizeof(a)) && ocl_.write_buffer(b_buf, b, sizeof(b)) &&
+                 ocl_.write_buffer(c_buf, c, sizeof(c));
+    const int variants = wmma_arch_ == 12 ? 2 : 1;
+    for (int v = 0; io_ok && v < variants; ++v) {
+        cl_int err = CL_SUCCESS;
+        err |= clSetKernelArg(k, 0, sizeof(cl_mem), &a_buf);
+        err |= clSetKernelArg(k, 1, sizeof(cl_mem), &b_buf);
+        err |= clSetKernelArg(k, 2, sizeof(cl_mem), &c_buf);
+        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_buf);
+        err |= clSetKernelArg(k, 4, sizeof(cl_mem), &w_buf);
+        err |= clSetKernelArg(k, 5, sizeof(int), &v);
+        const size_t gsz = 32;
+        if (err == CL_SUCCESS) {
+            err = clEnqueueNDRangeKernel(ocl_.queue, k, 1, nullptr, &gsz, &gsz, 0, nullptr,
+                                         nullptr);
+        }
+        int32_t d[256];
+        uint32_t w[34];
+        if (err != CL_SUCCESS || clFinish(ocl_.queue) != CL_SUCCESS ||
+            !ocl_.read_buffer(d_buf, d, sizeof(d)) || !ocl_.read_buffer(w_buf, w, sizeof(w))) {
+            std::fprintf(stderr, "[ocl] WMMA self-test: launch failed (%s)\n",
+                         OpenClContext::error_string(err).c_str());
+            io_ok = false;
+            break;
+        }
+        int bad_d = 0;
+        int first_bad = -1;
+        for (int i = 0; i < 256; ++i) {
+            if (d[i] != d_ref[i]) {
+                if (first_bad < 0) {
+                    first_bad = i;
+                }
+                ++bad_d;
+            }
+        }
+        int bad_rs = 0;
+        for (int t = 0; t < 32; ++t) {
+            bad_rs += w[t] != rs_ref[t];
+        }
+        const bool tiles_ok = w[32] == top_ref && w[33] == bot_ref;
+        const bool pass = bad_d == 0 && bad_rs == 0 && tiles_ok;
+        const char *name = wmma_arch_ == 12 ? (v ? "ksplit=1 (k 8h..8h+7)"
+                                                  : "ksplit=0 (k 4h.., 8+4h..)")
+                                            : "(k 0..15 per lane, halves duplicated)";
+        std::printf("[ocl] WMMA self-test gfx%d %s: %s (D %d/256 wrong, reduce-scatter %d/32 "
+                    "wrong, hash-tile split %s)\n",
+                    wmma_arch_, name, pass ? "PASS" : "FAIL", bad_d, bad_rs,
+                    tiles_ok ? "ok" : "WRONG");
+        if (first_bad >= 0) {
+            std::printf("[ocl]   first wrong D[%d][%d] = %d, expected %d\n", first_bad / 16,
+                        first_bad % 16, d[first_bad], d_ref[first_bad]);
+        }
+        const int compiled = wmma_arch_ == 12 ? wmma_g12_ksplit_ : 0;
+        if (v == compiled) {
+            pass_compiled = pass;
+        }
+    }
+    std::printf("[ocl] WMMA self-test: %s\n", io_ok && pass_compiled ? "PASS" : "FAIL");
+    std::fflush(stdout);
+    for (cl_mem m : {a_buf, b_buf, c_buf, d_buf, w_buf}) {
+        if (m) {
+            clReleaseMemObject(m);
+        }
+    }
+    clReleaseKernel(k);
+    return io_ok && pass_compiled;
 }
 
 bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,

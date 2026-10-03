@@ -270,7 +270,7 @@ extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
     if (policy < 0) {
         policy = 0;
     }
-    if (policy > 6) {
+    if (policy > 7) {
         policy = 0;
     }
     g_dot_policy = policy;
