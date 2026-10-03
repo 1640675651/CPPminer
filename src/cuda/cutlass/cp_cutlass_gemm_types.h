@@ -51,8 +51,16 @@ template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
 struct GemmTypesCommon {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, EpilogueVectorLength, ElementAccumulator, ElementCompute>;
+  /* Group 8 N-tiles per M step. With the default (1) a launch walks all 32
+   * M-tiles of the row batch for one N-tile before moving on, so the 32 A
+   * panels (16 MiB) are re-read from DRAM for every one of the 1024 N-tiles
+   * on parts with a small L2 (6 MiB on GA102/TU102): ~500 GB per attempt,
+   * which made the tensor-op kernels DRAM- and power-bound. Grouping cuts the
+   * A re-reads 8x. RTX 3090, 131072^2: m16n8k32 82-84 -> 99 TMAC/s, m8n8k16
+   * 87-90 -> 92; 4 and 16 measure the same as 8. Tile offsets come from
+   * the swizzle, so hash-tile coordinates are unaffected. */
   using ThreadblockSwizzle =
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
 
   using DefaultGemmKernel = typename cutlass::gemm::kernel::DefaultGemm<
       ElementInput, LayoutA, Alignment, ElementInput, LayoutB, Alignment,
