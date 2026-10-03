@@ -107,8 +107,10 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
 
     if(log_step) t_step = cp_now_sec();
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, g_zero_b.b_noise_seed);
-    if(log_step)
+    if(log_step){
         printf("[gen]   zero-B b_noise_seed done in %.1fs\n", cp_now_sec() - t_step);
+        fflush(stdout);
+    }
 
     if(g_prepack_mode == CP_PREPACK_FUSED){
         if(!g_gemm.prepare_job_b(m, n, K_DIM, &g_zero_b.B_noisy, NULL,
@@ -131,8 +133,10 @@ static int zero_b_prepare_job(const uint8_t job_key[32], int m, int n)
         }
     }
 
-    if(log_step)
+    if(log_step){
         printf("[gen]   zero-B job setup done in %.1fs\n", cp_now_sec() - t0);
+        fflush(stdout);
+    }
 
     g_zero_b.ready = 1;
     return 0;
