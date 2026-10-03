@@ -80,6 +80,11 @@ struct Case33GemmOcl {
 
 
 
+    /* Correctness check: run the whole M x N GEMM with fuse_jackpot = 0 and read back
+       every milestone word as out[ms * tile_count + spatial_id] (the layout of
+       case32::reference_milestone_tile_xor). Needs prepare_job + prepare_attempt_a. */
+    bool compute_milestone_tile_xor(std::vector<uint32_t> *out);
+
     const char *backend() const { return backend_; }
 
     const char *device_name() const { return device_name_.c_str(); }
@@ -103,11 +108,13 @@ private:
 
     bool build_kernel_(const char *kernel_cl_path);
 
+    bool run_wmma_selftest_();
+
     bool setup_dims_(int M, int N, int K);
 
     bool ensure_jackpot_bufs_();
 
-    bool run_macro_batch_(int mb_begin, int batch_count);
+    bool run_macro_batch_(int mb_begin, int batch_count, cl_mem tile_xor_out = nullptr);
 
 
 
@@ -152,6 +159,10 @@ private:
     bool use_cpm_int_ = false;
 
     bool use_lds_ = false;
+    int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
+    int wmma_arch_ = 0;       /* Wmma backend: 11 (gfx11) or 12 (gfx12) */
+    int wmma_g12_ksplit_ = 0; /* gfx12 A/B k mapping (CP_OCL_WMMA_G12_KSPLIT) */
+    int wmma_pipeline_ = 0;   /* register double buffer (CP_OCL_WMMA_PIPELINE) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 

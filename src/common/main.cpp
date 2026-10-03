@@ -100,7 +100,7 @@ static void print_usage(void)
     printf("  --ocl-macro MxN    OpenCL macro block: 64x64 or 128x128 (default 128x128)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-dot MODE     OpenCL dot backend: auto (default), sudot, sdot4, khr,\n");
-    printf("                     force-khr, asm, or off\n");
+    printf("                     force-khr, asm, wmma (AMD gfx11/gfx12 matrix cores), or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
 #endif
@@ -602,7 +602,7 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-dot requires auto, sudot, sdot4, khr, force-khr, asm, or off\n");
+                fprintf(stderr, "--ocl-dot requires auto, sudot, sdot4, khr, force-khr, asm, wmma, or off\n");
                 return 1;
             }
             if(!strcmp(v, "auto")){
@@ -619,9 +619,11 @@ int main(int argc, char** argv)
                 ocl_dot_policy = 5;
             } else if(!strcmp(v, "khr") || !strcmp(v, "dpi")){
                 ocl_dot_policy = 6;
+            } else if(!strcmp(v, "wmma")){
+                ocl_dot_policy = 7;
             } else {
                 fprintf(stderr,
-                        "invalid --ocl-dot %s (expected auto, sudot, sdot4, khr, force-khr, asm, or off)\n",
+                        "invalid --ocl-dot %s (expected auto, sudot, sdot4, khr, force-khr, asm, wmma, or off)\n",
                         v);
                 return 1;
             }
@@ -1130,6 +1132,10 @@ int main(int argc, char** argv)
         pearl_set_cutlass_fused(cutlass_fused);
         g_cutlass_fused = cutlass_fused;
         if(pearl_run_alignment_tests() != 0) return 1;
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        if(bid == CP_BACKEND_OPENCL &&
+           cp_opencl_run_gemm_align_test(devs[0]) != 0) return 1;
+#endif
         if(align_test_prod){
             const int pm = g_m_active;
             const int pn = g_n_active;
