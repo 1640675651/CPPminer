@@ -180,6 +180,8 @@ if(CP_ENABLE_CPU)
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         list(APPEND CP_SOURCES
+            src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
             src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
             src/cpu/gemm/case33_gemm_xor_avx2.cpp
             src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
@@ -773,6 +775,10 @@ if(MSVC)
             PROPERTIES
                 COMPILE_OPTIONS "/arch:AVX2"
                 COMPILE_DEFINITIONS "__AVXVNNI__")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 
     endif()
 else()
@@ -827,6 +833,10 @@ else()
             PROPERTIES COMPILE_OPTIONS "-mavx2")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl")
     endif()
 endif()
 
