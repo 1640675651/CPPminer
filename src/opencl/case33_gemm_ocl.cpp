@@ -349,6 +349,10 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         if (use_wmma) {
             build_opts += " -DCASE32_WMMA=" + std::to_string(wmma_arch_);
             build_opts += " -DCASE32_WMMA_G12_KSPLIT=" + std::to_string(wmma_g12_ksplit_);
+            const char *pipe = std::getenv("CP_OCL_WMMA_PIPELINE");
+            /* Default on (+5-8% on gfx1103, same VGPRs); CP_OCL_WMMA_PIPELINE=0 disables. */
+            wmma_pipeline_ = (pipe && pipe[0] && std::atoi(pipe) == 0) ? 0 : 1;
+            build_opts += " -DCASE32_WMMA_PIPELINE=" + std::to_string(wmma_pipeline_);
         } else if (use_sudot) {
             build_opts += " -DCASE32_USE_BUILTIN_SUDOT4=1";
         } else if (use_asm) {
@@ -436,9 +440,10 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 return false;
             }
             char wl[96];
-            std::snprintf(wl, sizeof(wl), "%s (gfx%d layout%s)", label, wmma_arch_,
+            std::snprintf(wl, sizeof(wl), "%s (gfx%d layout%s%s)", label, wmma_arch_,
                           wmma_arch_ == 12 ? (wmma_g12_ksplit_ ? ", ksplit=1" : ", ksplit=0")
-                                           : "");
+                                           : "",
+                          wmma_pipeline_ ? ", pipelined" : "");
             return adopt_kernel(wl);
         }
         return adopt_kernel(label);

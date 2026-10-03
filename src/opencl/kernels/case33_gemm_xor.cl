@@ -810,6 +810,14 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #ifndef CASE32_WMMA_G12_KSPLIT
 #define CASE32_WMMA_G12_KSPLIT 0
 #endif
+/* 1: register double-buffer the 16-k step operands (host default; CP_OCL_WMMA_PIPELINE=0
+   builds the plain load-then-WMMA loop). */
+#ifndef CASE32_WMMA_PIPELINE
+#define CASE32_WMMA_PIPELINE 1
+#endif
+#if CASE32_WMMA_PIPELINE && (KGROUPS % 8) != 0
+#error CASE32_WMMA_PIPELINE needs an even number of 16-k steps per KR panel
+#endif
 
 #define WMMA_WAVE_ROWS 64
 #define WMMA_WAVE_COLS 64
@@ -907,6 +915,32 @@ inline uint wmma_reduce_scatter32(uint *p, uint lane) {
     return p[0];
 }
 
+/* Operands of one 16-k step (k-groups g..g+3) for the wave's 4 row and 4 column blocks. */
+inline void wmma_load_step(__private wmma_ab *a, __private wmma_ab *b, __global const int *a_lane,
+                           __global const int *b_lane, int g) {
+    #pragma unroll
+    for (int bi = 0; bi < WMMA_BM; ++bi) {
+        a[bi] = wmma_load_ab(a_lane + g * WMMA_KG_DW_A + bi * 16, WMMA_KG_DW_A,
+                             CASE32_WMMA_G12_KSPLIT);
+    }
+    #pragma unroll
+    for (int bj = 0; bj < WMMA_BN; ++bj) {
+        b[bj] = wmma_load_ab(b_lane + g * WMMA_KG_DW_B + bj * 16, WMMA_KG_DW_B,
+                             CASE32_WMMA_G12_KSPLIT);
+    }
+}
+
+inline void wmma_mac_step(__private wmma_acc *acc, __private const wmma_ab *a,
+                          __private const wmma_ab *b) {
+    #pragma unroll
+    for (int bi = 0; bi < WMMA_BM; ++bi) {
+        #pragma unroll
+        for (int bj = 0; bj < WMMA_BN; ++bj) {
+            acc[bi * WMMA_BN + bj] = wmma_mac(a[bi], b[bj], acc[bi * WMMA_BN + bj]);
+        }
+    }
+}
+
 #ifdef CASE32_REQD_WG
 __attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
 #endif
@@ -981,29 +1015,37 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     }
 
     int kg_flat = 0;
+#if CASE32_WMMA_PIPELINE
+    /* Register double buffer: the next 16-k step's operands are in flight while the
+       current step's 16 WMMAs issue. The k walk is one flat k-group stride across KR
+       panels, so the prefetch crosses milestones; the very last one is clamped (re-reads
+       the final step, harmless). */
+    const int kg_last_step = blocks_k * KGROUPS - 4;
+    wmma_ab a0[WMMA_BM];
+    wmma_ab b0[WMMA_BN];
+    wmma_ab a1[WMMA_BM];
+    wmma_ab b1[WMMA_BN];
+    wmma_load_step(a0, b0, a_lane, b_lane, 0);
+#endif
     for (int ms = 0; ms < blocks_k; ++ms) {
+#if CASE32_WMMA_PIPELINE
+        for (int ks = 0; ks < WMMA_KSTEPS; ks += 2) {
+            wmma_load_step(a1, b1, a_lane, b_lane, kg_flat + 4);
+            wmma_mac_step(acc, a0, b0);
+            const int kg_n2 = (kg_flat + 8 <= kg_last_step) ? (kg_flat + 8) : kg_last_step;
+            wmma_load_step(a0, b0, a_lane, b_lane, kg_n2);
+            wmma_mac_step(acc, a1, b1);
+            kg_flat += 8;
+        }
+#else
         for (int ks = 0; ks < WMMA_KSTEPS; ++ks) {
             wmma_ab a[WMMA_BM];
             wmma_ab b[WMMA_BN];
-            #pragma unroll
-            for (int bi = 0; bi < WMMA_BM; ++bi) {
-                a[bi] = wmma_load_ab(a_lane + kg_flat * WMMA_KG_DW_A + bi * 16, WMMA_KG_DW_A,
-                                     CASE32_WMMA_G12_KSPLIT);
-            }
-            #pragma unroll
-            for (int bj = 0; bj < WMMA_BN; ++bj) {
-                b[bj] = wmma_load_ab(b_lane + kg_flat * WMMA_KG_DW_B + bj * 16, WMMA_KG_DW_B,
-                                     CASE32_WMMA_G12_KSPLIT);
-            }
-            #pragma unroll
-            for (int bi = 0; bi < WMMA_BM; ++bi) {
-                #pragma unroll
-                for (int bj = 0; bj < WMMA_BN; ++bj) {
-                    acc[bi * WMMA_BN + bj] = wmma_mac(a[bi], b[bj], acc[bi * WMMA_BN + bj]);
-                }
-            }
+            wmma_load_step(a, b, a_lane, b_lane, kg_flat);
+            wmma_mac_step(acc, a, b);
             kg_flat += 4;
         }
+#endif
 
         /* Milestone (one per KR panel, cumulative C): word of hash tile `lane`. */
         uint p[32];
