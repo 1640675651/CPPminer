@@ -1256,27 +1256,51 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     printf("[align-test-prod] noisy A sample rows OK\n");
     fflush(stdout);
 
-    /* CUTLASS simt vs tensorop: the per-hash-tile milestone XOR words
-     * ([step][cta][virtual SIMT tile]) feed the proof, so both kernels must
-     * produce bit-identical dumps on the same noisy Ap/BpT panels. */
+    /* CUTLASS kernel cross-check: the per-hash-tile milestone XOR words
+     * ([step][cta][virtual SIMT tile]) feed the proof, so every kernel kind
+     * (simt, tensorop, tensoropms, tensorop80 where supported) must produce
+     * bit-identical dumps on the same noisy Ap/BpT panels, and hash tile 0
+     * must match a CPU prefix GEMM. */
     if(g_cutlass_fused && !g_step_major_ap){
         cudaDeviceProp prop;
         CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
-        const int has_imma = prop.major > 7 || (prop.major == 7 && prop.minor >= 5);
         const int rb = (m / CP_CUTLASS_CTA_M) < 2 ? (m / CP_CUTLASS_CTA_M) : 2;
         const int cb = (n / CP_CUTLASS_CTA_N) < 3 ? (n / CP_CUTLASS_CTA_N) : 3;
-        if(has_imma && rb > 0 && cb > 0){
+        static const int all_kinds[] = {CP_CUTLASS_MMA_SIMT, CP_CUTLASS_MMA_TENSOROP,
+                                        CP_CUTLASS_MMA_TENSOROP_MS, CP_CUTLASS_MMA_TENSOROP80};
+        enum { kMaxKinds = (int)(sizeof(all_kinds) / sizeof(all_kinds[0])) };
+        int kinds[kMaxKinds];
+        int nk = 0;
+        for(int i = 0; i < kMaxKinds; i++){
+            if(cp_cutlass_kind_supported(g->dev, all_kinds[i]))
+                kinds[nk++] = all_kinds[i];
+            else
+                printf("[align-test-prod] sm_%d%d: CUTLASS %s not available, skipped\n",
+                       prop.major, prop.minor, cp_cutlass_mma_mode_name(all_kinds[i]));
+        }
+        int xrc = 0;
+        /* Hash-tile policy vs CUTLASS's accumulator iterator (no MMA executed,
+         * so the m16n8k32 policy is checked even on sm_75). */
+        for(int i = 1; i < kMaxKinds && xrc == 0; i++){
+            const int bad = cp_cutlass_hash_policy_selftest(g->dev, all_kinds[i]);
+            printf("[align-test-prod] CUTLASS %s hash-tile policy vs IteratorC: %s",
+                   cp_cutlass_mma_mode_name(all_kinds[i]), bad == 0 ? "OK (256/256 tiles)\n" : "");
+            if(bad != 0){
+                printf("%s %d\n", bad < 0 ? "CUDA error" : "bad tiles", bad);
+                xrc = -1;
+            }
+            fflush(stdout);
+        }
+        if(xrc == 0 && nk > 1 && rb > 0 && cb > 0){
             const size_t tiles = cp_cutlass_tiles_per_batch(rb, cb);
             const size_t bytes = cp_cutlass_tile_xor_bytes(rb, cb);
             const size_t words = bytes / sizeof(uint32_t);
             const int num_steps = K_DIM / R_RANK;
-            const int kinds[2] = {CP_CUTLASS_MMA_SIMT, CP_CUTLASS_MMA_TENSOROP};
             const int saved_mode = cp_cutlass_mma_mode();
             uint32_t* d_x = NULL;
-            uint32_t* h_x[2] = {NULL, NULL};
-            int xrc = 0;
+            uint32_t* h_x[kMaxKinds] = {NULL};
             CU_CHECK(cudaMalloc(&d_x, bytes));
-            for(int k = 0; k < 2 && xrc == 0; k++){
+            for(int k = 0; k < nk && xrc == 0; k++){
                 h_x[k] = (uint32_t*)malloc(bytes);
                 if(!h_x[k]){ xrc = -1; break; }
                 cp_cutlass_set_mma_mode(kinds[k]);
@@ -1303,7 +1327,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     static const int offs[8] = {0, 1, 2, 3, 16, 17, 18, 19};
                     static const int coffs[8] = {0, 1, 2, 3, 32, 33, 34, 35};
                     int32_t acc[64];
-                    int ref_bad[2] = {0, 0};
+                    int ref_bad[kMaxKinds] = {0};
                     for(int i = 0; i < 8; i++){
                         CU_CHECK(cudaMemcpy(h_ar + (size_t)i * K_DIM,
                                             g->d_Ap + ((size_t)1 * CP_CUTLASS_CTA_M + offs[i]) * K_DIM,
@@ -1323,56 +1347,67 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                                     acc[r * 8 + c] += (int32_t)a[k] * (int32_t)b[k];
                                 xv ^= (uint32_t)acc[r * 8 + c];
                             }
-                        for(int k = 0; k < 2; k++)
+                        for(int k = 0; k < nk; k++)
                             if(h_x[k][(size_t)s * tiles] != xv) ref_bad[k]++;
                     }
                     free(h_ar);
-                    printf("[align-test-prod] CUTLASS hash tile 0 vs CPU prefix GEMM: simt %d/%d steps differ, "
-                           "tensorop %d/%d\n", ref_bad[0], num_steps, ref_bad[1], num_steps);
+                    printf("[align-test-prod] CUTLASS hash tile 0 vs CPU prefix GEMM:");
+                    for(int k = 0; k < nk; k++){
+                        printf(" %s %d/%d", cp_cutlass_mma_mode_name(kinds[k]), ref_bad[k], num_steps);
+                        if(ref_bad[k]) xrc = -1;
+                    }
+                    printf(" steps differ\n");
                     fflush(stdout);
-                    if(ref_bad[0] || ref_bad[1]) xrc = -1;
                 }
-                size_t bad = 0, first = (size_t)-1, nz = 0;
-                for(size_t i = 0; i < words; i++){
+                size_t nz = 0;
+                for(size_t i = 0; i < words; i++)
                     if(h_x[0][i]) nz++;
-                    if(h_x[0][i] != h_x[1][i]){ if(!bad) first = i; bad++; }
-                }
                 if(nz == 0){
                     fprintf(stderr, "[align-test-prod] CUTLASS tile-xor dump is all zero\n");
                     xrc = -1;
-                } else if(bad){
-                    const size_t step = first / tiles;
-                    const size_t rem = first % tiles;
-                    fprintf(stderr,
-                            "[align-test-prod] CUTLASS simt vs tensorop tile-xor mismatch: "
-                            "%zu/%zu words differ, first at step %zu cta %zu tile %zu "
-                            "(simt %08x tensorop %08x)\n",
-                            bad, words, step, rem / 256, rem % 256,
-                            h_x[0][first], h_x[1][first]);
-                    /* XOR of a CTA's 256 words is mapping-independent (all 16384
-                     * cells): equal => hash-tile mapping bug, else data/K schedule. */
-                    uint32_t cw[2] = {0, 0};
-                    for(int k = 0; k < 2; k++)
-                        for(int t = 0; t < 256; t++)
-                            cw[k] ^= h_x[k][step * tiles + (rem / 256) * 256 + t];
-                    fprintf(stderr, "[align-test-prod]   CTA-wide XOR there: simt %08x tensorop %08x (%s)\n",
-                            cw[0], cw[1], cw[0] == cw[1] ? "equal: mapping bug" : "differ: data/K-schedule bug");
-                    xrc = -1;
-                } else {
-                    printf("[align-test-prod] CUTLASS simt vs tensorop tile-xor OK "
-                           "(%zu words, %d steps, %zu hash tiles)\n",
-                           words, num_steps, tiles);
-                    fflush(stdout);
+                }
+                for(int k = 1; k < nk && nz; k++){
+                    const char* ka = cp_cutlass_mma_mode_name(kinds[0]);
+                    const char* kb = cp_cutlass_mma_mode_name(kinds[k]);
+                    size_t bad = 0, first = (size_t)-1;
+                    for(size_t i = 0; i < words; i++)
+                        if(h_x[0][i] != h_x[k][i]){ if(!bad) first = i; bad++; }
+                    if(bad){
+                        const size_t step = first / tiles;
+                        const size_t rem = first % tiles;
+                        fprintf(stderr,
+                                "[align-test-prod] CUTLASS %s vs %s tile-xor mismatch: "
+                                "%zu/%zu words differ, first at step %zu cta %zu tile %zu "
+                                "(%s %08x %s %08x)\n",
+                                ka, kb, bad, words, step, rem / 256, rem % 256,
+                                ka, h_x[0][first], kb, h_x[k][first]);
+                        /* XOR of a CTA's 256 words is mapping-independent (all 16384
+                         * cells): equal => hash-tile mapping bug, else data/K schedule. */
+                        uint32_t cw[2] = {0, 0};
+                        for(int t = 0; t < 256; t++){
+                            cw[0] ^= h_x[0][step * tiles + (rem / 256) * 256 + t];
+                            cw[1] ^= h_x[k][step * tiles + (rem / 256) * 256 + t];
+                        }
+                        fprintf(stderr, "[align-test-prod]   CTA-wide XOR there: %s %08x %s %08x (%s)\n",
+                                ka, cw[0], kb, cw[1],
+                                cw[0] == cw[1] ? "equal: mapping bug" : "differ: data/K-schedule bug");
+                        xrc = -1;
+                    } else {
+                        printf("[align-test-prod] CUTLASS %s vs %s tile-xor OK "
+                               "(%zu words, %d steps, %zu hash tiles)\n",
+                               ka, kb, words, num_steps, tiles);
+                        fflush(stdout);
+                    }
                 }
             }
             cudaFree(d_x);
-            free(h_x[0]);
-            free(h_x[1]);
-            if(xrc != 0) goto done;
-        } else if(!has_imma){
-            printf("[align-test-prod] sm_%d%d: no int8 tensor cores, simt vs tensorop check skipped\n",
+            for(int k = 0; k < kMaxKinds; k++)
+                free(h_x[k]);
+        } else if(xrc == 0 && nk <= 1){
+            printf("[align-test-prod] sm_%d%d: no int8 tensor cores, kernel cross-check skipped\n",
                    prop.major, prop.minor);
         }
+        if(xrc != 0) goto done;
     }
 
     rc = 0;
