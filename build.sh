@@ -139,6 +139,12 @@ ensure_blake3() {
 ensure_onednn_deps() {
     local onednn_dir="${PROJECT_ROOT}/src/onednn"
     local kernel_db="${PROJECT_ROOT}/third_party/onednn-src/src/gpu/intel/gemm/jit/selector/db/kernel.db"
+    if [[ "$OSTYPE" != msys* && "$OSTYPE" != cygwin* ]]; then
+        # Idempotent: vendors once, then re-applies case5_patches on every build.
+        (cd "${onednn_dir}" && sh prepare_onednn_deps.sh) || fail "prepare_onednn_deps.sh failed"
+        [[ -f "${kernel_db}" ]] || fail "OneDNN deps missing after prepare script"
+        return
+    fi
     if [[ -f "${kernel_db}" ]]; then
         log "oneDNN/gemmstone deps already present"
         return
@@ -148,7 +154,8 @@ ensure_onednn_deps() {
         (cd "${onednn_dir}" && cmd /c prepare_onednn_deps.bat) \
             || fail "prepare_onednn_deps.bat failed"
     else
-        fail "OneDNN backend on Unix: vendor deps via src/onednn/prepare_onednn_deps.bat (Wine) or set ONEDNN_SRC"
+        (cd "${onednn_dir}" && sh prepare_onednn_deps.sh) \
+            || fail "prepare_onednn_deps.sh failed"
     fi
     [[ -f "${kernel_db}" ]] || fail "OneDNN deps missing after prepare script"
 }
