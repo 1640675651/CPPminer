@@ -627,6 +627,15 @@ bool Case33OclPrep::noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb,
     if (!build_perm_pairs_(is_b, K)) {
         return false;
     }
+    // Column j at out + j*ldb is the row-major noise layout without signal.
+    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    if (noisy_matrix_rowmajor_wg_(out, nullptr, cols, K, ldb, is_b, 0)) {
+        if (prep_timing_enabled()) {
+            std::printf("[ocl-prep] %s column-major noise: %.1fms\n", is_b ? "B" : "A",
+                        (cp_now_sec() - t0) * 1e3);
+        }
+        return true;
+    }
 
     const int rank = R_RANK;
     cl_int err = CL_SUCCESS;
