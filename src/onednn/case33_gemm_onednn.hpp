@@ -72,6 +72,13 @@ private:
                                 int panel_tile_cols, int tr_base, int tc_base, cl_uint num_wait,
                                 const cl_event *wait, cl_event *done);
     bool ensure_pipeline_(int panel_tile_count);
+    /* ESIMD scan engine (libcp_esimd via dlopen): GEMM, milestone XOR, fold,
+     * BLAKE3 and target compare in one kernel on blocked operands. */
+    bool try_init_esimd_();
+    int scan_esimd_(int *out_found, int *out_t_rows, int *out_t_cols,
+                    uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
+                    const std::function<void(uint64_t)> &on_progress);
+    void release_esimd_();
     int scan_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
                         uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
                         const std::function<void(uint64_t)> &on_progress);
@@ -124,6 +131,17 @@ private:
     cl_mem b_buf_ = nullptr;
     cl_mem c_buf_ = nullptr;
     cl_mem tile_xor_buf_ = nullptr;
+    bool esimd_ = false;
+    void *esimd_lib_ = nullptr;
+    struct CpEsimdScan *esimd_scan_ = nullptr;
+    void *esimd_panel_fn_ = nullptr;   // cp_esimd_scan_panel_fn
+    void *esimd_wait_fn_ = nullptr;    // cp_esimd_wait_fn
+    void *esimd_destroy_fn_ = nullptr; // cp_esimd_destroy_fn
+    int esimd_es_ = 8;
+    int esimd_tile_m_ = 0;
+    int esimd_tile_n_ = 0;
+    cl_mem esimd_found_ = nullptr;
+    int esimd_found_host_[2][4] = {};
     /* Pipelined scan: out-of-order queue, double tile_xor, async found flags. */
     cl_command_queue pipe_queue_ = nullptr;
     cl_mem pipe_tile_xor_[2] = {};

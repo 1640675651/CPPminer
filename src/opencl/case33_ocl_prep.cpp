@@ -439,6 +439,10 @@ bool Case33OclPrep::noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, 
     if (noisy_matrix_rowmajor_wg_(out, signal, rows, K, out_lda, is_b, has_signal)) {
         return true;
     }
+    if (esimd_layout_) {
+        std::fprintf(stderr, "[ocl-prep] ESIMD block layout needs the work-group noise kernel\n");
+        return false;
+    }
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(k_noisy_rowmajor_, 0, sizeof(cl_mem), &out);
     err |= clSetKernelArg(k_noisy_rowmajor_, 1, sizeof(cl_mem), &d_noise_seed_);
@@ -509,6 +513,9 @@ bool Case33OclPrep::noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int row
     err |= clSetKernelArg(k_noisy_rowmajor_wg_, 6, sizeof(int), &has_signal);
     err |= clSetKernelArg(k_noisy_rowmajor_wg_, 7, sizeof(cl_mem), &signal);
     err |= clSetKernelArg(k_noisy_rowmajor_wg_, 8, sizeof(int), &out_lda);
+    const int layout = noise_layout_(is_b);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 9, sizeof(int), &layout);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 10, sizeof(int), &esimd_es_);
     if (err != CL_SUCCESS) {
         return false;
     }
@@ -520,7 +527,7 @@ bool Case33OclPrep::noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int row
         return false;
     }
     clFinish(ocl_->queue);
-    if (prep_check_enabled()) {
+    if (prep_check_enabled() && layout == 0) {
         return noisy_matrix_rowmajor_check_(out, signal, rows, K, out_lda, is_b, has_signal);
     }
     return true;
@@ -635,6 +642,10 @@ bool Case33OclPrep::noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb,
                         (cp_now_sec() - t0) * 1e3);
         }
         return true;
+    }
+    if (esimd_layout_) {
+        std::fprintf(stderr, "[ocl-prep] ESIMD block layout needs the work-group noise kernel\n");
+        return false;
     }
 
     const int rank = R_RANK;

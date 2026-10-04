@@ -91,6 +91,7 @@ private:
                                    int is_b, int has_signal);
     bool noisy_matrix_rowmajor_check_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
                                       int is_b, int has_signal);
+    int noise_layout_(int is_b) const { return esimd_layout_ ? (is_b ? 2 : 1) : 0; }
     bool noisy_matrix_a_colmajor_(cl_mem out, cl_mem signal, int rows, int K, int lda);
     bool noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb, int is_b);
     bool noisy_matrix_b_rowmajor_(cl_mem out, int K, int N, int ldb);
@@ -137,6 +138,16 @@ private:
     size_t noisy_scratch_cap_ = 0;
     cl_mem d_el_rows_ = nullptr; // rows x R_RANK uniform noise for the work-group path
     size_t el_rows_cap_ = 0;
+    bool esimd_layout_ = false;  // noisy A in 8x32 blocks, B^T in 32 x esimd_es_ VNNI blocks
+    int esimd_es_ = 8;
+
+public:
+    /* Row-major noise outputs (noisy A and the job's noisy B^T) are written in the
+     * ESIMD scan's DPAS block layouts instead; needs the work-group noise kernel. */
+    void set_esimd_layout(bool on, int exec_size) {
+        esimd_layout_ = on;
+        esimd_es_ = exec_size;
+    }
 };
 
 std::string cp_ocl_kernel_dir();
