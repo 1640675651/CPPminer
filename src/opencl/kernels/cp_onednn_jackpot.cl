@@ -24,50 +24,54 @@ inline void b3_g(uint *v, int a, int b, int c, int d, uint x, uint y) {
     v[b] = b3_rotr32(v[b] ^ v[c], 7);
 }
 
+/* BLAKE3 message schedule per round (permutation applied r times), so every
+ * index below is a compile-time constant after unrolling and the state stays
+ * in registers instead of private memory. */
+__constant uchar kB3Sched[7][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
+    {3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1},
+    {10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6},
+    {12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
+    {9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7},
+    {11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13},
+};
+
 inline void b3_compress64(__global const uint *key8, const uint *msg16, uint *out8) {
-    const uint kIV[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-                         0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
     uint v[16] = {key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7],
-                  kIV[0],  kIV[1],  kIV[2],  kIV[3],  0u,      0u,      64u,     0x1Bu};
-    uint m[16];
-    for (int i = 0; i < 16; ++i) {
-        m[i] = msg16[i];
-    }
-    const uchar kPerm[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+                  0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au, 0u, 0u, 64u, 0x1Bu};
+#pragma unroll
     for (int round = 0; round < 7; ++round) {
-        b3_g(v, 0, 4, 8, 12, m[0], m[1]);
-        b3_g(v, 1, 5, 9, 13, m[2], m[3]);
-        b3_g(v, 2, 6, 10, 14, m[4], m[5]);
-        b3_g(v, 3, 7, 11, 15, m[6], m[7]);
-        b3_g(v, 0, 5, 10, 15, m[8], m[9]);
-        b3_g(v, 1, 6, 11, 12, m[10], m[11]);
-        b3_g(v, 2, 7, 8, 13, m[12], m[13]);
-        b3_g(v, 3, 4, 9, 14, m[14], m[15]);
-        if (round < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; ++i) {
-                t[i] = m[kPerm[i]];
-            }
-            for (int i = 0; i < 16; ++i) {
-                m[i] = t[i];
-            }
-        }
+#define M(i) msg16[kB3Sched[round][i]]
+        b3_g(v, 0, 4, 8, 12, M(0), M(1));
+        b3_g(v, 1, 5, 9, 13, M(2), M(3));
+        b3_g(v, 2, 6, 10, 14, M(4), M(5));
+        b3_g(v, 3, 7, 11, 15, M(6), M(7));
+        b3_g(v, 0, 5, 10, 15, M(8), M(9));
+        b3_g(v, 1, 6, 11, 12, M(10), M(11));
+        b3_g(v, 2, 7, 8, 13, M(12), M(13));
+        b3_g(v, 3, 4, 9, 14, M(14), M(15));
+#undef M
     }
+#pragma unroll
     for (int i = 0; i < 8; ++i) {
         out8[i] = v[i] ^ v[i + 8];
     }
 }
 
-inline void fold_milestones(const uint *milestone_xor, int num_milestones, uint out_msg[PP_JACKPOT_WORDS]) {
-    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
-        out_msg[i] = 0u;
-    }
-    for (int step = 0; step < num_milestones; ++step) {
-        const int tid = step % PP_JACKPOT_WORDS;
-        out_msg[tid] = pp_rotl32(out_msg[tid], PP_LROT) ^ milestone_xor[step];
+/* Fold of milestone ms into word ms % 16: msg[w] = rotl(msg[w], 13) ^ xor[ms],
+ * read straight from tile_xor (ms-major) with constant word indices. */
+inline void fold_milestones_glob(__global const uint *tile_xor, int num_milestones,
+                                 int tile_count, int sid, uint out_msg[PP_JACKPOT_WORDS]) {
+#pragma unroll
+    for (int w = 0; w < PP_JACKPOT_WORDS; ++w) {
+        uint acc = 0u;
+        for (int ms = w; ms < num_milestones; ms += PP_JACKPOT_WORDS) {
+            acc = pp_rotl32(acc, PP_LROT) ^ tile_xor[(size_t)ms * (size_t)tile_count + (size_t)sid];
+        }
+        out_msg[w] = acc;
     }
 }
-
 inline bool digest_beats_target(const uint digest[8], __global const uint *bound) {
     for (int w = 7; w >= 0; --w) {
         if (digest[w] < bound[w]) {
@@ -106,12 +110,8 @@ __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_mile
             msg[w] = tile_xor[(size_t)w * (size_t)tile_count + (size_t)sid];
         }
     } else {
-        uint milestone_xor[PP_MAX_MILESTONES];
-        for (int ms = 0; ms < num_milestones; ++ms) {
-            milestone_xor[ms] =
-                    tile_xor[(size_t)ms * (size_t)tile_count + (size_t)sid];
-        }
-        fold_milestones(milestone_xor, num_milestones, msg);
+        fold_milestones_glob(tile_xor, num_milestones, tile_count, sid, msg);
+
     }
 
     uint digest[8];
