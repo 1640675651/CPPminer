@@ -26,10 +26,9 @@
 #include <fstream>
 
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
+#undef min
+#undef max
 #else
 #include <dlfcn.h>
 #endif
