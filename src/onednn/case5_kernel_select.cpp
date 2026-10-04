@@ -9,6 +9,8 @@
 
 #include "ngen_core.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <vector>
@@ -250,7 +252,21 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
             setup.match_params.data(), result.eval_params, aux);
 
     const auto fallbacks = fallback_candidates(hw);
-    result.candidates.reserve(ranked.size() + fallbacks.size());
+    result.candidates.reserve(ranked.size() + fallbacks.size() + 1);
+
+    // Tuning hook: CASE5_STRATEGY="<gemmstone strategy>" with CASE5_UNROLL=MxN is
+    // tried first, as label "custom".
+    if (const char *s = std::getenv("CASE5_STRATEGY"); s && *s) {
+        CatalogCandidate custom;
+        custom.label = "custom";
+        custom.strategy = s;
+        for (char &c : custom.strategy) // '_' allowed as a separator for env-safe values
+            if (c == '_')
+                c = ' ';
+        if (const char *u = std::getenv("CASE5_UNROLL"); u && *u)
+            std::sscanf(u, "%dx%d", &custom.unroll_m, &custom.unroll_n);
+        result.candidates.push_back(std::move(custom));
+    }
 
     // Case 5 filters apply after oneDNN's ordered catalog list (same contract as entries[0..N]).
     for (const Entry *entry : ranked) {
@@ -294,7 +310,10 @@ bool prepare_case5_strategy(HW hw, const Product &product, GEMMProblem &problem,
             parseStrategy(entry.strategy, hw, problem, strategy);
         } else {
             strategy = GEMMStrategy(hw, product.stepping);
-            if (candidate.seed_gen12_unroll) {
+            if (candidate.unroll_m > 0 && candidate.unroll_n > 0) {
+                strategy.unroll[LoopM] = candidate.unroll_m;
+                strategy.unroll[LoopN] = candidate.unroll_n;
+            } else if (candidate.seed_gen12_unroll) {
                 strategy.unroll[LoopM] = 32;
                 strategy.unroll[LoopN] = 16;
             }
