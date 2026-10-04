@@ -219,6 +219,31 @@ std::vector<CatalogCandidate> fallback_candidates(HW hw) {
     return out;
 }
 
+// Arc A380 (XeHPG, s8 TN, 131072^2 with milestone XOR): this 8x4-workgroup
+// 16x32 systolic kernel scanned at 15.0 TMAC/s vs 9.7 for oneDNN's top pick.
+// The catalog repeats the strategy string with other unrolls, so match both.
+struct PreferredKernel {
+    int unroll_m, unroll_n;
+    const char *strategy;
+};
+
+bool is_preferred_entry(HW hw, const Entry &entry) {
+    static const PreferredKernel kXeHPG[] = {
+            {16, 32, "sB64 sB32 aB wg 8x4 cab4 ks64 af dw vav bo bk0 sm sn grf256 sys pab l4 sr"},
+    };
+    if (hw != HW::XeHPG) {
+        return false;
+    }
+    for (const auto &p : kXeHPG) {
+        if (entry.driverInfo.unroll[LoopM] == p.unroll_m
+                && entry.driverInfo.unroll[LoopN] == p.unroll_n
+                && std::string(entry.strategy) == p.strategy) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void append_catalog_candidate(std::vector<CatalogCandidate> &out, const Entry *entry) {
     if (!entry) {
         return;
@@ -269,12 +294,19 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
     }
 
     // Case 5 filters apply after oneDNN's ordered catalog list (same contract as entries[0..N]).
+    // Strategies measured fastest with the milestone XOR are moved to the front:
+    // oneDNN's model ranks plain GEMM, not GEMM + per-milestone fold.
+    std::vector<const Entry *> preferred, rest;
     for (const Entry *entry : ranked) {
         if (!entry || !entry_case5_compatible(*entry)) {
             continue;
         }
-        append_catalog_candidate(result.candidates, entry);
+        (is_preferred_entry(hw, *entry) ? preferred : rest).push_back(entry);
     }
+    for (const Entry *entry : preferred)
+        append_catalog_candidate(result.candidates, entry);
+    for (const Entry *entry : rest)
+        append_catalog_candidate(result.candidates, entry);
 
     for (auto &fallback : fallbacks) {
         result.candidates.push_back(std::move(fallback));

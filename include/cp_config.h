@@ -50,6 +50,9 @@
 
 /* oneDNN: hash-tile row/col batch per panel (see Case33GemmOnednn scan). */
 #define CP_ONEDNN_PERIOD_BATCH_DEFAULT 256
+/* Systolic (XMX) kernels: 1024x1024 hash tiles per panel (16384^2 GEMM) was
+ * fastest on Arc A380 at 131072^2; smaller panels leave throughput unused. */
+#define CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT 1024
 
 /* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
 #define CP_MACRO_BATCH_DEFAULT 1024 // one full row of 131072 cols
