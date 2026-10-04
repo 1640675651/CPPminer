@@ -208,13 +208,16 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
         std::fprintf(stderr, "[onednn] K %% unrollK != 0 (K=%d unrollK=%d)\n", K_, info_.unrollK);
         return false;
     }
-    if ((milestone_k % info_.unrollK) != 0 || (K_ % milestone_k) != 0) {
+    /* unrollK <= milestone_k: XOR every xor_period unrolled panels. Larger
+     * (systolic) unrolls schedule the XOR every milestone_k inside the panel. */
+    if (((milestone_k % info_.unrollK) != 0 && (info_.unrollK % milestone_k) != 0)
+        || (K_ % milestone_k) != 0) {
         std::fprintf(stderr,
-                     "[onednn] milestone_k=%d must divide unrollK=%d and K=%d\n", milestone_k,
-                     info_.unrollK, K_);
+                     "[onednn] milestone_k=%d must divide or be a multiple of unrollK=%d, "
+                     "and divide K=%d\n", milestone_k, info_.unrollK, K_);
         return false;
     }
-    xor_period_ = milestone_k / info_.unrollK;
+    xor_period_ = info_.unrollK <= milestone_k ? milestone_k / info_.unrollK : 1;
     num_milestones_ = K_ / milestone_k;
     folded_msg_words_ = cp_jackpot::kJackpotWords;
     milestone_k_ = milestone_k;

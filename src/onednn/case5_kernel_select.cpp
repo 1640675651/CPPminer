@@ -83,7 +83,7 @@ bool entry_case5_compatible(const Entry &entry) {
         return false;
     }
     const int unroll_k = di.unroll[LoopK];
-    if (unroll_k <= 0 || (kMilestoneK % unroll_k) != 0) {
+    if (unroll_k <= 0 || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)) {
         return false;
     }
     return true;
@@ -100,7 +100,7 @@ bool strategy_postparse_compatible(const GEMMStrategy &strategy) {
         return false;
     }
     const int unroll_k = strategy.unroll[LoopK];
-    if (unroll_k <= 0 || (kMilestoneK % unroll_k) != 0) {
+    if (unroll_k <= 0 || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)) {
         return false;
     }
     return true;
@@ -210,9 +210,9 @@ OnednnSelectInput onednn_select_input_from_dims(const BuildParams &dims) {
 std::vector<CatalogCandidate> fallback_candidates(HW hw) {
     std::vector<CatalogCandidate> out;
     if (hw == HW::XeHPG) {
-        out.push_back(CatalogCandidate{nullptr, "fallback-grf256", kFallbackXeHPG, true, true});
+        out.push_back(CatalogCandidate{nullptr, "fallback-grf256", kFallbackXeHPG, true, false});
     } else {
-        out.push_back(CatalogCandidate{nullptr, "fallback-Gen12LP", kFallbackGen12LP, true, true});
+        out.push_back(CatalogCandidate{nullptr, "fallback-Gen12LP", kFallbackGen12LP, true, false});
     }
     return out;
 }

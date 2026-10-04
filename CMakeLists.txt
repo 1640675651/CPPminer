@@ -433,6 +433,13 @@ if(CP_ENABLE_OPENCL)
             "${CMAKE_SOURCE_DIR}/src/qpow/opencl/kernels/qpow_mining.cl"
             "$<TARGET_FILE_DIR:cppminer>/kernels/qpow_mining.cl"
         COMMENT "Copy OpenCL kernels next to cppminer")
+    if(CP_ENABLE_ONEDNN)
+        add_custom_command(TARGET cppminer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_onednn_jackpot.cl"
+                "$<TARGET_FILE_DIR:cppminer>/kernels/cp_onednn_jackpot.cl"
+            COMMENT "Copy oneDNN jackpot kernel next to cppminer")
+    endif()
 elseif(CP_ENABLE_ONEDNN)
     target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
     add_custom_command(TARGET cppminer POST_BUILD

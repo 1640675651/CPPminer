@@ -1101,9 +1101,15 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
         }
     });
 
-    // Case5 milestoned tile XOR after each unrollK panel (runtime xorPeriod gate).
+    // Case5 milestoned tile XOR after each unrollK panel (runtime xorPeriod gate),
+    // or every case5XorEveryK k inside a larger (systolic) panel.
     if (problem.case5TileXor) {
-        auto reqTileXor = every(unrollK).delay(unrollK - 1);
+        const int xorEvery = (problem.case5XorEveryK > 0) ? problem.case5XorEveryK : unrollK;
+        if (unrollK % xorEvery != 0)
+            stub("case5 XOR period must divide unrollK");
+        if (xorEvery != unrollK && problem.case5TileXorIncremental)
+            stub("case5 incremental XOR needs one milestone per unrollK panel");
+        auto reqTileXor = every(xorEvery).delay(xorEvery - 1);
         ls.schedule_if(reqTileXor,
             [&](Iteration h) {
                 gemmCase5TileXorStore(problem, strategy, state);

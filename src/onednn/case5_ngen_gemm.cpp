@@ -217,6 +217,10 @@ void log_candidate_rejection(const CatalogCandidate &candidate, const std::strin
     }
     line += ": ";
     line += reason;
+    if (case5_debug_select()) {
+        std::fprintf(stderr, "Case5 rejected %s\n", line.c_str());
+        std::fflush(stderr);
+    }
     if (rejected) {
         rejected->push_back(std::move(line));
     }
@@ -277,10 +281,23 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
         }
 
         try {
-            if (strategy.unroll[LoopK] <= 0 || (kMilestoneK % strategy.unroll[LoopK]) != 0) {
-                throw std::runtime_error("Case5 milestone_k must be a multiple of unrollK");
+            const int unroll_k = strategy.unroll[LoopK];
+            if (unroll_k <= 0
+                    || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)
+                    || (dims.k > 0 && (dims.k % unroll_k) != 0)) {
+                throw std::runtime_error("Case5 milestone_k and unrollK must divide one another "
+                        "and K (unrollK=" + std::to_string(unroll_k) + ", ka_load="
+                        + std::to_string(strategy.ka_load) + ", kb_load="
+                        + std::to_string(strategy.kb_load) + ")");
             }
-            problem.case5XorPeriod = kMilestoneK / strategy.unroll[LoopK];
+            if (unroll_k <= kMilestoneK) {
+                problem.case5XorPeriod = kMilestoneK / unroll_k;
+                problem.case5XorEveryK = 0;
+            } else {
+                // Systolic kernels unroll K past one milestone: XOR inside the panel.
+                problem.case5XorPeriod = 1;
+                problem.case5XorEveryK = kMilestoneK;
+            }
             const auto xsd =
                     compute_xor_subtile_dims(strategy.unroll[LoopM], strategy.unroll[LoopN]);
             problem.case5XorSubM = xsd.subM;
