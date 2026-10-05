@@ -268,6 +268,7 @@ if(CP_ENABLE_CUDA)
     list(APPEND CP_SOURCES
         src/cuda/cp_gpu.cu
         src/cuda/cp_cutlass_gemm.cu
+        src/cuda/cp_turing_scan.cu
         src/cuda/cp_cuda_worker.cpp
         src/qpow/cuda/cp_qpow_cuda.cu
     )
