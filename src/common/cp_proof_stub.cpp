@@ -66,6 +66,19 @@ int cp_proof_build_witness(
     return -1;
 }
 
+int cp_proof_gzip_b64(
+    const char* in_b64,
+    char* out_b64,
+    size_t out_cap,
+    char* err,
+    size_t err_cap)
+{
+    (void)in_b64; (void)out_b64; (void)out_cap;
+    if(err && err_cap)
+        snprintf(err, err_cap, "cp_proof_ffi not linked (build rust/cp-proof-ffi)");
+    return -1;
+}
+
 int cp_proof_verify(
     const uint8_t* header,
     size_t header_len,

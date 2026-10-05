@@ -59,6 +59,8 @@ static void print_usage(void)
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
     printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
+    printf("  --pool-pass STR    mining.authorize password (default: x); Kryptex custom\n");
+    printf("                     share difficulty: d=N (default d=2097152)\n");
     printf("  --backend NAME     cpu");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("|cuda");
@@ -862,6 +864,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--agent") && i + 1 < argc){
             strncpy(agent_global, argv[++i], sizeof(agent_global) - 1);
             agent_global[sizeof(agent_global) - 1] = 0;
+        } else if(!strcmp(argv[i], "--pool-pass") && i + 1 < argc){
+            strncpy(pool_pass_global, argv[++i], sizeof(pool_pass_global) - 1);
+            pool_pass_global[sizeof(pool_pass_global) - 1] = 0;
         } else if(!strcmp(argv[i], "--dry-run")){
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--verify")){
@@ -1632,7 +1637,8 @@ reconnect:
         cp_sleep(5);
     }
 
-    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global))
+    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global,
+                               pool_pass_global))
         goto reconnect;
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
