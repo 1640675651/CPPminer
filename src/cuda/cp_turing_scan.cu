@@ -272,6 +272,205 @@ __global__ void __launch_bounds__(kThreads, 1) cp_turing_scan_kernel(TuringParam
 #endif
 }
 
+/* ---- sm_80+ (Ampere/Ada) variant: mma.sync.m16n8k32 and a 4-stage cp.async ring. ---- */
+
+constexpr int kStages80 = 4;
+constexpr int kStage80 = kStageA + kStageB;
+constexpr int kSmem80 = kStages80 * kStage80 + 2 * kWords * kThreads * 4;  /* 80 KB */
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void mma16832(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void cp_async16(uint32_t saddr, const void* gptr)
+{
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(saddr), "l"(gptr));
+}
+
+__device__ __forceinline__ void cp_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void cp_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+#endif
+
+/* m16n8k32 warp tile 64x64: acc[mi][ni][e] holds row mi*16 + (e>>1)*8 + lane/4, col
+ * ni*8 + (lane%4)*2 + (e&1). Partial p = h*8 + a*4 + b of the SIMT tiles this lane
+ * touches: rows mi = 2h + dm, cols ni = b + 4dn, elements e = 2a + j. */
+__device__ __forceinline__ void local_xor_m16(const int (&acc)[4][8][4], uint32_t (&part)[16])
+{
+#pragma unroll
+    for (int p = 0; p < 16; ++p) {
+        const int h = p >> 3, a = (p >> 2) & 1, b = p & 3;
+        uint32_t x = 0;
+#pragma unroll
+        for (int dm = 0; dm < 2; ++dm)
+#pragma unroll
+            for (int dn = 0; dn < 2; ++dn)
+                x ^= (uint32_t)acc[2 * h + dm][b + 4 * dn][2 * a] ^
+                     (uint32_t)acc[2 * h + dm][b + 4 * dn][2 * a + 1];
+        part[p] = x;
+    }
+}
+
+__global__ void __launch_bounds__(kThreads, 1) cp_ampere_scan_kernel(TuringParams p)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (p.found && *p.found != 0) return;
+
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint32_t* tr = reinterpret_cast<uint32_t*>(smem + kStages80 * kStage80);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp & 3, wn = warp >> 2;
+    const int g = p.group;
+    const int grp = blockIdx.x / (p.row_blocks * g), rr = blockIdx.x % (p.row_blocks * g);
+    const int rb = p.row_block0 + rr % p.row_blocks;
+    const int cb = p.col_block0 + grp * g + rr / p.row_blocks;
+
+    /* Copy plan: A k-tile = 512 16-byte chunks (2 per thread), B = 256 (1 per thread); both
+     * contiguous in the packed layout, stored as 32-byte rows with swizzled halves. */
+    const int8_t* ga = p.A + (size_t)rb * kTiles * kStageA + tid * 16;
+    const int8_t* gb = p.B + (size_t)cb * kTiles * kStageB + tid * 16;
+    const int lr = tid >> 1, hh = tid & 1;
+    const uint32_t sto = lr * kBK + ((hh ^ ((lr >> 2) & 1)) << 4);
+    const uint32_t sbase = smem_u32(smem);
+    auto issue = [&](int kt) {  /* clamped: the tail re-reads the last tile into a free stage */
+        const size_t k = (size_t)min(kt, kTiles - 1);
+        const uint32_t so = sbase + (kt % kStages80) * kStage80;
+        cp_async16(so + sto, ga + k * kStageA);
+        cp_async16(so + sto + (kBM / 2) * kBK, ga + k * kStageA + kStageA / 2);
+        cp_async16(so + kStageA + sto, gb + k * kStageB);
+        cp_commit();
+    };
+
+#pragma unroll
+    for (int i = 0; i < 2 * kWords; ++i) tr[i * kThreads + tid] = 0u;
+
+    int acc[4][8][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0;
+
+    /* ldmatrix: A x4 per m16 tile = (rows 0-7,k0-15),(8-15,k0-15),(0-7,k16-31),(8-15,k16-31);
+     * B x4 per pair of n8 tiles = (n0-7,k0-15),(n0-7,k16-31),(n8-15,k0-15),(n8-15,k16-31). */
+    const int q = lane >> 3, r8 = lane & 7;
+    const int a_row = wm * 64 + (q & 1) * 8 + r8, a_chunk = q >> 1;
+    const uint32_t a_addr = sbase + a_row * kBK + ((a_chunk ^ ((a_row >> 2) & 1)) << 4);
+    const int b_row = wn * 64 + (q >> 1) * 8 + r8, b_chunk = q & 1;
+    const uint32_t b_addr = sbase + kStageA + b_row * kBK + ((b_chunk ^ ((b_row >> 2) & 1)) << 4);
+
+    uint32_t fa[2][4][4], fb[2][8][2];
+    auto load_frags = [&](int stage, uint32_t(&A)[4][4], uint32_t(&B)[8][2]) {
+        const uint32_t so = stage * kStage80;
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+            ldsm_x4(a_addr + so + mi * 16 * kBK, A[mi][0], A[mi][1], A[mi][2], A[mi][3]);
+#pragma unroll
+        for (int nj = 0; nj < 4; ++nj)
+            ldsm_x4(b_addr + so + nj * 16 * kBK, B[2 * nj][0], B[2 * nj][1], B[2 * nj + 1][0],
+                    B[2 * nj + 1][1]);
+    };
+    auto mma_tile = [&](const uint32_t(&A)[4][4], const uint32_t(&B)[8][2]) {
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+            for (int nj = 0; nj < 8; ++nj) {
+                const int ni = (mi & 1) ? 7 - nj : nj;
+                mma16832(acc[mi][ni], A[mi], B[ni][0], B[ni][1]);
+            }
+    };
+    auto fold = [&](int idx, uint32_t(&part)[16]) {
+        rs_step<16, 8>(part, lane);
+        rs_step<8, 4>(part, lane);
+        rs_step<4, 1>(part, lane);
+        uint32_t* t0 = tr + idx * kThreads + tid;
+        uint32_t* t1 = tr + (kWords + idx) * kThreads + tid;
+        *t0 = rotl32(*t0, 13) ^ part[0];
+        *t1 = rotl32(*t1, 13) ^ part[1];
+    };
+
+#pragma unroll
+    for (int s = 0; s < kStages80 - 1; ++s) issue(s);
+    cp_wait<kStages80 - 2>();
+    __syncthreads();
+    load_frags(0, fa[0], fb[0]);
+
+    /* One k-tile = one k32 step; fragments of tile kt live in buffer kt & 1. */
+    uint32_t part[16];
+    for (int ms = 0; ms < kMilestones; ++ms) {
+#pragma unroll
+        for (int kq = 0; kq < kTilesPerMilestone; ++kq) {
+            const int kt = ms * kTilesPerMilestone + kq;
+            const int cur = kq & 1;
+            if (kq == 0) local_xor_m16(acc, part);  /* previous milestone; ms == 0 is a no-op */
+            cp_wait<kStages80 - 3>();               /* tile kt + 1 resident */
+            __syncthreads();
+            issue(kt + kStages80 - 1);
+            load_frags((kt + 1) % kStages80, fa[cur ^ 1], fb[cur ^ 1]);
+            mma_tile(fa[cur], fb[cur]);
+            if (kq == 0) fold((ms + kWords - 1) % kWords, part);
+        }
+    }
+    cp_wait<0>();
+    local_xor_m16(acc, part);
+    fold(kWords - 1, part);
+
+    if (p.found && *p.found != 0 && !p.dump_words) return;
+
+    const int b0 = lane & 1, b1 = (lane >> 1) & 1, b2 = (lane >> 2) & 1;
+    const int b3 = (lane >> 3) & 1, b4 = (lane >> 4) & 1;
+    const int vr = rb * 2 + (wm >> 1), vc = cb;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const int j = (b3 * 4 + b2 * 2 + b0) * 2 + t;
+        const int h = j >> 3, aa = (j >> 2) & 1, bb = j & 3;
+        const int gm = aa * 2 + b4, gn = bb * 2 + b1;
+        const int simt_warp = ((wm * 2 + h) & 3) + 4 * wn;
+        const int simt_lane = (gn >> 1) * 8 + gm * 2 + (gn & 1);
+        uint32_t msg[kWords];
+#pragma unroll
+        for (int w = 0; w < kWords; ++w) msg[w] = tr[(t * kWords + w) * kThreads + tid];
+        if (p.dump_words) {
+            const int cta = (vr - 2 * p.row_block0) * p.col_blocks + (vc - p.col_block0);
+            const size_t tile = (size_t)cta * 256 + simt_warp * 32 + simt_lane;
+#pragma unroll
+            for (int w = 0; w < kWords; ++w) p.dump_words[tile * kWords + w] = msg[w];
+        }
+        if (!p.found || !p.a_key8) continue;
+        uint32_t key[8], d[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) key[w] = p.a_key8[w];
+        b3_compress64(key, msg, d);
+        bool ok = true;
+#pragma unroll
+        for (int w = 7; w >= 0; --w) {
+            if (d[w] != p.bound[w]) {
+                ok = d[w] < p.bound[w];
+                break;
+            }
+        }
+        if (ok && atomicCAS(p.found, 0, 1) == 0) {
+            *p.out_t_rows = vr * 128 + (simt_warp & 3) * 32 + gm * 4;
+            *p.out_t_cols = vc * 128 + (simt_warp >> 2) * 64 + gn * 4;
+        }
+    }
+#endif
+}
+
 __global__ void cp_turing_pack_kernel(const int8_t* src, int8_t* dst, int rows, int blk)
 {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -286,7 +485,9 @@ extern "C" int cp_turing_scan_supported(int dev)
 {
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
-    return prop.major == 7 && prop.minor == 5;
+    /* sm_75 Turing kernel; sm_8x (Ampere/Ada) m16n8k32 kernel. Hopper and Blackwell keep
+     * the CUTLASS path until measured. */
+    return (prop.major == 7 && prop.minor == 5) || prop.major == 8;
 }
 
 extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m,
@@ -301,12 +502,21 @@ extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t*
         return -1;
     }
     static bool attr_set[64];
+    static bool sm80[64];
     if (dev >= 0 && dev < 64 && !attr_set[dev]) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return -1;
+        sm80[dev] = prop.major >= 8;
         if (cudaFuncSetAttribute(cp_turing_scan_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem) != cudaSuccess)
             return -1;
+        if (sm80[dev] &&
+            cudaFuncSetAttribute(cp_ampere_scan_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem80) != cudaSuccess)
+            return -1;
         attr_set[dev] = true;
     }
+    const bool use80 = dev >= 0 && dev < 64 && sm80[dev];
     TuringParams p{};
     p.A = d_Ap;
     p.B = d_BpT;
@@ -323,7 +533,10 @@ extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t*
         p.out_t_cols = jackpot->d_out_t_cols;
     }
     p.dump_words = d_dump_words;
-    cp_turing_scan_kernel<<<p.row_blocks * p.col_blocks, kThreads, kSmem>>>(p);
+    if (use80)
+        cp_ampere_scan_kernel<<<p.row_blocks * p.col_blocks, kThreads, kSmem80>>>(p);
+    else
+        cp_turing_scan_kernel<<<p.row_blocks * p.col_blocks, kThreads, kSmem>>>(p);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[turing] launch failed: %s\n", cudaGetErrorString(err));
