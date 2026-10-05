@@ -277,9 +277,11 @@ static void update_packed_layout(void)
     const char* env = getenv("CP_CUDA_PACKED");
     int on = g_ngpu > 0 && g_cutlass_fused && !g_step_major_ap && !g_contiguous &&
              !(env && !strcmp(env, "0"));
-    for(int i = 0; i < g_ngpu && on; i++)
-        on = cp_cutlass_mma_kind(g_gpus[i].dev) == CP_CUTLASS_MMA_TENSOROP &&
+    for(int i = 0; i < g_ngpu && on; i++){
+        const int kind = cp_cutlass_mma_kind(g_gpus[i].dev);
+        on = (kind == CP_CUTLASS_MMA_TENSOROP || kind == CP_CUTLASS_MMA_TENSOROP80) &&
              cp_turing_scan_supported(g_gpus[i].dev);
+    }
     for(int i = 0; i < g_ngpu; i++)
         g_gpus[i].use_turing = on;
     if(on && (g_row_period_batch & 1)){
@@ -288,7 +290,7 @@ static void update_packed_layout(void)
                              g_row_period_batch + 1 : g_row_period_batch - 1;
     }
     if(on && !g_packed_ab){
-        printf("[gpu] sm_75: Turing scan kernel on packed operands "
+        printf("[gpu] packed-operand scan kernel (sm_75 m8n8k16 / sm_8x m16n8k32) "
                "(CP_CUDA_PACKED=0 for the CUTLASS kernel)\n");
         fflush(stdout);
     }
@@ -1794,7 +1796,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                                                  NULL, d_tw);
                 CU_CHECK(cudaDeviceSynchronize());
                 if(trc != 0 || !h_ref || !h_tw){
-                    fprintf(stderr, "[align-test-prod] Turing kernel check could not run\n");
+                    fprintf(stderr, "[align-test-prod] packed kernel check could not run\n");
                     xrc = -1;
                 } else {
                     CU_CHECK(cudaMemcpy(h_ref, d_x, bytes, cudaMemcpyDeviceToHost));
@@ -1815,11 +1817,11 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                         }
                     }
                     if(bad){
-                        fprintf(stderr, "[align-test-prod] Turing packed kernel vs CUTLASS simt: "
+                        fprintf(stderr, "[align-test-prod] packed scan kernel vs CUTLASS simt: "
                                 "%zu/%zu hash tiles differ\n", bad, tiles);
                         xrc = -1;
                     } else {
-                        printf("[align-test-prod] Turing packed kernel vs CUTLASS simt transcript "
+                        printf("[align-test-prod] packed scan kernel vs CUTLASS simt transcript "
                                "OK (%zu hash tiles x 16 words, %.3fs)\n", tiles, cp_now_sec() - t0);
                         fflush(stdout);
                     }
