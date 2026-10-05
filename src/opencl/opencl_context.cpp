@@ -388,6 +388,16 @@ bool OpenClContext::probe_build(const char *source, const char *build_options) {
         return false;
     }
 
+    /* The NVIDIA OpenCL driver is not fork-safe after context init: the child's
+     * clBuildProgram always fails there. NVIDIA reports build errors normally, so
+     * build in-process instead. */
+    char vendor[128] = {0};
+    if (clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor) - 1, vendor, nullptr) ==
+                CL_SUCCESS &&
+        std::strstr(vendor, "NVIDIA") != nullptr) {
+        return true;
+    }
+
     cl_int probe_err = CL_SUCCESS;
     const char *srcs[] = {source};
     const size_t lens[] = {std::strlen(source)};
