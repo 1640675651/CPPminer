@@ -24,6 +24,7 @@
 #include "cp_merkle_tree.cuh"
 #include "cp_noise.h"
 #include "cp_cutlass.h"
+#include "cp_turing_scan.h"
 #include "cp_proof.h"
 #include "cp_share_witness.h"
 #include "plain_proof_kernel.cuh"
@@ -95,6 +96,8 @@ typedef struct {
 #endif
     int       use_cublas_period;
     int       use_cutlass_fused;
+    /* sm_75 tensor-op: Turing scan kernel on packed noisy operands. */
+    int       use_turing;
 } GpuCtx;
 
 static GpuCtx g_gpus[MAX_GPUS];
@@ -104,6 +107,8 @@ static int g_period_gemm = 1;
 static int g_row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 0; /* Case 10 default; main sets 1 for cuBLAS period */
+/* Noisy A/B^T in the packed layout of cp_turing_layout.cuh (Turing scan kernel). */
+static int g_packed_ab = 0;
 /* Cert V3: bind Merkle roots with m/n before noise-seed chain. Set by begin_job. */
 static int g_salted = 1;
 
@@ -264,6 +269,32 @@ static int gpu_probe_cublas_int8(GpuCtx* g)
 }
 #endif /* CP_ENABLE_CUBLAS */
 
+/* Packed operands + the Turing scan kernel when every GPU in use runs the
+ * fused sm_75 tensor-op path. CP_CUDA_PACKED=0 keeps the CUTLASS kernel.
+ * Must be settled before a job builds its noisy B^T. */
+static void update_packed_layout(void)
+{
+    const char* env = getenv("CP_CUDA_PACKED");
+    int on = g_ngpu > 0 && g_cutlass_fused && !g_step_major_ap && !g_contiguous &&
+             !(env && !strcmp(env, "0"));
+    for(int i = 0; i < g_ngpu && on; i++)
+        on = cp_cutlass_mma_kind(g_gpus[i].dev) == CP_CUTLASS_MMA_TENSOROP &&
+             cp_turing_scan_supported(g_gpus[i].dev);
+    for(int i = 0; i < g_ngpu; i++)
+        g_gpus[i].use_turing = on;
+    if(on && (g_row_period_batch & 1)){
+        /* 256-row CTAs: row periods are scanned in pairs. */
+        g_row_period_batch = g_row_period_batch < CP_ROW_PERIOD_BATCH_MAX ?
+                             g_row_period_batch + 1 : g_row_period_batch - 1;
+    }
+    if(on && !g_packed_ab){
+        printf("[gpu] sm_75: Turing scan kernel on packed operands "
+               "(CP_CUDA_PACKED=0 for the CUTLASS kernel)\n");
+        fflush(stdout);
+    }
+    g_packed_ab = on;
+}
+
 static void sync_ap_layout(void)
 {
     int mode = g_step_major_ap ? 1 : 0;
@@ -305,6 +336,7 @@ void cp_gpu_set_contiguous_tiles(int on)
     g_contiguous = on;
     if(on) g_period_gemm = 0;
     if(g_ngpu > 0) sync_tile_config();
+    update_packed_layout();
 }
 
 void cp_gpu_set_period_gemm(int on)
@@ -331,6 +363,7 @@ void cp_gpu_set_step_major_ap(int on)
 {
     g_step_major_ap = on ? 1 : 0;
     if(g_ngpu > 0) sync_ap_layout();
+    update_packed_layout();
 }
 
 void cp_gpu_set_cutlass_fused(int on)
@@ -338,11 +371,13 @@ void cp_gpu_set_cutlass_fused(int on)
     g_cutlass_fused = on ? 1 : 0;
     for(int i = 0; i < g_ngpu; i++)
         g_gpus[i].use_cutlass_fused = g_cutlass_fused;
+    update_packed_layout();
 }
 
 void cp_gpu_set_cuda_mma(int mode)
 {
     cp_cutlass_set_mma_mode(mode);
+    update_packed_layout();
 }
 
 void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
@@ -414,6 +449,7 @@ void cp_gpu_init(int* devs, int ndev)
     }
     sync_tile_config();
     sync_ap_layout();
+    update_packed_layout();
 }
 
 int cp_gpu_list_devices(void)
@@ -619,7 +655,10 @@ static void gpu_noise_apply_a(GpuCtx* g, int m, cudaStream_t st = 0,
     if(!a_sig) a_sig = g->d_A_sig;
     if(!ap) ap = g->d_Ap;
 
-    if(g_step_major_ap){
+    if(g_packed_ab){
+        cp_apply_noise_packed_kernel<<<m, tpb, smem, st>>>(
+            a_sig, g->d_eal, ap, m, K_DIM, R_RANK, g->d_e_ar, CP_TURING_A_BLK);
+    } else if(g_step_major_ap){
         cp_apply_noise_a_kernel<<<m, tpb, smem, st>>>(
             a_sig, g->d_eal, ap, m, K_DIM, R_RANK, g->d_e_ar);
     } else {
@@ -635,7 +674,10 @@ static void gpu_noise_apply_b(GpuCtx* g, int n, const int8_t* d_bt_sig)
     const int tpb = 256;
     const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
 
-    if(g_step_major_ap){
+    if(g_packed_ab){
+        cp_apply_noise_packed_kernel<<<n, tpb, smem>>>(
+            d_bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl, CP_TURING_B_BLK);
+    } else if(g_step_major_ap){
         cp_apply_noise_b_kernel<<<n, tpb, smem>>>(
             d_bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
     } else {
@@ -665,6 +707,12 @@ static void gpu_upload_rowmajor_noisy(
             g->d_A_sig, g->d_Ap, m, K_DIM, R_RANK);
         cp_pack_rowmajor_to_step_kernel<<<(int)((szBpT + tpb - 1) / tpb), tpb>>>(
             g->d_Bt_sig, g->d_BpT, n, K_DIM, R_RANK);
+    } else if(g_packed_ab){
+        if(cp_turing_pack(g->d_A_sig, g->d_Ap, m, CP_TURING_A_BLK) != 0 ||
+           cp_turing_pack(g->d_Bt_sig, g->d_BpT, n, CP_TURING_B_BLK) != 0){
+            fprintf(stderr, "[gpu] packed upload failed\n");
+            exit(1);
+        }
     } else {
         CU_CHECK(cudaMemcpy(g->d_Ap, g->d_A_sig, szAp, cudaMemcpyDeviceToDevice));
         CU_CHECK(cudaMemcpy(g->d_BpT, g->d_Bt_sig, szBpT, cudaMemcpyDeviceToDevice));
@@ -823,6 +871,15 @@ static void gpu_period_gemm_batch(
         jp.d_out_t_cols = g->d_out_t_cols;
         jp.row_period0 = row_period0;
         jp.col_period0 = col_period0;
+        if(g->use_turing && g_packed_ab){
+            if(cp_turing_period_batch(
+                   g->dev, g->d_Ap, g->d_BpT, m, n, row_period0, col_period0,
+                   row_batch_count, col_batch_count, &jp, nullptr) != 0){
+                fprintf(stderr, "[turing] period batch failed\n");
+                exit(1);
+            }
+            return;
+        }
         if(cp_cutlass_period_batch(
                g->dev, g->d_Ap, g->d_BpT, m, n, row_period0, col_period0,
                row_batch_count, col_batch_count, g_step_major_ap, nullptr,
@@ -1364,6 +1421,10 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
 
     cp_gpu_init(devs, 1);
     GpuCtx* g = &g_gpus[0];
+    /* The checks below read noisy rows directly: keep the row-major layout and
+     * test the Turing kernel on packed copies instead. */
+    g_packed_ab = 0;
+    g->use_turing = 0;
     ensure_buffers(g, m, n);
     ensure_bt_sig(g, szBpT);
     CU_CHECK(cudaSetDevice(g->dev));
@@ -1700,6 +1761,74 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                         fflush(stdout);
                     }
                 }
+            }
+            if(xrc == 0 && cp_turing_scan_supported(g->dev) &&
+               2 + rb <= m / CP_CUTLASS_CTA_M){
+                /* Turing kernel on packed copies of the operands vs the SIMT CUTLASS
+                 * dump of the same panel, folded into the 16 transcript words of
+                 * every hash tile. Its row periods come in pairs, so the panel
+                 * starts at row period 2. */
+                const int trp0 = 2;
+                const size_t twords = tiles * 16;
+                int8_t* d_pa = NULL;
+                int8_t* d_pb = NULL;
+                uint32_t* d_tw = NULL;
+                uint32_t* h_ref = (uint32_t*)malloc(bytes);
+                uint32_t* h_tw = (uint32_t*)malloc(twords * sizeof(uint32_t));
+                CU_CHECK(cudaMalloc(&d_pa, szAp));
+                CU_CHECK(cudaMalloc(&d_pb, szBpT));
+                CU_CHECK(cudaMalloc(&d_tw, twords * sizeof(uint32_t)));
+                cp_cutlass_set_mma_mode(CP_CUTLASS_MMA_SIMT);
+                cp_cutlass_set_tb(CP_CUTLASS_TB_128x128);
+                CU_CHECK(cudaMemset(d_x, 0, bytes));
+                int trc = cp_cutlass_period_batch(g->dev, g->d_Ap, g->d_BpT, m, n,
+                                                  trp0, 1, rb, cb, 0, d_x, tiles, NULL);
+                cp_cutlass_set_mma_mode(saved_mode);
+                cp_cutlass_set_tb(saved_tb);
+                if(trc == 0) trc = cp_turing_pack(g->d_Ap, d_pa, m, CP_TURING_A_BLK);
+                if(trc == 0) trc = cp_turing_pack(g->d_BpT, d_pb, n, CP_TURING_B_BLK);
+                CU_CHECK(cudaMemset(d_tw, 0xAB, twords * sizeof(uint32_t)));
+                t0 = cp_now_sec();
+                if(trc == 0)
+                    trc = cp_turing_period_batch(g->dev, d_pa, d_pb, m, n, trp0, 1, rb, cb,
+                                                 NULL, d_tw);
+                CU_CHECK(cudaDeviceSynchronize());
+                if(trc != 0 || !h_ref || !h_tw){
+                    fprintf(stderr, "[align-test-prod] Turing kernel check could not run\n");
+                    xrc = -1;
+                } else {
+                    CU_CHECK(cudaMemcpy(h_ref, d_x, bytes, cudaMemcpyDeviceToHost));
+                    CU_CHECK(cudaMemcpy(h_tw, d_tw, twords * sizeof(uint32_t),
+                                        cudaMemcpyDeviceToHost));
+                    size_t bad = 0;
+                    for(size_t t = 0; t < tiles; t++){
+                        uint32_t w[16] = {0};
+                        for(int s = 0; s < num_steps; s++)
+                            w[s % 16] = ((w[s % 16] << 13) | (w[s % 16] >> 19)) ^
+                                        h_ref[(size_t)s * tiles + t];
+                        if(memcmp(w, h_tw + t * 16, sizeof(w)) != 0){
+                            if(!bad)
+                                fprintf(stderr, "[align-test-prod] Turing tile %zu (cta %zu vt %zu) "
+                                        "word0 %08x expected %08x\n", t, t / 256, t % 256,
+                                        h_tw[t * 16], w[0]);
+                            bad++;
+                        }
+                    }
+                    if(bad){
+                        fprintf(stderr, "[align-test-prod] Turing packed kernel vs CUTLASS simt: "
+                                "%zu/%zu hash tiles differ\n", bad, tiles);
+                        xrc = -1;
+                    } else {
+                        printf("[align-test-prod] Turing packed kernel vs CUTLASS simt transcript "
+                               "OK (%zu hash tiles x 16 words, %.3fs)\n", tiles, cp_now_sec() - t0);
+                        fflush(stdout);
+                    }
+                }
+                cudaFree(d_pa);
+                cudaFree(d_pb);
+                cudaFree(d_tw);
+                free(h_ref);
+                free(h_tw);
             }
             cudaFree(d_x);
             for(int k = 0; k < kMaxVariants; k++)

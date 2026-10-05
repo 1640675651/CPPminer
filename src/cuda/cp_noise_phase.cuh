@@ -3,6 +3,7 @@
 #define CP_NOISE_PHASE_CUH
 
 #include "cp_gpu_gen.cuh"
+#include "cp_turing_layout.cuh"
 
 /* Parallel matvec: out[i] = vec[pairs[2i]] - vec[pairs[2i+1]]. */
 __device__ __forceinline__ void d_matvec_sparse_perm_par(
@@ -163,6 +164,33 @@ __global__ void cp_apply_noise_b_rowmajor_kernel(
         size_t idx = (size_t)col * (size_t)k + (size_t)l;
         const int32_t sig = signal ? (int32_t)signal[idx] : 0;
         noisy[idx] = (int8_t)(sig + (int32_t)sh_noise[l]);
+    }
+}
+
+/* Noisy rows written in the packed layout of the Turing scan kernel
+ * (cp_turing_layout.cuh): blk = 256 for A (e = E_AL), 128 for B^T (e = E_BR).
+ * signal may be NULL (zero-B). */
+__global__ void cp_apply_noise_packed_kernel(
+    const int8_t* signal, const int8_t* e, int8_t* noisy,
+    int rows, int k, int rank, const uint32_t* pairs, int blk)
+{
+    const int row = (int)blockIdx.x;
+    if(row >= rows) return;
+
+    extern __shared__ int8_t sh_noise_buf[];
+    int8_t* sh_el = sh_noise_buf;
+    int8_t* sh_noise = sh_noise_buf + rank;
+
+    for(int i = (int)threadIdx.x; i < rank; i += (int)blockDim.x)
+        sh_el[i] = e[(size_t)row * (size_t)rank + (size_t)i];
+    __syncthreads();
+
+    d_matvec_sparse_perm_par(pairs, k, sh_el, sh_noise, (int)threadIdx.x, (int)blockDim.x);
+    __syncthreads();
+
+    for(int l = (int)threadIdx.x; l < k; l += (int)blockDim.x){
+        const int32_t sig = signal ? (int32_t)signal[(size_t)row * (size_t)k + (size_t)l] : 0;
+        noisy[cp_turing_packed_offset(row, l, k, blk)] = (int8_t)(sig + (int32_t)sh_noise[l]);
     }
 }
 
