@@ -18,7 +18,7 @@ void cp_qpow_opencl_worker_shutdown(void);
 int cp_qpow_opencl_worker_is_ready(void);
 int cp_qpow_opencl_worker_list_devices(void);
 
-/* Nonces per launch; 0 → 1e6. Call before init. */
+/* Nonces per launch; 0 = automatic (about 100 ms per launch). Call before init. */
 void cp_qpow_opencl_worker_set_batch_size(uint32_t batch);
 uint32_t cp_qpow_opencl_worker_batch_size(void);
 

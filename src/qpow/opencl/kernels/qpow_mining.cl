@@ -1,19 +1,49 @@
-/* Quantus Poseidon2 QPoW — OpenCL port of engine-gpu mining_u64.wgsl (native ulong).
- * Bit-exact with pow_core / qpow host midstate path. */
+/* Quantus QPoW: Poseidon2 over Goldilocks (p = 2^64 - 2^32 + 1, width 12), one nonce per
+ * work-item.
+ *
+ * Only the last big-endian word of the 64-byte nonce varies inside a launch. The host folds the
+ * midstate, the other nonce words, the first external linear layer and the first round
+ * constants into `pre`; the kernel adds counter * (column 7 of that layer) and runs the rest of
+ * both permutations. After the last S-box layer only the first output element is computed: it
+ * holds the first 8 hash bytes. A nonce whose first 8 bytes are <= the target's becomes a
+ * candidate; the host re-hashes every candidate with the reference code before reporting it.
+ *
+ * Field elements are any 64-bit value (not necessarily < p); all arithmetic is mod p.
+ *
+ * Build options:
+ *   -DQV_MUL=1|2|3   64x64 -> 128 product: 1 = ulong mul + mul_hi, 2 = four 32x32 products
+ *                    with explicit carries, 3 = carry-free chain of 32x32 + 64 multiply-adds
+ *                    (maps to one mad_u64_u32 each on AMD GCN5+/RDNA)
+ *   -DQV_OVF=0|1     carry detection by compare or by __builtin_add_overflow (default 1 where
+ *                    the compiler has the builtin: +3-4% on Intel and NVIDIA, same on AMD)
+ *   -DQV_TEST        also build the field-op test kernel
+ */
 
-#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
+#ifndef QV_MUL
+#define QV_MUL 3
+#endif
 
-#define P64  ((ulong)0xFFFFFFFF00000001UL)
-#define EPS64 ((ulong)0xFFFFFFFFUL)
+#define EPS 0xFFFFFFFFUL
 
-__constant ulong RC_INTERNAL[22] = {
-    0x97f7798a784ad863UL, 0xd1d2bf082f60d4f0UL, 0x69a377a79f9ad206UL, 0xa9d06906a3858e24UL,
-    0x295275001eede5b5UL, 0x5874e441117bd746UL, 0x8a084bbba8ed86ccUL, 0x3defd7645cde6425UL,
-    0x3998cfe6871cc137UL, 0x3e52ef8bca48314aUL, 0x964a209f85dc9eccUL, 0x3fcc9ee82cc4577eUL,
-    0x8e79b4a5d0096d6dUL, 0x8492362ad2392556UL, 0xee72f470262574d6UL, 0x1e0e18496da2444aUL,
-    0x0f3a74bf215eaac6UL, 0x1b061b76a1c0ded3UL, 0x192c42d86803d7a6UL, 0xf6d49ff997ae0260UL,
-    0x3ec372e7a0fa3786UL, 0x5538cdf4f23445d3UL
-};
+/* r = a + b, returns the carry out of bit 63. With -DQV_OVF=1 through the compiler's
+ * add-with-overflow builtin (lets the backend reuse the add's own carry), else by compare. */
+#ifndef QV_OVF
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_add_overflow)
+#define QV_OVF 1
+#endif
+#endif
+#endif
+#ifndef QV_OVF
+#define QV_OVF 0
+#endif
+#if QV_OVF
+#define ADDC(r, a, b) ((uint)__builtin_add_overflow((ulong)(a), (ulong)(b), &(r)))
+#else
+#define ADDC(r, a, b) ((r) = (ulong)(a) + (ulong)(b), (uint)((r) < (ulong)(b)))
+#endif
+
+/* ------------------------------------------------------------------ constants */
 
 __constant ulong RC_INITIAL[4][12] = {
     {0xc002e770975b1607UL, 0xbca51a8dfe14593aUL, 0x72938dfbe774f7f9UL, 0xe4f2fe29e03234acUL,
@@ -27,8 +57,7 @@ __constant ulong RC_INITIAL[4][12] = {
      0xee0b22d0dfae8bb8UL, 0x4fd53e50ca04a7eeUL, 0x5762bfe181f25047UL, 0xf51593e2beb5e3bdUL},
     {0x1e5e2b5760e32477UL, 0x622462a1f9aaaeedUL, 0xaa284b3ecdb222aeUL, 0x63c8e72f542bf3fcUL,
      0x3ba588cacb43b5e0UL, 0x23eda6f3c99150ddUL, 0xaad3bea4baac9a5aUL, 0xe9da8d699b94184aUL,
-     0xcdb13f4cd93e024cUL, 0x902cbd0956f655e3UL, 0x5b4e40ffc759532fUL, 0xde795c20a2357af7UL}
-};
+     0xcdb13f4cd93e024cUL, 0x902cbd0956f655e3UL, 0x5b4e40ffc759532fUL, 0xde795c20a2357af7UL}};
 
 __constant ulong RC_TERMINAL[4][12] = {
     {0x7b72c539e0ea4c6eUL, 0x144573dae2ce9976UL, 0x802028b68f35fc88UL, 0x6d36c5022c4fe7c2UL,
@@ -42,263 +71,244 @@ __constant ulong RC_TERMINAL[4][12] = {
      0x1ef581a93eaf6acfUL, 0x0b24c1b7a030fca4UL, 0x624370be5670b327UL, 0x5f1e28615a11e486UL},
     {0xfe04051f909e042bUL, 0x7257e5b147fd3803UL, 0xe6ae134bb82f2e78UL, 0x5711fd5cf4784511UL,
      0xf83a42660c08c0bcUL, 0x2cd8c96d9a3ce855UL, 0x7d2ffb1bb0e17271UL, 0x85ae1528caea3811UL,
-     0x52a345d5c7adb0b8UL, 0x504c4c51f3faee94UL, 0xbce34a649cfccaf9UL, 0xe0a3389266fb6dc9UL}
-};
+     0x52a345d5c7adb0b8UL, 0x504c4c51f3faee94UL, 0xbce34a649cfccaf9UL, 0xe0a3389266fb6dc9UL}};
+
+/* RC_INTERNAL[r + 1] for internal round r (the last one adds nothing). */
+__constant ulong RC_INTERNAL_NEXT[22] = {
+    0xd1d2bf082f60d4f0UL, 0x69a377a79f9ad206UL, 0xa9d06906a3858e24UL, 0x295275001eede5b5UL,
+    0x5874e441117bd746UL, 0x8a084bbba8ed86ccUL, 0x3defd7645cde6425UL, 0x3998cfe6871cc137UL,
+    0x3e52ef8bca48314aUL, 0x964a209f85dc9eccUL, 0x3fcc9ee82cc4577eUL, 0x8e79b4a5d0096d6dUL,
+    0x8492362ad2392556UL, 0xee72f470262574d6UL, 0x1e0e18496da2444aUL, 0x0f3a74bf215eaac6UL,
+    0x1b061b76a1c0ded3UL, 0x192c42d86803d7a6UL, 0xf6d49ff997ae0260UL, 0x3ec372e7a0fa3786UL,
+    0x5538cdf4f23445d3UL, 0x0UL};
+
+/* Rows added after a linear layer that has no full-round constants of its own: RC_INTERNAL[0]
+ * on lane 0 before the internal rounds, and the second absorb's +1/+1 between permutations. */
+__constant ulong ROW_RCI0[12] = {0x97f7798a784ad863UL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+__constant ulong ROW_ONES[12] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 __constant ulong MDS_DIAG[12] = {
     0xc3b6c08e23ba9300UL, 0xd84b5de94a324fb6UL, 0x0d0c371c5b35b84fUL, 0x7964f570e7188037UL,
     0x5daf18bbd996604bUL, 0x6743bc47b9595257UL, 0x5528b9362c59bb70UL, 0xac45e25b7127b68bUL,
-    0xa2077d7dfbb606b5UL, 0xf3faac6faee378aeUL, 0x0c6388b51545e883UL, 0xd27dbb6944917b60UL
-};
+    0xa2077d7dfbb606b5UL, 0xf3faac6faee378aeUL, 0x0c6388b51545e883UL, 0xd27dbb6944917b60UL};
 
-ulong gf64_add(ulong a, ulong b)
+/* ------------------------------------------------------------------ field arithmetic */
+
+/* a*b as 128 bits */
+void mul128(ulong a, ulong b, ulong* lo, ulong* hi)
 {
-    ulong s0 = a + b;
-    int c1 = (s0 < a);
-    ulong s1 = s0 + (c1 ? EPS64 : 0UL);
-    int c2 = c1 && (s1 < s0);
-    return s1 + (c2 ? EPS64 : 0UL);
+#if QV_MUL == 1
+    *lo = a * b;
+    *hi = mul_hi(a, b);
+#elif QV_MUL == 2
+    uint a0 = (uint)a, a1 = (uint)(a >> 32), b0 = (uint)b, b1 = (uint)(b >> 32);
+    ulong p = (ulong)a0 * b0, q = (ulong)a1 * b1;
+    ulong m1 = (ulong)a0 * b1, m2 = (ulong)a1 * b0;
+    ulong m, l;
+    uint mc = ADDC(m, m1, m2);
+    uint lc = ADDC(l, p, m << 32);
+    *lo = l;
+    *hi = q + (m >> 32) + ((ulong)mc << 32) + lc;
+#else
+    /* Every step fits 64 bits: (2^32 - 1)^2 + 2 * (2^32 - 1) = 2^64 - 1. */
+    uint a0 = (uint)a, a1 = (uint)(a >> 32), b0 = (uint)b, b1 = (uint)(b >> 32);
+    ulong p0 = (ulong)a0 * b0;
+    ulong m = (ulong)a1 * b0 + (p0 >> 32);
+    ulong m2 = (ulong)a0 * b1 + (uint)m;
+    *hi = (ulong)a1 * b1 + (m >> 32) + (m2 >> 32);
+    *lo = (p0 & EPS) | (m2 << 32);
+#endif
 }
 
-ulong gf64_reduce(ulong lo, ulong hi)
+/* a^2 as 128 bits from three 32x32 products */
+void sqr128(ulong a, ulong* lo, ulong* hi)
 {
-    ulong hi_hi = hi >> 32;
-    ulong hi_lo = hi & EPS64;
-    ulong t0 = lo - hi_hi;
-    t0 = t0 - ((lo < hi_hi) ? EPS64 : 0UL);
-    /* hi_lo * EPS64 as shift-subtract. Written as a multiply, NVIDIA's OpenCL
-     * compiler emits an emulated 64-bit multiply here, which halved the
-     * kernel's throughput on Pascal (measured 8.7 -> 16.4 MH/s on a GTX 1070). */
-    ulong t1 = (hi_lo << 32) - hi_lo;
-    ulong t2 = t0 + t1;
-    return t2 + ((t2 < t0) ? EPS64 : 0UL);
-}
-
-/* 64x64 -> 128 from four 32x32 products. The limbs are typed uint so every
- * product is a zero-extended 32x32 multiply, and the cross terms are split
- * into 32-bit halves before they are summed so no partial sum can carry
- * (mid < 3*2^32, hi <= 2^64-1): no 64-bit compare/select carry fixes, which
- * is worth ~16% on Intel Gen12 and is neutral on NVIDIA. */
-ulong gf64_mul(ulong a, ulong b)
-{
+#if QV_MUL == 1
+    *lo = a * a;
+    *hi = mul_hi(a, a);
+#else
     uint a0 = (uint)a, a1 = (uint)(a >> 32);
-    uint b0 = (uint)b, b1 = (uint)(b >> 32);
-    ulong ll = (ulong)a0 * b0;
-    ulong lh = (ulong)a0 * b1;
-    ulong hl = (ulong)a1 * b0;
-    ulong hh = (ulong)a1 * b1;
-    ulong mid = (ll >> 32) + (ulong)(uint)lh + (ulong)(uint)hl;
-    ulong lo = (ll & EPS64) | (mid << 32);
-    ulong hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
-    return gf64_reduce(lo, hi);
+    ulong p = (ulong)a0 * a0, q = (ulong)a1 * a1, t = (ulong)a0 * a1;
+    /* p + 2t * 2^32 + q * 2^64 */
+    ulong l;
+    uint lc = ADDC(l, p, t << 33);
+    *lo = l;
+    *hi = q + (t >> 31) + lc;
+#endif
 }
 
-ulong gf64_sqr(ulong a)
+/* 128 -> 64 bits mod p. V = lo + r2*2^64 + r3*2^96 = lo + r2*EPS - r3. t = lo + r2*EPS with
+ * carry c; on a carry 2^64 = EPS turns -r3 into EPS - r3 = c*2^32 - (r3 + c), which cannot
+ * overflow. Exact except when r2 == 0 and lo < r3 without a carry (probability ~2^-64 for
+ * hash data); a miss there only affects the candidate filter, and candidates are re-hashed on
+ * the host. Needs r3 <= 2^32 - 2: true for any product, and for a*b + w with b below the
+ * internal diagonal's 0xF3FB... */
+ulong red128(ulong lo, ulong hi)
 {
-    uint a0 = (uint)a, a1 = (uint)(a >> 32);
-    ulong ll = (ulong)a0 * a0;
-    ulong lh = (ulong)a0 * a1;
-    ulong hh = (ulong)a1 * a1;
-    ulong mid = (ll >> 32) + 2UL * (ulong)(uint)lh;      /* < 3*2^32 */
-    ulong lo = (ll & EPS64) | (mid << 32);
-    ulong hi = hh + 2UL * (lh >> 32) + (mid >> 32);      /* <= 2^64-1 */
-    return gf64_reduce(lo, hi);
+    uint r2 = (uint)hi, r3 = (uint)(hi >> 32);
+    ulong t;
+    uint c = ADDC(t, lo, ((ulong)r2 << 32) - r2);
+    return t + ((ulong)c << 32) - (ulong)(r3 + c);
 }
 
-ulong gf64_sbox(ulong x)
+ulong gmul(ulong a, ulong b) { ulong l, h; mul128(a, b, &l, &h); return red128(l, h); }
+ulong gsqr(ulong a) { ulong l, h; sqr128(a, &l, &h); return red128(l, h); }
+
+/* Lazy sum for the linear layers: value = v + t * 2^64. */
+typedef struct { ulong v; uint t; } W;
+
+W w2(ulong a, ulong b) { W r; r.t = ADDC(r.v, a, b); return r; }
+W wadd(W a, W b) { W r; r.t = a.t + b.t + ADDC(r.v, a.v, b.v); return r; }
+W wadd64(W a, ulong b) { W r; r.t = a.t + ADDC(r.v, a.v, b); return r; }
+
+/* v + t*EPS with small t: one carry at most, after which the sum is < 2^37, so +EPS is safe */
+ulong wred(W a)
 {
-    ulong x2 = gf64_sqr(x);
-    ulong x4 = gf64_sqr(x2);
-    ulong x6 = gf64_mul(x4, x2);
-    return gf64_mul(x6, x);
+    ulong s;
+    uint c = ADDC(s, a.v, ((ulong)a.t << 32) - a.t);
+    return s + (c ? EPS : 0UL);
 }
 
-ulong gf64_canon(ulong a)
+ulong gadd(ulong a, ulong b) { return wred(w2(a, b)); }
+
+ulong canon(ulong a) { return a >= 0xFFFFFFFF00000001UL ? a - 0xFFFFFFFF00000001UL : a; }
+
+/* a*b + w with w a lazy sum, reduced once */
+ulong gfma_w(ulong a, ulong b, W w)
 {
-    return a - ((a >= P64) ? P64 : 0UL);
+    ulong lo, hi;
+    mul128(a, b, &lo, &hi);
+    ulong l2;
+    hi += (ulong)w.t + ADDC(l2, lo, w.v);
+    return red128(l2, hi);
 }
 
-void ext_layer64(ulong state[12])
+ulong sbox(ulong x)
 {
-    for(uint chunk = 0; chunk < 3u; chunk++){
-        uint o = chunk * 4u;
-        ulong x0 = state[o];
-        ulong x1 = state[o + 1];
-        ulong x2 = state[o + 2];
-        ulong x3 = state[o + 3];
-        ulong t01 = gf64_add(x0, x1);
-        ulong t23 = gf64_add(x2, x3);
-        ulong t0123 = gf64_add(t01, t23);
-        ulong t01123 = gf64_add(t0123, x1);
-        ulong t01233 = gf64_add(t0123, x3);
-        state[o + 3] = gf64_add(t01233, gf64_add(x0, x0));
-        state[o + 1] = gf64_add(t01123, gf64_add(x2, x2));
-        state[o] = gf64_add(t01123, t01);
-        state[o + 2] = gf64_add(t01233, t23);
-    }
-    ulong sums[4];
-    for(uint k = 0; k < 4u; k++)
-        sums[k] = gf64_add(gf64_add(state[k], state[k + 4]), state[k + 8]);
-    for(uint i = 0; i < 12u; i++)
-        state[i] = gf64_add(state[i], sums[i % 4u]);
+    ulong x2 = gsqr(x);
+    ulong x3 = gmul(x2, x);
+    ulong x4 = gsqr(x2);
+    return gmul(x3, x4);
 }
 
-void int_layer64(ulong state[12])
+/* ------------------------------------------------------------------ permutation */
+
+void mat4(ulong x0, ulong x1, ulong x2, ulong x3, W* y0, W* y1, W* y2, W* y3)
 {
-    ulong sum = state[0];
-    for(uint i = 1; i < 12u; i++)
-        sum = gf64_add(sum, state[i]);
-    for(uint i = 0; i < 12u; i++)
-        state[i] = gf64_add(gf64_mul(state[i], MDS_DIAG[i]), sum);
+    W t01 = w2(x0, x1), t23 = w2(x2, x3);
+    W t0123 = wadd(t01, t23);
+    W t01123 = wadd64(t0123, x1);
+    W t01233 = wadd64(t0123, x3);
+    *y3 = wadd(t01233, w2(x0, x0));
+    *y1 = wadd(t01123, w2(x2, x2));
+    *y0 = wadd(t01123, t01);
+    *y2 = wadd(t01233, t23);
 }
 
-void permute64(ulong state[12])
+/* s = M_ext * s + add, M_ext = circ(2*M4, M4, M4) */
+void ext_add(ulong* s, __constant const ulong* add)
 {
-    ext_layer64(state);
-    for(uint r = 0; r < 4u; r++){
-        for(uint i = 0; i < 12u; i++)
-            state[i] = gf64_add(state[i], RC_INITIAL[r][i]);
-        for(uint i = 0; i < 12u; i++)
-            state[i] = gf64_sbox(state[i]);
-        ext_layer64(state);
-    }
-    for(uint r = 0; r < 22u; r++){
-        state[0] = gf64_sbox(gf64_add(state[0], RC_INTERNAL[r]));
-        int_layer64(state);
-    }
-    for(uint r = 0; r < 4u; r++){
-        for(uint i = 0; i < 12u; i++)
-            state[i] = gf64_add(state[i], RC_TERMINAL[r][i]);
-        for(uint i = 0; i < 12u; i++)
-            state[i] = gf64_sbox(state[i]);
-        ext_layer64(state);
+    W y[12];
+    for (int k = 0; k < 3; k++)
+        mat4(s[4 * k], s[4 * k + 1], s[4 * k + 2], s[4 * k + 3], &y[4 * k], &y[4 * k + 1], &y[4 * k + 2], &y[4 * k + 3]);
+    for (int j = 0; j < 4; j++) {
+        W sum = wadd(wadd(y[j], y[4 + j]), y[8 + j]);
+        for (int k = 0; k < 3; k++) s[4 * k + j] = wred(wadd64(wadd(y[4 * k + j], sum), add[4 * k + j]));
     }
 }
 
-uint bswap32(uint v)
+/* What is added after the linear layer that follows full round g of the two permutations;
+ * g == 15 is the second permutation's first linear layer (RC_INITIAL[0]). */
+__constant const ulong* post_row(int g)
 {
-    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+    if (g == 15) return RC_INITIAL[0];
+    const int gg = g & 7;
+    if (gg <= 2) return RC_INITIAL[gg + 1];
+    if (gg == 3) return ROW_RCI0;
+    if (gg <= 6) return RC_TERMINAL[gg - 3];
+    return ROW_ONES;
 }
 
-/*
- * Buffers (same layout as wgpu):
- *   results[0]     = found flag
- *   results[1..16] = nonce LE u32s
- *   results[17..32]= hash LE u32s (BE-compared layout as wgpu)
- *   midstate       = 24 LE u32s (12 felts)
- *   start_nonce    = 16 LE u32s
- *   target         = 16 LE u32s (U512 LE limbs)
- *   dispatch_config= [total_threads, nonces_per_thread, total_nonces]
- */
-__kernel void mining_main(
-    __global volatile uint* results,
-    __global const uint* midstate,
-    __global const uint* start_nonce,
-    __global const uint* difficulty_target,
-    __global const uint* dispatch_config)
+/* 22 internal rounds: s[0] arrives with RC_INTERNAL[0] added, leaves with RC_TERMINAL[0].
+ * The row sum stays a lazy value and enters each diagonal product before its reduction. */
+void internal22(ulong* s)
 {
-    if(results[0] != 0u)
-        return;
+#pragma unroll 1
+    for (int r = 0; r < 22; r++) {
+        W rest = w2(s[1], s[2]);
+        for (int i = 3; i < 12; i++) rest = wadd64(rest, s[i]);
+        s[0] = sbox(s[0]);
+        W sg = wadd64(rest, s[0]);
+        s[0] = gfma_w(s[0], MDS_DIAG[0], wadd64(sg, RC_INTERNAL_NEXT[r]));
+        for (int i = 1; i < 12; i++) s[i] = gfma_w(s[i], MDS_DIAG[i], sg);
+    }
+    for (int i = 0; i < 12; i++) s[i] = gadd(s[i], RC_TERMINAL[0][i]);
+}
 
-    uint thread_id = get_global_id(0);
-    uint total_threads = dispatch_config[0];
-    uint nonces_per_thread = dispatch_config[1];
-    uint total_nonces = dispatch_config[2];
-    if(thread_id >= total_threads)
-        return;
-
-    uint base_index = thread_id * nonces_per_thread;
-
-    ulong mid[12];
-    for(uint i = 0; i < 12u; i++)
-        mid[i] = (((ulong)midstate[2u * i + 1u]) << 32) | (ulong)midstate[2u * i];
-
-    uint tgt[16];
-    for(uint i = 0; i < 16u; i++)
-        tgt[i] = difficulty_target[i];
-
-    uint nonce_base[16];
-    for(uint i = 0; i < 16u; i++)
-        nonce_base[i] = start_nonce[i];
-
-    for(uint j = 0; j < nonces_per_thread; j++){
-        uint logical_index = base_index + j;
-        if(logical_index >= total_nonces)
-            break;
-        if(j > 0u && results[0] != 0u)
-            return;
-
-        uint current_nonce[16];
-        uint val0 = nonce_base[0];
-        uint sum0 = val0 + logical_index;
-        current_nonce[0] = sum0;
-        uint carry = (sum0 < val0) ? 1u : 0u;
-        for(uint i = 1; i < 8u; i++){
-            uint val = nonce_base[i];
-            uint sum = val + carry;
-            current_nonce[i] = sum;
-            carry = (sum < val) ? 1u : 0u;
+/* canonical first element of the second permutation's output for counter value x */
+ulong hash_out0(__constant const ulong* pre, uint x)
+{
+    const uint col[12] = {1, 1, 3, 2, 2, 2, 6, 4, 1, 1, 3, 2}; /* column 7 of M_ext */
+    ulong s[12];
+    for (int i = 0; i < 12; i++) s[i] = gadd(pre[i], (ulong)x * col[i]);
+#pragma unroll 1
+    for (int g = 0;; g++) {
+        for (int i = 0; i < 12; i++) s[i] = sbox(s[i]);
+        if (g == 15) break;
+        ext_add(s, post_row(g));
+        if (g == 7) ext_add(s, post_row(15));
+        if ((g & 7) == 3) internal22(s);
+    }
+    /* out0 = 2*y00 + y10 + y20, y_k0 = 2*x0 + 3*x1 + x2 + x3 of chunk k */
+    W acc = w2(s[0], s[0]);
+    acc = wadd64(acc, s[0]); acc = wadd64(acc, s[0]);
+    for (int k = 0; k < 3; k++) {
+        const int m = k == 0 ? 2 : 1;
+        for (int rep = 0; rep < m; rep++) {
+            acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]);
+            acc = wadd64(acc, s[4 * k + 2]); acc = wadd64(acc, s[4 * k + 3]);
         }
-        for(uint i = 8; i < 16u; i++)
-            current_nonce[i] = nonce_base[i];
+        if (k > 0) { acc = wadd64(acc, s[4 * k]); acc = wadd64(acc, s[4 * k]); }
+    }
+    return canon(wred(acc));
+}
 
-        ulong st[12];
-        for(uint i = 0; i < 12u; i++)
-            st[i] = mid[i];
-        for(uint i = 0; i < 8u; i++)
-            st[i] = gf64_add(st[i], (ulong)bswap32(current_nonce[7u - i]));
-        permute64(st);
-        st[0] = gf64_add(st[0], 1UL);
-        st[1] = gf64_add(st[1], 1UL);
-        permute64(st);
+uint bswap32(uint v) { return as_uint(as_uchar4(v).s3210); }
 
-        uint first[8];
-        for(uint i = 0; i < 4u; i++){
-            ulong c = gf64_canon(st[i]);
-            first[2u * i] = (uint)(c & EPS64);
-            first[2u * i + 1u] = (uint)(c >> 32);
-        }
-        uint cmp = 0u;
-        for(uint i = 0; i < 8u; i++){
-            uint h = bswap32(first[i]);
-            uint t = tgt[15u - i];
-            if(h != t){
-                cmp = (h > t) ? 1u : 2u;
-                break;
-            }
-        }
-        if(cmp == 1u)
-            continue;
+#if defined(QV_SG) && defined(cl_intel_subgroups)
+#define QV_KERNEL_ATTR __attribute__((intel_reqd_sub_group_size(QV_SG)))
+#else
+#define QV_KERNEL_ATTR
+#endif
 
-        uint hash_le[16];
-        for(uint i = 0; i < 8u; i++)
-            hash_le[15u - i] = bswap32(first[i]);
-        permute64(st);
-        for(uint i = 0; i < 4u; i++){
-            ulong c = gf64_canon(st[i]);
-            hash_le[7u - 2u * i] = bswap32((uint)(c & EPS64));
-            hash_le[6u - 2u * i] = bswap32((uint)(c >> 32));
-        }
-        int below = (cmp == 2u);
-        if(!below){
-            for(uint i = 0; i < 8u; i++){
-                uint h = hash_le[7u - i];
-                uint t = tgt[7u - i];
-                if(h != t){
-                    below = (h < t);
-                    break;
-                }
-            }
-        }
-
-        if(below){
-            if(atomic_cmpxchg(results, 0u, 1u) == 0u){
-                for(uint i = 0; i < 16u; i++){
-                    results[1u + i] = current_nonce[i];
-                    results[17u + i] = hash_le[i];
-                }
-            }
-            return;
+/* out[0] = candidate count, out[1..15] = nonce index (nonce = start + index) */
+__kernel QV_KERNEL_ATTR void qpow_scan(__global volatile uint* out, __global ulong* dump, __constant ulong* pre,
+                        ulong t0, uint w0, uint count)
+{
+    const uint stride = (uint)get_global_size(0);
+    for (uint idx = (uint)get_global_id(0); idx < count; idx += stride) {
+        const ulong o = hash_out0(pre, bswap32(w0 + idx));
+        const ulong key = ((ulong)bswap32((uint)o) << 32) | bswap32((uint)(o >> 32));
+        if (dump) dump[idx] = o;
+        if (key <= t0) {
+            const uint slot = atomic_inc(&out[0]);
+            if (slot < 15u) out[1 + slot] = idx;
         }
     }
 }
+
+#ifdef QV_TEST
+/* out[5*i + k]: k = 0 mul, 1 sqr, 2 fma with a lazy sum (b, c), 3 add, 4 lazy 2a + b + c */
+__kernel void field_test(__global const ulong* a, __global const ulong* b, __global const ulong* c,
+                         __global ulong* out, uint n)
+{
+    const uint i = (uint)get_global_id(0);
+    if (i >= n) return;
+    out[5 * i + 0] = canon(gmul(a[i], b[i]));
+    out[5 * i + 1] = canon(gsqr(a[i]));
+    W w = w2(c[i], c[i]);
+    out[5 * i + 2] = canon(gfma_w(a[i], b[i], w));
+    out[5 * i + 3] = canon(gadd(a[i], b[i]));
+    out[5 * i + 4] = canon(wred(wadd(w2(a[i], b[i]), w2(c[i], a[i]))));
+}
+#endif

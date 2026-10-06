@@ -1261,15 +1261,18 @@ int main(int argc, char** argv)
     if(algo_sel == CP_ALGO_QUANTUS){
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
         fflush(stdout);
-        /* Quantus launch batch: --batch-size, else 1e6 nonces. */
+        /* Quantus launch batch: --batch-size, else automatic (OpenCL) or 1e6 nonces. */
         {
-            uint32_t qbatch = 1000000u;
+            uint32_t qbatch = cp_worker_backend_id() == CP_BACKEND_OPENCL ? 0u : 1000000u;
             if(batch_size_set){
                 if(batch_size < 1) batch_size = 1;
                 qbatch = (uint32_t)batch_size;
             }
             cp_worker_set_period_batch((int)qbatch);
-            printf("[mode] batch-size: %u nonces/launch\n", qbatch);
+            if(qbatch)
+                printf("[mode] batch-size: %u nonces/launch\n", qbatch);
+            else
+                printf("[mode] batch-size: auto\n");
             fflush(stdout);
         }
         if(cp_worker_backend_id() == CP_BACKEND_WGPU){

@@ -5,7 +5,9 @@
 #include "opencl_context.hpp"
 #include "qpow/miner.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -20,19 +22,29 @@
 #include <unistd.h>
 #endif
 
+/* Host side of kernels/qpow_mining.cl. Only the last big-endian nonce word varies inside a
+ * launch: the host folds the midstate, the other nonce words, the first linear layer and the
+ * first round constants into a 12-element `pre` vector, and re-hashes every candidate the
+ * kernel reports with the reference Poseidon2 before returning it. */
+
 namespace {
+
+typedef uint32_t u32;
+typedef uint64_t u64;
 
 OpenClContext g_ctx;
 cl_kernel g_kernel = nullptr;
-cl_mem g_buf_results = nullptr;
-cl_mem g_buf_midstate = nullptr;
-cl_mem g_buf_start = nullptr;
-cl_mem g_buf_target = nullptr;
-cl_mem g_buf_dispatch = nullptr;
+cl_mem g_buf_out = nullptr;   /* [0] = candidate count, [1..15] = nonce index */
+cl_mem g_buf_pre = nullptr;   /* 12 x u64 */
 int g_ready = 0;
 int g_platform_filter = -1;
-uint32_t g_batch_size = 1000000u;
-uint32_t g_compute_units = 1;
+u32 g_batch_req = 0;          /* 0 = automatic */
+u32 g_launch = 1u << 20;      /* nonces per launch */
+size_t g_local = 64;
+int g_mul = 0;
+std::string g_kernel_path;
+
+constexpr u32 k_max_candidates = 15;
 
 std::string directory_of_exe()
 {
@@ -64,53 +76,52 @@ std::string resolve_qpow_kernel_path()
 #endif
 }
 
-void be64_to_le_u32s(const uint8_t be[64], uint32_t le[16])
+void be_add(uint8_t n[64], u64 v)
 {
-    uint8_t raw[64];
-    for(int i = 0; i < 64; i++) raw[i] = be[63 - i];
-    for(int i = 0; i < 16; i++){
-        le[i] = (uint32_t)raw[i * 4 + 0]
-              | ((uint32_t)raw[i * 4 + 1] << 8)
-              | ((uint32_t)raw[i * 4 + 2] << 16)
-              | ((uint32_t)raw[i * 4 + 3] << 24);
+    for(int i = 63; i >= 0 && v; i--){
+        v += n[i];
+        n[i] = (uint8_t)v;
+        v >>= 8;
     }
 }
 
-void le_u32s_to_be64(const uint32_t le[16], uint8_t be[64])
+u32 counter_word(const uint8_t nonce[64])
 {
-    uint8_t raw[64];
-    for(int i = 0; i < 16; i++){
-        raw[i * 4 + 0] = (uint8_t)(le[i] & 0xff);
-        raw[i * 4 + 1] = (uint8_t)((le[i] >> 8) & 0xff);
-        raw[i * 4 + 2] = (uint8_t)((le[i] >> 16) & 0xff);
-        raw[i * 4 + 3] = (uint8_t)((le[i] >> 24) & 0xff);
-    }
-    for(int i = 0; i < 64; i++) be[i] = raw[63 - i];
+    return ((u32)nonce[60] << 24) | ((u32)nonce[61] << 16) | ((u32)nonce[62] << 8) | nonce[63];
 }
 
-void midstate_to_u32_le(const uint64_t mid[12], uint32_t out[24])
+/* Kernel input for nonces nonce .. nonce + count - 1 (counter word must not wrap). */
+void make_pre(const u64 mid[12], const uint8_t nonce[64], u64 pre[12])
 {
-    for(int i = 0; i < 12; i++){
-        out[2 * i] = (uint32_t)(mid[i] & 0xffffffffull);
-        out[2 * i + 1] = (uint32_t)(mid[i] >> 32);
+    u64 s[12];
+    memcpy(s, mid, sizeof(s));
+    for(int i = 0; i < 7; i++){
+        u32 w;
+        memcpy(&w, nonce + 32 + 4 * i, 4);
+        s[i] = qpow::gf_add(s[i], (u64)w);
     }
+    qpow::ext_layer(s);
+    for(int i = 0; i < 12; i++)
+        pre[i] = qpow::gf_canon(qpow::gf_add(s[i], qpow::RC_INITIAL[0][i]));
 }
 
-/* Max +1 increments before low-256 wraps (carry into high half / midstate invalid). */
-uint32_t headroom_low256(const uint32_t start_le[16])
+/* What the kernel computes for one nonce: canonical s[0] after the second permutation. */
+u64 cpu_out0(const uint8_t header[32], const uint8_t nonce[64])
 {
-    /* rem = ~low + 1 (2's complement distance to 2^256) */
-    uint32_t rem[8];
-    uint32_t carry = 1;
-    for(int i = 0; i < 8; i++){
-        uint64_t s = (uint64_t)(~start_le[i] & 0xffffffffu) + carry;
-        rem[i] = (uint32_t)s;
-        carry = (uint32_t)(s >> 32);
-    }
-    for(int i = 7; i >= 1; i--){
-        if(rem[i] != 0) return 0xffffffffu;
-    }
-    return rem[0] == 0 ? 0xffffffffu : rem[0];
+    u64 s[12];
+    qpow::mining_midstate(header, nonce, s);
+    qpow::absorb32(s, nonce + 32);
+    qpow::permute(s);
+    s[0] = qpow::gf_add(s[0], 1);
+    s[1] = qpow::gf_add(s[1], 1);
+    qpow::permute(s);
+    return qpow::gf_canon(s[0]);
+}
+
+void release_kernel()
+{
+    if(g_kernel){ clReleaseKernel(g_kernel); g_kernel = nullptr; }
+    if(g_ctx.program){ clReleaseProgram(g_ctx.program); g_ctx.program = nullptr; }
 }
 
 void release_buffers()
@@ -118,15 +129,105 @@ void release_buffers()
     auto rel = [](cl_mem& m){
         if(m){ clReleaseMemObject(m); m = nullptr; }
     };
-    rel(g_buf_results);
-    rel(g_buf_midstate);
-    rel(g_buf_start);
-    rel(g_buf_target);
-    rel(g_buf_dispatch);
-    if(g_kernel){
-        clReleaseKernel(g_kernel);
-        g_kernel = nullptr;
+    rel(g_buf_out);
+    rel(g_buf_pre);
+    release_kernel();
+}
+
+bool build_variant(int mul)
+{
+    release_kernel();
+    char opts[64];
+    snprintf(opts, sizeof(opts), "-DQV_MUL=%d", mul);
+    if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts)) return false;
+    g_kernel = g_ctx.create_kernel("qpow_scan");
+    return g_kernel != nullptr;
+}
+
+/* Enqueue one scan and wait for it. dump: optional per-nonce output (self-test). */
+bool run_scan(const u64 pre[12], u64 t0, u32 w0, u32 count, size_t local, cl_mem dump, u32 out[16])
+{
+    const u32 zero[16] = {};
+    if(!g_ctx.write_buffer(g_buf_out, zero, sizeof(zero))) return false;
+    if(!g_ctx.write_buffer(g_buf_pre, pre, 12 * sizeof(u64))) return false;
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(g_kernel, 0, sizeof(cl_mem), &g_buf_out);
+    err |= clSetKernelArg(g_kernel, 1, sizeof(cl_mem), dump ? &dump : nullptr);
+    err |= clSetKernelArg(g_kernel, 2, sizeof(cl_mem), &g_buf_pre);
+    err |= clSetKernelArg(g_kernel, 3, sizeof(u64), &t0);
+    err |= clSetKernelArg(g_kernel, 4, sizeof(u32), &w0);
+    err |= clSetKernelArg(g_kernel, 5, sizeof(u32), &count);
+    if(err != CL_SUCCESS){
+        fprintf(stderr, "[qpow-ocl] set kernel args failed (%d)\n", err);
+        return false;
     }
+    const size_t global = ((size_t)count + local - 1) / local * local;
+    err = clEnqueueNDRangeKernel(g_ctx.queue, g_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+    if(err != CL_SUCCESS){
+        fprintf(stderr, "[qpow-ocl] enqueue failed (%d)\n", err);
+        return false;
+    }
+    return g_ctx.read_buffer(g_buf_out, out, 16 * sizeof(u32));
+}
+
+/* Hash 4096 nonces with the current program and compare a spread of them with the
+ * reference code. */
+bool self_test(size_t local)
+{
+    uint8_t header[32], nonce[64];
+    for(int i = 0; i < 32; i++) header[i] = (uint8_t)(i * 37 + 11);
+    for(int i = 0; i < 64; i++) nonce[i] = (uint8_t)(i * 91 + 5);
+    nonce[60] = 0x10;
+    nonce[63] = 0xF0;
+    const u32 n = 4096;
+    u64 mid[12], pre[12];
+    qpow::mining_midstate(header, nonce, mid);
+    make_pre(mid, nonce, pre);
+    cl_mem dump = g_ctx.alloc_buffer(n * sizeof(u64), CL_MEM_READ_WRITE);
+    if(!dump) return false;
+    u32 out[16];
+    std::vector<u64> got(n);
+    bool ok = run_scan(pre, 0, counter_word(nonce), n, local, dump, out) &&
+              g_ctx.read_buffer(dump, got.data(), n * sizeof(u64));
+    clReleaseMemObject(dump);
+    if(!ok) return false;
+    const u32 idx[] = {0, 1, 2, 15, 16, 255, 256, 1000, 2047, 4095};
+    for(u32 i : idx){
+        uint8_t nn[64];
+        memcpy(nn, nonce, 64);
+        be_add(nn, i);
+        const u64 ref = cpu_out0(header, nn);
+        if(got[i] != ref){
+            fprintf(stderr, "[qpow-ocl] self-test mismatch (mul=%d) at nonce +%u: got %016llx, want %016llx\n",
+                    g_mul, i, (unsigned long long)got[i], (unsigned long long)ref);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Hash rate of the current program for one work-group size: a short run sizes the probe to
+ * about 50 ms, then the best of three probes counts. */
+double probe_rate(size_t local)
+{
+    u64 pre[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    u32 out[16];
+    auto timed = [&](u32 n) -> double {
+        auto t0 = std::chrono::steady_clock::now();
+        if(!run_scan(pre, 0, 0, n, local, nullptr, out)) return 0;
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return s > 0 ? n / s : 0;
+    };
+    const double est = timed(1u << 18);
+    if(est <= 0) return 0;
+    double n = est * 0.05;
+    n = n < 65536.0 ? 65536.0 : (n > 268435456.0 ? 268435456.0 : n);
+    double best = 0;
+    for(int rep = 0; rep < 3; rep++){
+        const double r = timed((u32)n);
+        if(r > best) best = r;
+    }
+    return best;
 }
 
 int cancelled()
@@ -138,12 +239,12 @@ int cancelled()
 
 extern "C" void cp_qpow_opencl_worker_set_batch_size(uint32_t batch)
 {
-    g_batch_size = batch == 0 ? 1000000u : batch;
+    g_batch_req = batch;
 }
 
 extern "C" uint32_t cp_qpow_opencl_worker_batch_size(void)
 {
-    return g_batch_size;
+    return g_launch;
 }
 
 extern "C" int cp_qpow_opencl_worker_list_devices(void)
@@ -173,49 +274,68 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
 
     cl_uint cu = 1;
     clGetDeviceInfo(g_ctx.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, nullptr);
-    g_compute_units = cu ? cu : 1;
 
-    const std::string kpath = resolve_qpow_kernel_path();
-    if(!g_ctx.safe_build_program_from_file(kpath.c_str(), "")){
-        fprintf(stderr, "[qpow-ocl] kernel build failed (%s)\n", kpath.c_str());
-        return -1;
-    }
-
-    g_kernel = g_ctx.create_kernel("mining_main");
-    if(!g_kernel){
-        fprintf(stderr, "[qpow-ocl] create_kernel mining_main failed\n");
-        return -1;
-    }
-
-    const size_t results_bytes = (1 + 16 + 16) * sizeof(uint32_t);
-    g_buf_results = g_ctx.alloc_buffer(results_bytes, CL_MEM_READ_WRITE);
-    g_buf_midstate = g_ctx.alloc_buffer(24 * sizeof(uint32_t), CL_MEM_READ_ONLY);
-    g_buf_start = g_ctx.alloc_buffer(16 * sizeof(uint32_t), CL_MEM_READ_ONLY);
-    g_buf_target = g_ctx.alloc_buffer(16 * sizeof(uint32_t), CL_MEM_READ_ONLY);
-    g_buf_dispatch = g_ctx.alloc_buffer(4 * sizeof(uint32_t), CL_MEM_READ_ONLY);
-    if(!g_buf_results || !g_buf_midstate || !g_buf_start || !g_buf_target || !g_buf_dispatch){
+    g_kernel_path = resolve_qpow_kernel_path();
+    g_buf_out = g_ctx.alloc_buffer(16 * sizeof(u32), CL_MEM_READ_WRITE);
+    g_buf_pre = g_ctx.alloc_buffer(12 * sizeof(u64), CL_MEM_READ_ONLY);
+    if(!g_buf_out || !g_buf_pre){
         fprintf(stderr, "[qpow-ocl] buffer alloc failed\n");
         release_buffers();
         return -1;
     }
 
-    cl_int err = 0;
-    err |= clSetKernelArg(g_kernel, 0, sizeof(cl_mem), &g_buf_results);
-    err |= clSetKernelArg(g_kernel, 1, sizeof(cl_mem), &g_buf_midstate);
-    err |= clSetKernelArg(g_kernel, 2, sizeof(cl_mem), &g_buf_start);
-    err |= clSetKernelArg(g_kernel, 3, sizeof(cl_mem), &g_buf_target);
-    err |= clSetKernelArg(g_kernel, 4, sizeof(cl_mem), &g_buf_dispatch);
-    if(err != CL_SUCCESS){
-        fprintf(stderr, "[qpow-ocl] set kernel args failed (%d)\n", err);
+    /* Pick the product variant and work-group size that run fastest on this device: the
+     * best one differs by vendor (NVIDIA: 64-bit mul_hi; Intel/AMD: 32x32+64 multiply-add
+     * chain). CP_QPOW_OCL_MUL=1|2|3 forces one. Every candidate must pass the self-test. */
+    std::vector<int> muls = {3, 1};
+    if(const char* e = getenv("CP_QPOW_OCL_MUL")){
+        const int m = atoi(e);
+        if(m >= 1 && m <= 3) muls = {m};
+    }
+    const size_t locals[] = {64, 256};
+    int best_mul = 0;
+    size_t best_local = 64;
+    double best_rate = 0;
+    for(int m : muls){
+        g_mul = m;
+        if(!build_variant(m)){
+            fprintf(stderr, "[qpow-ocl] kernel build failed (%s, mul=%d)\n", g_kernel_path.c_str(), m);
+            continue;
+        }
+        size_t max_wg = 0;
+        clGetKernelWorkGroupInfo(g_kernel, g_ctx.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr);
+        if(!self_test(max_wg >= 64 ? 64 : max_wg)) continue;
+        for(size_t l : locals){
+            if(l > max_wg) continue;
+            const double r = probe_rate(l);
+            printf("[qpow-ocl] probe mul=%d local=%zu: %.2f MH/s\n", m, l, r / 1e6);
+            if(r > best_rate){
+                best_rate = r;
+                best_mul = m;
+                best_local = l;
+            }
+        }
+    }
+    if(!best_mul){
+        fprintf(stderr, "[qpow-ocl] no kernel variant passed the self-test, not mining on this device\n");
         release_buffers();
         return -1;
     }
+    g_mul = best_mul;
+    g_local = best_local;
+    if(muls.size() > 1 && !build_variant(best_mul)){
+        fprintf(stderr, "[qpow-ocl] kernel rebuild failed\n");
+        release_buffers();
+        return -1;
+    }
+    /* Start near 100 ms per launch; search() keeps it there unless --batch-size is set. */
+    g_launch = g_batch_req ? g_batch_req : (u32)(best_rate * 0.1 > (1u << 16) ? best_rate * 0.1 : (1u << 16));
 
     g_ready = 1;
-    printf("[qpow-ocl] device[%d]: %s (%s) CUs=%u batch=%u\n",
+    printf("[qpow-ocl] device[%d]: %s (%s) CUs=%u kernel mul=%d local=%zu batch=%s self-test ok\n",
            g_ctx.device_flat_index, g_ctx.device_name.c_str(),
            g_ctx.discrete_gpu ? "discrete" : "integrated",
-           (unsigned)g_compute_units, (unsigned)g_batch_size);
+           (unsigned)cu, g_mul, g_local, g_batch_req ? "fixed" : "auto");
     fflush(stdout);
     return 0;
 }
@@ -223,10 +343,6 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
 extern "C" void cp_qpow_opencl_worker_shutdown(void)
 {
     release_buffers();
-    if(g_ctx.program){
-        clReleaseProgram(g_ctx.program);
-        g_ctx.program = nullptr;
-    }
     if(g_ctx.queue){
         clReleaseCommandQueue(g_ctx.queue);
         g_ctx.queue = nullptr;
@@ -258,13 +374,14 @@ extern "C" int cp_qpow_opencl_worker_search(
     if(!g_ready || !out_hashes || count == 0) return CP_QPOW_OCL_ERROR;
     *out_hashes = 0;
 
-    uint32_t target_le[16];
-    be64_to_le_u32s(target_be, target_le);
-    if(!g_ctx.write_buffer(g_buf_target, target_le, sizeof(target_le)))
-        return CP_QPOW_OCL_ERROR;
+    u64 t0 = 0;
+    for(int i = 0; i < 8; i++) t0 = (t0 << 8) | target_be[i];
 
-    uint8_t cur_be[64];
-    memcpy(cur_be, start_be, 64);
+    uint8_t cur[64];
+    memcpy(cur, start_be, 64);
+    uint8_t mid_high[32];
+    u64 mid[12];
+    bool have_mid = false;
     uint64_t done = 0;
 
     while(done < count){
@@ -272,89 +389,55 @@ extern "C" int cp_qpow_opencl_worker_search(
             *out_hashes = done;
             return CP_QPOW_OCL_CANCELLED;
         }
+        /* One launch; it must not cross a wrap of the counter word. */
+        const u32 w0 = counter_word(cur);
+        uint64_t n = g_launch;
+        if(n > count - done) n = count - done;
+        const uint64_t room = 0x100000000ull - w0;
+        if(n > room) n = room;
 
-        uint32_t start_le[16];
-        be64_to_le_u32s(cur_be, start_le);
-
-        uint64_t remaining = count - done;
-        uint32_t batch = g_batch_size;
-        if((uint64_t)batch > remaining) batch = (uint32_t)remaining;
-
-        uint32_t room = headroom_low256(start_le);
-        if(room == 0){
-            /* Advance high half by rebuilding midstate path: bump BE high via +2^256
-               is not needed if host always keeps salt in high; treat as error. */
-            fprintf(stderr, "[qpow-ocl] nonce low-256 exhausted\n");
+        if(!have_mid || memcmp(mid_high, cur, 32) != 0){
+            memcpy(mid_high, cur, 32);
+            qpow::mining_midstate(header, cur, mid);
+            have_mid = true;
+        }
+        u64 pre[12];
+        make_pre(mid, cur, pre);
+        u32 out[16];
+        const auto ts = std::chrono::steady_clock::now();
+        if(!run_scan(pre, t0, w0, (u32)n, g_local, nullptr, out)){
             *out_hashes = done;
             return CP_QPOW_OCL_ERROR;
         }
-        if(batch > room) batch = room;
-
-        uint64_t mid[12];
-        qpow::mining_midstate(header, cur_be, mid);
-        uint32_t mid_u32[24];
-        midstate_to_u32_le(mid, mid_u32);
-
-        if(!g_ctx.write_buffer(g_buf_midstate, mid_u32, sizeof(mid_u32)))
-            return CP_QPOW_OCL_ERROR;
-        if(!g_ctx.write_buffer(g_buf_start, start_le, sizeof(start_le)))
-            return CP_QPOW_OCL_ERROR;
-
-        uint32_t zeros[33] = {0};
-        if(!g_ctx.write_buffer(g_buf_results, zeros, sizeof(zeros)))
-            return CP_QPOW_OCL_ERROR;
-
-        /* One nonce per thread (pad global to local size). Matches wgpu occupancy
-         * better than CU×8 under-dispatch with long per-thread loops. */
-        const uint32_t local = 256;
-        const uint32_t nonces_per_thread = 1;
-        uint32_t num_wg = (batch + local - 1) / local;
-        if(num_wg < 1) num_wg = 1;
-        uint32_t total_threads = num_wg * local;
-
-        uint32_t dispatch[4] = {
-            total_threads, nonces_per_thread, batch, 0
-        };
-        if(!g_ctx.write_buffer(g_buf_dispatch, dispatch, sizeof(dispatch)))
-            return CP_QPOW_OCL_ERROR;
-
-        size_t global = (size_t)total_threads;
-        size_t local_sz = local;
-        cl_int err = clEnqueueNDRangeKernel(g_ctx.queue, g_kernel, 1, nullptr,
-                                            &global, &local_sz, 0, nullptr, nullptr);
-        if(err != CL_SUCCESS){
-            fprintf(stderr, "[qpow-ocl] enqueue failed (%d)\n", err);
-            return CP_QPOW_OCL_ERROR;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+        if(!g_batch_req && n == g_launch && ms > 0){
+            double next = (double)g_launch * 100.0 / ms;
+            next = next < 65536.0 ? 65536.0 : (next > 1073741824.0 ? 1073741824.0 : next);
+            g_launch = (u32)(0.5 * g_launch + 0.5 * next);
         }
 
-        uint32_t results[33];
-        if(!g_ctx.read_buffer(g_buf_results, results, sizeof(results)))
-            return CP_QPOW_OCL_ERROR;
-
-        done += batch;
+        /* Lowest valid nonce of the launch: the caller resumes right after it, so later
+         * shares of the same launch are found again on the next call. */
+        const u32 nc = out[0] < k_max_candidates ? out[0] : k_max_candidates;
+        u32 best = 0xFFFFFFFFu;
+        for(u32 k = 0; k < nc; k++){
+            const u32 idx = out[1 + k];
+            if(idx >= best) continue;
+            uint8_t nonce[64], hash[64];
+            memcpy(nonce, cur, 64);
+            be_add(nonce, idx);
+            u64 m[12];
+            qpow::mining_midstate(header, nonce, m);
+            if(qpow::hash_if_valid(m, nonce + 32, target_be, hash)){
+                best = idx;
+                memcpy(out_nonce_be, nonce, 64);
+                memcpy(out_hash_be, hash, 64);
+            }
+        }
+        be_add(cur, n);
+        done += n;
         *out_hashes = done;
-
-        if(results[0] != 0){
-            le_u32s_to_be64(results + 1, out_nonce_be);
-            /* hash_le layout matches wgpu results[17..]; convert to BE hash bytes */
-            le_u32s_to_be64(results + 17, out_hash_be);
-            return CP_QPOW_OCL_OK_FOUND;
-        }
-
-        /* Advance BE start by batch */
-        uint8_t tmp[64];
-        memcpy(tmp, cur_be, 64);
-        /* add batch into BE nonce = add into LE then convert back */
-        uint32_t next_le[16];
-        memcpy(next_le, start_le, sizeof(next_le));
-        uint64_t add = batch;
-        for(int i = 0; i < 16 && add; i++){
-            uint64_t s = (uint64_t)next_le[i] + (add & 0xffffffffull);
-            next_le[i] = (uint32_t)s;
-            add = (add >> 32) + (s >> 32);
-        }
-        le_u32s_to_be64(next_le, cur_be);
-        (void)tmp;
+        if(best != 0xFFFFFFFFu) return CP_QPOW_OCL_OK_FOUND;
     }
 
     return CP_QPOW_OCL_OK_EXHAUSTED;

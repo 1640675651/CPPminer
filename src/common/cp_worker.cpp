@@ -444,7 +444,7 @@ extern "C" void cp_worker_set_period_batch(int batch)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
         if(g_algo == 1)
-            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 1 ? 1 : batch));
+            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 0 ? 0 : batch));
         else
             cp_opencl_worker_set_macro_batch(batch);
     }
@@ -486,7 +486,7 @@ extern "C" void cp_worker_set_col_period_batch(int batch)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
         if(g_algo == 1)
-            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 1 ? 1 : batch));
+            cp_qpow_opencl_worker_set_batch_size((uint32_t)(batch < 0 ? 0 : batch));
         else
             cp_opencl_worker_set_macro_batch(batch);
     }
