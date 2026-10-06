@@ -486,7 +486,8 @@ extern "C" int cp_qpow_opencl_worker_search(
 
     for(Slot& sl : slots)
         if(plan(sl) && !enqueue_slot(sl, t0, g_local)){ drain(); return CP_QPOW_OCL_ERROR; }
-    auto t_prev = std::chrono::steady_clock::now();
+    const auto t_start = std::chrono::steady_clock::now();
+    uint64_t measured = 0;
     for(int si = 0; slots[si].n; si ^= 1){
         Slot& sl = slots[si];
         if(clWaitForEvents(1, &sl.done_ev) != CL_SUCCESS){
@@ -496,12 +497,13 @@ extern "C" int cp_qpow_opencl_worker_search(
         }
         clReleaseEvent(sl.done_ev);
         sl.done_ev = nullptr;
-        /* Automatic launch size: ~100 ms between completions. */
-        const auto now = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(now - t_prev).count();
-        t_prev = now;
-        if(!g_batch_req && sl.n == g_launch && ms > 0){
-            double next = (double)g_launch * 100.0 / ms;
+        /* Automatic launch size: ~100 ms of work, from the rate over the whole call. The time
+         * between two completions is no measure: some drivers (Intel) report both slots of the
+         * pipeline done within a millisecond, which made the size jump a hundredfold. */
+        measured += sl.n;
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        if(!g_batch_req && s > 0.05){
+            double next = (double)measured / s * 0.1;
             next = next < 65536.0 ? 65536.0 : (next > 1073741824.0 ? 1073741824.0 : next);
             g_launch = (u32)(0.5 * g_launch + 0.5 * next);
         }
