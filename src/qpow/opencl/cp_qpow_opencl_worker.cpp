@@ -36,12 +36,15 @@ OpenClContext g_ctx;
 cl_kernel g_kernel = nullptr;
 cl_mem g_buf_out = nullptr;   /* [0] = candidate count, [1..15] = nonce index */
 cl_mem g_buf_pre = nullptr;   /* 12 x u64 */
+cl_mem g_buf_out2 = nullptr;  /* second slot of the search pipeline */
+cl_mem g_buf_pre2 = nullptr;
 int g_ready = 0;
 int g_platform_filter = -1;
 u32 g_batch_req = 0;          /* 0 = automatic */
 u32 g_launch = 1u << 20;      /* nonces per launch */
 size_t g_local = 64;
 int g_mul = 0;
+int g_red = 1;
 std::string g_kernel_path;
 
 constexpr u32 k_max_candidates = 15;
@@ -131,14 +134,16 @@ void release_buffers()
     };
     rel(g_buf_out);
     rel(g_buf_pre);
+    rel(g_buf_out2);
+    rel(g_buf_pre2);
     release_kernel();
 }
 
-bool build_variant(int mul)
+bool build_variant(int mul, int red)
 {
     release_kernel();
     char opts[64];
-    snprintf(opts, sizeof(opts), "-DQV_MUL=%d", mul);
+    snprintf(opts, sizeof(opts), "-DQV_MUL=%d -DQV_RED=%d", mul, red);
     if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts)) return false;
     g_kernel = g_ctx.create_kernel("qpow_scan");
     return g_kernel != nullptr;
@@ -198,8 +203,8 @@ bool self_test(size_t local)
         be_add(nn, i);
         const u64 ref = cpu_out0(header, nn);
         if(got[i] != ref){
-            fprintf(stderr, "[qpow-ocl] self-test mismatch (mul=%d) at nonce +%u: got %016llx, want %016llx\n",
-                    g_mul, i, (unsigned long long)got[i], (unsigned long long)ref);
+            fprintf(stderr, "[qpow-ocl] self-test mismatch (mul=%d red=%d) at nonce +%u: got %016llx, want %016llx\n",
+                    g_mul, g_red, i, (unsigned long long)got[i], (unsigned long long)ref);
             return false;
         }
     }
@@ -242,9 +247,13 @@ extern "C" void cp_qpow_opencl_worker_set_batch_size(uint32_t batch)
     g_batch_req = batch;
 }
 
+/* Nonces per search() call: several launches, so the two-slot pipeline stays full. */
+constexpr u32 k_launches_per_search = 8;
+
 extern "C" uint32_t cp_qpow_opencl_worker_batch_size(void)
 {
-    return g_launch;
+    const uint64_t n = (uint64_t)g_launch * k_launches_per_search;
+    return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)n;
 }
 
 extern "C" int cp_qpow_opencl_worker_list_devices(void)
@@ -278,64 +287,83 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
     g_kernel_path = resolve_qpow_kernel_path();
     g_buf_out = g_ctx.alloc_buffer(16 * sizeof(u32), CL_MEM_READ_WRITE);
     g_buf_pre = g_ctx.alloc_buffer(12 * sizeof(u64), CL_MEM_READ_ONLY);
-    if(!g_buf_out || !g_buf_pre){
+    g_buf_out2 = g_ctx.alloc_buffer(16 * sizeof(u32), CL_MEM_READ_WRITE);
+    g_buf_pre2 = g_ctx.alloc_buffer(12 * sizeof(u64), CL_MEM_READ_ONLY);
+    if(!g_buf_out || !g_buf_pre || !g_buf_out2 || !g_buf_pre2){
         fprintf(stderr, "[qpow-ocl] buffer alloc failed\n");
         release_buffers();
         return -1;
     }
 
-    /* Pick the product variant and work-group size that run fastest on this device: the
-     * best one differs by vendor (NVIDIA: 64-bit mul_hi; Intel/AMD: 32x32+64 multiply-add
-     * chain). CP_QPOW_OCL_MUL=1|2|3 forces one. Every candidate must pass the self-test. */
+    /* Pick the kernel variant and work-group size that run fastest on this device; the best
+     * differs by vendor. First the 64x64 product (NVIDIA: 64-bit mul_hi; Intel/AMD: 32x32+64
+     * multiply-add chain) at work-group sizes 64 and 256, then the reduction for that product
+     * (Intel: the signed form). CP_QPOW_OCL_MUL=1|2|3 and CP_QPOW_OCL_RED=1|2 force one.
+     * Every candidate must pass the self-test. */
     std::vector<int> muls = {3, 1};
     if(const char* e = getenv("CP_QPOW_OCL_MUL")){
         const int m = atoi(e);
         if(m >= 1 && m <= 3) muls = {m};
     }
+    std::vector<int> reds = {2};
+    int red_forced = 0;
+    if(const char* e = getenv("CP_QPOW_OCL_RED")){
+        const int r = atoi(e);
+        if(r >= 1 && r <= 2){ red_forced = r; reds.clear(); }
+    }
     const size_t locals[] = {64, 256};
-    int best_mul = 0;
+    int best_mul = 0, best_red = red_forced ? red_forced : 1;
     size_t best_local = 64;
     double best_rate = 0;
-    for(int m : muls){
+    auto try_variant = [&](int m, int r, const size_t* ls, int nls) {
         g_mul = m;
-        if(!build_variant(m)){
-            fprintf(stderr, "[qpow-ocl] kernel build failed (%s, mul=%d)\n", g_kernel_path.c_str(), m);
-            continue;
+        g_red = r;
+        if(!build_variant(m, r)){
+            fprintf(stderr, "[qpow-ocl] kernel build failed (%s, mul=%d red=%d)\n", g_kernel_path.c_str(), m, r);
+            return;
         }
         size_t max_wg = 0;
         clGetKernelWorkGroupInfo(g_kernel, g_ctx.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr);
-        if(!self_test(max_wg >= 64 ? 64 : max_wg)) continue;
-        for(size_t l : locals){
+        if(!self_test(max_wg >= 64 ? 64 : max_wg)) return;
+        for(int i = 0; i < nls; i++){
+            const size_t l = ls[i];
             if(l > max_wg) continue;
-            const double r = probe_rate(l);
-            printf("[qpow-ocl] probe mul=%d local=%zu: %.2f MH/s\n", m, l, r / 1e6);
-            if(r > best_rate){
-                best_rate = r;
+            const double rate = probe_rate(l);
+            printf("[qpow-ocl] probe mul=%d red=%d local=%zu: %.2f MH/s\n", m, r, l, rate / 1e6);
+            if(rate > best_rate){
+                best_rate = rate;
                 best_mul = m;
+                best_red = r;
                 best_local = l;
             }
         }
+    };
+    for(int m : muls) try_variant(m, best_red, locals, 2);
+    if(best_mul){
+        const size_t l = best_local;
+        for(int r : reds) try_variant(best_mul, r, &l, 1);
     }
     if(!best_mul){
         fprintf(stderr, "[qpow-ocl] no kernel variant passed the self-test, not mining on this device\n");
         release_buffers();
         return -1;
     }
-    g_mul = best_mul;
     g_local = best_local;
-    if(muls.size() > 1 && !build_variant(best_mul)){
+    if((g_mul != best_mul || g_red != best_red) && !build_variant(best_mul, best_red)){
         fprintf(stderr, "[qpow-ocl] kernel rebuild failed\n");
         release_buffers();
         return -1;
     }
+    g_mul = best_mul;
+    g_red = best_red;
     /* Start near 100 ms per launch; search() keeps it there unless --batch-size is set. */
     g_launch = g_batch_req ? g_batch_req : (u32)(best_rate * 0.1 > (1u << 16) ? best_rate * 0.1 : (1u << 16));
 
     g_ready = 1;
-    printf("[qpow-ocl] device[%d]: %s (%s) CUs=%u kernel mul=%d local=%zu batch=%s self-test ok\n",
+    printf("[qpow-ocl] device[%d]: %s (%s) CUs=%u kernel mul=%d red=%d local=%zu batch=%s self-test ok\n",
            g_ctx.device_flat_index, g_ctx.device_name.c_str(),
            g_ctx.discrete_gpu ? "discrete" : "integrated",
-           (unsigned)cu, g_mul, g_local, g_batch_req ? "fixed" : "auto");
+           (unsigned)cu, g_mul, g_red, g_local, g_batch_req ? "fixed" : "auto");
     fflush(stdout);
     return 0;
 }
@@ -362,6 +390,47 @@ extern "C" int cp_qpow_opencl_worker_is_ready(void)
     return g_ready;
 }
 
+namespace {
+
+/* One in-flight launch of the search pipeline. */
+struct Slot {
+    cl_mem out = nullptr, pre_buf = nullptr;
+    uint8_t base[64];
+    u64 pre[12];
+    u32 out_host[16];
+    u32 n = 0;
+    cl_event done_ev = nullptr;
+};
+
+const u32 k_zero16[16] = {};
+
+/* Enqueue a launch without waiting: pre upload, scan, and the read-back of the candidates. */
+bool enqueue_slot(Slot& sl, u64 t0, size_t local)
+{
+    cl_int err = clEnqueueWriteBuffer(g_ctx.queue, sl.out, CL_FALSE, 0, sizeof(k_zero16), k_zero16, 0, nullptr, nullptr);
+    err |= clEnqueueWriteBuffer(g_ctx.queue, sl.pre_buf, CL_FALSE, 0, sizeof(sl.pre), sl.pre, 0, nullptr, nullptr);
+    const u32 w0 = counter_word(sl.base);
+    err |= clSetKernelArg(g_kernel, 0, sizeof(cl_mem), &sl.out);
+    err |= clSetKernelArg(g_kernel, 1, sizeof(cl_mem), nullptr);
+    err |= clSetKernelArg(g_kernel, 2, sizeof(cl_mem), &sl.pre_buf);
+    err |= clSetKernelArg(g_kernel, 3, sizeof(u64), &t0);
+    err |= clSetKernelArg(g_kernel, 4, sizeof(u32), &w0);
+    err |= clSetKernelArg(g_kernel, 5, sizeof(u32), &sl.n);
+    const size_t global = ((size_t)sl.n + local - 1) / local * local;
+    if(err == CL_SUCCESS)
+        err = clEnqueueNDRangeKernel(g_ctx.queue, g_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+    if(err == CL_SUCCESS)
+        err = clEnqueueReadBuffer(g_ctx.queue, sl.out, CL_FALSE, 0, sizeof(sl.out_host), sl.out_host, 0, nullptr, &sl.done_ev);
+    if(err != CL_SUCCESS){
+        fprintf(stderr, "[qpow-ocl] enqueue failed (%d)\n", err);
+        return false;
+    }
+    clFlush(g_ctx.queue);
+    return true;
+}
+
+} // namespace
+
 extern "C" int cp_qpow_opencl_worker_search(
     const uint8_t header[32],
     const uint8_t target_be[64],
@@ -382,49 +451,70 @@ extern "C" int cp_qpow_opencl_worker_search(
     uint8_t mid_high[32];
     u64 mid[12];
     bool have_mid = false;
-    uint64_t done = 0;
+    uint64_t planned = 0, done = 0;
 
-    while(done < count){
-        if(cancelled()){
-            *out_hashes = done;
-            return CP_QPOW_OCL_CANCELLED;
-        }
-        /* One launch; it must not cross a wrap of the counter word. */
-        const u32 w0 = counter_word(cur);
+    /* Two launches in flight: the next one is queued before the current one's candidates
+     * are checked on the host, so the device does not idle between launches. */
+    Slot slots[2];
+    slots[0].out = g_buf_out; slots[0].pre_buf = g_buf_pre;
+    slots[1].out = g_buf_out2; slots[1].pre_buf = g_buf_pre2;
+    auto plan = [&](Slot& sl) -> bool {
+        sl.n = 0;
+        if(planned >= count) return false;
+        /* A launch must not cross a wrap of the counter word. */
+        const uint64_t room = 0x100000000ull - counter_word(cur);
         uint64_t n = g_launch;
-        if(n > count - done) n = count - done;
-        const uint64_t room = 0x100000000ull - w0;
+        if(n > count - planned) n = count - planned;
         if(n > room) n = room;
-
+        memcpy(sl.base, cur, 64);
         if(!have_mid || memcmp(mid_high, cur, 32) != 0){
             memcpy(mid_high, cur, 32);
             qpow::mining_midstate(header, cur, mid);
             have_mid = true;
         }
-        u64 pre[12];
-        make_pre(mid, cur, pre);
-        u32 out[16];
-        const auto ts = std::chrono::steady_clock::now();
-        if(!run_scan(pre, t0, w0, (u32)n, g_local, nullptr, out)){
+        make_pre(mid, cur, sl.pre);
+        sl.n = (u32)n;
+        be_add(cur, n);
+        planned += n;
+        return true;
+    };
+    auto drain = [&](){
+        clFinish(g_ctx.queue);
+        for(Slot& sl : slots)
+            if(sl.done_ev){ clReleaseEvent(sl.done_ev); sl.done_ev = nullptr; }
+    };
+
+    for(Slot& sl : slots)
+        if(plan(sl) && !enqueue_slot(sl, t0, g_local)){ drain(); return CP_QPOW_OCL_ERROR; }
+    auto t_prev = std::chrono::steady_clock::now();
+    for(int si = 0; slots[si].n; si ^= 1){
+        Slot& sl = slots[si];
+        if(clWaitForEvents(1, &sl.done_ev) != CL_SUCCESS){
+            drain();
             *out_hashes = done;
             return CP_QPOW_OCL_ERROR;
         }
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
-        if(!g_batch_req && n == g_launch && ms > 0){
+        clReleaseEvent(sl.done_ev);
+        sl.done_ev = nullptr;
+        /* Automatic launch size: ~100 ms between completions. */
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t_prev).count();
+        t_prev = now;
+        if(!g_batch_req && sl.n == g_launch && ms > 0){
             double next = (double)g_launch * 100.0 / ms;
             next = next < 65536.0 ? 65536.0 : (next > 1073741824.0 ? 1073741824.0 : next);
             g_launch = (u32)(0.5 * g_launch + 0.5 * next);
         }
 
         /* Lowest valid nonce of the launch: the caller resumes right after it, so later
-         * shares of the same launch are found again on the next call. */
-        const u32 nc = out[0] < k_max_candidates ? out[0] : k_max_candidates;
+         * shares (including the other slot's range) are found again on the next call. */
+        const u32 nc = sl.out_host[0] < k_max_candidates ? sl.out_host[0] : k_max_candidates;
         u32 best = 0xFFFFFFFFu;
         for(u32 k = 0; k < nc; k++){
-            const u32 idx = out[1 + k];
+            const u32 idx = sl.out_host[1 + k];
             if(idx >= best) continue;
             uint8_t nonce[64], hash[64];
-            memcpy(nonce, cur, 64);
+            memcpy(nonce, sl.base, 64);
             be_add(nonce, idx);
             u64 m[12];
             qpow::mining_midstate(header, nonce, m);
@@ -434,10 +524,20 @@ extern "C" int cp_qpow_opencl_worker_search(
                 memcpy(out_hash_be, hash, 64);
             }
         }
-        be_add(cur, n);
-        done += n;
+        done += sl.n;
         *out_hashes = done;
-        if(best != 0xFFFFFFFFu) return CP_QPOW_OCL_OK_FOUND;
+        if(best != 0xFFFFFFFFu){
+            drain();
+            return CP_QPOW_OCL_OK_FOUND;
+        }
+        if(cancelled()){
+            drain();
+            return CP_QPOW_OCL_CANCELLED;
+        }
+        if(plan(sl) && !enqueue_slot(sl, t0, g_local)){
+            drain();
+            return CP_QPOW_OCL_ERROR;
+        }
     }
 
     return CP_QPOW_OCL_OK_EXHAUSTED;

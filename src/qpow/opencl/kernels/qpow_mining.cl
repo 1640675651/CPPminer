@@ -14,6 +14,9 @@
  *   -DQV_MUL=1|2|3   64x64 -> 128 product: 1 = ulong mul + mul_hi, 2 = four 32x32 products
  *                    with explicit carries, 3 = carry-free chain of 32x32 + 64 multiply-adds
  *                    (maps to one mad_u64_u32 each on AMD GCN5+/RDNA)
+ *   -DQV_RED=1|2     128 -> 64 reduction: 1 = single carry fold (exact except a ~2^-64 corner),
+ *                    2 = signed form with shift-derived borrows (exact; best on Intel Xe-HPG)
+ *   -DQV_EXT22=0|1   linear layers in lazy 96-bit sums, or in carry-free 22-bit limbs (default)
  *   -DQV_OVF=0|1     carry detection by compare or by __builtin_add_overflow (default 1 where
  *                    the compiler has the builtin: +3-4% on Intel and NVIDIA, same on AMD)
  *   -DQV_TEST        also build the field-op test kernel
@@ -143,12 +146,26 @@ void sqr128(ulong a, ulong* lo, ulong* hi)
  * hash data); a miss there only affects the candidate filter, and candidates are re-hashed on
  * the host. Needs r3 <= 2^32 - 2: true for any product, and for a*b + w with b below the
  * internal diagonal's 0xF3FB... */
+#ifndef QV_RED
+#define QV_RED 1
+#endif
 ulong red128(ulong lo, ulong hi)
 {
-    uint r2 = (uint)hi, r3 = (uint)(hi >> 32);
+    const uint r2 = (uint)hi, r3 = (uint)(hi >> 32);
+#if QV_RED == 2
+    /* Signed form, exact: V = (l0 - r2 - r3) + (l1 + r2) * 2^32 lies in (-2^33, 2^65). The
+     * borrows and carries come from arithmetic shifts, so no carry-out test is needed; the
+     * top word v2 in {-1, 0, 1} folds back as v2 * EPS without a second overflow. */
+    const long d0 = (long)(uint)lo - (long)r2 - (long)r3;
+    const long d1 = (long)(uint)(lo >> 32) + (long)r2 + (d0 >> 32);
+    const long v2 = d1 >> 32;
+    const ulong z = ((ulong)(uint)d1 << 32) | (uint)d0;
+    return z + ((ulong)v2 << 32) - (ulong)v2;
+#else
     ulong t;
-    uint c = ADDC(t, lo, ((ulong)r2 << 32) - r2);
+    const uint c = ADDC(t, lo, ((ulong)r2 << 32) - r2);
     return t + ((ulong)c << 32) - (ulong)(r3 + c);
+#endif
 }
 
 ulong gmul(ulong a, ulong b) { ulong l, h; mul128(a, b, &l, &h); return red128(l, h); }
@@ -193,6 +210,74 @@ ulong sbox(ulong x)
 
 /* ------------------------------------------------------------------ permutation */
 
+#ifndef QV_EXT22
+#define QV_EXT22 1
+#endif
+
+#if QV_EXT22
+/* Linear layers in three carry-free limbs, x = a + b*2^22 + c*2^44 (22/22/20 bits). The
+ * coefficients of a layer row sum to at most 28, so a limb stays below 2^27 and plain 32-bit
+ * adds never overflow; carries are resolved once per output in l3red. Pays off where 64-bit
+ * adds and carry-outs are emulated (Intel Xe-HPG). */
+typedef struct { uint a, b, c; } L3;
+
+L3 l3(ulong x)
+{
+    const uint lo = (uint)x, hi = (uint)(x >> 32);
+    L3 r;
+    r.a = lo & 0x3FFFFFu;
+    r.b = (lo >> 22) | ((hi & 0xFFFu) << 10);
+    r.c = hi >> 12;
+    return r;
+}
+L3 l3add(L3 x, L3 y) { L3 r; r.a = x.a + y.a; r.b = x.b + y.b; r.c = x.c + y.c; return r; }
+
+/* limbs + add, reduced to 64 bits */
+ulong l3red(L3 y, ulong add)
+{
+    const ulong v0 = (ulong)y.a + ((ulong)y.b << 22);            /* < 2^50 */
+    W w;
+    w.t = (y.c >> 20) + ADDC(w.v, v0, (ulong)(y.c & 0xFFFFFu) << 44);
+    return wred(wadd64(w, add));
+}
+
+void mat4l(L3 x0, L3 x1, L3 x2, L3 x3, L3* y0, L3* y1, L3* y2, L3* y3)
+{
+    L3 t01 = l3add(x0, x1), t23 = l3add(x2, x3);
+    L3 t0123 = l3add(t01, t23);
+    L3 t01123 = l3add(t0123, x1);
+    L3 t01233 = l3add(t0123, x3);
+    *y3 = l3add(t01233, l3add(x0, x0));
+    *y1 = l3add(t01123, l3add(x2, x2));
+    *y0 = l3add(t01123, t01);
+    *y2 = l3add(t01233, t23);
+}
+
+/* s = M_ext * s + add, M_ext = circ(2*M4, M4, M4) */
+void ext_add(ulong* s, __constant const ulong* add)
+{
+    L3 x[12], y[12];
+    for (int i = 0; i < 12; i++) x[i] = l3(s[i]);
+    for (int k = 0; k < 3; k++)
+        mat4l(x[4 * k], x[4 * k + 1], x[4 * k + 2], x[4 * k + 3], &y[4 * k], &y[4 * k + 1], &y[4 * k + 2], &y[4 * k + 3]);
+    for (int j = 0; j < 4; j++) {
+        const L3 sum = l3add(l3add(y[j], y[4 + j]), y[8 + j]);
+        for (int k = 0; k < 3; k++) s[4 * k + j] = l3red(l3add(y[4 * k + j], sum), add[4 * k + j]);
+    }
+}
+
+/* out0 = 2*y00 + y10 + y20 with y_k0 = 2*x0 + 3*x1 + x2 + x3 of chunk k */
+ulong out0_of(const ulong* s)
+{
+    L3 acc = {0, 0, 0};
+    const uint coef[12] = {4, 6, 2, 2, 2, 3, 1, 1, 2, 3, 1, 1};
+    for (int i = 0; i < 12; i++) {
+        const L3 x = l3(s[i]);
+        acc.a += coef[i] * x.a; acc.b += coef[i] * x.b; acc.c += coef[i] * x.c;
+    }
+    return canon(l3red(acc, 0));
+}
+#else
 void mat4(ulong x0, ulong x1, ulong x2, ulong x3, W* y0, W* y1, W* y2, W* y3)
 {
     W t01 = w2(x0, x1), t23 = w2(x2, x3);
@@ -216,6 +301,23 @@ void ext_add(ulong* s, __constant const ulong* add)
         for (int k = 0; k < 3; k++) s[4 * k + j] = wred(wadd64(wadd(y[4 * k + j], sum), add[4 * k + j]));
     }
 }
+
+/* out0 = 2*y00 + y10 + y20 with y_k0 = 2*x0 + 3*x1 + x2 + x3 of chunk k */
+ulong out0_of(const ulong* s)
+{
+    W acc = w2(s[0], s[0]);
+    acc = wadd64(acc, s[0]); acc = wadd64(acc, s[0]);
+    for (int k = 0; k < 3; k++) {
+        const int m = k == 0 ? 2 : 1;
+        for (int rep = 0; rep < m; rep++) {
+            acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]);
+            acc = wadd64(acc, s[4 * k + 2]); acc = wadd64(acc, s[4 * k + 3]);
+        }
+        if (k > 0) { acc = wadd64(acc, s[4 * k]); acc = wadd64(acc, s[4 * k]); }
+    }
+    return canon(wred(acc));
+}
+#endif
 
 /* What is added after the linear layer that follows full round g of the two permutations;
  * g == 15 is the second permutation's first linear layer (RC_INITIAL[0]). */
@@ -259,18 +361,7 @@ ulong hash_out0(__constant const ulong* pre, uint x)
         if (g == 7) ext_add(s, post_row(15));
         if ((g & 7) == 3) internal22(s);
     }
-    /* out0 = 2*y00 + y10 + y20, y_k0 = 2*x0 + 3*x1 + x2 + x3 of chunk k */
-    W acc = w2(s[0], s[0]);
-    acc = wadd64(acc, s[0]); acc = wadd64(acc, s[0]);
-    for (int k = 0; k < 3; k++) {
-        const int m = k == 0 ? 2 : 1;
-        for (int rep = 0; rep < m; rep++) {
-            acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]); acc = wadd64(acc, s[4 * k + 1]);
-            acc = wadd64(acc, s[4 * k + 2]); acc = wadd64(acc, s[4 * k + 3]);
-        }
-        if (k > 0) { acc = wadd64(acc, s[4 * k]); acc = wadd64(acc, s[4 * k]); }
-    }
-    return canon(wred(acc));
+    return out0_of(s);
 }
 
 uint bswap32(uint v) { return as_uint(as_uchar4(v).s3210); }
