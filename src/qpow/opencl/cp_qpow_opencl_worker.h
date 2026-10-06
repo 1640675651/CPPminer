@@ -32,6 +32,10 @@ int cp_qpow_opencl_worker_search(
     uint8_t out_hash_be[64],
     uint64_t* out_hashes);
 
+/* search() counts 64-byte values that stand for nonces of qpow/nonce_line.hpp, so out_nonce_be is
+ * the nonce to submit; this gives the counter to continue from after it. */
+void cp_qpow_opencl_worker_resume(const uint8_t found_be[64], uint8_t next_be[64]);
+
 #ifdef __cplusplus
 }
 #endif

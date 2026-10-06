@@ -347,14 +347,33 @@ void internal22(ulong* s)
     for (int i = 0; i < 12; i++) s[i] = gadd(s[i], RC_TERMINAL[0][i]);
 }
 
-/* canonical first element of the second permutation's output for counter value x */
-ulong hash_out0(__constant const ulong* pre, uint x)
+/* Canonical first element of the second permutation's output for nonce-line position t
+ * (qpow/nonce_line.hpp). pk[0], pk[1] are lanes 0 and 4 after the first linear layer at t = 0,
+ * pk[2..13] the state entering round 1 without them. Only lanes 0 (-35t) and 4 (+35t) depend on
+ * t; columns 0 and 4 of M_ext are m0 * (2,1,1) and m0 * (1,2,1) over the blocks, m0 = (2,1,1,3). */
+ulong hash_out0(__constant const ulong* pk, uint t)
 {
-    const uint col[12] = {1, 1, 3, 2, 2, 2, 6, 4, 1, 1, 3, 2}; /* column 7 of M_ext */
     ulong s[12];
-    for (int i = 0; i < 12; i++) s[i] = gadd(pre[i], (ulong)x * col[i]);
+    {
+        const ulong d = 35ul * t;
+        const ulong f = sbox(gadd(pk[0], 0xFFFFFFFF00000001ul - d));
+        const ulong g = sbox(gadd(pk[1], d));
+        const W c2 = w2(f, g);
+        W c[3];
+        c[0] = wadd64(c2, f);
+        c[1] = wadd64(c2, g);
+        c[2] = c2;
+        const int m0[4] = {2, 1, 1, 3};
+        for (int k = 0; k < 3; k++)
+            for (int j = 0; j < 4; j++) {
+                W v = c[k];
+                if (m0[j] >= 2) v = wadd(v, c[k]);
+                if (m0[j] == 3) v = wadd(v, c[k]);
+                s[4 * k + j] = wred(wadd64(v, pk[2 + 4 * k + j]));
+            }
+    }
 #pragma unroll 1
-    for (int g = 0;; g++) {
+    for (int g = 1;; g++) {
         for (int i = 0; i < 12; i++) s[i] = sbox(s[i]);
         if (g == 15) break;
         ext_add(s, post_row(g));
@@ -372,13 +391,13 @@ uint bswap32(uint v) { return as_uint(as_uchar4(v).s3210); }
 #define QV_KERNEL_ATTR
 #endif
 
-/* out[0] = candidate count, out[1..15] = nonce index (nonce = start + index) */
-__kernel QV_KERNEL_ATTR void qpow_scan(__global volatile uint* out, __global ulong* dump, __constant ulong* pre,
-                        ulong t0, uint w0, uint count)
+/* out[0] = candidate count, out[1..15] = index (line position tb + index) */
+__kernel QV_KERNEL_ATTR void qpow_scan(__global volatile uint* out, __global ulong* dump, __constant ulong* pk,
+                        ulong t0, uint tb, uint count)
 {
     const uint stride = (uint)get_global_size(0);
     for (uint idx = (uint)get_global_id(0); idx < count; idx += stride) {
-        const ulong o = hash_out0(pre, bswap32(w0 + idx));
+        const ulong o = hash_out0(pk, tb + idx);
         const ulong key = ((ulong)bswap32((uint)o) << 32) | bswap32((uint)(o >> 32));
         if (dump) dump[idx] = o;
         if (key <= t0) {
