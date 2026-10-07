@@ -9,6 +9,9 @@
 #include "cp_share_witness.h"
 #include "cp_util.h"
 #include "cp_worker.h"
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+#include "cp_cpu_affinity.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -383,6 +386,9 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 }
 
 void CpShareQueueImpl::worker_main() {
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    cp_cpu_affinity_release_thread();
+#endif
     for (;;) {
         ShareSnapshot *snap = nullptr;
         {

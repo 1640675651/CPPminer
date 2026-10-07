@@ -37,8 +37,7 @@
 
 namespace {
 
-/* One pin target: a single logical CPU (SMT mode) or a whole physical core
- * (all its SMT siblings OR-ed together, 1/core mode). */
+/* One pin target: a single logical CPU. */
 struct CpuSlot {
 #if defined(_WIN32)
     WORD group = 0;
@@ -57,9 +56,16 @@ enum class BindMode { None, Pinned, Runtime };
 static std::vector<CpuSlot> g_cpu_order;
 static int g_physical_cores = 0;
 static int g_logical_cpus = 0;
-static bool g_smt_slots = false;
 static BindMode g_bind_mode = BindMode::None;
 static char g_summary[200] = "disabled";
+
+#if defined(__linux__)
+/* The CPUs the process may run on (taskset, cgroup cpusets), read once before
+ * anything is pinned. Topology is restricted to it, and helper threads return to
+ * it (cp_cpu_affinity_release_thread). */
+static cpu_set_t g_process_mask;
+static bool g_have_process_mask = false;
+#endif
 
 static bool affinity_disabled(void) {
     const char *env = std::getenv("CP_CPU_AFFINITY");
@@ -74,30 +80,23 @@ static bool runtime_binds_threads(void) {
     return (places && *places) || (bind && *bind);
 }
 
-static CpuSlot make_slot(const std::vector<int> &cpus) {
+static CpuSlot make_slot(int cpu) {
     CpuSlot slot{};
 #if defined(_WIN32)
-    /* A core's siblings always share a processor group; take the first CPU's
-     * group and OR in every sibling that lives in it. */
-    slot.group = static_cast<WORD>(cpus[0] / 64);
-    for (int cpu : cpus) {
-        if (static_cast<WORD>(cpu / 64) == slot.group) {
-            slot.mask |= KAFFINITY(1) << (cpu % 64);
-        }
-    }
+    slot.group = static_cast<WORD>(cpu / 64);
+    slot.mask = KAFFINITY(1) << (cpu % 64);
 #else
-    slot.cpus = cpus;
+    slot.cpus = {cpu};
 #endif
     return slot;
 }
 
-/* smt=true: one slot per logical CPU, physical cores first then their SMT
- * siblings (ids < physical_cores are distinct cores; Quantus hybrid relies on
- * that). smt=false: one slot per physical core covering all its siblings. */
-static void build_cpu_order(const std::vector<CoreGroup> &cores, bool smt) {
+/* One slot per logical CPU, physical cores first, then their SMT siblings: OpenMP
+ * thread ids below the core count sit on distinct cores (Quantus hybrid relies
+ * on that), so --threads N up to the core count never doubles up on a core. */
+static void build_cpu_order(const std::vector<CoreGroup> &cores) {
     g_cpu_order.clear();
     g_physical_cores = static_cast<int>(cores.size());
-    g_smt_slots = smt;
 
     size_t max_smt = 1;
     size_t logical = 0;
@@ -107,20 +106,66 @@ static void build_cpu_order(const std::vector<CoreGroup> &cores, bool smt) {
     }
     g_logical_cpus = static_cast<int>(logical);
 
-    if (!smt) {
-        for (const CoreGroup &core : cores) {
-            g_cpu_order.push_back(make_slot(core.logical));
-        }
-        return;
-    }
-
     for (size_t s = 0; s < max_smt; ++s) {
         for (const CoreGroup &core : cores) {
             if (s < core.logical.size()) {
-                g_cpu_order.push_back(make_slot({core.logical[s]}));
+                g_cpu_order.push_back(make_slot(core.logical[s]));
             }
         }
     }
+}
+
+template <typename Allowed>
+static void keep_allowed(std::vector<CoreGroup> *cores, Allowed allowed) {
+    std::vector<CoreGroup> kept;
+    for (const CoreGroup &core : *cores) {
+        CoreGroup c;
+        for (int cpu : core.logical) {
+            if (allowed(cpu)) {
+                c.logical.push_back(cpu);
+            }
+        }
+        if (!c.logical.empty()) {
+            kept.push_back(std::move(c));
+        }
+    }
+    if (!kept.empty()) {
+        *cores = std::move(kept);
+    }
+}
+
+/* Keep only the CPUs this process may run on (taskset, cgroup cpusets, Windows
+ * process affinity), dropping cores left with none, so the default thread count
+ * and the pins stay inside the allowed set. */
+static void restrict_to_process_mask(std::vector<CoreGroup> *cores) {
+#if defined(_WIN32)
+    DWORD_PTR process = 0, system = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system) || process == 0) {
+        return;
+    }
+    /* The mask covers the process's own processor group only; leave machines
+     * with more than one group (>64 logical CPUs) unfiltered. */
+    for (const CoreGroup &core : *cores) {
+        for (int cpu : core.logical) {
+            if (cpu >= 64) {
+                return;
+            }
+        }
+    }
+    keep_allowed(cores, [&](int cpu) { return ((process >> cpu) & 1) != 0; });
+#elif defined(__linux__)
+    if (!g_have_process_mask) {
+        CPU_ZERO(&g_process_mask);
+        g_have_process_mask = sched_getaffinity(0, sizeof(g_process_mask), &g_process_mask) == 0;
+    }
+    if (g_have_process_mask) {
+        keep_allowed(cores, [](int cpu) {
+            return cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &g_process_mask);
+        });
+    }
+#else
+    (void)cores; /* no per-process CPU masks */
+#endif
 }
 
 #if defined(_WIN32)
@@ -417,7 +462,7 @@ static void update_summary(void) {
         placement = ", unpinned";
         break;
     case BindMode::Pinned:
-        placement = g_smt_slots ? ", SMT (pinned 1/logical CPU)" : ", pinned 1/core";
+        placement = ", pinned (cores first, then SMT siblings)";
         break;
     case BindMode::Runtime:
         placement = ", placement left to OpenMP runtime (OMP_PLACES/OMP_PROC_BIND)";
@@ -437,11 +482,10 @@ static void update_summary(void) {
 
 } /* namespace */
 
-extern "C" int cp_cpu_affinity_init(int smt) {
+extern "C" int cp_cpu_affinity_init(void) {
     g_cpu_order.clear();
     g_physical_cores = 0;
     g_logical_cpus = 0;
-    g_smt_slots = false;
     g_bind_mode = BindMode::None;
     std::snprintf(g_summary, sizeof(g_summary), "disabled");
 
@@ -456,7 +500,8 @@ extern "C" int cp_cpu_affinity_init(int smt) {
         return -1;
     }
 
-    build_cpu_order(cores, smt != 0);
+    restrict_to_process_mask(&cores);
+    build_cpu_order(cores);
     update_summary();
     return 0;
 }
@@ -472,27 +517,14 @@ extern "C" void cp_cpu_affinity_bind_openmp_pool(void) {
     }
 
 #if defined(_OPENMP)
-#if defined(__linux__)
-    /* OpenMP thread 0 is the main thread. Linux threads inherit the creator's
-     * affinity, so keep the main thread's mask and put it back after the pool is
-     * pinned; otherwise every std::thread spawned later (progress, pool reader,
-     * proof worker) would be stuck on the main thread's slot. The pool threads
-     * keep their pins. */
-    cpu_set_t main_mask;
-    CPU_ZERO(&main_mask);
-    const bool have_main_mask = sched_getaffinity(0, sizeof(main_mask), &main_mask) == 0;
-#endif
+    /* OpenMP thread 0 is the main thread and stays pinned like the others; helper
+     * threads it creates later call cp_cpu_affinity_release_thread(). */
 #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
         const CpuSlot &slot = g_cpu_order[static_cast<size_t>(tid) % g_cpu_order.size()];
         bind_current_thread(slot);
     }
-#if defined(__linux__)
-    if (have_main_mask) {
-        sched_setaffinity(0, sizeof(main_mask), &main_mask);
-    }
-#endif
 #else
     bind_current_thread(g_cpu_order[0]);
 #endif
@@ -516,6 +548,17 @@ extern "C" int cp_cpu_affinity_logical_cpus(void) {
         return 0;
     }
     return g_logical_cpus;
+}
+
+extern "C" void cp_cpu_affinity_release_thread(void) {
+#if defined(__linux__)
+    /* Linux threads inherit their creator's mask; a helper created by the pinned
+     * main thread would otherwise share its single CPU with OpenMP thread 0.
+     * Windows and macOS threads start from the process mask, nothing to undo. */
+    if (g_bind_mode == BindMode::Pinned && g_have_process_mask) {
+        sched_setaffinity(0, sizeof(g_process_mask), &g_process_mask);
+    }
+#endif
 }
 
 extern "C" int cp_cpu_affinity_bind_thread(int tid) {

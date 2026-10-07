@@ -281,20 +281,20 @@ extern "C" void cp_cpu_worker_init(void)
     }
     /* Topology first (thread count depends on it), then the team size, then the
      * pins; the bind pass sizes the pool it pins from the team size set here. */
-    const int affinity_ok = (cp_cpu_affinity_init(g_cpu_smt) == 0);
+    const int affinity_ok = (cp_cpu_affinity_init() == 0);
 #ifdef _OPENMP
     {
         /* --threads N wins; otherwise respect an explicit OMP_NUM_THREADS; else
-         * default to one thread per logical CPU, or per physical core with
-         * --no-smt. Measured on a Zen4 8C/16T at 8192^2: AVX2 is indifferent to
-         * SMT (~875 GMAC/s either way, the kernel saturates the multiply
-         * ports), AVX512-VNNI gains ~30% (1.2 -> 1.6 TMAC/s) from the second
-         * thread hiding dpbusd and load latency. If the topology is unknown
-         * keep the runtime default. */
+         * one thread per logical CPU the process may use. Threads fill physical
+         * cores first, so --threads <= cores keeps one thread per core. Measured
+         * on a Zen4 8C/16T at 8192^2: AVX2 is indifferent to SMT (~875 GMAC/s
+         * either way), AVX512-VNNI gains ~30% (1.2 -> 1.6 TMAC/s) from the second
+         * thread hiding dpbusd and load latency. If the topology is unknown keep
+         * the runtime default. */
         int n = g_cpu_threads;
         const char* env_threads = getenv("OMP_NUM_THREADS");
         if(n <= 0 && !(env_threads && *env_threads))
-            n = g_cpu_smt ? cp_cpu_affinity_logical_cpus() : cp_cpu_affinity_physical_cores();
+            n = cp_cpu_affinity_logical_cpus();
         if(n > 0)
             omp_set_num_threads(n);
     }
@@ -397,6 +397,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
     constexpr auto kProgressInterval = std::chrono::seconds(2);
 
     std::thread progress_thread([&]() {
+        cp_cpu_affinity_release_thread();
         uint64_t last_tiles = 0;
         double last_report = scan_t0;
         for (;;) {
