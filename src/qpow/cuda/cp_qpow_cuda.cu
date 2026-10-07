@@ -189,11 +189,27 @@ DEV W wadd64(W a, u64 b)
     return r;
 }
 #endif
+/* CP_QPOW_WRED_FAST: skip the carry fold in wred. The sums it reduces have t <= ~16, so the
+ * carry fires with probability about 16 / 2^32 per call: 2 of 2^20 hashes differed from the exact
+ * kernel on a CMP 50HX. A wrong hash can only lose a share with that probability (every candidate
+ * is re-hashed on the host anyway), while the kernel drops ~9% of its instructions: 341 -> 328 SM
+ * cycles per hash. 0 restores the exact reduction. */
+#ifndef CP_QPOW_WRED_FAST
+#define CP_QPOW_WRED_FAST 1
+#endif
+
 /* (hi:lo) + t*2^64 with t < 2^31 -> 64 bits. w = t*EPS + lo < 2^63; adding hi*2^32 carries at
  * most once, and then the high word is < 2^31, so the +EPS fold cannot carry again. */
 DEV u64 wred(W a)
 {
-    u32 w0, w1, c;
+    u32 w0, w1;
+#if CP_QPOW_WRED_FAST
+    asm("mad.lo.cc.u32  %0, %2, %5, %3;\n\t"
+        "madc.hi.u32    %1, %2, %5, 0;\n\t"
+        "add.u32        %1, %1, %4;"
+        : "=r"(w0), "=r"(w1) : "r"(W_T(a)), "r"(W_LO(a)), "r"(W_HI(a)), "r"(c_eps));
+#else
+    u32 c;
     asm("mad.lo.cc.u32  %0, %3, %6, %4;\n\t"
         "madc.hi.u32    %1, %3, %6, 0;\n\t"
         "add.cc.u32     %1, %1, %5;\n\t"
@@ -201,6 +217,7 @@ DEV u64 wred(W a)
         : "=r"(w0), "=r"(w1), "=r"(c) : "r"(W_T(a)), "r"(W_LO(a)), "r"(W_HI(a)), "r"(c_eps));
     u32 n = 0u - c;
     asm("add.cc.u32 %0, %0, %2;\n\t addc.u32 %1, %1, 0;" : "+r"(w0), "+r"(w1) : "r"(n));
+#endif
     return mk64(w0, w1);
 }
 
@@ -499,7 +516,10 @@ bool self_test(Dev& d)
     if (ok) ok = ck(cudaMemcpy(got.data(), dump, n * sizeof(u64), cudaMemcpyDeviceToHost), "self-test copy", d.ordinal);
     cudaFree(dump);
     if (!ok) return false;
-    /* 128 samples: an unstable overclock that corrupts a few hashes in a thousand still shows up */
+    /* 128 samples: an unstable overclock that corrupts a few hashes in a thousand still shows up.
+     * The fast reduction (CP_QPOW_WRED_FAST) itself misses about 2 hashes in a million, so one
+     * mismatch is reported but tolerated; a bad overclock produces many. */
+    int bad = 0;
     for (u32 i = 0; i < n; i += 32) {
         uint8_t c[64], nn[64];
         memcpy(c, ctr, 64);
@@ -509,7 +529,7 @@ bool self_test(Dev& d)
         if (got[i] != ref) {
             fprintf(stderr, "[qpow-cuda] device %d: self-test mismatch at nonce +%u (got %016llx, want %016llx)\n",
                     d.ordinal, i, (unsigned long long)got[i], (unsigned long long)ref);
-            return false;
+            if (++bad > CP_QPOW_WRED_FAST) return false;
         }
     }
     return true;
