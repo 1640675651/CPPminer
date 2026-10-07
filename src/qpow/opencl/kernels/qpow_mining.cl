@@ -1,10 +1,11 @@
 /* Quantus QPoW: Poseidon2 over Goldilocks (p = 2^64 - 2^32 + 1, width 12), one nonce per
  * work-item.
  *
- * Only the last big-endian word of the 64-byte nonce varies inside a launch. The host folds the
- * midstate, the other nonce words, the first external linear layer and the first round
- * constants into `pre`; the kernel adds counter * (column 7 of that layer) and runs the rest of
- * both permutations. After the last S-box layer only the first output element is computed: it
+ * A launch covers consecutive positions t of one nonce line (qpow/nonce_line.hpp), along which
+ * only lanes 0 and 4 change after the first linear layer. The host folds the midstate, the line
+ * base, that layer and the other ten S-boxes of the first round into 14 constants; the kernel
+ * runs two S-boxes, then the rest of both permutations. After the last S-box layer only the
+ * first output element is computed: it
  * holds the first 8 hash bytes. A nonce whose first 8 bytes are <= the target's becomes a
  * candidate; the host re-hashes every candidate with the reference code before reporting it.
  *
