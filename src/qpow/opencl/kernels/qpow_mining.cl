@@ -258,11 +258,15 @@ void mat4l(L3 x0, L3 x1, L3 x2, L3 x3, L3* y0, L3* y1, L3* y2, L3* y3)
 void ext_add(ulong* s, __constant const ulong* add)
 {
     L3 x[12], y[12];
+    #pragma unroll
     for (int i = 0; i < 12; i++) x[i] = l3(s[i]);
+    #pragma unroll
     for (int k = 0; k < 3; k++)
         mat4l(x[4 * k], x[4 * k + 1], x[4 * k + 2], x[4 * k + 3], &y[4 * k], &y[4 * k + 1], &y[4 * k + 2], &y[4 * k + 3]);
+    #pragma unroll
     for (int j = 0; j < 4; j++) {
         const L3 sum = l3add(l3add(y[j], y[4 + j]), y[8 + j]);
+        #pragma unroll
         for (int k = 0; k < 3; k++) s[4 * k + j] = l3red(l3add(y[4 * k + j], sum), add[4 * k + j]);
     }
 }
@@ -272,6 +276,7 @@ ulong out0_of(const ulong* s)
 {
     L3 acc = {0, 0, 0};
     const uint coef[12] = {4, 6, 2, 2, 2, 3, 1, 1, 2, 3, 1, 1};
+    #pragma unroll
     for (int i = 0; i < 12; i++) {
         const L3 x = l3(s[i]);
         acc.a += coef[i] * x.a; acc.b += coef[i] * x.b; acc.c += coef[i] * x.c;
@@ -295,10 +300,13 @@ void mat4(ulong x0, ulong x1, ulong x2, ulong x3, W* y0, W* y1, W* y2, W* y3)
 void ext_add(ulong* s, __constant const ulong* add)
 {
     W y[12];
+    #pragma unroll
     for (int k = 0; k < 3; k++)
         mat4(s[4 * k], s[4 * k + 1], s[4 * k + 2], s[4 * k + 3], &y[4 * k], &y[4 * k + 1], &y[4 * k + 2], &y[4 * k + 3]);
+    #pragma unroll
     for (int j = 0; j < 4; j++) {
         W sum = wadd(wadd(y[j], y[4 + j]), y[8 + j]);
+        #pragma unroll
         for (int k = 0; k < 3; k++) s[4 * k + j] = wred(wadd64(wadd(y[4 * k + j], sum), add[4 * k + j]));
     }
 }
@@ -308,6 +316,7 @@ ulong out0_of(const ulong* s)
 {
     W acc = w2(s[0], s[0]);
     acc = wadd64(acc, s[0]); acc = wadd64(acc, s[0]);
+    #pragma unroll
     for (int k = 0; k < 3; k++) {
         const int m = k == 0 ? 2 : 1;
         for (int rep = 0; rep < m; rep++) {
@@ -339,12 +348,15 @@ void internal22(ulong* s)
 #pragma unroll 1
     for (int r = 0; r < 22; r++) {
         W rest = w2(s[1], s[2]);
+        #pragma unroll
         for (int i = 3; i < 12; i++) rest = wadd64(rest, s[i]);
         s[0] = sbox(s[0]);
         W sg = wadd64(rest, s[0]);
         s[0] = gfma_w(s[0], MDS_DIAG[0], wadd64(sg, RC_INTERNAL_NEXT[r]));
+        #pragma unroll
         for (int i = 1; i < 12; i++) s[i] = gfma_w(s[i], MDS_DIAG[i], sg);
     }
+    #pragma unroll
     for (int i = 0; i < 12; i++) s[i] = gadd(s[i], RC_TERMINAL[0][i]);
 }
 
@@ -365,7 +377,9 @@ ulong hash_out0(__constant const ulong* pk, uint t)
         c[1] = wadd64(c2, g);
         c[2] = c2;
         const int m0[4] = {2, 1, 1, 3};
+        #pragma unroll
         for (int k = 0; k < 3; k++)
+            #pragma unroll
             for (int j = 0; j < 4; j++) {
                 W v = c[k];
                 if (m0[j] >= 2) v = wadd(v, c[k]);
@@ -375,6 +389,7 @@ ulong hash_out0(__constant const ulong* pk, uint t)
     }
 #pragma unroll 1
     for (int g = 1;; g++) {
+        #pragma unroll
         for (int i = 0; i < 12; i++) s[i] = sbox(s[i]);
         if (g == 15) break;
         ext_add(s, post_row(g));
