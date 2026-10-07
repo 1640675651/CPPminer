@@ -364,8 +364,13 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             build_opts += " -DCASE32_WMMA=" + std::to_string(wmma_arch_);
             build_opts += " -DCASE32_WMMA_G12_KSPLIT=" + std::to_string(wmma_g12_ksplit_);
             const char *pipe = std::getenv("CP_OCL_WMMA_PIPELINE");
-            /* Default on (+5-8% on gfx1103, same VGPRs); CP_OCL_WMMA_PIPELINE=0 disables. */
-            wmma_pipeline_ = (pipe && pipe[0] && std::atoi(pipe) == 0) ? 0 : 1;
+            /* Register double buffer of the step operands: on for gfx11 (+5-8% on gfx1103, same
+               VGPRs), off for gfx12 (R9700: 88.5 vs 70.9 TMAC/s without it; the fully unrolled
+               pipelined k loop spills). CP_OCL_WMMA_PIPELINE=0/1 overrides. */
+            wmma_pipeline_ = wmma_arch_ == 12 ? 0 : 1;
+            if (pipe && pipe[0]) {
+                wmma_pipeline_ = std::atoi(pipe) != 0 ? 1 : 0;
+            }
             build_opts += " -DCASE32_WMMA_PIPELINE=" + std::to_string(wmma_pipeline_);
         } else if (use_sudot) {
             build_opts += " -DCASE32_USE_BUILTIN_SUDOT4=1";
