@@ -777,17 +777,19 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
  *
  * gfx12 wave32 V_WMMA_I32_16X16X16_IU8 (A, B: 2 VGPRs; C, D: 8 VGPRs), h = l/16:
  *   A: lane l holds row m = l%16, no duplication across the halves.
- *      CASE32_WMMA_G12_KSPLIT=0 (default, RDNA4 ISA guide):
+ *      CASE32_WMMA_G12_KSPLIT=1 (default; AMD's RDNA4 WMMA guide: one layout for every
+ *      data type, 8 consecutive k per lane):
+ *          VGPR0 = k 8h..8h+3, VGPR1 = k 8h+4..8h+7
+ *      CASE32_WMMA_G12_KSPLIT=0 (alternative):
  *          VGPR0 = k 4h..4h+3, VGPR1 = k 8+4h..8+4h+3
  *          (lanes 0..15: k 0-3, 8-11; lanes 16..31: k 4-7, 12-15)
- *      CASE32_WMMA_G12_KSPLIT=1 (alternative, for the self-test):
- *          VGPR0 = k 8h..8h+3, VGPR1 = k 8h+4..8h+7
  *   B: same with column n = l%16.
  *   D: VGPR e of lane l = D[e + 8*(l/16)][l%16]:
  *                 lanes 0..15     lanes 16..31
  *        VGPR e   row e           row 8+e
  *      -> lanes 0..15 hold the top hash tile, lanes 16..31 the bottom one.
- *   These gfx12 assumptions are unverified until CP_OCL_WMMA_SELFTEST=1 runs on gfx12.
+ *   Not yet run on gfx12 hardware: the host runs case33_wmma_selftest for both k mappings
+ *   at start-up and uses the one that passes (sudot4 if none does).
  *
  * Milestones. Every KR = 128 k the 32 hash-tile words of a wave are formed in two steps:
  * each lane XORs the D elements it owns per hash tile (2 partials per WMMA block, 32 per
@@ -808,7 +810,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #error WMMA path reads the coalesced prepack directly (no LDS staging)
 #endif
 #ifndef CASE32_WMMA_G12_KSPLIT
-#define CASE32_WMMA_G12_KSPLIT 0
+#define CASE32_WMMA_G12_KSPLIT 1
 #endif
 /* 1: register double-buffer the 16-k step operands (host default; CP_OCL_WMMA_PIPELINE=0
    builds the plain load-then-WMMA loop). */
