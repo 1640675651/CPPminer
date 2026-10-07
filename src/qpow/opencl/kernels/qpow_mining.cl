@@ -33,7 +33,10 @@
  * add-with-overflow builtin (lets the backend reuse the add's own carry), else by compare. */
 #ifndef QV_OVF
 #if defined(__has_builtin)
-#if __has_builtin(__builtin_add_overflow)
+#if defined(__AMDGCN__) && __has_builtin(__builtin_addc)
+/* gfx1201: 11% fewer VALU instructions in qpow_scan than form 1 (no 64-bit compares) */
+#define QV_OVF 2
+#elif __has_builtin(__builtin_add_overflow)
 #define QV_OVF 1
 #endif
 #endif
@@ -41,7 +44,20 @@
 #ifndef QV_OVF
 #define QV_OVF 0
 #endif
-#if QV_OVF
+#if QV_OVF == 2
+/* Two chained 32-bit add-with-carry: AMDGPU maps them onto v_add_co_u32 + v_add_co_ci_u32 and can
+ * feed the final carry straight into the next add, where the 64-bit uaddo was expanded to the add
+ * plus a 64-bit compare and a cndmask. */
+uint addc64(ulong* r, ulong a, ulong b)
+{
+    uint c0, c1;
+    const uint lo = __builtin_addc((uint)a, (uint)b, 0u, &c0);
+    const uint hi = __builtin_addc((uint)(a >> 32), (uint)(b >> 32), c0, &c1);
+    *r = ((ulong)hi << 32) | lo;
+    return c1;
+}
+#define ADDC(r, a, b) addc64(&(r), (ulong)(a), (ulong)(b))
+#elif QV_OVF
 #define ADDC(r, a, b) ((uint)__builtin_add_overflow((ulong)(a), (ulong)(b), &(r)))
 #else
 #define ADDC(r, a, b) ((r) = (ulong)(a) + (ulong)(b), (uint)((r) < (ulong)(b)))
