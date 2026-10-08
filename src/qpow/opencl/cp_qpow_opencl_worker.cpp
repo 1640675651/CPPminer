@@ -128,9 +128,12 @@ void release_buffers()
 bool build_variant(int mul, int red)
 {
     release_kernel();
-    char opts[64];
-    snprintf(opts, sizeof(opts), "-DQV_MUL=%d -DQV_RED=%d", mul, red);
-    if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts)) return false;
+    /* CP_QPOW_OCL_OPTS: extra kernel build options (variants without a rebuild) */
+    std::string opts = "-DQV_MUL=" + std::to_string(mul) + " -DQV_RED=" + std::to_string(red);
+    if(const char* x = getenv("CP_QPOW_OCL_OPTS")){
+        if(x[0]){ opts += " "; opts += x; }
+    }
+    if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts.c_str())) return false;
     g_kernel = g_ctx.create_kernel("qpow_scan");
     return g_kernel != nullptr;
 }
