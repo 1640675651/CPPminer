@@ -229,7 +229,7 @@ ulong canon(ulong a) { return a >= 0xFFFFFFFF00000001UL ? a - 0xFFFFFFFF00000001
  *   hi = a1*b1 + m>>32 + m2>>32 + t                 (a*b + w < 2^128 for the diagonal b)
  * so every step maps onto one v_mad_u64_u32 with its 64-bit addend and no carry-out tests. */
 #ifndef QV_GFMA_CHAIN
-#define QV_GFMA_CHAIN 0
+#define QV_GFMA_CHAIN 1
 #endif
 ulong gfma_w(ulong a, ulong b, W w)
 {
