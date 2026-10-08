@@ -164,6 +164,8 @@ private:
     int wmma_arch_ = 0;       /* Wmma backend: 11 (gfx11) or 12 (gfx12) */
     int wmma_g12_ksplit_ = 0; /* gfx12 A/B k mapping (CP_OCL_WMMA_G12_KSPLIT) */
     int wmma_pipeline_ = 0;   /* register double buffer (CP_OCL_WMMA_PIPELINE) */
+    int wmma_wave_n_ = 64;    /* wave sub-tile width: 64 or 32 (CP_OCL_WMMA_WAVE_N) */
+    int wmma_wg_size_ = 0;    /* WIs per macro-block work-group on the Wmma backend */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
