@@ -472,8 +472,8 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
                 stop_rc = CP_JOB_NONE;
                 break;
             }
-            memcpy(cur, out_nonce, CP_QPOW_NONCE_BYTES);
-            qpow::inc_be(cur);
+            /* out_nonce is the mapped nonce; continue after its line counter */
+            cp_qpow_opencl_worker_resume(out_nonce, cur);
         } else if(st == CP_QPOW_OCL_OK_EXHAUSTED){
             add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_QPOW_OCL_CANCELLED){
@@ -585,7 +585,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
                     running.store(0, std::memory_order_relaxed);
                     break;
                 }
-                memcpy(cur, r.nonce, CP_QPOW_NONCE_BYTES);
+                memcpy(cur, r.counter, CP_QPOW_NONCE_BYTES);
                 qpow::inc_be(cur);
             } else {
                 add_be_u64(cur, k_search_chunk);
