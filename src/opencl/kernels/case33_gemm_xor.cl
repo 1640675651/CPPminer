@@ -820,6 +820,19 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #if CASE32_WMMA_PIPELINE && (KGROUPS % 8) != 0
 #error CASE32_WMMA_PIPELINE needs an even number of 16-k steps per KR panel
 #endif
+/* Unroll of the 16-k step loop inside a KR panel (0 = compiler default, i.e. full). With
+   the full unroll the scheduler hoists the loads of several steps to hide latency and the
+   operands of all of them stay live: 256 VGPRs and scratch spills on gfx12. */
+#ifndef CASE32_WMMA_KUNROLL
+#define CASE32_WMMA_KUNROLL 0
+#endif
+#define WMMA_PRAGMA_(x) _Pragma(#x)
+#define WMMA_UNROLL_(n) WMMA_PRAGMA_(unroll n)
+#if CASE32_WMMA_KUNROLL > 0
+#define WMMA_KLOOP_UNROLL WMMA_UNROLL_(CASE32_WMMA_KUNROLL)
+#else
+#define WMMA_KLOOP_UNROLL
+#endif
 
 #define WMMA_WAVE_ROWS 64
 #define WMMA_WAVE_COLS 64
@@ -829,6 +842,11 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #define WMMA_KG_DW_A (MACRO_KG_STRIP_A / 4) /* dwords between consecutive k-groups */
 #define WMMA_KG_DW_B (MACRO_KG_STRIP_B / 4)
 #define WMMA_KSTEPS (KGROUPS / 4)          /* 16-k WMMA steps per KR panel */
+#define WMMA_WG ((MACRO_M / WMMA_WAVE_ROWS) * (MACRO_N / WMMA_WAVE_COLS) * 32) /* WIs per group */
+/* 1: the 16 jackpot words per lane sit in LDS (8 KB per 128-WI group) instead of VGPRs. */
+#ifndef CASE32_WMMA_MSG_LDS
+#define CASE32_WMMA_MSG_LDS 1
+#endif
 
 #if CASE32_WMMA == 11
 typedef int4 wmma_ab;
@@ -836,6 +854,31 @@ typedef int4 wmma_ab;
 typedef int2 wmma_ab;
 #endif
 typedef int8 wmma_acc;
+
+/* CASE32_WMMA_EMU=1 (host: CP_OCL_WMMA_EMU=11|12): the WMMA instruction and ds_swizzle are
+   emulated through LDS with the same lane layouts, so this whole path (prepack indexing,
+   k mapping, accumulator layout, milestone reduce-scatter, LDS staging) can be checked with
+   --align-test / --verify on any OpenCL device. Slow; for testing only. Every lane of the
+   work-group must make the same calls (they contain barriers). */
+#ifndef CASE32_WMMA_EMU
+#define CASE32_WMMA_EMU 0
+#endif
+#if CASE32_WMMA_EMU
+#define WMMA_EMU_INTS 160 /* per wave: A 16x16 int8 (64), B (64), swizzle (32) */
+#define WMMA_EMU_ARG , __local int *emu
+#define WMMA_EMU_FWD , emu
+#define WMMA_EMU_DECL(wis) __local int wmma_emu_lds_[((wis) / 32) * WMMA_EMU_INTS]
+#define WMMA_EMU_PASS , (wmma_emu_lds_ + ((int)get_local_id(0) >> 5) * WMMA_EMU_INTS)
+inline int wmma_emu_dot4(int a, int b) {
+    return (int)(char)a * (int)(char)b + (int)(char)(a >> 8) * (int)(char)(b >> 8) +
+           (int)(char)(a >> 16) * (int)(char)(b >> 16) + (int)(char)(a >> 24) * (int)(char)(b >> 24);
+}
+#else
+#define WMMA_EMU_ARG
+#define WMMA_EMU_FWD
+#define WMMA_EMU_DECL(wis)
+#define WMMA_EMU_PASS
+#endif
 
 /* k-group offset of the first operand dword of `lane` (0 on gfx11: full k per lane). */
 inline int wmma_lane_kg0(uint lane, int ksplit) {
@@ -869,6 +912,53 @@ inline int wmma_c_row(int e, uint lane) {
 #endif
 }
 
+#if CASE32_WMMA_EMU
+/* emu: A/B as [row or column][k-group] dwords in LDS (4 k-groups = 16 k per row). */
+inline wmma_acc wmma_mac(wmma_ab a, wmma_ab b, wmma_acc c, __local int *emu, int ksplit) {
+    const int lane = (int)get_local_id(0) & 31;
+    const int m = lane & 15;
+    const int h = lane >> 4;
+    __local int *ea = emu;
+    __local int *eb = emu + 64;
+#if CASE32_WMMA == 11
+    (void)ksplit;
+    if (h == 0) {
+        ea[m * 4 + 0] = a.s0; ea[m * 4 + 1] = a.s1; ea[m * 4 + 2] = a.s2; ea[m * 4 + 3] = a.s3;
+        eb[m * 4 + 0] = b.s0; eb[m * 4 + 1] = b.s1; eb[m * 4 + 2] = b.s2; eb[m * 4 + 3] = b.s3;
+    }
+#else
+    const int g0 = ksplit ? 2 * h : h;
+    const int g1 = ksplit ? 2 * h + 1 : 2 + h;
+    ea[m * 4 + g0] = a.s0;
+    ea[m * 4 + g1] = a.s1;
+    eb[m * 4 + g0] = b.s0;
+    eb[m * 4 + g1] = b.s1;
+#endif
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int d[8] = {c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7};
+    for (int e = 0; e < 8; ++e) {
+#if CASE32_WMMA == 11
+        const int row = 2 * e + h;
+#else
+        const int row = e + 8 * h;
+#endif
+        for (int q = 0; q < 4; ++q) {
+            d[e] += wmma_emu_dot4(ea[row * 4 + q], eb[m * 4 + q]);
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return (wmma_acc)(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+}
+inline uint wmma_swz_xor(uint v, uint m, __local int *emu) {
+    const int lane = (int)get_local_id(0) & 31;
+    emu[128 + lane] = as_int(v);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const uint r = as_uint(emu[128 + (lane ^ (int)m)]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return r;
+}
+#define WMMA_MAC(a, b, c) wmma_mac((a), (b), (c), emu, CASE32_WMMA_G12_KSPLIT)
+#else
 inline wmma_acc wmma_mac(wmma_ab a, wmma_ab b, wmma_acc c) {
 #if CASE32_WMMA == 11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
@@ -876,6 +966,8 @@ inline wmma_acc wmma_mac(wmma_ab a, wmma_ab b, wmma_acc c) {
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
 #endif
 }
+#define WMMA_MAC(a, b, c) wmma_mac((a), (b), (c))
+#endif
 
 /* This lane's XOR partials of the two 8x16 hash tiles of one 16x16 block. */
 inline void wmma_tile_partials(wmma_acc c, uint lane, uint *top, uint *bot) {
@@ -893,22 +985,31 @@ inline void wmma_tile_partials(wmma_acc c, uint lane, uint *top, uint *bot) {
 
 /* ds_swizzle bit-mask mode (offset[15] = 0): and_mask = 0x1f, or_mask = 0, xor_mask = m.
    Works within groups of 32 lanes, i.e. the whole wave32. */
+#if CASE32_WMMA_EMU
+#define WMMA_SWZ_XOR(v, m) wmma_swz_xor((v), (m), emu)
+#else
 #define WMMA_SWZ_XOR(v, m) as_uint(__builtin_amdgcn_ds_swizzle(as_int(v), ((m) << 10) | 0x1f))
+#endif
 /* Reduce-scatter stage over lane bit m: keep the half of p[0..n) whose index bit
    matches the lane bit, send the other half to lane ^ m, XOR in what comes back. */
+/* The halves are picked with a lane mask, not `hi ? p[a] : p[b]`: LLVM turns that select of
+   two elements into one load at a select-ed index, which forces p[] out of registers into
+   scratch (gfx11/gfx12: ~70 scratch ops per milestone). */
 #define WMMA_RS_STAGE(p, lane, n, m)                                                  \
     do {                                                                              \
-        const int hi_ = ((lane) & (m)) != 0u;                                         \
+        const uint hm_ = (((lane) & (m)) != 0u) ? 0xFFFFFFFFu : 0u;                   \
         _Pragma("unroll") for (int j_ = 0; j_ < (n) / 2; ++j_) {                      \
-            const uint keep_ = hi_ ? (p)[j_ + (n) / 2] : (p)[j_];                     \
-            const uint send_ = hi_ ? (p)[j_] : (p)[j_ + (n) / 2];                     \
+            const uint lo_ = (p)[j_];                                                 \
+            const uint up_ = (p)[j_ + (n) / 2];                                       \
+            const uint keep_ = (up_ & hm_) | (lo_ & ~hm_);                            \
+            const uint send_ = (lo_ & hm_) | (up_ & ~hm_);                            \
             (p)[j_] = keep_ ^ WMMA_SWZ_XOR(send_, m);                                 \
         }                                                                             \
     } while (0)
 
 /* p[t] (t = 0..31): this lane's partial of word t. Returns XOR over all 32 lanes of
    p[lane], i.e. lane t receives the complete word t. Whole wave must be active. */
-inline uint wmma_reduce_scatter32(uint *p, uint lane) {
+inline uint wmma_reduce_scatter32(uint *p, uint lane WMMA_EMU_ARG) {
     WMMA_RS_STAGE(p, lane, 32, 16);
     WMMA_RS_STAGE(p, lane, 16, 8);
     WMMA_RS_STAGE(p, lane, 8, 4);
@@ -933,12 +1034,12 @@ inline void wmma_load_step(__private wmma_ab *a, __private wmma_ab *b, __global 
 }
 
 inline void wmma_mac_step(__private wmma_acc *acc, __private const wmma_ab *a,
-                          __private const wmma_ab *b) {
+                          __private const wmma_ab *b WMMA_EMU_ARG) {
     #pragma unroll
     for (int bi = 0; bi < WMMA_BM; ++bi) {
         #pragma unroll
         for (int bj = 0; bj < WMMA_BN; ++bj) {
-            acc[bi * WMMA_BN + bj] = wmma_mac(a[bi], b[bj], acc[bi * WMMA_BN + bj]);
+            acc[bi * WMMA_BN + bj] = WMMA_MAC(a[bi], b[bj], acc[bi * WMMA_BN + bj]);
         }
     }
 }
@@ -958,9 +1059,12 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     (void)blocks_per_milestone;
     (void)micro_m_begin;
     (void)micro_m_count;
+    WMMA_EMU_DECL(WMMA_WG);
+#if !CASE32_WMMA_EMU /* emu: the waves of a group must all reach every barrier */
     if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
         return;
     }
+#endif
 
     const int mb = mb_begin + (int)get_group_id(0);
     int jm;
@@ -1006,10 +1110,21 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     const int hash_tc_global = jm * HASH_MICRO_N + hash_col;
     const int hash_spatial_id = tr_global * (N / HASH_NR) + hash_tc_global;
 
+#if CASE32_WMMA_MSG_LDS
+    /* Jackpot words live in LDS, word-major so a wave's lanes hit consecutive banks: the
+       128 accumulator VGPRs leave no room for them at the milestone without spills. Each
+       lane touches only its own column, so no barrier is needed. */
+    __local uint msg_lds[PP_JACKPOT_WORDS * WMMA_WG];
+    #pragma unroll
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg_lds[i * WMMA_WG + (int)lid] = 0u;
+    }
+#else
     uint msg[PP_JACKPOT_WORDS];
     for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
         msg[i] = 0u;
     }
+#endif
     wmma_acc acc[WMMA_BM * WMMA_BN];
     #pragma unroll
     for (int i = 0; i < WMMA_BM * WMMA_BN; ++i) {
@@ -1033,18 +1148,19 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #if CASE32_WMMA_PIPELINE
         for (int ks = 0; ks < WMMA_KSTEPS; ks += 2) {
             wmma_load_step(a1, b1, a_lane, b_lane, kg_flat + 4);
-            wmma_mac_step(acc, a0, b0);
+            wmma_mac_step(acc, a0, b0 WMMA_EMU_PASS);
             const int kg_n2 = (kg_flat + 8 <= kg_last_step) ? (kg_flat + 8) : kg_last_step;
             wmma_load_step(a0, b0, a_lane, b_lane, kg_n2);
-            wmma_mac_step(acc, a1, b1);
+            wmma_mac_step(acc, a1, b1 WMMA_EMU_PASS);
             kg_flat += 8;
         }
 #else
+        WMMA_KLOOP_UNROLL
         for (int ks = 0; ks < WMMA_KSTEPS; ++ks) {
             wmma_ab a[WMMA_BM];
             wmma_ab b[WMMA_BN];
             wmma_load_step(a, b, a_lane, b_lane, kg_flat);
-            wmma_mac_step(acc, a, b);
+            wmma_mac_step(acc, a, b WMMA_EMU_PASS);
             kg_flat += 4;
         }
 #endif
@@ -1059,7 +1175,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                                    &p[bj * 8 + bi * 2 + 1]);
             }
         }
-        const uint x = wmma_reduce_scatter32(p, lane);
+        const uint x = wmma_reduce_scatter32(p, lane WMMA_EMU_PASS);
 
         if (xor_after_milestone) {
             if (fuse_jackpot) {
@@ -1067,7 +1183,15 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                     const int tid = ms % PP_JACKPOT_WORDS;
                     const uint contribution =
                             (ms + PP_JACKPOT_WORDS < num_milestones) ? pp_rotl32(x, PP_LROT) : x;
-                    msg[tid] ^= contribution;
+#if CASE32_WMMA_MSG_LDS
+                    msg_lds[tid * WMMA_WG + (int)lid] ^= contribution;
+#else
+                    /* static indices keep msg[] in VGPRs (msg[tid] would live in scratch) */
+                    #pragma unroll
+                    for (int w = 0; w < PP_JACKPOT_WORDS; ++w) {
+                        msg[w] ^= (w == tid) ? contribution : 0u;
+                    }
+#endif
                 }
             } else {
                 ulong out_idx;
@@ -1089,6 +1213,13 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         return;
     }
 
+#if CASE32_WMMA_MSG_LDS
+    uint msg[PP_JACKPOT_WORDS];
+    #pragma unroll
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg[i] = msg_lds[i * WMMA_WG + (int)lid];
+    }
+#endif
     uint digest[8];
     b3_compress64(a_key8, msg, digest);
     if (!digest_beats_target(digest, bound)) {
@@ -1115,6 +1246,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 __kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
                                    __global const int *c_in, __global int *d_out,
                                    __global uint *words, int ksplit) {
+    WMMA_EMU_DECL(32);
     const uint lane = (uint)get_local_id(0) & 31u;
     const int col = (int)(lane & 15u);
     const int kg0 = wmma_lane_kg0(lane, ksplit);
@@ -1130,7 +1262,11 @@ __kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
     c.s5 = c_in[wmma_c_row(5, lane) * 16 + col];
     c.s6 = c_in[wmma_c_row(6, lane) * 16 + col];
     c.s7 = c_in[wmma_c_row(7, lane) * 16 + col];
+#if CASE32_WMMA_EMU
+    const wmma_acc d = wmma_mac(av, bv, c WMMA_EMU_PASS, ksplit);
+#else
     const wmma_acc d = wmma_mac(av, bv, c);
+#endif
     d_out[wmma_c_row(0, lane) * 16 + col] = d.s0;
     d_out[wmma_c_row(1, lane) * 16 + col] = d.s1;
     d_out[wmma_c_row(2, lane) * 16 + col] = d.s2;
@@ -1145,7 +1281,7 @@ __kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
     for (int t = 0; t < 32; ++t) {
         p[t] = (lane * 2654435761u + (uint)t * 2246822519u) ^ ((lane + 1u) * (uint)(t + 3));
     }
-    words[lane] = wmma_reduce_scatter32(p, lane);
+    words[lane] = wmma_reduce_scatter32(p, lane WMMA_EMU_PASS);
 
     uint q[32];
     #pragma unroll
@@ -1153,7 +1289,7 @@ __kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
         q[t] = 0u;
     }
     wmma_tile_partials(d, lane, &q[0], &q[1]);
-    const uint w = wmma_reduce_scatter32(q, lane);
+    const uint w = wmma_reduce_scatter32(q, lane WMMA_EMU_PASS);
     if (lane < 2u) {
         words[32 + lane] = w;
     }
