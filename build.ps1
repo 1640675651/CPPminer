@@ -331,7 +331,7 @@ function Ensure-OneDnnDeps {
         throw "OneDNN deps missing after prepare_onednn_deps.bat ($kernelDb)"
     }
     if (-not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)) {
-        throw "Case5 patches missing in $problemHpp — run: cd src\onednn && prepare_onednn_deps.bat refresh"
+        throw "Case5 patches missing in $problemHpp - run: cd src\onednn && prepare_onednn_deps.bat refresh"
     }
 }
 
