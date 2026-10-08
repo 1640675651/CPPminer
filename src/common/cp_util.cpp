@@ -267,6 +267,22 @@ int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap)
     return nb;
 }
 
+int cp_pearl_job_key(char* out, size_t cap, const char* job_id,
+                     const uint8_t* header, int hlen, const uint32_t target[8],
+                     uint32_t cert_version)
+{
+    if(!out || !cap) return 0;
+    out[0] = 0;
+    if(!job_id || !header || hlen != INCOMPLETE_HEADER_BYTES || !target) return 0;
+    char header_hex[INCOMPLETE_HEADER_BYTES * 2 + 1], target_hex[65];
+    cp_bin_to_hex(header, INCOMPLETE_HEADER_BYTES, header_hex);
+    cp_le_words_to_be_target_hex(target, target_hex);
+    const int n = snprintf(out, cap, "%s:%s:%s:%u", job_id, header_hex, target_hex,
+                           (unsigned)cert_version);
+    if(n < 0 || (size_t)n >= cap){ out[0] = 0; return 0; }
+    return 1;
+}
+
 /* Find a JSON member name, skipping string contents (including escapes).
  * The pool protocol uses unique member names for the fields read here. */
 static const char* cp_json_value(const char* json, const char* key, int top_level_only = 0)

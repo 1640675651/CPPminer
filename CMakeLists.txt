@@ -35,17 +35,43 @@ set(CMAKE_CXX_STANDARD 17)
 include(CTest)
 if(BUILD_TESTING)
     find_package(Threads REQUIRED)
+    # Pool reader and share queue threads release the CPU affinity when the
+    # CPU backend is enabled (CP_ENABLE_CPU is a directory-wide definition).
+    set(CP_TEST_CPU_SOURCES)
+    if(CP_ENABLE_CPU)
+        set(CP_TEST_CPU_SOURCES src/cpu/cp_cpu_affinity.cpp)
+    endif()
     add_executable(cp_pool_protocol_test
         tests/cp_pool_protocol_test.cpp
         src/common/cp_json_frame.cpp
         src/common/cp_util.cpp
-        src/common/cp_state.cpp)
-    target_include_directories(cp_pool_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+        src/common/cp_pool.cpp
+        src/common/cp_job_ctrl.cpp
+        src/common/cp_qpow_pool.cpp
+        src/common/cp_state.cpp
+        ${CP_TEST_CPU_SOURCES})
+    target_include_directories(cp_pool_protocol_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/cpu)
     target_link_libraries(cp_pool_protocol_test PRIVATE Threads::Threads)
     if(WIN32)
         target_link_libraries(cp_pool_protocol_test PRIVATE bcrypt ws2_32)
     endif()
     add_test(NAME cp_pool_protocol COMMAND cp_pool_protocol_test)
+    add_executable(cp_share_cancel_test
+        tests/cp_share_cancel_test.cpp
+        src/common/cp_share_queue.cpp
+        src/common/cp_job_ctrl.cpp
+        src/common/cp_util.cpp
+        src/common/cp_state.cpp
+        ${CP_TEST_CPU_SOURCES})
+    target_include_directories(cp_share_cancel_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/cpu)
+    target_link_libraries(cp_share_cancel_test PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_libraries(cp_share_cancel_test PRIVATE bcrypt ws2_32)
+    endif()
+    add_test(NAME cp_share_cancel COMMAND cp_share_cancel_test)
+    set_tests_properties(cp_share_cancel PROPERTIES TIMEOUT 15)
 endif()
 if(CP_ENABLE_CUDA)
     set(CMAKE_CUDA_STANDARD 17)

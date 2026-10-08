@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "cp_config.h"
+#include "cp_job_ctrl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,7 +48,7 @@ int cp_pool_parse_notify(const char* json,
 
 typedef struct {
     char job_id[128];
-    char job_key[320];
+    char job_key[CP_JOB_KEY_CAP];
     char target_hex[80];
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     uint32_t tgt[8];

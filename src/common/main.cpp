@@ -180,7 +180,7 @@ static void print_usage(void)
     printf("                       overrides it. Threads fill physical cores first\n");
 }
 
-static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
+static int handle_notify_line(const char* line, int* msg_id, char (&cur_job_key)[CP_JOB_KEY_CAP])
 {
     char job_id[128] = {0};
     char header_hex[320] = {0};
@@ -194,15 +194,6 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
         return CP_JOB_NONE;
     }
     cert_version = cp_resolve_cert_version(cert_version);
-
-    char job_key[320];
-    snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
-    if(!strcmp(job_key, cur_job_key)){
-        printf("[pool] duplicate notify ignored job=%s\n", job_id); fflush(stdout);
-        return CP_JOB_NONE;
-    }
-    strncpy(cur_job_key, job_key, sizeof(cur_job_key) - 1);
-    cur_job_key[319] = 0;
 
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
@@ -224,6 +215,15 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     }
     fflush(stdout);
 
+    char job_key[CP_JOB_KEY_CAP];
+    if(!cp_pearl_job_key(job_key, sizeof(job_key), job_id, header, hlen, tgt,
+                         cert_version)) return CP_JOB_NONE;
+    if(!strcmp(job_key, cur_job_key)){
+        printf("[pool] duplicate notify ignored job=%s\n", job_id); fflush(stdout);
+        return CP_JOB_NONE;
+    }
+    memcpy(cur_job_key, job_key, strlen(job_key) + 1);
+
     printf("[plain] mining job=%s%s...\n", job_id,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
@@ -240,9 +240,9 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     }
 
     CpPendingJob pj;
-    while(rc == CP_JOB_CANCELLED && cp_pool_take_pending_job(&pj)){
-        strncpy(cur_job_key, pj.job_key, 320);
-        cur_job_key[319] = 0;
+    while(rc == CP_JOB_CANCELLED && !cp_pool_conn_lost() && cp_pool_take_pending_job(&pj)){
+        strncpy(cur_job_key, pj.job_key, sizeof(cur_job_key) - 1);
+        cur_job_key[sizeof(cur_job_key) - 1] = 0;
         printf("[plain] mining queued job=%s%s...\n", pj.job_id,
                cp_fee_next_is_dev() ? " [DEV FEE]" : "");
         fflush(stdout);
@@ -261,7 +261,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     return rc;
 }
 
-static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char (&cur_job_key)[320])
+static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char (&cur_job_key)[CP_JOB_KEY_CAP])
 {
     if(!job || !job->job_id[0]) return CP_JOB_NONE;
     if(!strcmp(job->job_key, cur_job_key)){
@@ -310,7 +310,7 @@ static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char (&cur_job_key
 
 static int run_quantus_pool(const char* pool_host, int pool_port)
 {
-    char cur_job_key[320] = {0};
+    char cur_job_key[CP_JOB_KEY_CAP] = {0};
     int msg_id = 1;
 
     cp_qpow_pool_set_active(1);
@@ -1621,7 +1621,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    char cur_job_key[320] = {0};
+    char cur_job_key[CP_JOB_KEY_CAP] = {0};
     int msg_id = 1;
 
 reconnect:

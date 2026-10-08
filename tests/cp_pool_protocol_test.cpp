@@ -2,6 +2,8 @@
 #include "cp_json_text.hpp"
 #include "cp_util.h"
 #include "cp_pool_session.hpp"
+#include "cp_job_ctrl.h"
+#include "cp_pool.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -99,11 +101,44 @@ static void test_handshake_deadlines()
     assert(!session.authorized());
 }
 
+static void test_work_identity_and_cancellation()
+{
+    uint8_t header[INCOMPLETE_HEADER_BYTES] = {};
+    uint32_t target[8] = {};
+    char key[CP_JOB_KEY_CAP], changed[CP_JOB_KEY_CAP];
+    char job_id[128];
+    memset(job_id, 'j', sizeof(job_id) - 1);
+    job_id[sizeof(job_id) - 1] = 0;
+    assert(cp_pearl_job_key(key, sizeof(key), job_id, header, sizeof(header), target, 3));
+    header[75] = 1; // Same ID and first eight bytes, different work.
+    assert(cp_pearl_job_key(changed, sizeof(changed), job_id, header, sizeof(header), target, 3));
+    assert(strcmp(key, changed));
+    header[75] = 0;
+    target[0] = 1;
+    assert(cp_pearl_job_key(changed, sizeof(changed), job_id, header, sizeof(header), target, 3));
+    assert(strcmp(key, changed));
+    target[0] = 0;
+    assert(cp_pearl_job_key(changed, sizeof(changed), job_id, header, sizeof(header), target, 2));
+    assert(strcmp(key, changed));
+    assert(!cp_pearl_job_key(changed, 8, job_id, header, sizeof(header), target, 3));
+    assert(!changed[0]);
+
+    cp_job_mine_begin(key);
+    assert(cp_job_key_matches(key) && !cp_job_should_cancel());
+    cp_job_request_cancel();
+    assert(cp_job_should_cancel()); // A proof must stop even though the old key still matches.
+    cp_job_mine_end();
+    cp_job_mine_begin(key);
+    assert(!cp_job_should_cancel()); // A new mining epoch clears the old cancellation.
+    cp_job_mine_end();
+}
+
 int main()
 {
     test_response_ids();
     test_submit_deadlines();
     test_handshake_deadlines();
+    test_work_identity_and_cancellation();
     size_t len = 0;
     const char* combined = "{\"job_id\":\"a}b\\\"{c\",\"target\":[1,2]}{\"id\":2}";
     assert(cp_json_object_length(combined, strlen(combined), &len) == 1);

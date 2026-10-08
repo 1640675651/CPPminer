@@ -8,7 +8,7 @@
 static std::atomic<uint64_t> g_mine_epoch{0};
 static std::atomic<uint64_t> g_cancel_epoch{0};
 static std::atomic<int> g_mining_active{0};
-static char g_mining_job_key[320] = {0};
+static char g_mining_job_key[CP_JOB_KEY_CAP] = {0};
 static std::mutex g_mine_mx;
 
 extern "C" void cp_job_mine_begin(const char* job_key)
@@ -47,10 +47,14 @@ extern "C" int cp_job_mining_active(void)
 
 extern "C" const char* cp_job_mining_key(void)
 {
-    return g_mining_job_key;
+    thread_local char key[CP_JOB_KEY_CAP];
+    std::lock_guard<std::mutex> lk(g_mine_mx);
+    memcpy(key, g_mining_job_key, sizeof(key));
+    return key;
 }
 
 extern "C" int cp_job_key_matches(const char* job_key)
 {
+    std::lock_guard<std::mutex> lk(g_mine_mx);
     return !strcmp(g_mining_job_key, job_key);
 }

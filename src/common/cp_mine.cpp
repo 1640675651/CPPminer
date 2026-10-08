@@ -70,10 +70,9 @@ int cp_mine_last_share_outcome(void)
 int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char *target_hex,
                 const uint32_t pool_tgt[8], uint32_t cert_version, int sock, int *msg_id) {
     int rc = CP_JOB_NONE;
-    char job_key[320];
-    char hdr_prefix[20];
-    cp_bin_to_hex(header, 8, hdr_prefix);
-    snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, hdr_prefix);
+    char job_key[CP_JOB_KEY_CAP];
+    if(!cp_pearl_job_key(job_key, sizeof(job_key), job_id, header, hlen, pool_tgt,
+                         cert_version)) return CP_JOB_NONE;
 
     cp_job_mine_begin(job_key);
 

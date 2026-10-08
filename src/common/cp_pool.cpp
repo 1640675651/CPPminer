@@ -196,9 +196,6 @@ static void pool_dispatch_line(const char* line)
         }
         cert_version = cp_resolve_cert_version(cert_version);
 
-        char job_key[320];
-        snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
-
         uint8_t header[INCOMPLETE_HEADER_BYTES];
         int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
         if(hlen != INCOMPLETE_HEADER_BYTES) return;
@@ -208,6 +205,10 @@ static void pool_dispatch_line(const char* line)
         memset(tgt, 0, sizeof(tgt));
         if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
             cp_pool_target_from_difficulty(g_diff.load(), tgt);
+
+        char job_key[CP_JOB_KEY_CAP];
+        if(!cp_pearl_job_key(job_key, sizeof(job_key), job_id, header, hlen, tgt,
+                             cert_version)) return;
 
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
@@ -290,6 +291,10 @@ void cp_pool_disconnect(void)
         tcp_sock = -1;
     }
     net_pos = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mx);
+        g_pending_valid = 0;
+    }
     g_session.reset();
 }
 

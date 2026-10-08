@@ -23,6 +23,10 @@ int cp_write_file_bin(const char* path, const void* buf, size_t nbytes);
 
 void cp_bin_to_hex(const uint8_t* in, size_t n, char* out);
 int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap);
+/* Canonical work identity; includes every header byte and the effective target. */
+int cp_pearl_job_key(char* out, size_t cap, const char* job_id,
+                     const uint8_t* header, int hlen, const uint32_t target[8],
+                     uint32_t cert_version);
 
 int cp_json_str(const char* json, const char* key, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);

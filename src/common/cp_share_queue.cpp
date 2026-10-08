@@ -31,7 +31,7 @@ struct ShareSnapshot {
     uint64_t tiles_since_prev = 0;
     double interval_sec = 0.0;
 
-    char job_key[320]{};
+    char job_key[CP_JOB_KEY_CAP]{};
     char job_id[128]{};
     char target_hex[80]{};
     uint8_t header[INCOMPLETE_HEADER_BYTES]{};
@@ -133,7 +133,7 @@ struct CpShareQueueImpl {
     int8_t *returned_a = nullptr;
     int8_t *returned_bt = nullptr;
     CpShareJobCtx job_ctx{};
-    char job_key[320]{};
+    char job_key[CP_JOB_KEY_CAP]{};
     std::atomic<int> last_outcome{CP_SHARE_OUTCOME_NONE};
 
     void worker_main();
@@ -243,7 +243,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
-    if (!cp_job_key_matches(snap->job_key)) {
+    if (cp_job_should_cancel() || !cp_job_key_matches(snap->job_key)) {
         printf("[plain] stale share nonce=%llu dropped (job changed)\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
@@ -298,7 +298,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         }
     }
 
-    if (!cp_job_key_matches(snap->job_key)) {
+    if (cp_job_should_cancel() || !cp_job_key_matches(snap->job_key)) {
         printf("[plain] stale share nonce=%llu dropped before verify/submit\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
@@ -363,6 +363,16 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
+    /* Verification may take long enough for a new job to arrive. */
+    if (cp_job_should_cancel() || !cp_job_key_matches(snap->job_key)) {
+        printf("[plain] stale share nonce=%llu dropped before submit\n",
+               (unsigned long long)snap->nonce);
+        set_outcome(CP_SHARE_OUTCOME_DROPPED);
+        free(b64);
+        return_snapshot_matrices(snap);
+        share_snapshot_delete(snap);
+        return;
+    }
     const int submit_id = (*job_ctx.msg_id)++;
     if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, b64, hs)) {
         printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);

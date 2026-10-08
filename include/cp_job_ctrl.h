@@ -1,6 +1,9 @@
 #ifndef CP_JOB_CTRL_H
 #define CP_JOB_CTRL_H
 
+/* Full Pearl header, target, certificate version and a 127-byte pool job id. */
+#define CP_JOB_KEY_CAP 384
+
 #ifdef __cplusplus
 extern "C" {
 #endif
