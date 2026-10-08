@@ -220,14 +220,34 @@ ulong gadd(ulong a, ulong b) { return wred(w2(a, b)); }
 
 ulong canon(ulong a) { return a >= 0xFFFFFFFF00000001UL ? a - 0xFFFFFFFF00000001UL : a; }
 
-/* a*b + w with w a lazy sum, reduced once */
+/* a*b + w with w a lazy sum, reduced once.
+ * QV_GFMA_CHAIN=1 (with QV_MUL=3): w rides in the 32x32+64 multiply-add chain instead of a
+ * separate 128-bit add. Bounds, with every 32-bit word <= 2^32-1:
+ *   p0 = a0*b0 + w.lo                               < 2^64
+ *   m  = a1*b0 + (p0>>32 + w.hi)  <= (2^32-1)^2 + 2(2^32-1) = 2^64-1
+ *   m2 = a0*b1 + (uint)m                            < 2^64
+ *   hi = a1*b1 + m>>32 + m2>>32 + t                 (a*b + w < 2^128 for the diagonal b)
+ * so every step maps onto one v_mad_u64_u32 with its 64-bit addend and no carry-out tests. */
+#ifndef QV_GFMA_CHAIN
+#define QV_GFMA_CHAIN 0
+#endif
 ulong gfma_w(ulong a, ulong b, W w)
 {
+#if QV_GFMA_CHAIN && QV_MUL == 3
+    const uint a0 = (uint)a, a1 = (uint)(a >> 32), b0 = (uint)b, b1 = (uint)(b >> 32);
+    const ulong p0 = (ulong)a0 * b0 + (uint)w.v;
+    const ulong m = (ulong)a1 * b0 + ((p0 >> 32) + (w.v >> 32));
+    const ulong m2 = (ulong)a0 * b1 + (uint)m;
+    const ulong hi = (ulong)a1 * b1 + ((m >> 32) + (m2 >> 32) + (ulong)w.t);
+    const ulong lo = (p0 & EPS) | (m2 << 32);
+    return red128(lo, hi);
+#else
     ulong lo, hi;
     mul128(a, b, &lo, &hi);
     ulong l2;
     hi += (ulong)w.t + ADDC(l2, lo, w.v);
     return red128(l2, hi);
+#endif
 }
 
 ulong sbox(ulong x)
