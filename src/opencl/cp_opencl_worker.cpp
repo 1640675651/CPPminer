@@ -270,10 +270,30 @@ extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
     if (policy < 0) {
         policy = 0;
     }
-    if (policy > 6) {
+    if (policy > 7) {
         policy = 0;
     }
     g_dot_policy = policy;
+}
+
+extern "C" void cp_opencl_worker_get_gemm_options(int *dot_policy, int *issue_mode,
+                                                  int *cpm_int, int *use_lds,
+                                                  int *platform_filter) {
+    if (dot_policy) {
+        *dot_policy = g_dot_policy;
+    }
+    if (issue_mode) {
+        *issue_mode = g_issue_mode;
+    }
+    if (cpm_int) {
+        *cpm_int = g_cpm_int;
+    }
+    if (use_lds) {
+        *use_lds = g_use_lds;
+    }
+    if (platform_filter) {
+        *platform_filter = g_platform_filter;
+    }
 }
 
 extern "C" void cp_opencl_worker_set_cpm_int(int on) {
