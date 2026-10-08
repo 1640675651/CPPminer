@@ -476,7 +476,9 @@ def targetless_verify(binary):
     with PoolProbe(binary, ('--verify',)) as pool:
         (pathlib.Path(pool.binary_dir.name) / 'pp_header.bin').mkdir()
         pool.send({'id': pool.auth_id, 'result': True})
-        pool.send({'method': 'mining.set_difficulty', 'params': [40]})
+        # With the stratum target (0xFFFF << 208) / diff, difficulty 1 lets the 1024^2 attempt
+        # find a share; much easier targets fail the proof's penalized-target check.
+        pool.send({'method': 'mining.set_difficulty', 'params': [1]})
         pool.send(job('verify-no-target', False))
         pool.connection.settimeout(25)
         data = b''
@@ -547,7 +549,7 @@ def diagnostic_files(binary):
         test_binary = pathlib.Path(folder) / binary.name
         shutil.copy2(binary, test_binary)
         args = [str(test_binary), "--backend", "cpu", "--mock", "--dry-run", "--verify",
-                "--mock-diff", "40", "--m", "1", "--n", "1", "--threads", "1",
+                "--mock-diff", "32", "--m", "1", "--n", "1", "--threads", "1",
                 "--max-nonce", "4"]
         processes = [subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                      for _ in range(2)]
