@@ -121,6 +121,40 @@ function Initialize-MSVC {
     if ($script:ClExe) { $script:ClExe = $script:ClExe.Trim() }
     if (-not $script:ClExe) { throw "cl.exe not found after vcvars64" }
     Write-Host "=== cl.exe: $($script:ClExe) ==="
+    Import-VcvarsEnvironment $vcvars
+}
+
+# Bring the vcvars64 toolchain variables into this process. MSBuild sets them for its own
+# compile steps, but custom commands that run the oneAPI compiler get the LIB/INCLUDE that
+# CMake captured at configure time from this process: from a plain shell (CI) that is empty
+# and icx's link fails with LNK1104 msvcprt.lib. A Developer shell already has them, which
+# is why local builds never saw it. Restore-ShellEnvironment undoes this at the end.
+function Import-VcvarsEnvironment {
+    param([string]$Vcvars)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $lines = $null
+    try {
+        $lines = cmd /c "`"$Vcvars`" >nul 2>&1 && set" 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $wanted = @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion',
+                'VCToolsRedistDir', 'VSINSTALLDIR', 'VSCMD_VER', 'VSCMD_ARG_TGT_ARCH', 'VSCMD_ARG_HOST_ARCH',
+                'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath', 'WindowsLibPath',
+                'UCRTVersion', 'UniversalCRTSdkDir', 'ExtensionSdkDir', 'Platform')
+    $imported = 0
+    foreach ($line in $lines) {
+        $text = if ($line -is [System.Management.Automation.ErrorRecord]) { $line.ToString() } else { "$line" }
+        $eq = $text.IndexOf('=')
+        if ($eq -le 0) { continue }
+        $name = $text.Substring(0, $eq)
+        if ($wanted -notcontains $name) { continue }
+        Set-Item -Path "env:$name" -Value $text.Substring($eq + 1)
+        $imported++
+    }
+    if ($imported -eq 0) { throw "vcvars64 environment could not be imported from $Vcvars" }
+    if (-not $env:LIB) { throw "LIB is empty after vcvars64" }
 }
 
 function Find-CMake {
