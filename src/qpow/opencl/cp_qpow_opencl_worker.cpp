@@ -131,6 +131,8 @@ bool build_variant(int mul, int red)
     release_kernel();
     /* CP_QPOW_OCL_OPTS: extra kernel build options (variants without a rebuild) */
     std::string opts = "-DQV_MUL=" + std::to_string(mul) + " -DQV_RED=" + std::to_string(red);
+    /* gfx12 inline assembly (QV_RED=3) is only valid on RDNA4 */
+    if(g_ctx.device_name.compare(0, 5, "gfx12") == 0) opts += " -DQV_GFX12=1";
     if(const char* x = getenv("CP_QPOW_OCL_OPTS")){
         if(x[0]){ opts += " "; opts += x; }
     }
@@ -300,18 +302,19 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
     /* Pick the kernel variant and work-group size that run fastest on this device; the best
      * differs by vendor. First the 64x64 product (NVIDIA: 64-bit mul_hi; Intel/AMD: 32x32+64
      * multiply-add chain) at work-group sizes 64 and 256, then the reduction for that product
-     * (Intel: the signed form). CP_QPOW_OCL_MUL=1|2|3 and CP_QPOW_OCL_RED=1|2 force one.
+     * (Intel: the signed form; AMD RDNA4: the inline-assembly form 3, which builds as form 1
+     * elsewhere). CP_QPOW_OCL_MUL=1|2|3 and CP_QPOW_OCL_RED=1|2|3 force one.
      * Every candidate must pass the self-test. */
     std::vector<int> muls = {3, 1};
     if(const char* e = getenv("CP_QPOW_OCL_MUL")){
         const int m = atoi(e);
         if(m >= 1 && m <= 3) muls = {m};
     }
-    std::vector<int> reds = {2};
+    std::vector<int> reds = {2, 3};
     int red_forced = 0;
     if(const char* e = getenv("CP_QPOW_OCL_RED")){
         const int r = atoi(e);
-        if(r >= 1 && r <= 2){ red_forced = r; reds.clear(); }
+        if(r >= 1 && r <= 3){ red_forced = r; reds.clear(); }
     }
     const size_t locals[] = {64, 256};
     int best_mul = 0, best_red = red_forced ? red_forced : 1;

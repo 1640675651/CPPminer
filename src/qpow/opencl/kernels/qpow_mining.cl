@@ -15,8 +15,10 @@
  *   -DQV_MUL=1|2|3   64x64 -> 128 product: 1 = ulong mul + mul_hi, 2 = four 32x32 products
  *                    with explicit carries, 3 = carry-free chain of 32x32 + 64 multiply-adds
  *                    (maps to one mad_u64_u32 each on AMD GCN5+/RDNA)
- *   -DQV_RED=1|2     128 -> 64 reduction: 1 = single carry fold (exact except a ~2^-64 corner),
- *                    2 = signed form with shift-derived borrows (exact; best on Intel Xe-HPG)
+ *   -DQV_RED=1|2|3   128 -> 64 reduction: 1 = single carry fold (exact except a ~2^-64 corner),
+ *                    2 = signed form with shift-derived borrows (exact; best on Intel Xe-HPG),
+ *                    3 = form 1 in gfx12 inline assembly around one carry-out multiply-add
+ *                    (AMD RDNA4, with -DQV_GFX12 from the host; elsewhere it builds as form 1)
  *   -DQV_EXT22=0|1   linear layers in lazy 96-bit sums, or in carry-free 22-bit limbs (default)
  *   -DQV_OVF=0|1     carry detection by compare or by __builtin_add_overflow (default 1 where
  *                    the compiler has the builtin: +3-4% on Intel and NVIDIA, same on AMD)
@@ -169,10 +171,63 @@ void sqr128(ulong a, ulong* lo, ulong* hi)
 #ifndef QV_RED
 #define QV_RED 1
 #endif
+/* QV_GFX12: set by the host for gfx12xx devices (ROCm OpenCL defines no per-target macro). */
+#if QV_RED == 3 && defined(QV_GFX12)
+#define QV_RED_ASM 1
+/* Single gfx12 instructions. A carry is an SGPR lane mask; each reader of one first waits for
+ * outstanding VALU SGPR writes (s_wait_alu va_sdst(0)), as the compiler does for its own carries.
+ * On an R9700 a 32-bit carry op issues in ~1.7 cycles, a 64-bit shift in ~1.75, v_cndmask and
+ * other 32-bit ops in 1 and v_mad_co_u64_u32 in ~3.6 (wave32, 16 waves per SIMD). */
+ulong qv_mad_eps_co(uint a, ulong c, uint* co) /* a * 0xFFFFFFFF + c, carry mask out */
+{
+    ulong r;
+    uint k;
+    __asm__("v_mad_co_u64_u32 %0, %1, %2, -1, %3" : "=v"(r), "=s"(k) : "v"(a), "v"(c));
+    *co = k;
+    return r;
+}
+uint qv_add_ci(uint a, uint b, uint ci) /* a + b + carry */
+{
+    uint r;
+    __asm__("s_wait_alu 0xf1ff\n\tv_add_co_ci_u32_e64 %0, null, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "s"(ci));
+    return r;
+}
+uint qv_sel_ci(uint ci, uint x) /* carry ? x : 0 */
+{
+    uint r;
+    __asm__("s_wait_alu 0xf1ff\n\tv_cndmask_b32_e64 %0, 0, %1, %2" : "=v"(r) : "v"(x), "s"(ci));
+    return r;
+}
+uint qv_sub_co(uint a, uint b, uint* co)
+{
+    uint r, k;
+    __asm__("v_sub_co_u32 %0, %1, %2, %3" : "=v"(r), "=s"(k) : "v"(a), "v"(b));
+    *co = k;
+    return r;
+}
+uint qv_sub_ci(uint a, uint b, uint ci) /* a - b - borrow */
+{
+    uint r;
+    __asm__("s_wait_alu 0xf1ff\n\tv_sub_co_ci_u32_e64 %0, null, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "s"(ci));
+    return r;
+}
+#endif
+
 ulong red128(ulong lo, ulong hi)
 {
     const uint r2 = (uint)hi, r3 = (uint)(hi >> 32);
-#if QV_RED == 2
+#if defined(QV_RED_ASM)
+    /* Form 1 with {c, t} = r2 * EPS + lo from one multiply-add (the compiler builds r2 * EPS with
+     * one and adds lo with two more carry ops), then V = t + c*2^32 - (r3 + c) = t - w with
+     * w = {r3 + c, c ? 2^32 - 1 : 0} as 64 bits. ~20% fewer cycles per gmul on an R9700. */
+    uint c, b;
+    const ulong t = qv_mad_eps_co(r2, lo, &c);
+    const uint wl = qv_add_ci(r3, 0u, c);
+    const uint wh = qv_sel_ci(c, 0xFFFFFFFFu);
+    const uint rl = qv_sub_co((uint)t, wl, &b);
+    const uint rh = qv_sub_ci((uint)(t >> 32), wh, b);
+    return ((ulong)rh << 32) | rl;
+#elif QV_RED == 2
     /* Signed form, exact: V = (l0 - r2 - r3) + (l1 + r2) * 2^32 lies in (-2^33, 2^65). The
      * borrows and carries come from arithmetic shifts, so no carry-out test is needed; the
      * top word v2 in {-1, 0, 1} folds back as v2 * EPS without a second overflow. */
@@ -189,7 +244,15 @@ ulong red128(ulong lo, ulong hi)
 }
 
 ulong gmul(ulong a, ulong b) { ulong l, h; mul128(a, b, &l, &h); return red128(l, h); }
+/* QV_SQR_MUL=1: square through the four-product chain instead (R9700 with QV_RED=3: 1% slower). */
+#ifndef QV_SQR_MUL
+#define QV_SQR_MUL 0
+#endif
+#if QV_SQR_MUL
+ulong gsqr(ulong a) { return gmul(a, a); }
+#else
 ulong gsqr(ulong a) { ulong l, h; sqr128(a, &l, &h); return red128(l, h); }
+#endif
 
 /* Lazy sum for the linear layers: value = v + t * 2^64. */
 typedef struct { ulong v; uint t; } W;
