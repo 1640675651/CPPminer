@@ -760,6 +760,24 @@ bool Case33OclPrep::merkle_finish_root_(int num_subroots) {
     return err == CL_SUCCESS;
 }
 
+bool Case33OclPrep::zero_matrix_keyed_hash(int n, int K, const uint8_t job_key[32],
+                                           uint8_t out[32]) {
+    if (!ready_ || n <= 0 || K <= 0 || !job_key || !out) {
+        return false;
+    }
+    /* size the Merkle scratch for n x K without shrinking the A buffer */
+    if (!ensure_buffers(m_cap_ > 0 ? m_cap_ : n, n, K)) {
+        return false;
+    }
+    const size_t raw = static_cast<size_t>(n) * static_cast<size_t>(K);
+    const size_t pad = (raw + 1023) / 1024 * 1024;
+    if (pad / 1024 <= 1) {
+        return false; /* single-chunk case: leave it to the CPU path */
+    }
+    /* raw_len 0: every chunk takes the kernel's all-zero path, the buffer is never read */
+    return matrix_keyed_hash_(d_A_sig_, 0, pad, job_key, out, nullptr, nullptr);
+}
+
 bool Case33OclPrep::hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
                                    uint8_t out[32]) {
     a_witness_valid_ = false;

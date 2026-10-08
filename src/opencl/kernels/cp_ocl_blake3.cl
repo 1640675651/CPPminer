@@ -201,6 +201,25 @@ inline void d_b3_keyed_chunk_cv_glob(__global const uchar *key, ulong chunk_idx,
         }
         return;
     }
+    /* Zero path: a full chunk entirely past the data (zero padding, e.g. the all-zero B of
+       zero-B mining): no loads. */
+    if (chunk_len == D_B3_CHUNK && mat_off >= raw_len) {
+        #pragma unroll 1
+        for (int b = 0; b < D_B3_CHUNK / D_B3_BLOCK; b++) {
+            uint m[16];
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                m[i] = 0u;
+            }
+            const uint fl = D_B3_KEYED | (b == 0 ? D_B3_CHUNK_START : 0u) |
+                            (b == D_B3_CHUNK / D_B3_BLOCK - 1 ? D_B3_CHUNK_END : 0u);
+            d_b3_compress_words(cv, m, D_B3_BLOCK, chunk_idx, fl);
+        }
+        for (int i = 0; i < 8; i++) {
+            d_b3_store32_priv(cv_out + 4 * i, cv[i]);
+        }
+        return;
+    }
     int pos = 0;
     int blocks_compressed = 0;
     while (chunk_len - pos > D_B3_BLOCK) {

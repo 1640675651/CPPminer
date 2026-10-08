@@ -22,6 +22,9 @@ struct Case33OclPrep {
                            int K, int blocks_k, int macro_rows, int salted,
                            uint8_t a_key_out[32]);
 
+    /* Keyed digest of an all-zero n x K matrix (zero-B mining) on the GPU. */
+    bool zero_matrix_keyed_hash(int n, int K, const uint8_t job_key[32], uint8_t out[32]);
+
     /* GPU random A + keyed hash + row-major noisy A (signal from d_A_sig_). */
     bool prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t *ab_seed, int ab_seed_len,
                                     const uint8_t job_key[32], const uint8_t b_noise_seed[32],
