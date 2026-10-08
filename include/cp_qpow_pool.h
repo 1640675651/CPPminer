@@ -42,8 +42,12 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
                              const uint8_t nonce[CP_QPOW_NONCE_BYTES]);
 
 /* Parse login ack or job notify. Returns 1 on success. */
-int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int session_len,
+int cp_qpow_pool_parse_login_result(const char* json, int expected_id, char* session_out, int session_len,
                                     CpQpowJob* job_out);
+/* Reader must be stopped. One 30-second budget for ACK and initial work;
+ * preserves the latest early job and never accepts an unrelated response. */
+int cp_qpow_pool_wait_login(int expected_id, char* session_out, int session_len,
+                             CpQpowJob* job_out);
 int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out);
 
 /* Called from Pearl pool reader when Quantus mode is active. Returns 1 if handled. */

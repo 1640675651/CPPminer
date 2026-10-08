@@ -171,6 +171,39 @@ static void test_quantus_work_identity()
     assert(strcmp(original.job_key, changed.job_key));
 }
 
+static void test_quantus_login()
+{
+    const std::string job = quantus_job_json(std::string(64, '0'), std::string(128, '0'), "");
+    char session[80];
+    CpQpowJob parsed;
+    const std::string result = "{\"job\":" + job + ",\"id\":\"session\",\"status\":\"OK\"}";
+    const std::string ack = "{\"id\":7,\"result\":" + result + ",\"error\":null}";
+    assert(cp_qpow_pool_parse_login_result(ack.c_str(), 7, session, sizeof(session), &parsed));
+    assert(!strcmp(session, "session") && parsed.job_id[0]);
+    assert(!cp_qpow_pool_parse_login_result(ack.c_str(), 8, session, sizeof(session), &parsed));
+    assert(!session[0] && !parsed.job_id[0]);
+    const std::string error = "{\"id\":7,\"result\":" + result + ",\"error\":{\"code\":-1}}";
+    assert(!cp_qpow_pool_parse_login_result(error.c_str(), 7, session, sizeof(session), &parsed));
+    assert(!cp_qpow_pool_parse_login_result("{\"id\":7,\"result\":{\"id\":\"s\",\"status\":\"FAIL\"}}",
+                                           7, session, sizeof(session), &parsed));
+    assert(!cp_qpow_pool_parse_login_result("{\"id\":7,\"result\":{\"id\":\"s\",\"status\":null}}",
+                                           7, session, sizeof(session), &parsed));
+    // Nested or sibling ids/statuses cannot supply a missing session or override a failure.
+    assert(!cp_qpow_pool_parse_login_result("{\"id\":7,\"result\":{\"job\":{\"id\":\"fake\"}},\"other\":{\"id\":\"fake\"}}",
+                                           7, session, sizeof(session), &parsed));
+    assert(!cp_qpow_pool_parse_login_result("{\"id\":7,\"result\":{\"job\":{\"status\":\"OK\"},\"id\":\"s\",\"status\":\"FAIL\"}}",
+                                           7, session, sizeof(session), &parsed));
+    assert(cp_qpow_pool_parse_login_result("{\"id\":7,\"result\":{\"id\":\"s\"}}",
+                                          7, session, sizeof(session), &parsed));
+    assert(!strcmp(session, "s") && !parsed.job_id[0]); // A notification may supply initial work.
+    const std::string wrapped = "{\"method\" : \"job\",\"params\":{\"clean_jobs\":true,\"job\":" + job + "}}";
+    assert(cp_qpow_pool_parse_job(wrapped.c_str(), &parsed) && parsed.clean_jobs);
+    const std::string nested_clean = "{\"method\":\"job\",\"params\":{\"job\":{\"clean_jobs\":true," + job.substr(1) + "}}}";
+    assert(cp_qpow_pool_parse_job(nested_clean.c_str(), &parsed) && parsed.clean_jobs);
+    assert(!cp_qpow_pool_parse_job(quantus_job_json(std::string(64, '0'), std::string(128, '0'),
+                                                   std::string(100, 'a')).c_str(), &parsed));
+}
+
 int main()
 {
     std::vector<std::thread> clocks;
@@ -194,6 +227,7 @@ int main()
     test_handshake_deadlines();
     test_work_identity_and_cancellation();
     test_quantus_work_identity();
+    test_quantus_login();
 #ifdef __linux__
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);

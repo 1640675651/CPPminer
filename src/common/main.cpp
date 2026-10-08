@@ -338,24 +338,12 @@ reconnect:
     if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
 
-    char login_line[65536];
-    int got = cp_pool_recv_one(login_line, sizeof(login_line), 30000);
-    if(got <= 0){
-        printf("[net] login response missing, reconnecting...\n");
-        fflush(stdout);
-        goto reconnect;
-    }
-    printf("[pool-raw] %s\n", login_line);
-    fflush(stdout);
-
     char session[80] = {0};
     CpQpowJob first_job;
     memset(&first_job, 0, sizeof(first_job));
-    if(!cp_qpow_pool_parse_login_result(login_line, session, (int)sizeof(session),
-                                        &first_job)){
-        printf("[net] login parse failed: %s\n", login_line);
-        fflush(stdout);
-        cp_sleep(3);
+    if(!cp_qpow_pool_wait_login(msg_id - 1, session, (int)sizeof(session), &first_job)){
+        cp_pool_disconnect();
+        cp_sleep(1);
         goto reconnect;
     }
     cp_qpow_pool_set_session_id(session);
@@ -387,8 +375,9 @@ reconnect:
         }
         if(wr == 0) continue;
 
-        if(strstr(line_buf, "\"method\":\"job\"") ||
-           strstr(line_buf, "\"method\": \"job\"")){
+        char method[16];
+        if(cp_json_str_value(cp_json_member(line_buf, "method"), method, sizeof(method)) &&
+           !strcmp(method, "job")){
             CpQpowJob job;
             if(!cp_qpow_pool_parse_job(line_buf, &job)){
                 printf("[pool] quantus job parse failed\n");
@@ -926,7 +915,7 @@ int main(int argc, char** argv)
             char session[80];
             CpQpowJob j0, j1;
             int fail = 0;
-            if(!cp_qpow_pool_parse_login_result(login, session, (int)sizeof(session), &j0)){
+            if(!cp_qpow_pool_parse_login_result(login, 1, session, (int)sizeof(session), &j0)){
                 fprintf(stderr, "FAIL login parse\n");
                 fail++;
             } else if(strcmp(session, "d5adbda4-fd6c-4f33-8924-b3c1ae35dcbc") != 0){

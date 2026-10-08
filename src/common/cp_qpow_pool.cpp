@@ -1,6 +1,7 @@
 #include "cp_qpow_pool.h"
 
 #include "cp_job_ctrl.h"
+#include "cp_json_frame.h"
 #include "cp_json_text.hpp"
 #include "cp_pool.h"
 #include "cp_util.h"
@@ -22,7 +23,16 @@ static int g_pending_valid = 0;
 static int json_str_from(const char* json, const char* key, char* out, int outlen)
 {
     if(!json) return 0;
-    return cp_json_str(json, key, out, outlen);
+    return cp_json_str_value(cp_json_member(json, key), out, outlen);
+}
+
+static int json_object(const char* value, std::string& out)
+{
+    size_t len = 0;
+    if(!value || *value != '{' ||
+       cp_json_object_length(value, strlen(value), &len) != 1) return 0;
+    out.assign(value, len);
+    return 1;
 }
 
 static void queue_pending(const CpQpowJob* job)
@@ -97,7 +107,23 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
     if(!json || !out) return 0;
     memset(out, 0, sizeof(*out));
 
-    if(!json_str_from(json, "job_id", out->job_id, (int)sizeof(out->job_id)))
+    std::string params, nested_job;
+    if(cp_json_member(json, "method")){
+        char method[16];
+        if(!json_str_from(json, "method", method, sizeof(method)) || strcmp(method, "job") ||
+           !json_object(cp_json_member(json, "params"), params)) return 0;
+        json = params.c_str();
+    }
+    /* clean_jobs can be alongside params.job, as well as in a direct job. */
+    const char* clean = cp_json_member(json, "clean_jobs");
+    if(cp_json_member(json, "job")){
+        if(!json_object(cp_json_member(json, "job"), nested_job)) return 0;
+        json = nested_job.c_str();
+    }
+    if(!clean) clean = cp_json_member(json, "clean_jobs");
+    out->clean_jobs = clean && !strncmp(clean, "true", 4);
+
+    if(!json_str_from(json, "job_id", out->job_id, (int)sizeof(out->job_id)) || !out->job_id[0])
         return 0;
 
     char mh[CP_QPOW_HEADER_BYTES * 2 + 4] = {0};
@@ -105,7 +131,8 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
     char en[CP_QPOW_EXTRANONCE_MAX * 2 + 4] = {0};
     if(!json_str_from(json, "mining_hash", mh, (int)sizeof(mh))) return 0;
     if(!json_str_from(json, "target", th, (int)sizeof(th))) return 0;
-    json_str_from(json, "extranonce", en, (int)sizeof(en));
+    if(cp_json_member(json, "extranonce") &&
+       !json_str_from(json, "extranonce", en, (int)sizeof(en))) return 0;
 
     int mhlen = cp_hex_to_bytes(mh, out->mining_hash, CP_QPOW_HEADER_BYTES);
     int thlen = cp_hex_to_bytes(th, out->target, CP_QPOW_TARGET_BYTES);
@@ -123,8 +150,6 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
 
     out->difficulty = cp_json_num(json, "difficulty");
     out->seq = (uint64_t)cp_json_num(json, "seq");
-    out->clean_jobs = strstr(json, "\"clean_jobs\":true") != NULL ||
-                      strstr(json, "\"clean_jobs\": true") != NULL;
 
     /* Canonical bytes: case-only hex changes are duplicates, but every work field matters. */
     cp_bin_to_hex(out->mining_hash, sizeof(out->mining_hash), mh);
@@ -135,25 +160,64 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
     return size >= 0 && (size_t)size < sizeof(out->job_key);
 }
 
-int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int session_len,
+int cp_qpow_pool_parse_login_result(const char* json, int expected_id, char* session_out, int session_len,
                                     CpQpowJob* job_out)
 {
-    if(!json) return 0;
-    const char* result = strstr(json, "\"result\"");
-    if(!result) return 0;
-    if(strstr(result, "\"status\":\"OK\"") == NULL &&
-       strstr(result, "\"status\": \"OK\"") == NULL){
-        /* Some pools omit status; require session id instead. */
-    }
-    if(session_out && session_len > 0){
-        session_out[0] = 0;
-        if(!json_str_from(result, "id", session_out, session_len) || !session_out[0])
-            return 0;
-    }
-    if(job_out){
-        if(!cp_qpow_pool_parse_job(result, job_out)) return 0;
-    }
+    if(!session_out || session_len <= 0) return 0;
+    session_out[0] = 0;
+    if(job_out) memset(job_out, 0, sizeof(*job_out));
+    int id = -1, accepted = 0;
+    if(!cp_json_rpc_response(json, &id, &accepted) || id != expected_id || !accepted)
+        return 0;
+    std::string result;
+    if(!json_object(cp_json_member(json, "result"), result)) return 0;
+    char status[16], session[80];
+    if(cp_json_member(result.c_str(), "status") &&
+       (!json_str_from(result.c_str(), "status", status, sizeof(status)) || strcmp(status, "OK")))
+        return 0;
+    if(!json_str_from(result.c_str(), "id", session, sizeof(session)) || !session[0] ||
+       strlen(session) >= (size_t)session_len) return 0;
+    if(job_out && cp_json_member(result.c_str(), "job") &&
+       !cp_qpow_pool_parse_job(result.c_str(), job_out)) return 0;
+    strcpy(session_out, session);
     return 1;
+}
+
+int cp_qpow_pool_wait_login(int expected_id, char* session_out, int session_len,
+                             CpQpowJob* job_out)
+{
+    if(!session_out || session_len <= 0 || !job_out) return 0;
+    session_out[0] = 0;
+    memset(job_out, 0, sizeof(*job_out));
+    const double deadline = cp_now_sec() + 30.0;
+    int authorized = 0;
+    while(cp_now_sec() < deadline){
+        char line[65536];
+        const int remaining = (int)((deadline - cp_now_sec()) * 1000);
+        if(remaining <= 0 || cp_pool_recv_one(line, sizeof(line), remaining) <= 0) break;
+        printf("[pool-raw] %s\n", line);
+        fflush(stdout);
+        int id = -1;
+        if(!authorized && cp_json_rpc_response(line, &id, nullptr) && id == expected_id){
+            CpQpowJob embedded;
+            if(!cp_qpow_pool_parse_login_result(line, expected_id, session_out, session_len, &embedded)){
+                printf("[net] Quantus login rejected or malformed\n");
+                fflush(stdout);
+                return 0;
+            }
+            authorized = 1;
+            if(!job_out->job_id[0]) *job_out = embedded;
+        }else{
+            char method[16];
+            CpQpowJob early;
+            if(json_str_from(line, "method", method, sizeof(method)) && !strcmp(method, "job") &&
+               cp_qpow_pool_parse_job(line, &early)) *job_out = early;
+        }
+        if(authorized && job_out->job_id[0]) return 1;
+    }
+    printf("[net] Quantus login/first job missing or timed out (30 s budget)\n");
+    fflush(stdout);
+    return 0;
 }
 
 int cp_qpow_pool_on_line(const char* line)
@@ -161,9 +225,9 @@ int cp_qpow_pool_on_line(const char* line)
     if(!g_qpow_active.load() || !line) return 0;
 
     /* Job notification (and login-embedded jobs are handled by main). */
-    const int is_job_method =
-        (strstr(line, "\"method\":\"job\"") != NULL) ||
-        (strstr(line, "\"method\": \"job\"") != NULL);
+    char method[16];
+    const int is_job_method = json_str_from(line, "method", method, sizeof(method)) &&
+                              !strcmp(method, "job");
     if(!is_job_method) return 0;
 
     CpQpowJob job;

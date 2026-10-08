@@ -30,6 +30,9 @@ int cp_pearl_job_key(char* out, size_t cap, const char* job_id,
                      uint32_t cert_version);
 
 int cp_json_str(const char* json, const char* key, char* out, int outlen);
+/* Direct member of this object, skipping nested names and string contents. */
+const char* cp_json_member(const char* json, const char* key);
+int cp_json_str_value(const char* value, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);
 /* Response with a top-level integer id and no method. Nested ids do not
  * match outstanding requests. accepted is false on result:false or error. */
