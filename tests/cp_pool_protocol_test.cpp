@@ -42,6 +42,13 @@ int main()
     cp_pool_target_from_difficulty(1.0, tgt);
     cp_le_words_to_be_target_hex(tgt, hex);
     assert(strcmp(hex, "00000000ffff0000000000000000000000000000000000000000000000000000") == 0);
+    /* divisors above 2^32 must stay exact */
+    cp_pool_target_from_difficulty(5000000000.0, tgt);
+    cp_le_words_to_be_target_hex(tgt, hex);
+    assert(strcmp(hex, "0000000000000000dbe622e7bf1f17d0dfb48e9b1679f292e2a3d73dc7945c4b") == 0);
+    cp_pool_target_from_difficulty(18446744073709549568.0, tgt); /* 2^64 - 2048, largest double < 2^64 */
+    cp_le_words_to_be_target_hex(tgt, hex);
+    assert(strcmp(hex, "000000000000000000000000ffff0000000007fff8000000003fffc000000001") == 0);
     /* mock: 2^(256 - D), independent of the hash tile */
     cp_mock_target_from_difficulty(44.0, tgt);
     cp_le_words_to_be_target_hex(tgt, hex);

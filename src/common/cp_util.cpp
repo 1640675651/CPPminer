@@ -410,15 +410,22 @@ void cp_pool_target_from_difficulty(double difficulty, uint32_t tgt[8])
     memset(tgt, 0, 8 * sizeof(uint32_t));
     if(!(difficulty > 0.0)) return;
     const long double d = (long double)difficulty;
-    if(d == floorl(d) && d <= 18446744073709551615.0L){
+    /* 2^64 is exact in long double; with MSVC's 53-bit long double the
+     * literal 2^64 - 1 would round up to it and overflow the cast. */
+    if(d == floorl(d) && d < 18446744073709551616.0L){
         const uint64_t div = (uint64_t)d;
         /* numerator 0xFFFF << 208 as LE 32-bit words: word 6 = 0xFFFF0000 */
-        uint32_t num[8] = {0, 0, 0, 0, 0, 0, 0xFFFF0000u, 0};
+        const uint32_t num[8] = {0, 0, 0, 0, 0, 0, 0xFFFF0000u, 0};
+        /* Bitwise long division: rem < div, so 2*rem + 1 fits in 65 bits; the
+         * bit shifted out of rem marks the cases where it must exceed div. */
         uint64_t rem = 0;
-        for(int i = 7; i >= 0; i--){
-            const uint64_t cur = (rem << 32) | num[i];
-            tgt[i] = (uint32_t)(cur / div);
-            rem = cur % div;
+        for(int bit = 255; bit >= 0; bit--){
+            const uint64_t carry = rem >> 63;
+            rem = (rem << 1) | ((num[bit >> 5] >> (bit & 31)) & 1u);
+            if(carry || rem >= div){
+                rem -= div;
+                tgt[bit >> 5] |= 1u << (bit & 31);
+            }
         }
     } else {
         target_from_ld(65535.0L * powl(2.0L, 208.0L) / d, tgt);

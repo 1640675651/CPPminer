@@ -1,21 +1,27 @@
 # Changelog
 
 ## v0.5 (tentative)
-- Experimental OneDNN backend for intel GPU
-- Fix OpenCL dot product extension on intel GPU
-- Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group 
+### New features
+- Experimental OneDNN (gemmstone+nGEN) backend for intel GPU
+- Wgpu backend
+- Configurable matrix size: `--m` / `--n` in units of 1024 (default m=n=128)
 - Introduce quantus algorithm
-- Quantus wgpu backend via quantus-miner GpuEngine FFI
-- Quantus OpenCL Poseidon2 worker under src/qpow/opencl
-- Pearl wgpu backend
-- Reduce host memory usage (CPU, CUDA, OpenCL, OneDNN, Wgpu)
+
+### Fixes & Enhancements
+- Reduce host memory usage (All backends)
+- Fix OpenCL dot product extension on intel GPU
+- Shrink OpenCL macro size to 64x64 in 4x8 tile mode, prevent too many work items per work group 
 - MinGW and MSYS2 support (thanks to @danifest751)
-- Configurable matrix size: `--m` / `--n` in units of 1024 (default 128x128)
-- Pearl CPU: scan macro blocks scheduled one at a time (a chunk of 4096 left an 8k×8k scan on a single thread: 118 -> ~660 GMAC/s on a Zen4 8-core); `--threads N` now also sets the Pearl CPU pool; by default one thread per CPU the process may use (respects `taskset` / cpusets), pinned physical cores first; `OMP_PLACES` / `OMP_PROC_BIND` disable the built-in pinning
+- Fix Cuda compilation on Linux (thanks to @danifest751)
+- Fix OpenCL compilation on Adreno GPU (thanks to @danifest751)
+- Pearl CPU: scan macro blocks scheduled one at a time, better B reuse and better core utilization on hetrogeneous CPU (thanks to @danifest751)
+- Added `--threads N` option and unpin main thread from CPU 0 (thanks to @danifest751)
+- Fix difficulty calculation for mock (thanks to @danifest751)
+
 
 ### Pearl wgpu
 - vec4<u32> A/B panel loads in the GEMM shader
-- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s)
+- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4.0 TMAC/s)
 - Rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070
 - GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s)
 - Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s)
@@ -28,6 +34,11 @@
 - CPU, OpenCL `--cpu-gen` and oneDNN host fallback: drop the 512 MiB all-zero host B^T buffer; proofs use zero-matrix Merkle sub-roots cached per job
 - CPU `--prepack fused` is now the default (~1.5 GiB steady vs ~2.5 GiB for separate)
 - Host-matrix proofs hash A/B^T in place: transient per-share peak ~1.5 GiB -> < 1 MiB (no flatten/pad/MerkleTree copies of the 512 MiB matrix)
+
+### Quantus
+- Quantus wgpu backend via quantus-miner GpuEngine FFI
+- Quantus OpenCL Poseidon2 worker under src/qpow/opencl
+- Optimized CPU backend with scalar + AVX2 hybrid ISA
 
 ## v0.4
 - ARM CPU + NEON support.
