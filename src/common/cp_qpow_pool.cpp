@@ -126,8 +126,13 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
     out->clean_jobs = strstr(json, "\"clean_jobs\":true") != NULL ||
                       strstr(json, "\"clean_jobs\": true") != NULL;
 
-    snprintf(out->job_key, sizeof(out->job_key), "%s:%.16s", out->job_id, mh);
-    return 1;
+    /* Canonical bytes: case-only hex changes are duplicates, but every work field matters. */
+    cp_bin_to_hex(out->mining_hash, sizeof(out->mining_hash), mh);
+    cp_bin_to_hex(out->target, sizeof(out->target), th);
+    cp_bin_to_hex(out->extranonce, (size_t)out->extranonce_len, en);
+    const int size = snprintf(out->job_key, sizeof(out->job_key), "%s:%s:%s:%s",
+                              out->job_id, mh, th, en);
+    return size >= 0 && (size_t)size < sizeof(out->job_key);
 }
 
 int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int session_len,

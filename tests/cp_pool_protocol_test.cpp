@@ -4,6 +4,7 @@
 #include "cp_pool_session.hpp"
 #include "cp_job_ctrl.h"
 #include "cp_pool.h"
+#include "cp_qpow_pool.h"
 #include "cp_platform.h"
 
 #ifdef NDEBUG
@@ -14,6 +15,7 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <string>
 
 static void test_response_ids()
 {
@@ -140,6 +142,35 @@ static void test_work_identity_and_cancellation()
     cp_job_mine_end();
 }
 
+static std::string quantus_job_json(const std::string& hash, const std::string& target,
+                                    const std::string& extranonce)
+{
+    return "{\"job_id\":\"" + std::string(127, 'q') + "\",\"mining_hash\":\"" + hash +
+           "\",\"target\":\"" + target + "\",\"extranonce\":\"" + extranonce + "\"}";
+}
+
+static void test_quantus_work_identity()
+{
+    CpQpowJob original, changed;
+    std::string hash(64, 'a'), target(128, '0'), extranonce(64, 'b');
+    assert(cp_qpow_pool_parse_job(quantus_job_json(hash, target, extranonce).c_str(), &original));
+    assert(strlen(original.job_key) == 386); // All maximum-length fields fit without truncation.
+    assert(cp_qpow_pool_parse_job(quantus_job_json(std::string(64, 'A'), target,
+                                                std::string(64, 'B')).c_str(), &changed));
+    assert(!strcmp(original.job_key, changed.job_key));
+    hash.back() = 'c';
+    assert(cp_qpow_pool_parse_job(quantus_job_json(hash, target, extranonce).c_str(), &changed));
+    assert(strcmp(original.job_key, changed.job_key));
+    hash.back() = 'a';
+    target.back() = '1';
+    assert(cp_qpow_pool_parse_job(quantus_job_json(hash, target, extranonce).c_str(), &changed));
+    assert(strcmp(original.job_key, changed.job_key));
+    target.back() = '0';
+    extranonce.back() = 'a';
+    assert(cp_qpow_pool_parse_job(quantus_job_json(hash, target, extranonce).c_str(), &changed));
+    assert(strcmp(original.job_key, changed.job_key));
+}
+
 int main()
 {
     std::vector<std::thread> clocks;
@@ -162,6 +193,7 @@ int main()
     test_submit_deadlines();
     test_handshake_deadlines();
     test_work_identity_and_cancellation();
+    test_quantus_work_identity();
 #ifdef __linux__
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);

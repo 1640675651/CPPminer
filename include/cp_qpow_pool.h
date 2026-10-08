@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "cp_job_ctrl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,7 +16,7 @@ extern "C" {
 
 typedef struct {
     char job_id[128];
-    char job_key[160];
+    char job_key[CP_JOB_KEY_CAP];
     uint8_t mining_hash[CP_QPOW_HEADER_BYTES];
     uint8_t target[CP_QPOW_TARGET_BYTES];
     uint8_t extranonce[CP_QPOW_EXTRANONCE_MAX];
