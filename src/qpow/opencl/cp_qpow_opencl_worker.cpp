@@ -4,6 +4,7 @@
 #include "cp_pool.h"
 #include "opencl_context.hpp"
 #include "qpow/miner.hpp"
+#include "cp_api.h"
 
 #include <cstdio>
 #include <cstring>
@@ -212,6 +213,7 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
     }
 
     g_ready = 1;
+    cp_api_add_device(g_ctx.device_name.c_str(), OpenClContext::pci_bus_id(g_ctx.device).c_str());
     printf("[qpow-ocl] device[%d]: %s (%s) CUs=%u batch=%u\n",
            g_ctx.device_flat_index, g_ctx.device_name.c_str(),
            g_ctx.discrete_gpu ? "discrete" : "integrated",

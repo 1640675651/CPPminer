@@ -9,6 +9,8 @@
 #include "cp_util.h"
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
+#include "cp_api.h"
+#include "cp_fee.h"
 #endif
 
 #include <atomic>
@@ -23,6 +25,29 @@
 static int tcp_sock = -1;
 static std::atomic<double> g_diff{32.0};
 static std::atomic<int> g_submit_inflight{0};
+
+/* A submit reply accepts the share: "error" null or absent and "result" true, or a result
+ * object with "status":"OK" (Quantus). */
+static int pool_submit_accepted(const char* line)
+{
+    const char* e = strstr(line, "\"error\"");
+    if(e){
+        const char* v = strchr(e + 7, ':');
+        if(v){
+            v++;
+            while(*v == ' ') v++;
+            if(strncmp(v, "null", 4) != 0) return 0;
+        }
+    }
+    const char* r = strstr(line, "\"result\"");
+    if(!r) return 0;
+    const char* v = strchr(r + 8, ':');
+    if(!v) return 0;
+    v++;
+    while(*v == ' ') v++;
+    if(!strncmp(v, "true", 4)) return 1;
+    return *v == '{' && strstr(v, "\"OK\"") != nullptr;
+}
 static std::atomic<int> g_net_reader_run{0};
 static std::atomic<int> g_net_conn_lost{0};
 static std::mutex g_net_mx;
@@ -149,9 +174,10 @@ static void pool_dispatch_line(const char* line)
     }
 
     if(strstr(line, "result") || strstr(line, "error")){
-        if(g_submit_inflight.load())
+        if(g_submit_inflight.load()){
             printf("[pool] submit response: %s\n", line);
-        else
+            if(!cp_fee_session_is_dev()) cp_api_on_share(pool_submit_accepted(line));
+        } else
             printf("[pool] jsonrpc: %s\n", line);
         fflush(stdout);
         g_submit_inflight.store(0);

@@ -10,6 +10,7 @@
 #include "case33_gemm_ocl.hpp"
 #include "case32_layout.hpp"
 #include "opencl_context.hpp"
+#include "cp_api.h"
 
 #include <atomic>
 #include <chrono>
@@ -373,6 +374,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     }
 
     g_context_ready = 1;
+    cp_api_add_device(g_gemm.device_name(), g_gemm.pci_bus_id().c_str());
     printf("[ocl] device[%d]: %s (%s)\n", g_gemm.device_index(), g_gemm.device_name(),
            g_gemm.discrete_gpu() ? "discrete GPU" : "integrated GPU/CPU");
     printf("[ocl] platform: %s\n", g_gemm.platform_name());

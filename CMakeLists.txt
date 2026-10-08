@@ -62,6 +62,7 @@ set(CP_COMMON_SOURCES
     src/common/cp_qpow_mine.cpp
     src/common/cp_share_queue.cpp
     src/common/cp_state.cpp
+    src/common/cp_api.cpp
     src/common/cp_worker.cpp
     src/common/cp_noise.c
     src/qpow/cpu/miner.cpp

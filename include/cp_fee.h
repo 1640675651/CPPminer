@@ -45,6 +45,8 @@ uint64_t cp_fee_debt(void);
 uint64_t cp_fee_tiles_per_matrix(void);
 uint64_t cp_fee_threshold(void);
 int cp_fee_enabled(void);
+/* 1 while the current pool session mines for the dev fee */
+int cp_fee_session_is_dev(void);
 
 #ifdef __cplusplus
 }

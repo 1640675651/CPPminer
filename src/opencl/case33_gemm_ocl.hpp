@@ -83,6 +83,7 @@ struct Case33GemmOcl {
     const char *backend() const { return backend_; }
 
     const char *device_name() const { return device_name_.c_str(); }
+    std::string pci_bus_id() const { return OpenClContext::pci_bus_id(ocl_.device); }
 
     const char *platform_name() const { return platform_name_.c_str(); }
 

@@ -8,6 +8,7 @@
 #include "cp_state.h"
 #include "cp_util.h"
 #include "cp_worker.h"
+#include "cp_api.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,6 +272,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                        host_matrices ? h_B_scan : NULL, host_matrices ? a_key : NULL,
                                        h_Ap_global, h_BpT_global, &t_rows, &t_cols, &scan_tiles);
         tiles_scanned_total += scan_tiles;
+        cp_api_add_work((double)scan_tiles * cp_pp_macs_per_hash_tile());
         attempts++;
 
         if (found < 0) {
