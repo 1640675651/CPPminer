@@ -27,7 +27,10 @@ int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap);
 int cp_json_str(const char* json, const char* key, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);
 
-void cp_target_from_difficulty(double difficulty, uint32_t tgt[8]);
+/* Offline mock: unscaled target 2^(256 - D); the tile is applied once by cp_scale_jackpot_target. */
+void cp_mock_target_from_difficulty(double difficulty, uint32_t tgt[8]);
+/* Stratum fallback when mining.notify has no target: (0xFFFF << 208) / diff. */
+void cp_pool_target_from_difficulty(double difficulty, uint32_t tgt[8]);
 int cp_be_target_hex_to_le_words(const char* hex, uint32_t tgt[8]);
 /* Inverse of cp_be_target_hex_to_le_words. Writes 64 hex chars + NUL into hex[65]. */
 void cp_le_words_to_be_target_hex(const uint32_t tgt[8], char hex[65]);
