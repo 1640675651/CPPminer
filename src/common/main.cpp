@@ -4,6 +4,7 @@
 #include "cp_config.h"
 #include "cp_algo.h"
 #include "cp_fee.h"
+#include "cp_api.h"
 #include "cp_mine.h"
 #include "cp_noise.h"
 #include "cp_pool.h"
@@ -59,6 +60,8 @@ static void print_usage(void)
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
     printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
+    printf("  --api-port N       HTTP stats API on this port: /summary (JSON) and /hiveos\n");
+    printf("  --api-bind ADDR    API listen address (default: 127.0.0.1; 0.0.0.0 for all)\n");
     printf("  --backend NAME     cpu");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("|cuda");
@@ -324,6 +327,7 @@ reconnect:
     cp_pool_disconnect();
     cp_pool_inbox_clear();
     cp_qpow_pool_clear();
+    cp_api_set_pool_connected(0);
     cur_job_key[0] = 0;
 
     printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
@@ -359,6 +363,7 @@ reconnect:
     }
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
+    cp_api_set_pool(pool_host, pool_port, 1);
     if(cp_fee_enabled()){
         printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
@@ -430,6 +435,8 @@ int main(int argc, char** argv)
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
     int pool_specified = 0;
+    int api_port = 0;
+    const char* api_bind = NULL;
     const char* wallet = NULL;
     CpAlgoId algo_sel = CP_ALGO_PEARL;
     int devs[MAX_GPUS] = {0};
@@ -906,6 +913,11 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
+        } else if(!strcmp(argv[i], "--api-port") && i + 1 < argc){
+            api_port = atoi(argv[++i]);
+            if(api_port < 0 || api_port > 65535) api_port = 0;
+        } else if(!strcmp(argv[i], "--api-bind") && i + 1 < argc){
+            api_bind = argv[++i];
         } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
             int n = atoi(argv[++i]);
             if(n < 0) n = 0;
@@ -1257,6 +1269,8 @@ int main(int argc, char** argv)
 
     /* Offline mock skips the pool; no fee reconnects. */
     cp_fee_init(wallet_global, g_mock ? 0 : 1, algo_sel);
+    cp_api_set_algo(cp_algo_name(algo_sel), NULL);
+    if(api_port > 0) cp_api_start(api_bind, api_port);
 
     if(algo_sel == CP_ALGO_QUANTUS){
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
@@ -1305,6 +1319,8 @@ int main(int argc, char** argv)
             if(cp_qpow_set_simd_isa(simd_isa) != 0)
                 return 1;
         }
+        cp_api_set_algo(NULL, cp_worker_backend_name());
+        if(cp_api_device_count() == 0) cp_api_add_device(cp_worker_backend_name(), NULL);
         int qrc;
         if(g_mock){
             qrc = cp_qpow_mine_mock(worker_global);
@@ -1558,6 +1574,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "[%s] backend init failed; exiting\n", cp_worker_backend_name());
         return 1;
     }
+    cp_api_set_algo(NULL, cp_worker_backend_name());
+    if(cp_api_device_count() == 0) cp_api_add_device(cp_worker_backend_name(), NULL);
     {
         const int contiguous = cp_worker_uses_contiguous_tiles();
         const uint64_t t_tiles =
@@ -1628,6 +1646,7 @@ reconnect:
     cp_pool_reader_stop();
     cp_pool_disconnect();
     cp_pool_inbox_clear();
+    cp_api_set_pool_connected(0);
     cur_job_key[0] = 0;
 
     printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
@@ -1640,6 +1659,7 @@ reconnect:
     if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
     cp_fee_on_authorized();
+    cp_api_set_pool(pool_host, pool_port, 1);
     if(cp_fee_enabled()){
         printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",

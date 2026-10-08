@@ -26,6 +26,7 @@
 #include "cp_share_witness.h"
 #include "plain_proof_kernel.cuh"
 #include "plain_proof_period.cuh"
+#include "cp_api.h"
 
 static_assert(CP_MT_THREADS == CP_WITNESS_BLOCK_CHUNKS,
               "share witness blocks must match the chunk-roots kernel fold width");
@@ -367,6 +368,15 @@ void cp_gpu_init(int* devs, int ndev)
         g->use_cublas_period = 0;
 #endif
         g->use_cutlass_fused = g_cutlass_fused;
+        {
+            cudaDeviceProp ap;
+            if(cudaGetDeviceProperties(&ap, g->dev) == cudaSuccess){
+                char pci[32];
+                snprintf(pci, sizeof(pci), "%04x:%02x:%02x.0", ap.pciDomainID, ap.pciBusID,
+                         ap.pciDeviceID);
+                cp_api_add_device(ap.name, pci);
+            }
+        }
         printf("[gpu] GPU%d OK (%s, blocking sync)\n", g->dev,
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
                : (g->use_cublas_period ? "cuBLAS int8 period GEMM"

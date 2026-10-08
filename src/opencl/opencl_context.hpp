@@ -80,6 +80,10 @@ struct OpenClContext {
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
+
+    /* "dddd:bb:dd.f" of a device (cl_khr_pci_bus_info, AMD topology or NVIDIA ids), "" if the
+       driver reports none. */
+    static std::string pci_bus_id(cl_device_id dev);
 };
 
 std::string read_text_file(const char *path);

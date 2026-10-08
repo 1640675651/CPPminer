@@ -174,3 +174,4 @@ uint64_t cp_fee_debt(void){ return g_debt; }
 uint64_t cp_fee_tiles_per_matrix(void){ return g_tiles_per_matrix; }
 uint64_t cp_fee_threshold(void){ return threshold_tiles(); }
 int cp_fee_enabled(void){ return g_enabled; }
+int cp_fee_session_is_dev(void){ return g_enabled && g_auth_is_dev; }

@@ -35,6 +35,7 @@
 #endif
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
+#include "cp_api.h"
 #endif
 /* Fee reconnect quantum: ~40s at 0.25 MH/s per thread. */
 static const uint64_t k_qpow_fee_hashes_per_unit = 10000000ull;
@@ -373,6 +374,7 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
             job->mining_hash, diff, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
+        cp_api_add_work((double)hashes);
         cp_fee_note_tiles(hashes);
         cp_fee_prepare_matrix();
         if(cp_fee_needs_switch()){
@@ -451,6 +453,7 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
             job->mining_hash, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
+        cp_api_add_work((double)hashes);
         cp_fee_note_tiles(hashes);
         cp_fee_prepare_matrix();
         if(cp_fee_needs_switch()){
@@ -551,6 +554,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
             qpow::SearchResult r = qpow::search_range(
                 job->mining_hash, cur, k_search_chunk, job->target, isa);
             total_hashes.fetch_add(r.hashes, std::memory_order_relaxed);
+            cp_api_add_work((double)r.hashes);
             {
                 std::lock_guard<std::mutex> lk(fee_mx);
                 cp_fee_note_tiles(r.hashes);

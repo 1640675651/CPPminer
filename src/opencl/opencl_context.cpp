@@ -541,3 +541,49 @@ std::string exe_directory(const char *argv0) {
     return s.substr(0, slash);
 #endif
 }
+
+std::string OpenClContext::pci_bus_id(cl_device_id dev) {
+    if (!dev) {
+        return "";
+    }
+    char buf[32];
+    /* cl_khr_pci_bus_info: CL_DEVICE_PCI_BUS_INFO_KHR */
+    struct {
+        cl_uint domain, bus, device, function;
+    } khr = {0, 0, 0, 0};
+    if (clGetDeviceInfo(dev, 0x410F, sizeof(khr), &khr, nullptr) == CL_SUCCESS) {
+        std::snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", khr.domain, khr.bus, khr.device,
+                      khr.function);
+        return buf;
+    }
+    /* cl_amd_device_attribute_query: CL_DEVICE_TOPOLOGY_AMD, type 1 = PCIe */
+    union {
+        struct {
+            cl_uint type;
+            cl_uint data[5];
+        } raw;
+        struct {
+            cl_uint type;
+            cl_char unused[17];
+            cl_char bus, device, function;
+        } pcie;
+    } amd;
+    std::memset(&amd, 0, sizeof(amd));
+    if (clGetDeviceInfo(dev, 0x4037, sizeof(amd), &amd, nullptr) == CL_SUCCESS &&
+        amd.raw.type == 1) {
+        std::snprintf(buf, sizeof(buf), "0000:%02x:%02x.%x", (unsigned)(unsigned char)amd.pcie.bus,
+                      (unsigned)(unsigned char)amd.pcie.device,
+                      (unsigned)(unsigned char)amd.pcie.function);
+        return buf;
+    }
+    /* cl_nv_device_attribute_query: CL_DEVICE_PCI_BUS_ID_NV / SLOT_ID_NV / DOMAIN_ID_NV */
+    cl_uint nv_bus = 0, nv_slot = 0, nv_domain = 0;
+    if (clGetDeviceInfo(dev, 0x4008, sizeof(nv_bus), &nv_bus, nullptr) == CL_SUCCESS) {
+        clGetDeviceInfo(dev, 0x4009, sizeof(nv_slot), &nv_slot, nullptr);
+        clGetDeviceInfo(dev, 0x400A, sizeof(nv_domain), &nv_domain, nullptr);
+        std::snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", nv_domain, nv_bus, nv_slot >> 3,
+                      nv_slot & 7);
+        return buf;
+    }
+    return "";
+}
