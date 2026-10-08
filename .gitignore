@@ -1,4 +1,5 @@
 /build/
+/kernels/
 /rust/cp-proof-ffi/target/
 /rust/cp-wgpu-ffi/target/
 /rust/cp-pearl-wgpu-ffi/target/

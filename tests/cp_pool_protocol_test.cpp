@@ -32,5 +32,19 @@ int main()
     assert(cp_hex_to_bytes("0g", bytes, 2) == 0);
     assert(cp_hex_to_bytes("g0", bytes, 2) == 0);
     assert(cp_json_escape("a\"\\\nb") == "a\\\"\\\\\\u000ab");
+
+    /* stratum difficulty -> target: (0xFFFF << 208) / diff, example job from the pool */
+    uint32_t tgt[8];
+    char hex[65];
+    cp_pool_target_from_difficulty(26000.0, tgt);
+    cp_le_words_to_be_target_hex(tgt, hex);
+    assert(strcmp(hex, "0000000000028544877baaede211544877baaede211544877baaede211544877") == 0);
+    cp_pool_target_from_difficulty(1.0, tgt);
+    cp_le_words_to_be_target_hex(tgt, hex);
+    assert(strcmp(hex, "00000000ffff0000000000000000000000000000000000000000000000000000") == 0);
+    /* mock: 2^(256 - D), independent of the hash tile */
+    cp_mock_target_from_difficulty(44.0, tgt);
+    cp_le_words_to_be_target_hex(tgt, hex);
+    assert(strcmp(hex, "0000000000100000000000000000000000000000000000000000000000000000") == 0);
     return 0;
 }

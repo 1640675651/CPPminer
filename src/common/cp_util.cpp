@@ -367,28 +367,61 @@ int cp_pp_hash_tile_w(void)
     return cp_active_hash_w();
 }
 
-void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
+/* 256-bit LE target from a long double value (saturates at 2^256 - 1). */
+static void target_from_ld(long double v, uint32_t tgt[8])
 {
     memset(tgt, 0, 8 * sizeof(uint32_t));
-    long double exp_val = 256.0L - (long double)difficulty
-        + log2l((long double)(R_RANK * cp_active_hash_h() * cp_active_hash_w()));
+    if(!(v > 0.0L)) return;
+    if(!isfinite((double)v) || v >= 115792089237316195423570985008687907853269984665640564039457584007913129639936.0L){
+        for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
+        return;
+    }
+    const long double base = 4294967296.0L;
+    for(int i=0;i<8;i++){
+        long double rem = fmodl(v, base);
+        if(rem < 0.0L) rem = 0.0L;
+        if(rem > 4294967295.0L) rem = 4294967295.0L;
+        tgt[i] = (uint32_t)rem;
+        v = floorl(v / base);
+        if(v <= 0.0L) break;
+    }
+}
+
+void cp_mock_target_from_difficulty(double difficulty, uint32_t tgt[8])
+{
+    /* Offline mock: the unscaled share target is 2^(256 - D). The hash tile is
+     * applied once, later, by cp_scale_jackpot_target, so the mock share rate
+     * per attempt does not depend on the tile shape. */
+    memset(tgt, 0, 8 * sizeof(uint32_t));
+    const long double exp_val = 256.0L - (long double)difficulty;
     if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val > 0.0L){
-        long double v = powl(2.0L, exp_val);
-        if(!isfinite((double)v)){
-            for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
-        } else {
-            long double base = 4294967296.0L;
-            for(int i=0;i<8;i++){
-                long double rem = fmodl(v, base);
-                if(rem < 0.0L) rem = 0.0L;
-                if(rem > 4294967295.0L) rem = 4294967295.0L;
-                tgt[i] = (uint32_t)rem;
-                v = floorl(v / base);
-                if(v <= 0.0L) break;
-            }
+        target_from_ld(powl(2.0L, exp_val), tgt);
+    }
+}
+
+void cp_pool_target_from_difficulty(double difficulty, uint32_t tgt[8])
+{
+    /* Stratum convention: target = (0xFFFF << 208) / diff, e.g. diff 26000 ->
+     * 0000000000028544877baaede211544877baaede211544877baaede211544877. Exact
+     * 256-bit division for integral difficulties; fractional ones go through
+     * long double. Only used when mining.notify carries no target. */
+    memset(tgt, 0, 8 * sizeof(uint32_t));
+    if(!(difficulty > 0.0)) return;
+    const long double d = (long double)difficulty;
+    if(d == floorl(d) && d <= 18446744073709551615.0L){
+        const uint64_t div = (uint64_t)d;
+        /* numerator 0xFFFF << 208 as LE 32-bit words: word 6 = 0xFFFF0000 */
+        uint32_t num[8] = {0, 0, 0, 0, 0, 0, 0xFFFF0000u, 0};
+        uint64_t rem = 0;
+        for(int i = 7; i >= 0; i--){
+            const uint64_t cur = (rem << 32) | num[i];
+            tgt[i] = (uint32_t)(cur / div);
+            rem = cur % div;
         }
+    } else {
+        target_from_ld(65535.0L * powl(2.0L, 208.0L) / d, tgt);
     }
 }
 

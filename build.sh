@@ -215,10 +215,12 @@ ensure_cutlass() {
 
 # ── Auto-detect CUDA root ────────────────────────────────────────────────────
 find_cuda_root() {
+    # CUDA_HOME first so an explicit choice wins; ":-" keeps `set -u` quiet
+    # when it is not exported (the usual case outside CUDA docker images).
     local candidates=(
+        "${CUDA_HOME:-}"
         "/usr/local/cuda"
         "/usr/local/cuda-"*
-        "${CUDA_HOME}"
     )
     local c
     for c in "${candidates[@]}"; do
@@ -400,6 +402,22 @@ if [[ -n "$CMAKE_EXE" ]]; then
                 log "Copied ${runtime} next to ${cp_out_name}"
             fi
         done
+    fi
+    # OpenCL kernels are compiled at run time from <exe dir>/kernels.
+    if (( ENABLE_OPENCL || ENABLE_ONEDNN )); then
+        mkdir -p "${PROJECT_ROOT}/kernels"
+        for k in \
+            src/opencl/kernels/case33_gemm_xor.cl \
+            src/opencl/kernels/cp_ocl_blake3.cl \
+            src/opencl/kernels/cp_ocl_merkle.cl \
+            src/opencl/kernels/cp_ocl_prep.cl \
+            src/opencl/kernels/cp_onednn_jackpot.cl \
+            src/qpow/opencl/kernels/qpow_mining.cl; do
+            if [[ -f "${PROJECT_ROOT}/${k}" ]]; then
+                cp -f "${PROJECT_ROOT}/${k}" "${PROJECT_ROOT}/kernels/"
+            fi
+        done
+        log "Copied OpenCL kernels to ${PROJECT_ROOT}/kernels"
     fi
     log "Done: ${PROJECT_ROOT}/${cp_out_name}"
 else

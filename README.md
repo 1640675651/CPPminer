@@ -153,7 +153,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`). On a `kryptex` pool host the wallet is sent as `WALLET.worker` as well |
 | `--pool-pass STR` | `mining.authorize` password (default `x`). Kryptex reads a custom share difficulty from it: `--pool-pass d=2097152` (their default; `d = hashrate_H/s * target_share_seconds / 4294967296`) |
-| `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
+| `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
 | `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) || `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
@@ -168,7 +168,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
-| `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **58** (jackpot curve); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
+| `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **44** (unscaled target 2^(256-D)); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `fused` (default), `reuse`, or `separate` matrix prepack |
 | `--simd ISA` | CPU: `auto` (default), `hybrid`, `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar`. Quantus: `hybrid` runs one scalar and one AVX2 Poseidon2 worker per physical core (SMT siblings); `auto` is the best available mode (currently `hybrid`; may select a wider kernel such as AVX-512 in the future); `avx2` forces AVX2 on every thread; any other value runs scalar. Pearl: `hybrid` is the same as `auto` |

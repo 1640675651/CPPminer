@@ -177,7 +177,9 @@ static void print_usage(void)
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
     printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
-    printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
+    printf("  --threads N          OpenMP threads for the CPU backend (pearl and quantus).\n");
+    printf("                       Default: all CPUs the process may use; OMP_NUM_THREADS\n");
+    printf("                       overrides it. Threads fill physical cores first\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -218,7 +220,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
         printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
-        cp_target_from_difficulty(cp_pool_difficulty(), tgt);
+        cp_pool_target_from_difficulty(cp_pool_difficulty(), tgt);
         printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
                job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
     }
@@ -412,6 +414,21 @@ reconnect:
 
 int main(int argc, char** argv)
 {
+#ifdef __MINGW32__
+    /* MinGW/MSYS2 only: buffer stdout before anything prints.
+     *
+     * MinGW builds use the MinGW printf (__USE_MINGW_ANSI_STDIO=1), which
+     * emits each %-conversion as its own write to the stream. The MS CRT
+     * leaves a console stdout unbuffered, so every fragment of a status line
+     * becomes a separate WriteConsole and the log crawls out piece by piece.
+     * MSVC builds are not affected (the CRT printf writes a call at once) and
+     * other platforms keep their default buffering.
+     *
+     * On Win32, _IOLBF behaves as _IOFBF (full buffering), so prompt output
+     * relies on the fflush(stdout) that follows every log line. */
+    setvbuf(stdout, NULL, _IOLBF, 8192);
+#endif
+
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
     int pool_specified = 0;
@@ -895,8 +912,10 @@ int main(int argc, char** argv)
             print_usage();
             return 0;
         } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
-            g_qpow_threads = atoi(argv[++i]);
-            if(g_qpow_threads < 0) g_qpow_threads = 0;
+            int n = atoi(argv[++i]);
+            if(n < 0) n = 0;
+            g_qpow_threads = n;
+            g_cpu_threads = n;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             const char* login =
                 "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"
@@ -1139,6 +1158,7 @@ int main(int argc, char** argv)
             const int pm = g_m_active;
             const int pn = g_n_active;
             printf("[align-test-prod] m=%d n=%d\n", pm, pn);
+            fflush(stdout);
             if(pearl_run_alignment_tests_prod(pm, pn, K_DIM) != 0) return 1;
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
             if(bid == CP_BACKEND_CUDA &&
@@ -1173,6 +1193,7 @@ int main(int argc, char** argv)
         cp_worker_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
         printf("[profile-scan] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         return cp_gpu_run_scan_profile(devs[0], g_m_active, g_n_active, 2, profile_runs) != 0;
     }
 #else
@@ -1188,6 +1209,7 @@ int main(int argc, char** argv)
         }
         if(!ndev){ devs[0] = 0; ndev = 1; }
         printf("[profile-prep] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         const int warmup = profile_prep_runs > 1 ? 1 : 0;
         return cp_opencl_run_prep_profile(devs[0], g_m_active, g_n_active, warmup,
                                           profile_prep_runs) != 0;
@@ -1277,8 +1299,9 @@ int main(int argc, char** argv)
 #endif
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
-            /* Pin the OpenMP pool physical cores first, then SMT siblings, so
-             * the --simd auto scalar/AVX2 split pairs one of each per core. */
+            /* Pin the OpenMP pool physical cores first, then SMT siblings (one
+             * thread per logical CPU), so the --simd auto scalar/AVX2 split pairs
+             * one of each per core. */
             if(cp_cpu_affinity_init() == 0)
                 cp_cpu_affinity_bind_openmp_pool();
             printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
@@ -1369,6 +1392,7 @@ int main(int argc, char** argv)
                                                          K_DIM);
         printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
                rc_reuse == 0 ? "passed" : "failed", rc_reuse);
+        fflush(stdout);
         const int rc_fused = case33_test_fused_prepack(CP_PREPACK_TEST_DIM, CP_PREPACK_TEST_DIM,
                                                        K_DIM, R_RANK);
         printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
@@ -1564,7 +1588,7 @@ int main(int argc, char** argv)
         /* Mock difficulty → pool target (same path as mining.set_difficulty). */
         const double mock_diff = cp_resolve_mock_diff(0);
         uint32_t tgt[8];
-        cp_target_from_difficulty(mock_diff, tgt);
+        cp_mock_target_from_difficulty(mock_diff, tgt);
         char target_hex[65];
         cp_le_words_to_be_target_hex(tgt, target_hex);
 
