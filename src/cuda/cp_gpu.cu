@@ -269,8 +269,9 @@ static int gpu_probe_cublas_int8(GpuCtx* g)
 }
 #endif /* CP_ENABLE_CUBLAS */
 
-/* Packed operands + the Turing scan kernel when every GPU in use runs the
- * fused sm_75 tensor-op path. CP_CUDA_PACKED=0 keeps the CUTLASS kernel.
+/* Packed operands + the packed scan kernel when every GPU in use runs a fused
+ * tensor-op path the kernel supports. CP_CUDA_PACKED=0 keeps the CUTLASS kernel,
+ * CP_CUDA_PACKED=1 also enables it where it is not measured yet (sm_90, sm_10x).
  * Must be settled before a job builds its noisy B^T. */
 static void update_packed_layout(void)
 {
@@ -279,8 +280,9 @@ static void update_packed_layout(void)
              !(env && !strcmp(env, "0"));
     for(int i = 0; i < g_ngpu && on; i++){
         const int kind = cp_cutlass_mma_kind(g_gpus[i].dev);
+        const int sup = cp_turing_scan_supported(g_gpus[i].dev);
         on = (kind == CP_CUTLASS_MMA_TENSOROP || kind == CP_CUTLASS_MMA_TENSOROP80) &&
-             cp_turing_scan_supported(g_gpus[i].dev);
+             (sup == 1 || (sup == 2 && env && !strcmp(env, "1")));
     }
     for(int i = 0; i < g_ngpu; i++)
         g_gpus[i].use_turing = on;
@@ -290,7 +292,7 @@ static void update_packed_layout(void)
                              g_row_period_batch + 1 : g_row_period_batch - 1;
     }
     if(on && !g_packed_ab){
-        printf("[gpu] packed-operand scan kernel (sm_75 m8n8k16 / sm_8x m16n8k32) "
+        printf("[gpu] packed-operand scan kernel (sm_75 m8n8k16 / sm_8x, sm_12x m16n8k32) "
                "(CP_CUDA_PACKED=0 for the CUTLASS kernel)\n");
         fflush(stdout);
     }
