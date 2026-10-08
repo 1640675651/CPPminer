@@ -20,6 +20,9 @@
  *   -DQV_EXT22=0|1   linear layers in lazy 96-bit sums, or in carry-free 22-bit limbs (default)
  *   -DQV_OVF=0|1     carry detection by compare or by __builtin_add_overflow (default 1 where
  *                    the compiler has the builtin: +3-4% on Intel and NVIDIA, same on AMD)
+ *   -DQV_WRED_FAST=0|1  exact lazy-sum reduction, or skip its ~t/2^32 carry fold (default 1)
+ *   -DQV_NPW=N       hash N consecutive nonces per work-item in lockstep (default 1; the host
+ *                    reads N from CP_QPOW_OCL_OPTS and launches 1/N of the work-items)
  *   -DQV_TEST        also build the field-op test kernel
  */
 
@@ -425,6 +428,85 @@ ulong hash_out0(__constant const ulong* pk, uint t)
     return out0_of(s);
 }
 
+/* QV_NPW > 1: one work-item hashes QV_NPW consecutive line positions in lockstep. The chains are
+ * independent, so the compiler can fill carry (VCC) waits and pair instructions (VOPD on RDNA)
+ * from the other nonce. Costs registers; the host launches 1/QV_NPW of the work-items. */
+#ifndef QV_NPW
+#define QV_NPW 1
+#endif
+#if QV_NPW > 1
+void internal22_n(ulong s[QV_NPW][12])
+{
+#pragma unroll 1
+    for (int r = 0; r < 22; r++) {
+        W rest[QV_NPW];
+        #pragma unroll
+        for (int n = 0; n < QV_NPW; n++) {
+            rest[n] = w2(s[n][1], s[n][2]);
+            #pragma unroll
+            for (int i = 3; i < 12; i++) rest[n] = wadd64(rest[n], s[n][i]);
+        }
+        #pragma unroll
+        for (int n = 0; n < QV_NPW; n++) s[n][0] = sbox(s[n][0]);
+        #pragma unroll
+        for (int n = 0; n < QV_NPW; n++) {
+            const W sg = wadd64(rest[n], s[n][0]);
+            s[n][0] = gfma_w(s[n][0], MDS_DIAG[0], wadd64(sg, RC_INTERNAL_NEXT[r]));
+            #pragma unroll
+            for (int i = 1; i < 12; i++) s[n][i] = gfma_w(s[n][i], MDS_DIAG[i], sg);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < QV_NPW; n++)
+        #pragma unroll
+        for (int i = 0; i < 12; i++) s[n][i] = gadd(s[n][i], RC_TERMINAL[0][i]);
+}
+
+/* hash_out0 for positions t .. t + QV_NPW - 1 */
+void hash_out0_n(__constant const ulong* pk, uint t, ulong* o)
+{
+    ulong s[QV_NPW][12];
+    #pragma unroll
+    for (int n = 0; n < QV_NPW; n++) {
+        const ulong d = 35ul * (t + (uint)n);
+        const ulong f = sbox(gadd(pk[0], 0xFFFFFFFF00000001ul - d));
+        const ulong g = sbox(gadd(pk[1], d));
+        const W c2 = w2(f, g);
+        W c[3];
+        c[0] = wadd64(c2, f);
+        c[1] = wadd64(c2, g);
+        c[2] = c2;
+        const int m0[4] = {2, 1, 1, 3};
+        #pragma unroll
+        for (int k = 0; k < 3; k++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                W v = c[k];
+                if (m0[j] >= 2) v = wadd(v, c[k]);
+                if (m0[j] == 3) v = wadd(v, c[k]);
+                s[n][4 * k + j] = wred(wadd64(v, pk[2 + 4 * k + j]));
+            }
+    }
+#pragma unroll 1
+    for (int g = 1;; g++) {
+        #pragma unroll
+        for (int i = 0; i < 12; i++)
+            #pragma unroll
+            for (int n = 0; n < QV_NPW; n++) s[n][i] = sbox(s[n][i]);
+        if (g == 15) break;
+        #pragma unroll
+        for (int n = 0; n < QV_NPW; n++) ext_add(s[n], post_row(g));
+        if (g == 7) {
+            #pragma unroll
+            for (int n = 0; n < QV_NPW; n++) ext_add(s[n], post_row(15));
+        }
+        if ((g & 7) == 3) internal22_n(s);
+    }
+    #pragma unroll
+    for (int n = 0; n < QV_NPW; n++) o[n] = out0_of(s[n]);
+}
+#endif
+
 uint bswap32(uint v) { return as_uint(as_uchar4(v).s3210); }
 
 #if defined(QV_SG) && defined(cl_intel_subgroups)
@@ -438,6 +520,26 @@ __kernel QV_KERNEL_ATTR void qpow_scan(__global volatile uint* out, __global ulo
                         ulong t0, uint tb, uint count)
 {
     const uint stride = (uint)get_global_size(0);
+#if QV_NPW > 1
+    /* the host launches about count / QV_NPW work-items */
+    for (uint base = (uint)get_global_id(0) * QV_NPW; base < count; base += stride * QV_NPW) {
+        ulong os[QV_NPW];
+        hash_out0_n(pk, tb + base, os);
+        #pragma unroll
+        for (int n = 0; n < QV_NPW; n++) {
+            const uint idx = base + (uint)n;
+            const ulong o = os[n];
+            const ulong key = ((ulong)bswap32((uint)o) << 32) | bswap32((uint)(o >> 32));
+            if (idx < count) {
+                if (dump) dump[idx] = o;
+                if (key <= t0) {
+                    const uint slot = atomic_inc(&out[0]);
+                    if (slot < 15u) out[1 + slot] = idx;
+                }
+            }
+        }
+    }
+#else
     for (uint idx = (uint)get_global_id(0); idx < count; idx += stride) {
         const ulong o = hash_out0(pk, tb + idx);
         const ulong key = ((ulong)bswap32((uint)o) << 32) | bswap32((uint)(o >> 32));
@@ -447,6 +549,7 @@ __kernel QV_KERNEL_ATTR void qpow_scan(__global volatile uint* out, __global ulo
             if (slot < 15u) out[1 + slot] = idx;
         }
     }
+#endif
 }
 
 #ifdef QV_TEST

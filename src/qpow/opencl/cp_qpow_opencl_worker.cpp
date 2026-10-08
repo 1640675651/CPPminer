@@ -46,6 +46,7 @@ u32 g_launch = 1u << 20;      /* nonces per launch */
 size_t g_local = 64;
 int g_mul = 0;
 int g_red = 1;
+int g_npw = 1;   /* nonces per work-item (kernel option -DQV_NPW=N via CP_QPOW_OCL_OPTS) */
 std::string g_kernel_path;
 
 constexpr u32 k_max_candidates = 15;
@@ -133,6 +134,11 @@ bool build_variant(int mul, int red)
     if(const char* x = getenv("CP_QPOW_OCL_OPTS")){
         if(x[0]){ opts += " "; opts += x; }
     }
+    g_npw = 1;
+    if(const char* p = strstr(opts.c_str(), "QV_NPW=")){
+        const int v = atoi(p + 7);
+        if(v >= 1 && v <= 4) g_npw = v;
+    }
     if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts.c_str())) return false;
     g_kernel = g_ctx.create_kernel("qpow_scan");
     return g_kernel != nullptr;
@@ -155,7 +161,8 @@ bool run_scan(const u64 pk[k_params], u64 t0, u32 tb, u32 count, size_t local, c
         fprintf(stderr, "[qpow-ocl] set kernel args failed (%d)\n", err);
         return false;
     }
-    const size_t global = ((size_t)count + local - 1) / local * local;
+    const size_t items = ((size_t)count + g_npw - 1) / g_npw;
+    const size_t global = (items + local - 1) / local * local;
     err = clEnqueueNDRangeKernel(g_ctx.queue, g_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
     if(err != CL_SUCCESS){
         fprintf(stderr, "[qpow-ocl] enqueue failed (%d)\n", err);
@@ -411,7 +418,8 @@ bool enqueue_slot(Slot& sl, u64 t0, size_t local)
     err |= clSetKernelArg(g_kernel, 3, sizeof(u64), &t0);
     err |= clSetKernelArg(g_kernel, 4, sizeof(u32), &tb);
     err |= clSetKernelArg(g_kernel, 5, sizeof(u32), &sl.n);
-    const size_t global = ((size_t)sl.n + local - 1) / local * local;
+    const size_t items = ((size_t)sl.n + g_npw - 1) / g_npw;
+    const size_t global = (items + local - 1) / local * local;
     if(err == CL_SUCCESS)
         err = clEnqueueNDRangeKernel(g_ctx.queue, g_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
     if(err == CL_SUCCESS)
