@@ -63,6 +63,22 @@ __kernel void ocl_gen_random_matrix(ulong rng_seed, int matrix_tag, int total_el
     out[idx] = (char)((int)((s >> 32) % 128u) - 64);
 }
 
+/* ocl_gen_random_matrix values, 16 consecutive elements per work item (total % 16 == 0). */
+__kernel void ocl_gen_random_matrix16(ulong rng_seed, int matrix_tag, int total_elems,
+                                      __global char *out) {
+    const int base = (int)get_global_id(0) * 16;
+    if (base >= total_elems) {
+        return;
+    }
+    const ulong tag = rng_seed ^ ((ulong)matrix_tag * 0xD1B54A32D192ED03UL);
+    char v[16];
+    for (int j = 0; j < 16; ++j) {
+        const ulong s = cp_splitmix64(tag ^ (ulong)(base + j) * 0x9E3779B97F4A7C15UL);
+        v[j] = (char)((int)((s >> 32) % 128u) - 64);
+    }
+    vstore16(vload16(0, v), 0, out + base);
+}
+
 __kernel void ocl_build_perm_pairs(int is_b, __global const uchar *noise_seed, int k, int rank,
                                    __global uint *pairs_out) {
     const int block_idx = (int)get_global_id(0);
@@ -206,6 +222,90 @@ __kernel void ocl_noisy_matrix_rowmajor(__global char *out, __global const uchar
     }
     for (int l = K; l < out_lda; ++l) {
         dst[l] = 0;
+    }
+}
+
+/* Uniform noise rows for ocl_noisy_matrix_rowmajor_wg: one work item per row,
+ * rank bytes per row at el_out + row*rank. */
+__kernel void ocl_uniform_rows(__global const uchar *noise_seed, int rows, int rank, int is_b,
+                               __global uchar *el_out) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(row, rank, noise_seed, is_b, el);
+    __global uchar *dst = el_out + (size_t)row * (size_t)rank;
+    for (int j = 0; j < rank; ++j) {
+        dst[j] = el[j];
+    }
+}
+
+/* Same result as ocl_noisy_matrix_rowmajor, one work group per row: the row's
+ * uniform values sit in local memory and each work item handles 16 consecutive
+ * k with vector loads/stores, so neighbouring lanes touch neighbouring bytes. */
+/* layout 0: row-major, row stride out_lda.
+ * layout 1: ESIMD A blocks: 8 rows x 32 k (256 B) per block, blocks [row/8][k/32].
+ * layout 2: ESIMD B^T VNNI blocks: 32 k x es rows, byte ((k%32/4)*es + row%es)*4 + k%4,
+ *           blocks [row/es][k/32]. */
+inline size_t noisy_out_off(int layout, int row, int k, int K, int out_lda, int es) {
+    if (layout == 1) {
+        return (((size_t)(row / 8) * (size_t)(K / 32) + (size_t)(k / 32)) << 8) +
+               (size_t)((row % 8) * 32 + (k % 32));
+    }
+    if (layout == 2) {
+        return ((size_t)(row / es) * (size_t)(K / 32) + (size_t)(k / 32)) * (size_t)(32 * es) +
+               (size_t)((((k % 32) / 4) * es + row % es) * 4 + (k % 4));
+    }
+    return (size_t)row * (size_t)out_lda + (size_t)k;
+}
+
+__kernel void ocl_noisy_matrix_rowmajor_wg(__global char *out, __global const uchar *el_rows,
+                                           __global const uint *pairs, int rows, int K, int rank,
+                                           int has_signal, __global const char *signal,
+                                           int out_lda, int layout, int es) {
+    __local uchar el[R_RANK];
+    const int row = (int)get_group_id(0);
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+    if (row >= rows || out_lda < K) {
+        return; /* uniform across the work group */
+    }
+    for (int j = lid; j < rank; j += lsz) {
+        el[j] = el_rows[(size_t)row * (size_t)rank + (size_t)j];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    __global char *dst = out + (size_t)row * (size_t)out_lda;
+    __global const char *src = signal + (size_t)row * (size_t)K;
+    for (int l0 = lid * 16; l0 < K; l0 += lsz * 16) {
+        const int n = min(16, K - l0);
+        char v[16];
+        for (int j = 0; j < n; ++j) {
+            const int l = l0 + j;
+            const int pos = (int)(char)el[pairs[(size_t)l * 2]];
+            const int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
+            const int sig = has_signal ? (int)src[l] : 0;
+            v[j] = (char)(sig + (pos - neg));
+        }
+        if (layout == 2 && n == 16) {
+            /* Four 4-k groups land es*4 bytes apart in the VNNI block. */
+            __global char *b = out + noisy_out_off(2, row, l0, K, out_lda, es);
+            for (int g = 0; g < 4; ++g) {
+                vstore4(vload4(g, v), 0, b + g * es * 4);
+            }
+        } else if (n == 16) {
+            vstore16(vload16(0, v), 0, out + noisy_out_off(layout, row, l0, K, out_lda, es));
+        } else {
+            for (int j = 0; j < n; ++j) {
+                out[noisy_out_off(layout, row, l0 + j, K, out_lda, es)] = v[j];
+            }
+        }
+    }
+    if (layout == 0) {
+        for (int l = K + lid; l < out_lda; l += lsz) {
+            dst[l] = 0;
+        }
     }
 }
 

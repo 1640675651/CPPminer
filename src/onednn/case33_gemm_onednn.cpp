@@ -1,4 +1,11 @@
-﻿#include "case33_gemm_onednn.hpp"
+﻿#ifdef _WIN32
+/* Before any header: the OpenCL/oneDNN headers may include <windows.h>. */
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
+#include "case33_gemm_onednn.hpp"
 
 #include "case5_gemm_launch.hpp"
 #include "case5_xor_tile.hpp"
@@ -10,13 +17,73 @@
 
 #include "gemmstone/problem.hpp"
 
+#include "../esimd/cp_esimd_scan.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 
+#ifdef _WIN32
+#include <windows.h>
+#undef min
+#undef max
+#else
+#include <dlfcn.h>
+#endif
+
 namespace {
+
+/* CP_INTEL_GEMM: auto (default: ESIMD when libcp_esimd loads and the GPU has
+ * XMX), esimd (required), gemmstone. */
+const char *intel_gemm_mode() {
+    const char *v = std::getenv("CP_INTEL_GEMM");
+    return (v && *v) ? v : "auto";
+}
+
+void *esimd_dlopen(const std::string &path) {
+#ifdef _WIN32
+    /* UR's Windows proxy loads the real loader and adapters by name, outside
+     * the PE import chain. Keep the trusted kernels directory in the process
+     * search path for these later loads; LOAD_WITH_ALTERED_SEARCH_PATH alone
+     * only resolves the initial imports. This also removes cwd from DLL search. */
+    if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) return nullptr;
+    const size_t slash = path.find_last_of("/\\");
+    if (slash == std::string::npos || !SetDllDirectoryA(path.substr(0, slash).c_str())) {
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(
+            LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
+#else
+    return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+void *esimd_dlsym(void *lib, const char *name) {
+#ifdef _WIN32
+    return reinterpret_cast<void *>(GetProcAddress(static_cast<HMODULE>(lib), name));
+#else
+    return dlsym(lib, name);
+#endif
+}
+
+void esimd_dlclose(void *lib) {
+#ifdef _WIN32
+    FreeLibrary(static_cast<HMODULE>(lib));
+#else
+    dlclose(lib);
+#endif
+}
+
+/* CASE5_PIPELINE=0 keeps the synchronous GEMM -> jackpot -> read loop. */
+bool pipeline_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CASE5_PIPELINE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 
 constexpr size_t kJackpotFoundFlagOffFused = 8u * sizeof(uint32_t);
 constexpr size_t kJackpotFoundCoordsOff =
@@ -141,6 +208,7 @@ int64_t Case33GemmOnednn::panel_offset_b_(int64_t col_offset) const {
 }
 
 Case33GemmOnednn::~Case33GemmOnednn() {
+    release_esimd_();
     if (jackpot_kernel_) {
         clReleaseKernel(jackpot_kernel_);
         jackpot_kernel_ = nullptr;
@@ -193,6 +261,16 @@ Case33GemmOnednn::~Case33GemmOnednn() {
         clReleaseMemObject(tile_xor_buf_);
         tile_xor_buf_ = nullptr;
     }
+    for (cl_mem &buf : pipe_tile_xor_) {
+        if (buf) {
+            clReleaseMemObject(buf);
+            buf = nullptr;
+        }
+    }
+    if (pipe_queue_) {
+        clReleaseCommandQueue(pipe_queue_);
+        pipe_queue_ = nullptr;
+    }
 }
 
 bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
@@ -208,13 +286,16 @@ bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
         std::fprintf(stderr, "[onednn] K %% unrollK != 0 (K=%d unrollK=%d)\n", K_, info_.unrollK);
         return false;
     }
-    if ((milestone_k % info_.unrollK) != 0 || (K_ % milestone_k) != 0) {
+    /* unrollK <= milestone_k: XOR every xor_period unrolled panels. Larger
+     * (systolic) unrolls schedule the XOR every milestone_k inside the panel. */
+    if (((milestone_k % info_.unrollK) != 0 && (info_.unrollK % milestone_k) != 0)
+        || (K_ % milestone_k) != 0) {
         std::fprintf(stderr,
-                     "[onednn] milestone_k=%d must divide unrollK=%d and K=%d\n", milestone_k,
-                     info_.unrollK, K_);
+                     "[onednn] milestone_k=%d must divide or be a multiple of unrollK=%d, "
+                     "and divide K=%d\n", milestone_k, info_.unrollK, K_);
         return false;
     }
-    xor_period_ = milestone_k / info_.unrollK;
+    xor_period_ = info_.unrollK <= milestone_k ? milestone_k / info_.unrollK : 1;
     num_milestones_ = K_ / milestone_k;
     folded_msg_words_ = cp_jackpot::kJackpotWords;
     milestone_k_ = milestone_k;
@@ -491,6 +572,14 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     if (!info_.selectionLog.empty()) {
         std::fprintf(stderr, "[onednn] %s", info_.selectionLog.c_str());
     }
+    if (try_init_esimd_()) {
+        /* The ESIMD kernel hashes 16x16 contiguous tiles. */
+        info_.xorSubM = CP_ESIMD_HASH_TILE;
+        info_.xorSubN = CP_ESIMD_HASH_TILE;
+    } else if (!std::strcmp(intel_gemm_mode(), "esimd")) {
+        std::snprintf(backend_, sizeof(backend_), "CP_INTEL_GEMM=esimd unavailable");
+        return false;
+    }
 
     if (!setup_dims_(init_m, init_n, K_DIM)) {
         return false;
@@ -520,10 +609,26 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, fused_jackpot_ ? folded_msg_words_ : 0,
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_);
+    if (esimd_) {
+        std::snprintf(backend_, sizeof(backend_),
+                      "ESIMD XMX scan (dpas%s es=%d, %dx%d work-group tile, in-kernel jackpot) "
+                      "hash=%dx%d ms=%d",
+                      esimd_es_ == 8 ? "w" : "", esimd_es_, esimd_tile_m_, esimd_tile_n_,
+                      hash_tile_rows_, hash_tile_cols_, num_milestones_);
+    }
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
         std::fprintf(stderr, "[onednn] GPU matrix prep init failed; using CPU fallback\n");
+        if (esimd_) {
+            /* Only the GPU prep writes the blocked operand layouts, and the hash
+             * tile was already set for the ESIMD kernel. */
+            std::fprintf(stderr, "[onednn] ESIMD scan needs GPU prep; retry with "
+                                 "CP_INTEL_GEMM=gemmstone\n");
+            return false;
+        }
+    } else if (esimd_) {
+        prep_.set_esimd_layout(true, esimd_es_);
     }
     if (!build_jackpot_kernel_()) {
         std::fprintf(stderr, "[onednn] GPU jackpot kernel init failed\n");
@@ -697,11 +802,35 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
 
+    if (!enqueue_gemm_panel_(ocl_.queue, fused_jackpot_ ? nullptr : tile_xor_buf_, m_panel, n_panel,
+                             offset_a_rows, offset_b_cols, panel_tile_count, panel_tile_cols,
+                             tr_base, tc_base, 0, nullptr, nullptr)) {
+        return false;
+    }
+    if (finish_queue) {
+        const cl_int err = clFinish(ocl_.queue);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[onednn] clFinish failed (%d): %s\n", err,
+                         OpenClContext::error_string(err).c_str());
+            return false;
+        }
+    }
+
+    (void)out_found;
+    return true;
+}
+
+bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_xor, int m_panel,
+                                           int n_panel, int64_t offset_a_rows,
+                                           int64_t offset_b_cols, int panel_tile_count,
+                                           int panel_tile_cols, int tr_base, int tc_base,
+                                           cl_uint num_wait, const cl_event *wait,
+                                           cl_event *done) {
     case5_ngen::LaunchBuffers bufs;
     bufs.a = a_buf_;
     bufs.b = b_buf_;
     bufs.c = c_buf_;
-    bufs.tile_xor = fused_jackpot_ ? nullptr : tile_xor_buf_;
+    bufs.tile_xor = tile_xor;
     bufs.offset_a = panel_offset_a_(offset_a_rows);
     bufs.offset_b = panel_offset_b_(offset_b_cols);
     bufs.offset_c = 0;
@@ -748,22 +877,12 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
 
     const size_t gws[2] = {dims.gws[0], dims.gws[1]};
     const size_t lws[2] = {dims.lws[0], dims.lws[1]};
-    err = clEnqueueNDRangeKernel(ocl_.queue, kernel_, 2, nullptr, gws, lws, 0, nullptr, nullptr);
+    err = clEnqueueNDRangeKernel(queue, kernel_, 2, nullptr, gws, lws, num_wait, wait, done);
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[onednn] enqueue failed (%d): %s\n", err,
                      OpenClContext::error_string(err).c_str());
         return false;
     }
-    if (finish_queue) {
-        err = clFinish(ocl_.queue);
-        if (err != CL_SUCCESS) {
-            std::fprintf(stderr, "[onednn] clFinish failed (%d): %s\n", err,
-                         OpenClContext::error_string(err).c_str());
-            return false;
-        }
-    }
-
-    (void)out_found;
     return true;
 }
 
@@ -809,14 +928,41 @@ bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_ti
     if (!ensure_jackpot_bufs_()) {
         return false;
     }
+    if (!enqueue_jackpot_panel_(ocl_.queue, tile_xor_buf_, panel_tile_count, panel_tile_cols,
+                                tr_base, tc_base, 0, nullptr, nullptr)) {
+        return false;
+    }
+    if (finish_queue) {
+        const cl_int err = clFinish(ocl_.queue);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[onednn] jackpot clFinish failed (%d)\n", err);
+            return false;
+        }
 
+        int found = 0;
+        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found),
+                               jackpot_found_flag_off(/*fused=*/false))) {
+            return false;
+        }
+        if (out_found) {
+            *out_found = found;
+        }
+    }
+
+    return true;
+}
+
+bool Case33GemmOnednn::enqueue_jackpot_panel_(cl_command_queue queue, cl_mem tile_xor,
+                                              int panel_tile_count, int panel_tile_cols,
+                                              int tr_base, int tc_base, cl_uint num_wait,
+                                              const cl_event *wait, cl_event *done) {
     const int hash_mr = info_.xorSubM;
     const int hash_nr = info_.xorSubN;
     const int use_folded_msg = fused_jackpot_ ? 1 : 0;
     const int jackpot_words = use_folded_msg ? folded_msg_words_ : num_milestones_;
     cl_int err = CL_SUCCESS;
     int arg = 0;
-    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &tile_xor_buf_);
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &tile_xor);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &jackpot_words);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_count);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &panel_tile_cols);
@@ -843,30 +989,13 @@ bool Case33GemmOnednn::run_gpu_jackpot_panel_(int panel_tile_count, int panel_ti
         local >>= 1;
     }
     const size_t global = static_cast<size_t>(panel_tile_count);
-    err = clEnqueueNDRangeKernel(ocl_.queue, jackpot_kernel_, 1, nullptr, &global,
-                                 local > 1 ? &local : nullptr, 0, nullptr, nullptr);
+    err = clEnqueueNDRangeKernel(queue, jackpot_kernel_, 1, nullptr, &global,
+                                 local > 1 ? &local : nullptr, num_wait, wait, done);
     if (err != CL_SUCCESS) {
         std::fprintf(stderr, "[onednn] jackpot enqueue failed (%d): %s\n", err,
                      OpenClContext::error_string(err).c_str());
         return false;
     }
-    if (finish_queue) {
-        err = clFinish(ocl_.queue);
-        if (err != CL_SUCCESS) {
-            std::fprintf(stderr, "[onednn] jackpot clFinish failed (%d)\n", err);
-            return false;
-        }
-
-        int found = 0;
-        if (!ocl_.read_buffer(found_buf_, &found, sizeof(found),
-                               jackpot_found_flag_off(/*fused=*/false))) {
-            return false;
-        }
-        if (out_found) {
-            *out_found = found;
-        }
-    }
-
     return true;
 }
 
@@ -1010,6 +1139,356 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
     return true;
 }
 
+bool Case33GemmOnednn::try_init_esimd_() {
+    const char *mode = intel_gemm_mode();
+    const bool required = !std::strcmp(mode, "esimd");
+    if (!std::strcmp(mode, "gemmstone")) {
+        return false;
+    }
+    if (fused_jackpot_ || !a_row_major_ || b_row_major_) {
+        if (required) {
+            std::fprintf(stderr, "[onednn] ESIMD scan needs layout TN without --fused-jackpot\n");
+        }
+        return false;
+    }
+#ifdef _WIN32
+    const std::string path = cp_ocl_kernel_dir() + "\\cp_esimd.dll";
+#else
+    const std::string path = cp_ocl_kernel_dir() + "/libcp_esimd.so";
+#endif
+    void *lib = esimd_dlopen(path);
+    if (!lib) {
+        if (required) {
+            std::fprintf(stderr, "[onednn] cannot load %s\n", path.c_str());
+        }
+        return false;
+    }
+    auto version = reinterpret_cast<cp_esimd_abi_version_fn>(esimd_dlsym(lib, "cp_esimd_abi_version"));
+    auto create = reinterpret_cast<cp_esimd_create_fn>(esimd_dlsym(lib, "cp_esimd_create"));
+    void *panel = esimd_dlsym(lib, "cp_esimd_scan_panel");
+    void *wait = esimd_dlsym(lib, "cp_esimd_wait");
+    void *destroy = esimd_dlsym(lib, "cp_esimd_destroy");
+    if (!version || !create || !panel || !wait || !destroy || version() != CP_ESIMD_ABI_VERSION) {
+        std::fprintf(stderr, "[onednn] %s: missing symbols or ABI mismatch\n", path.c_str());
+        esimd_dlclose(lib);
+        return false;
+    }
+    CpEsimdInfo info{};
+    char err[256] = {};
+    CpEsimdScan *scan = create(ocl_.context, ocl_.device, ocl_.queue, &info, err, sizeof(err));
+    if (!scan) {
+        if (required) {
+            std::fprintf(stderr, "[onednn] ESIMD scan unavailable: %s\n", err);
+        }
+        esimd_dlclose(lib);
+        return false;
+    }
+    esimd_found_ = ocl_.alloc_buffer(4 * sizeof(int), CL_MEM_READ_WRITE);
+    if (!esimd_found_) {
+        reinterpret_cast<cp_esimd_destroy_fn>(destroy)(scan);
+        esimd_dlclose(lib);
+        return false;
+    }
+    esimd_lib_ = lib;
+    esimd_scan_ = scan;
+    esimd_panel_fn_ = panel;
+    esimd_wait_fn_ = wait;
+    esimd_destroy_fn_ = destroy;
+    esimd_es_ = info.exec_size;
+    esimd_tile_m_ = info.tile_m;
+    esimd_tile_n_ = info.tile_n;
+    esimd_ = true;
+    return true;
+}
+
+void Case33GemmOnednn::release_esimd_() {
+    if (esimd_scan_) {
+        reinterpret_cast<cp_esimd_destroy_fn>(esimd_destroy_fn_)(esimd_scan_);
+        esimd_scan_ = nullptr;
+    }
+    if (esimd_found_) {
+        clReleaseMemObject(esimd_found_);
+        esimd_found_ = nullptr;
+    }
+    if (esimd_lib_) {
+        esimd_dlclose(esimd_lib_);
+        esimd_lib_ = nullptr;
+    }
+    esimd_ = false;
+}
+
+/* One ESIMD launch per panel on the miner's queue; the host keeps one panel in
+ * flight and reads the previous panel's found flag after its kernel event. */
+int Case33GemmOnednn::scan_esimd_(int *out_found, int *out_t_rows, int *out_t_cols,
+                                  uint64_t *out_tiles_scanned,
+                                  const std::function<bool()> &should_cancel,
+                                  const std::function<void(uint64_t)> &on_progress) {
+    struct Panel {
+        int m0, n0, m, n;
+    };
+    std::vector<Panel> panels;
+    const int hm = info_.xorSubM, hn = info_.xorSubN;
+    for (int rpi0 = 0; rpi0 < hash_tile_rows_; rpi0 += row_period_batch_) {
+        const int rows = std::min(row_period_batch_, hash_tile_rows_ - rpi0) * hm;
+        for (int cpi0 = 0; cpi0 < hash_tile_cols_; cpi0 += col_period_batch_) {
+            const int cols = std::min(col_period_batch_, hash_tile_cols_ - cpi0) * hn;
+            if (rows % esimd_tile_m_ || cols % esimd_tile_n_) {
+                std::fprintf(stderr, "[onednn] ESIMD panel %dx%d is not a multiple of %dx%d\n", rows,
+                             cols, esimd_tile_m_, esimd_tile_n_);
+                return 0;
+            }
+            panels.push_back(Panel{rpi0 * hm, cpi0 * hn, rows, cols});
+        }
+    }
+    const int zero4[4] = {0, 0, 0, 0};
+    if (panels.empty() || !ocl_.write_buffer(esimd_found_, zero4, sizeof(zero4))) {
+        return 0;
+    }
+    std::memset(esimd_found_host_, 0, sizeof(esimd_found_host_));
+
+    auto scan_panel = reinterpret_cast<cp_esimd_scan_panel_fn>(esimd_panel_fn_);
+    cl_event rd_ev[2] = {};
+    auto release = [](cl_event &e) {
+        if (e) {
+            clReleaseEvent(e);
+            e = nullptr;
+        }
+    };
+    uint64_t tiles_scanned = 0;
+    int found = 0, found_slot = -1;
+    bool ok = true;
+    for (size_t i = 0; i < panels.size() && !found && ok; ++i) {
+        if (should_cancel && should_cancel()) {
+            ok = false;
+            break;
+        }
+        const int s = static_cast<int>(i & 1);
+        const Panel &p = panels[i];
+        void *kernel_done = nullptr;
+        if (scan_panel(esimd_scan_, a_buf_, b_buf_, esimd_found_, p.m0, p.n0, p.m, p.n,
+                       scan_jackpot_key_, scan_jackpot_bound_, &kernel_done) != 0 ||
+            !kernel_done) {
+            ok = false;
+            break;
+        }
+        cl_event kev = static_cast<cl_event>(kernel_done);
+        release(rd_ev[s]);
+        const cl_int err = clEnqueueReadBuffer(ocl_.queue, esimd_found_, CL_FALSE, 0,
+                                               sizeof(esimd_found_host_[s]), esimd_found_host_[s],
+                                               1, &kev, &rd_ev[s]);
+        clReleaseEvent(kev);
+        if (err != CL_SUCCESS) {
+            ok = false;
+            break;
+        }
+        clFlush(ocl_.queue);
+        if (i >= 1) {
+            const int ps = s ^ 1;
+            if (clWaitForEvents(1, &rd_ev[ps]) != CL_SUCCESS) {
+                ok = false;
+                break;
+            }
+            tiles_scanned += static_cast<uint64_t>(panels[i - 1].m / hm) * (panels[i - 1].n / hn);
+            if (on_progress) {
+                on_progress(tiles_scanned);
+            }
+            if (esimd_found_host_[ps][0]) {
+                found = 1;
+                found_slot = ps;
+            }
+        }
+    }
+    reinterpret_cast<cp_esimd_wait_fn>(esimd_wait_fn_)(esimd_scan_);
+    clFinish(ocl_.queue);
+    if (ok && !found) {
+        const int last = static_cast<int>((panels.size() - 1) & 1);
+        tiles_scanned += static_cast<uint64_t>(panels.back().m / hm) * (panels.back().n / hn);
+        if (on_progress) {
+            on_progress(tiles_scanned);
+        }
+        if (esimd_found_host_[last][0]) {
+            found = 1;
+            found_slot = last;
+        }
+    }
+    release(rd_ev[0]);
+    release(rd_ev[1]);
+    if (!ok) {
+        return 0;
+    }
+    if (found) {
+        /* A later panel may have overwritten the hit; read the settled copy. */
+        int hit[4] = {};
+        if (!ocl_.read_buffer(esimd_found_, hit, sizeof(hit))) {
+            return 0;
+        }
+        (void)found_slot;
+        if (out_t_rows) {
+            *out_t_rows = hit[1];
+        }
+        if (out_t_cols) {
+            *out_t_cols = hit[2];
+        }
+    }
+    if (out_tiles_scanned) {
+        *out_tiles_scanned = tiles_scanned;
+    }
+    if (out_found) {
+        *out_found = found;
+    }
+    return 1;
+}
+
+bool Case33GemmOnednn::ensure_pipeline_(int panel_tile_count) {
+    if (!pipe_queue_) {
+        cl_int err = CL_SUCCESS;
+        pipe_queue_ = clCreateCommandQueue(ocl_.context, ocl_.device,
+                                           CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err);
+        if (!pipe_queue_ || err != CL_SUCCESS) {
+            pipe_queue_ = nullptr;
+            return false;
+        }
+    }
+    if (pipe_tile_xor_[0] && pipe_tile_xor_[1] && pipe_tile_xor_cap_ >= panel_tile_count) {
+        return true;
+    }
+    const size_t bytes = static_cast<size_t>(num_milestones_) *
+                         static_cast<size_t>(panel_tile_count) * sizeof(uint32_t);
+    for (cl_mem &buf : pipe_tile_xor_) {
+        if (buf) {
+            clReleaseMemObject(buf);
+        }
+        buf = ocl_.alloc_buffer(bytes, CL_MEM_READ_WRITE);
+        if (!buf) {
+            return false;
+        }
+    }
+    pipe_tile_xor_cap_ = panel_tile_count;
+    return true;
+}
+
+/* GEMM panel i and the jackpot of panel i-1 overlap on an out-of-order queue:
+ * jackpot i waits for GEMM i, GEMM i waits for the jackpot that last read its
+ * tile_xor buffer (i-2), and the host only waits for panel i-1's found flag.
+ * Returns 1 done, 0 error/cancel, -1 pipeline unavailable. */
+int Case33GemmOnednn::scan_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
+                                      uint64_t *out_tiles_scanned,
+                                      const std::function<bool()> &should_cancel,
+                                      const std::function<void(uint64_t)> &on_progress) {
+    struct Panel {
+        int m, n, tile_count, tile_cols, tr_base, tc_base;
+        int64_t off_a, off_b;
+    };
+    std::vector<Panel> panels;
+    int max_tiles = 0;
+    for (int rpi0 = 0; rpi0 < hash_tile_rows_; rpi0 += row_period_batch_) {
+        const int row_batch = std::min(row_period_batch_, hash_tile_rows_ - rpi0);
+        for (int cpi0 = 0; cpi0 < hash_tile_cols_; cpi0 += col_period_batch_) {
+            const int col_batch = std::min(col_period_batch_, hash_tile_cols_ - cpi0);
+            Panel p{};
+            p.m = row_batch * info_.xorSubM;
+            p.n = col_batch * info_.xorSubN;
+            int tile_rows = 0;
+            compute_tile_grid_(p.m, p.n, tile_rows, p.tile_cols, p.tile_count);
+            p.tr_base = rpi0;
+            p.tc_base = cpi0;
+            p.off_a = static_cast<int64_t>(rpi0) * info_.xorSubM;
+            p.off_b = static_cast<int64_t>(cpi0) * info_.xorSubN;
+            max_tiles = std::max(max_tiles, p.tile_count);
+            panels.push_back(p);
+        }
+    }
+    if (panels.empty() || !ensure_pipeline_(max_tiles)) {
+        return -1;
+    }
+    pipe_found_host_[0] = pipe_found_host_[1] = 0;
+
+    auto release = [](cl_event &e) {
+        if (e) {
+            clReleaseEvent(e);
+            e = nullptr;
+        }
+    };
+    cl_event gemm_ev[2] = {}, jp_ev[2] = {}, rd_ev[2] = {};
+    const size_t flag_off = jackpot_found_flag_off(/*fused=*/false);
+    uint64_t tiles_scanned = 0;
+    int found = 0;
+    bool ok = true;
+    for (size_t i = 0; i < panels.size() && !found && ok; ++i) {
+        if (should_cancel && should_cancel()) {
+            ok = false;
+            break;
+        }
+        const int s = static_cast<int>(i & 1);
+        const Panel &p = panels[i];
+        cl_event prev_reader = jp_ev[s];
+        cl_event gemm_done = nullptr;
+        if (!enqueue_gemm_panel_(pipe_queue_, pipe_tile_xor_[s], p.m, p.n, p.off_a, p.off_b,
+                                 p.tile_count, p.tile_cols, p.tr_base, p.tc_base,
+                                 prev_reader ? 1 : 0, prev_reader ? &prev_reader : nullptr,
+                                 &gemm_done)) {
+            ok = false;
+            break;
+        }
+        release(jp_ev[s]);
+        release(gemm_ev[s]);
+        gemm_ev[s] = gemm_done;
+        release(rd_ev[s]);
+        if (!enqueue_jackpot_panel_(pipe_queue_, pipe_tile_xor_[s], p.tile_count, p.tile_cols,
+                                    p.tr_base, p.tc_base, 1, &gemm_ev[s], &jp_ev[s]) ||
+            clEnqueueReadBuffer(pipe_queue_, found_buf_, CL_FALSE, flag_off, sizeof(int),
+                                &pipe_found_host_[s], 1, &jp_ev[s], &rd_ev[s]) != CL_SUCCESS) {
+            ok = false;
+            break;
+        }
+        clFlush(pipe_queue_);
+        if (i >= 1) {
+            const int ps = s ^ 1;
+            if (clWaitForEvents(1, &rd_ev[ps]) != CL_SUCCESS) {
+                ok = false;
+                break;
+            }
+            tiles_scanned += static_cast<uint64_t>(panels[i - 1].tile_count);
+            if (on_progress) {
+                on_progress(tiles_scanned);
+            }
+            found = pipe_found_host_[ps] != 0;
+        }
+    }
+    clFinish(pipe_queue_);
+    if (ok && !found) {
+        const int last = static_cast<int>((panels.size() - 1) & 1);
+        tiles_scanned += static_cast<uint64_t>(panels.back().tile_count);
+        if (on_progress) {
+            on_progress(tiles_scanned);
+        }
+        found = pipe_found_host_[last] != 0;
+    }
+    for (int s = 0; s < 2; ++s) {
+        release(gemm_ev[s]);
+        release(jp_ev[s]);
+        release(rd_ev[s]);
+    }
+    if (!ok) {
+        return 0;
+    }
+    if (found) {
+        if (out_t_rows && !ocl_.read_buffer(out_rows_buf_, out_t_rows, sizeof(int))) {
+            return 0;
+        }
+        if (out_t_cols && !ocl_.read_buffer(out_cols_buf_, out_t_cols, sizeof(int))) {
+            return 0;
+        }
+    }
+    if (out_tiles_scanned) {
+        *out_tiles_scanned = tiles_scanned;
+    }
+    if (out_found) {
+        *out_found = found;
+    }
+    return 1;
+}
+
 bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t bound[8],
                                       int *out_found, int *out_t_rows, int *out_t_cols,
                                       uint64_t *out_tiles_scanned,
@@ -1054,6 +1533,20 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero),
                            jackpot_found_flag_off(fused_jackpot_))) {
         return false;
+    }
+
+    if (esimd_) {
+        return scan_esimd_(out_found, out_t_rows, out_t_cols, out_tiles_scanned, should_cancel,
+                           on_progress) != 0;
+    }
+    if (!fused_jackpot_ && pipeline_enabled() &&
+        !case5_ngen::case5_debug_tile_xor_zeros_enabled()) {
+        const int rc = scan_pipelined_(out_found, out_t_rows, out_t_cols, out_tiles_scanned,
+                                       should_cancel, on_progress);
+        if (rc >= 0) {
+            return rc != 0;
+        }
+        /* rc < 0: pipeline resources unavailable, use the synchronous loop. */
     }
 
     const int row_periods = hash_tile_rows_;

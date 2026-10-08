@@ -41,6 +41,8 @@ static int g_platform_filter = -1;
 static int g_context_ready = 0;
 static int g_row_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
 static int g_col_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
+static int g_row_batch_auto = 0;
+static int g_col_batch_auto = 0;
 static int g_fused_jackpot = 0;
 static bool g_a_row_major = true;
 static bool g_b_row_major = false;
@@ -208,6 +210,14 @@ extern "C" void cp_onednn_worker_set_col_period_batch(int batch) {
     g_gemm.set_col_period_batch(batch);
 }
 
+extern "C" void cp_onednn_worker_set_auto_batch(int col_auto, int row_auto) {
+    g_col_batch_auto = col_auto ? 1 : 0;
+    g_row_batch_auto = row_auto ? 1 : 0;
+}
+
+extern "C" int cp_onednn_worker_row_period_batch(void) { return g_row_period_batch; }
+extern "C" int cp_onednn_worker_col_period_batch(void) { return g_col_period_batch; }
+
 extern "C" void cp_onednn_worker_set_fused_jackpot(int on) {
     if (g_context_ready) {
         fprintf(stderr, "[onednn] set_fused_jackpot ignored after init\n");
@@ -286,6 +296,12 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     g_context_ready = 1;
     configure_hash_tile_from_kernel();
     const auto &di = g_gemm.driver_info();
+    if (di.strategy.systolic) {
+        if (g_row_batch_auto)
+            cp_onednn_worker_set_row_period_batch(CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT);
+        if (g_col_batch_auto)
+            cp_onednn_worker_set_col_period_batch(CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT);
+    }
     printf("[onednn] device[%d]: %s\n", g_gemm.device_index(), g_gemm.device_name());
     printf("[onednn] platform: %s\n", g_gemm.platform_name());
     printf("[onednn] %s\n", g_gemm.backend());

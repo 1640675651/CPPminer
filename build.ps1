@@ -17,7 +17,8 @@ param(
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = "",
-    [switch]$EnableCublas
+    [switch]$EnableCublas,
+    [switch]$EnableEsimd
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +58,9 @@ if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $En
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
+}
+if ($EnableEsimd -and -not $EnableOneDnn) {
+    throw "-EnableEsimd requires -Backend OneDnn (or Cpu,Cuda,OpenCl,OneDnn)"
 }
 $script:VcvarsBat = $null
 $script:ClExe = $null
@@ -117,6 +121,40 @@ function Initialize-MSVC {
     if ($script:ClExe) { $script:ClExe = $script:ClExe.Trim() }
     if (-not $script:ClExe) { throw "cl.exe not found after vcvars64" }
     Write-Host "=== cl.exe: $($script:ClExe) ==="
+    Import-VcvarsEnvironment $vcvars
+}
+
+# Bring the vcvars64 toolchain variables into this process. MSBuild sets them for its own
+# compile steps, but custom commands that run the oneAPI compiler get the LIB/INCLUDE that
+# CMake captured at configure time from this process: from a plain shell (CI) that is empty
+# and icx's link fails with LNK1104 msvcprt.lib. A Developer shell already has them, which
+# is why local builds never saw it. Restore-ShellEnvironment undoes this at the end.
+function Import-VcvarsEnvironment {
+    param([string]$Vcvars)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $lines = $null
+    try {
+        $lines = cmd /c "`"$Vcvars`" >nul 2>&1 && set" 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $wanted = @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion',
+                'VCToolsRedistDir', 'VSINSTALLDIR', 'VSCMD_VER', 'VSCMD_ARG_TGT_ARCH', 'VSCMD_ARG_HOST_ARCH',
+                'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath', 'WindowsLibPath',
+                'UCRTVersion', 'UniversalCRTSdkDir', 'ExtensionSdkDir', 'Platform')
+    $imported = 0
+    foreach ($line in $lines) {
+        $text = if ($line -is [System.Management.Automation.ErrorRecord]) { $line.ToString() } else { "$line" }
+        $eq = $text.IndexOf('=')
+        if ($eq -le 0) { continue }
+        $name = $text.Substring(0, $eq)
+        if ($wanted -notcontains $name) { continue }
+        Set-Item -Path "env:$name" -Value $text.Substring($eq + 1)
+        $imported++
+    }
+    if ($imported -eq 0) { throw "vcvars64 environment could not be imported from $Vcvars" }
+    if (-not $env:LIB) { throw "LIB is empty after vcvars64" }
 }
 
 function Find-CMake {
@@ -322,8 +360,8 @@ function Ensure-OneDnnDeps {
     }
     Push-Location $onednnDir
     try {
-        cmd /c "prepare_onednn_deps.bat"
-        if ($LASTEXITCODE -ne 0) { throw "prepare_onednn_deps.bat failed" }
+        Invoke-External -Command { cmd /c "prepare_onednn_deps.bat" } `
+            -FailureMessage "prepare_onednn_deps.bat failed"
     } finally {
         Pop-Location
     }
@@ -385,6 +423,19 @@ $buildExitCode = 0
 try {
     Clear-CondaToolchainOverrides
     Initialize-MSVC
+    if ($EnableEsimd -and $env:CP_ONEAPI_ROOT) {
+        # The conda DPC++ package needs LIB for its internal SYCL link stages;
+        # a compiler -L option only reaches the final host link. Restore these
+        # variables with the rest of the caller's environment in finally.
+        $intelBin = Join-Path $env:CP_ONEAPI_ROOT 'Library\bin'
+        $intelLib = Join-Path $env:CP_ONEAPI_ROOT 'Library\lib'
+        if (-not (Test-Path (Join-Path $intelBin 'icx.exe')) -or
+            -not (Test-Path (Join-Path $intelLib 'libircmt.lib'))) {
+            throw 'CP_ONEAPI_ROOT must point to the complete Windows oneAPI conda prefix'
+        }
+        $env:PATH = "$intelBin;$env:PATH"
+        $env:LIB = "$intelLib;$env:LIB"
+    }
     $script:CmakeExe = Find-CMake
     if (-not $script:CmakeExe) {
         throw "cmake not found. Install VS 'CMake tools for Windows' or add cmake to PATH (same as build.sh)."
@@ -433,7 +484,8 @@ try {
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_WGPU=$(if ($EnableWgpu) { 'ON' } else { 'OFF' })",
-        "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
+        "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_ESIMD=$(if ($EnableEsimd) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {
         $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
@@ -452,6 +504,11 @@ try {
     Copy-Item $built $OutExe -Force
     if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
+    }
+    if ($EnableEsimd) {
+        $esimdDll = Join-Path $CmakeBuild "kernels\cp_esimd.dll"
+        if (-not (Test-Path $esimdDll)) { throw "ESIMD library missing at $esimdDll" }
+        Copy-Item $esimdDll (Join-Path $Root "kernels\cp_esimd.dll") -Force
     }
     if ($EnableWgpu) {
         $wgpuDll = @(

@@ -9,6 +9,8 @@
 
 #include "ngen_core.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <vector>
@@ -83,7 +85,7 @@ bool entry_case5_compatible(const Entry &entry) {
         return false;
     }
     const int unroll_k = di.unroll[LoopK];
-    if (unroll_k <= 0 || (kMilestoneK % unroll_k) != 0) {
+    if (unroll_k <= 0 || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)) {
         return false;
     }
     return true;
@@ -100,7 +102,7 @@ bool strategy_postparse_compatible(const GEMMStrategy &strategy) {
         return false;
     }
     const int unroll_k = strategy.unroll[LoopK];
-    if (unroll_k <= 0 || (kMilestoneK % unroll_k) != 0) {
+    if (unroll_k <= 0 || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)) {
         return false;
     }
     return true;
@@ -210,11 +212,40 @@ OnednnSelectInput onednn_select_input_from_dims(const BuildParams &dims) {
 std::vector<CatalogCandidate> fallback_candidates(HW hw) {
     std::vector<CatalogCandidate> out;
     if (hw == HW::XeHPG) {
-        out.push_back(CatalogCandidate{nullptr, "fallback-grf256", kFallbackXeHPG, true, true});
+        out.push_back(CatalogCandidate{nullptr, "fallback-grf256", kFallbackXeHPG, true, false});
     } else {
-        out.push_back(CatalogCandidate{nullptr, "fallback-Gen12LP", kFallbackGen12LP, true, true});
+        out.push_back(CatalogCandidate{nullptr, "fallback-Gen12LP", kFallbackGen12LP, true, false});
     }
     return out;
+}
+
+// Arc A380 (XeHPG, s8 TN, 131072^2 with milestone XOR): this 8x4-workgroup
+// 16x32 systolic kernel scanned at 15.0 TMAC/s vs 9.7 for oneDNN's top pick.
+// The catalog repeats the strategy string with other unrolls, so match both.
+// `tuned` replaces the catalog string: dropping `af` (atomic FMA) measured
+// +1.06% at 131072^2 in an ABAB comparison.
+struct PreferredKernel {
+    int unroll_m, unroll_n;
+    const char *strategy;
+    const char *tuned;
+};
+
+const PreferredKernel *preferred_entry(HW hw, const Entry &entry) {
+    static const PreferredKernel kXeHPG[] = {
+            {16, 32, "sB64 sB32 aB wg 8x4 cab4 ks64 af dw vav bo bk0 sm sn grf256 sys pab l4 sr",
+             "sB64 sB32 aB wg 8x4 cab4 ks64 dw vav bo bk0 sm sn grf256 sys pab l4 sr"},
+    };
+    if (hw != HW::XeHPG) {
+        return nullptr;
+    }
+    for (const auto &p : kXeHPG) {
+        if (entry.driverInfo.unroll[LoopM] == p.unroll_m
+                && entry.driverInfo.unroll[LoopN] == p.unroll_n
+                && std::string(entry.strategy) == p.strategy) {
+            return &p;
+        }
+    }
+    return nullptr;
 }
 
 void append_catalog_candidate(std::vector<CatalogCandidate> &out, const Entry *entry) {
@@ -250,15 +281,38 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
             setup.match_params.data(), result.eval_params, aux);
 
     const auto fallbacks = fallback_candidates(hw);
-    result.candidates.reserve(ranked.size() + fallbacks.size());
+    result.candidates.reserve(ranked.size() + fallbacks.size() + 1);
+
+    // Tuning hook: CASE5_STRATEGY="<gemmstone strategy>" with CASE5_UNROLL=MxN is
+    // tried first, as label "custom".
+    if (const char *s = std::getenv("CASE5_STRATEGY"); s && *s) {
+        CatalogCandidate custom;
+        custom.label = "custom";
+        custom.strategy = s;
+        for (char &c : custom.strategy) // '_' allowed as a separator for env-safe values
+            if (c == '_')
+                c = ' ';
+        if (const char *u = std::getenv("CASE5_UNROLL"); u && *u)
+            std::sscanf(u, "%dx%d", &custom.unroll_m, &custom.unroll_n);
+        result.candidates.push_back(std::move(custom));
+    }
 
     // Case 5 filters apply after oneDNN's ordered catalog list (same contract as entries[0..N]).
+    // Strategies measured fastest with the milestone XOR are moved to the front:
+    // oneDNN's model ranks plain GEMM, not GEMM + per-milestone fold.
+    std::vector<const Entry *> preferred, rest;
     for (const Entry *entry : ranked) {
         if (!entry || !entry_case5_compatible(*entry)) {
             continue;
         }
-        append_catalog_candidate(result.candidates, entry);
+        (preferred_entry(hw, *entry) ? preferred : rest).push_back(entry);
     }
+    for (const Entry *entry : preferred) {
+        append_catalog_candidate(result.candidates, entry);
+        result.candidates.back().strategy = preferred_entry(hw, *entry)->tuned;
+    }
+    for (const Entry *entry : rest)
+        append_catalog_candidate(result.candidates, entry);
 
     for (auto &fallback : fallbacks) {
         result.candidates.push_back(std::move(fallback));
@@ -291,10 +345,14 @@ bool prepare_case5_strategy(HW hw, const Product &product, GEMMProblem &problem,
             strategy = GEMMStrategy(hw, product.stepping);
             strategy.unroll[LoopM] = entry.driverInfo.unroll[LoopM];
             strategy.unroll[LoopN] = entry.driverInfo.unroll[LoopN];
-            parseStrategy(entry.strategy, hw, problem, strategy);
+            // candidate.strategy is the entry's string unless a preferred entry is tuned.
+            parseStrategy(candidate.strategy.c_str(), hw, problem, strategy);
         } else {
             strategy = GEMMStrategy(hw, product.stepping);
-            if (candidate.seed_gen12_unroll) {
+            if (candidate.unroll_m > 0 && candidate.unroll_n > 0) {
+                strategy.unroll[LoopM] = candidate.unroll_m;
+                strategy.unroll[LoopN] = candidate.unroll_n;
+            } else if (candidate.seed_gen12_unroll) {
                 strategy.unroll[LoopM] = 32;
                 strategy.unroll[LoopN] = 16;
             }

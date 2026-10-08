@@ -3,8 +3,10 @@
 #include "case32_layout.hpp"
 #include "cp_config.h"
 #include "cp_noise.h"
+#include "cp_util.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -20,6 +22,33 @@
 #endif
 
 namespace {
+
+/* CP_OCL_PREP_TIMING=1: per-stage A prep timings (adds queue syncs). */
+bool prep_timing_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CP_OCL_PREP_TIMING");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+/* CP_OCL_PREP_WG=0 keeps the per-row noise kernel. */
+bool prep_wg_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CP_OCL_PREP_WG");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+/* CP_OCL_PREP_CHECK=1: compare the work-group noise path with the per-row kernel. */
+bool prep_check_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CP_OCL_PREP_CHECK");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
 
 std::string directory_of_exe() {
 #ifdef _WIN32
@@ -93,6 +122,11 @@ Case33OclPrep::~Case33OclPrep() {
         clReleaseMemObject(d_noisy_scratch_);
         d_noisy_scratch_ = nullptr;
     }
+    if (d_el_rows_) {
+        clReleaseMemObject(d_el_rows_);
+        d_el_rows_ = nullptr;
+        el_rows_cap_ = 0;
+    }
     if (program_) {
         clReleaseProgram(program_);
         program_ = nullptr;
@@ -159,6 +193,7 @@ bool Case33OclPrep::create_kernels_() {
     };
 
     k_gen_random_ = mk("ocl_gen_random_matrix");
+    k_gen_random16_ = mk("ocl_gen_random_matrix16");
     k_build_pairs_ = mk("ocl_build_perm_pairs");
     k_keyed_chunk_roots_ = mk("ocl_keyed_chunk_roots");
     k_compute_blake_mt_ = mk("ocl_compute_blake_mt");
@@ -166,6 +201,8 @@ bool Case33OclPrep::create_kernels_() {
     k_fused_prepack_a_ = fused_prepack_ ? mk("ocl_fused_prepack_a") : nullptr;
     k_fused_prepack_b_ = fused_prepack_ ? mk("ocl_fused_prepack_b") : nullptr;
     k_noisy_rowmajor_ = mk("ocl_noisy_matrix_rowmajor");
+    k_uniform_rows_ = mk("ocl_uniform_rows");
+    k_noisy_rowmajor_wg_ = mk("ocl_noisy_matrix_rowmajor_wg");
     k_noisy_a_colmajor_ = mk("ocl_noisy_matrix_a_colmajor");
     k_noisy_colmajor_ = mk("ocl_noisy_matrix_colmajor");
     k_noisy_b_rowmajor_ = mk("ocl_noisy_matrix_b_rowmajor");
@@ -190,6 +227,10 @@ void Case33OclPrep::release_kernels_() {
     if (k_gen_random_) {
         clReleaseKernel(k_gen_random_);
         k_gen_random_ = nullptr;
+    }
+    if (k_gen_random16_) {
+        clReleaseKernel(k_gen_random16_);
+        k_gen_random16_ = nullptr;
     }
     if (k_build_pairs_) {
         clReleaseKernel(k_build_pairs_);
@@ -218,6 +259,14 @@ void Case33OclPrep::release_kernels_() {
     if (k_noisy_rowmajor_) {
         clReleaseKernel(k_noisy_rowmajor_);
         k_noisy_rowmajor_ = nullptr;
+    }
+    if (k_uniform_rows_) {
+        clReleaseKernel(k_uniform_rows_);
+        k_uniform_rows_ = nullptr;
+    }
+    if (k_noisy_rowmajor_wg_) {
+        clReleaseKernel(k_noisy_rowmajor_wg_);
+        k_noisy_rowmajor_wg_ = nullptr;
     }
     if (k_noisy_a_colmajor_) {
         clReleaseKernel(k_noisy_a_colmajor_);
@@ -328,6 +377,30 @@ bool Case33OclPrep::ensure_noisy_scratch(size_t bytes) {
     return d_noisy_scratch_ != nullptr;
 }
 
+bool Case33OclPrep::gen_random_a_(uint64_t rng_seed, int total) {
+    const int matrix_tag = 0;
+    const cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
+    const bool wide = k_gen_random16_ && (total % 16) == 0;
+    cl_kernel k = wide ? k_gen_random16_ : k_gen_random_;
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k, 0, sizeof(cl_ulong), &rng_ul);
+    err |= clSetKernelArg(k, 1, sizeof(int), &matrix_tag);
+    err |= clSetKernelArg(k, 2, sizeof(int), &total);
+    err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_A_sig_);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    const size_t items = wide ? static_cast<size_t>(total / 16) : static_cast<size_t>(total);
+    const size_t l = 256;
+    const size_t g = (items + l - 1) / l * l;
+    if (clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, nullptr)
+            != CL_SUCCESS) {
+        return false;
+    }
+    clFinish(ocl_->queue);
+    return true;
+}
+
 bool Case33OclPrep::build_perm_pairs_(int is_b, int K) {
     if (!ready_ || K <= 0) {
         return false;
@@ -363,6 +436,13 @@ bool Case33OclPrep::noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, 
 
     const int rank = R_RANK;
     cl_mem sig_arg = signal;
+    if (noisy_matrix_rowmajor_wg_(out, signal, rows, K, out_lda, is_b, has_signal)) {
+        return true;
+    }
+    if (esimd_layout_) {
+        std::fprintf(stderr, "[ocl-prep] ESIMD block layout needs the work-group noise kernel\n");
+        return false;
+    }
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(k_noisy_rowmajor_, 0, sizeof(cl_mem), &out);
     err |= clSetKernelArg(k_noisy_rowmajor_, 1, sizeof(cl_mem), &d_noise_seed_);
@@ -388,6 +468,107 @@ bool Case33OclPrep::noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, 
     }
     clFinish(ocl_->queue);
     return true;
+}
+
+bool Case33OclPrep::noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int rows, int K,
+                                              int out_lda, int is_b, int has_signal) {
+    if (!k_uniform_rows_ || !k_noisy_rowmajor_wg_ || !prep_wg_enabled()) {
+        return false;
+    }
+    const int rank = R_RANK;
+    const size_t el_bytes = static_cast<size_t>(rows) * static_cast<size_t>(rank);
+    if (el_bytes > el_rows_cap_ || !d_el_rows_) {
+        if (d_el_rows_) {
+            clReleaseMemObject(d_el_rows_);
+        }
+        d_el_rows_ = ocl_->alloc_buffer(el_bytes, CL_MEM_READ_WRITE);
+        el_rows_cap_ = d_el_rows_ ? el_bytes : 0;
+        if (!d_el_rows_) {
+            return false;
+        }
+    }
+
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k_uniform_rows_, 0, sizeof(cl_mem), &d_noise_seed_);
+    err |= clSetKernelArg(k_uniform_rows_, 1, sizeof(int), &rows);
+    err |= clSetKernelArg(k_uniform_rows_, 2, sizeof(int), &rank);
+    err |= clSetKernelArg(k_uniform_rows_, 3, sizeof(int), &is_b);
+    err |= clSetKernelArg(k_uniform_rows_, 4, sizeof(cl_mem), &d_el_rows_);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    const size_t lu = 64;
+    const size_t gu = (static_cast<size_t>(rows) + lu - 1) / lu * lu;
+    if (clEnqueueNDRangeKernel(ocl_->queue, k_uniform_rows_, 1, nullptr, &gu, &lu, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+        return false;
+    }
+
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 0, sizeof(cl_mem), &out);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 1, sizeof(cl_mem), &d_el_rows_);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 2, sizeof(cl_mem), &d_pairs_);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 3, sizeof(int), &rows);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 4, sizeof(int), &K);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 5, sizeof(int), &rank);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 6, sizeof(int), &has_signal);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 7, sizeof(cl_mem), &signal);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 8, sizeof(int), &out_lda);
+    const int layout = noise_layout_(is_b);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 9, sizeof(int), &layout);
+    err |= clSetKernelArg(k_noisy_rowmajor_wg_, 10, sizeof(int), &esimd_es_);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    const size_t lw = 256;
+    const size_t gw = static_cast<size_t>(rows) * lw;
+    if (clEnqueueNDRangeKernel(ocl_->queue, k_noisy_rowmajor_wg_, 1, nullptr, &gw, &lw, 0,
+                               nullptr, nullptr) != CL_SUCCESS) {
+        std::fprintf(stderr, "[ocl-prep] noisy_matrix_rowmajor_wg launch failed; using row path\n");
+        return false;
+    }
+    clFinish(ocl_->queue);
+    if (prep_check_enabled() && layout == 0) {
+        return noisy_matrix_rowmajor_check_(out, signal, rows, K, out_lda, is_b, has_signal);
+    }
+    return true;
+}
+
+/* CP_OCL_PREP_CHECK=1: recompute with the per-row kernel and require identical bytes. */
+bool Case33OclPrep::noisy_matrix_rowmajor_check_(cl_mem out, cl_mem signal, int rows, int K,
+                                                 int out_lda, int is_b, int has_signal) {
+    const size_t bytes = static_cast<size_t>(rows) * static_cast<size_t>(out_lda);
+    if (!ensure_noisy_scratch(bytes)) {
+        return false;
+    }
+    const int rank = R_RANK;
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k_noisy_rowmajor_, 0, sizeof(cl_mem), &d_noisy_scratch_);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 1, sizeof(cl_mem), &d_noise_seed_);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 2, sizeof(cl_mem), &d_pairs_);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 3, sizeof(int), &rows);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 4, sizeof(int), &K);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 5, sizeof(int), &rank);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 6, sizeof(int), &is_b);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 7, sizeof(int), &has_signal);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 8, sizeof(cl_mem), &signal);
+    err |= clSetKernelArg(k_noisy_rowmajor_, 9, sizeof(int), &out_lda);
+    const size_t l = 256;
+    const size_t g = (static_cast<size_t>(rows) + l - 1) / l * l;
+    if (err != CL_SUCCESS || clEnqueueNDRangeKernel(ocl_->queue, k_noisy_rowmajor_, 1, nullptr,
+                                                    &g, &l, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    clFinish(ocl_->queue);
+    std::vector<char> a(bytes), b(bytes);
+    if (!ocl_->read_buffer(out, a.data(), bytes) ||
+        !ocl_->read_buffer(d_noisy_scratch_, b.data(), bytes)) {
+        return false;
+    }
+    const bool same = a == b;
+    std::printf("[ocl-prep] row-major noise check (%s, %dx%d): %s\n", is_b ? "B" : "A", rows,
+                out_lda, same ? "identical" : "MISMATCH");
+    std::fflush(stdout);
+    return same;
 }
 
 bool Case33OclPrep::noisy_matrix_a_colmajor_(cl_mem out, cl_mem signal, int rows, int K, int lda) {
@@ -451,6 +632,19 @@ bool Case33OclPrep::noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb,
         return false;
     }
     if (!build_perm_pairs_(is_b, K)) {
+        return false;
+    }
+    // Column j at out + j*ldb is the row-major noise layout without signal.
+    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    if (noisy_matrix_rowmajor_wg_(out, nullptr, cols, K, ldb, is_b, 0)) {
+        if (prep_timing_enabled()) {
+            std::printf("[ocl-prep] %s column-major noise: %.1fms\n", is_b ? "B" : "A",
+                        (cp_now_sec() - t0) * 1e3);
+        }
+        return true;
+    }
+    if (esimd_layout_) {
+        std::fprintf(stderr, "[ocl-prep] ESIMD block layout needs the work-group noise kernel\n");
         return false;
     }
 
@@ -731,28 +925,9 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
         return false;
     }
 
-    const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
-    const int total_a = m * K;
-    const int matrix_tag = 0;
-    cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
-    cl_int err = CL_SUCCESS;
-    err |= clSetKernelArg(k_gen_random_, 0, sizeof(cl_ulong), &rng_ul);
-    err |= clSetKernelArg(k_gen_random_, 1, sizeof(int), &matrix_tag);
-    err |= clSetKernelArg(k_gen_random_, 2, sizeof(int), &total_a);
-    err |= clSetKernelArg(k_gen_random_, 3, sizeof(cl_mem), &d_A_sig_);
-    if (err != CL_SUCCESS) {
+    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
         return false;
     }
-    {
-        const size_t g = static_cast<size_t>((total_a + 255) / 256) * 256;
-        const size_t l = 256;
-        err = clEnqueueNDRangeKernel(ocl_->queue, k_gen_random_, 1, nullptr, &g, &l, 0, nullptr,
-                                     nullptr);
-        if (err != CL_SUCCESS) {
-            return false;
-        }
-    }
-    clFinish(ocl_->queue);
 
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
@@ -781,29 +956,12 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
     if (!ensure_buffers(m, 1, K)) {
         return false;
     }
+    const double t_start = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
-    const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
-    const int total_a = m * K;
-    const int matrix_tag = 0;
-    cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
-    cl_int err = CL_SUCCESS;
-    err |= clSetKernelArg(k_gen_random_, 0, sizeof(cl_ulong), &rng_ul);
-    err |= clSetKernelArg(k_gen_random_, 1, sizeof(int), &matrix_tag);
-    err |= clSetKernelArg(k_gen_random_, 2, sizeof(int), &total_a);
-    err |= clSetKernelArg(k_gen_random_, 3, sizeof(cl_mem), &d_A_sig_);
-    if (err != CL_SUCCESS) {
+    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
         return false;
     }
-    {
-        const size_t g = static_cast<size_t>((total_a + 255) / 256) * 256;
-        const size_t l = 256;
-        err = clEnqueueNDRangeKernel(ocl_->queue, k_gen_random_, 1, nullptr, &g, &l, 0, nullptr,
-                                     nullptr);
-        if (err != CL_SUCCESS) {
-            return false;
-        }
-    }
-    clFinish(ocl_->queue);
+    const double t_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
@@ -811,6 +969,7 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
     if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
         return false;
     }
+    const double t_hash = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
     pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), salted,
                                  a_key_out);
@@ -819,7 +978,14 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
         return false;
     }
 
-    return noisy_matrix_rowmajor_(a_noisy_out, d_A_sig_, m, K, out_lda, 0, 1);
+    const bool ok = noisy_matrix_rowmajor_(a_noisy_out, d_A_sig_, m, K, out_lda, 0, 1);
+    if (prep_timing_enabled()) {
+        clFinish(ocl_->queue);
+        std::printf("[ocl-prep] A row-major: gen=%.1fms hash=%.1fms noise=%.1fms\n",
+                    (t_gen - t_start) * 1e3, (t_hash - t_gen) * 1e3,
+                    (cp_now_sec() - t_hash) * 1e3);
+    }
+    return ok;
 }
 
 bool Case33OclPrep::prepare_job_b_rowmajor(cl_mem b_noisy_out, const uint8_t b_noise_seed[32],
@@ -873,28 +1039,9 @@ bool Case33OclPrep::prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, 
         return false;
     }
 
-    const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
-    const int total_a = m * K;
-    const int matrix_tag = 0;
-    cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
-    cl_int err = CL_SUCCESS;
-    err |= clSetKernelArg(k_gen_random_, 0, sizeof(cl_ulong), &rng_ul);
-    err |= clSetKernelArg(k_gen_random_, 1, sizeof(int), &matrix_tag);
-    err |= clSetKernelArg(k_gen_random_, 2, sizeof(int), &total_a);
-    err |= clSetKernelArg(k_gen_random_, 3, sizeof(cl_mem), &d_A_sig_);
-    if (err != CL_SUCCESS) {
+    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
         return false;
     }
-    {
-        const size_t g = static_cast<size_t>((total_a + 255) / 256) * 256;
-        const size_t l = 256;
-        err = clEnqueueNDRangeKernel(ocl_->queue, k_gen_random_, 1, nullptr, &g, &l, 0, nullptr,
-                                     nullptr);
-        if (err != CL_SUCCESS) {
-            return false;
-        }
-    }
-    clFinish(ocl_->queue);
 
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;

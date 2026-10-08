@@ -64,6 +64,24 @@ private:
                          bool finish_queue, int *out_found = nullptr);
     bool run_gpu_jackpot_panel_(int panel_tile_count, int panel_tile_cols, int tr_base,
                                 int tc_base, int *out_found, bool finish_queue);
+    bool enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_xor, int m_panel, int n_panel,
+                             int64_t offset_a_rows, int64_t offset_b_cols, int panel_tile_count,
+                             int panel_tile_cols, int tr_base, int tc_base, cl_uint num_wait,
+                             const cl_event *wait, cl_event *done);
+    bool enqueue_jackpot_panel_(cl_command_queue queue, cl_mem tile_xor, int panel_tile_count,
+                                int panel_tile_cols, int tr_base, int tc_base, cl_uint num_wait,
+                                const cl_event *wait, cl_event *done);
+    bool ensure_pipeline_(int panel_tile_count);
+    /* ESIMD scan engine (libcp_esimd via dlopen): GEMM, milestone XOR, fold,
+     * BLAKE3 and target compare in one kernel on blocked operands. */
+    bool try_init_esimd_();
+    int scan_esimd_(int *out_found, int *out_t_rows, int *out_t_cols,
+                    uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
+                    const std::function<void(uint64_t)> &on_progress);
+    void release_esimd_();
+    int scan_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
+                        uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
+                        const std::function<void(uint64_t)> &on_progress);
     bool run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t offset_a_rows,
                                  int64_t offset_b_cols, int panel_tile_count, int panel_tile_cols,
                                  int tr_base, int tc_base, int *out_found, int *out_t_rows = nullptr,
@@ -113,6 +131,22 @@ private:
     cl_mem b_buf_ = nullptr;
     cl_mem c_buf_ = nullptr;
     cl_mem tile_xor_buf_ = nullptr;
+    bool esimd_ = false;
+    void *esimd_lib_ = nullptr;
+    struct CpEsimdScan *esimd_scan_ = nullptr;
+    void *esimd_panel_fn_ = nullptr;   // cp_esimd_scan_panel_fn
+    void *esimd_wait_fn_ = nullptr;    // cp_esimd_wait_fn
+    void *esimd_destroy_fn_ = nullptr; // cp_esimd_destroy_fn
+    int esimd_es_ = 8;
+    int esimd_tile_m_ = 0;
+    int esimd_tile_n_ = 0;
+    cl_mem esimd_found_ = nullptr;
+    int esimd_found_host_[2][4] = {};
+    /* Pipelined scan: out-of-order queue, double tile_xor, async found flags. */
+    cl_command_queue pipe_queue_ = nullptr;
+    cl_mem pipe_tile_xor_[2] = {};
+    int pipe_tile_xor_cap_ = 0;
+    int pipe_found_host_[2] = {};
     cl_program jackpot_program_ = nullptr;
     cl_kernel jackpot_kernel_ = nullptr;
     cl_kernel blake3_kernel_ = nullptr;

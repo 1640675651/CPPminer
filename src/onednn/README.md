@@ -17,6 +17,8 @@ prepare_onednn_deps.bat
 
 Fetches oneDNN into project `third_party/onednn-src` and vendors nGEN/gemmstone under `src/onednn/third_party/` (+ `case5_patches/` overlay).
 
+On Linux run `sh prepare_onednn_deps.sh` (same behaviour, `refresh` argument too); CMake does not run it automatically there. Arc (XeHPG) results: [docs/intel_a380_onednn.md](../../docs/intel_a380_onednn.md). Optional ESIMD XMX scan (`-DCP_ENABLE_ESIMD=ON`, oneAPI icpx/icx): [docs/intel_esimd.md](../../docs/intel_esimd.md).
+
 **Important:** `third_party/gemmstone` is generated locally (gitignored). The build applies `case5_patches/` on every configure. If you see errors like `case5TileXorWrap is not a member of gemmstone::GEMMProblem`, patches were not applied:
 
 ```bat

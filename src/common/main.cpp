@@ -441,6 +441,7 @@ int main(int argc, char** argv)
     int n_units = 0;
     int batch_size = CP_PERIOD_BATCH_DEFAULT;
     int batch_size_set = 0;
+    int row_period_batch_set = 0;
     int row_period_batch = CP_ROW_PERIOD_BATCH_DEFAULT;
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
@@ -777,6 +778,7 @@ int main(int argc, char** argv)
             const char* v = argv[i] + 18;
             if(*v == '=') row_period_batch = atoi(v + 1);
             else if(i + 1 < argc) row_period_batch = atoi(argv[++i]);
+            row_period_batch_set = 1;
         } else if(!strcmp(argv[i], "--row-major-ap")){
             step_major_ap = 0;
         } else if(!strcmp(argv[i], "--step-major")){
@@ -1335,12 +1337,14 @@ int main(int argc, char** argv)
 #endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-        if(batch_size == CP_PERIOD_BATCH_DEFAULT){
+        /* Unset batches: the worker picks them once it knows the kernel. */
+        if(!batch_size_set){
             batch_size = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
         }
-        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
+        if(!row_period_batch_set){
             row_period_batch = CP_ONEDNN_PERIOD_BATCH_DEFAULT;
         }
+        cp_onednn_worker_set_auto_batch(!batch_size_set, !row_period_batch_set);
     }
 #endif
     cp_worker_set_period_batch(batch_size);
@@ -1355,6 +1359,9 @@ int main(int argc, char** argv)
         }
         cp_onednn_worker_init(devs, ndev);
         cp_worker_apply_backend_defaults();
+        /* Init may raise unset batches for systolic kernels. */
+        batch_size = cp_onednn_worker_col_period_batch();
+        row_period_batch = cp_onednn_worker_row_period_batch();
     }
 #endif
     cp_worker_set_step_major_ap(step_major_ap);
