@@ -128,6 +128,11 @@ static void print_usage(void)
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+    printf("  --cuda-mma MODE      CUTLASS warp MMA: auto (default: tensorop80 on sm_80+,\n");
+    printf("                       tensorop on sm_75, dp4a SIMT below), simt, tensorop\n");
+    printf("                       (mma.m8n8k16, 2-stage), tensorop80 (mma.m16n8k32,\n");
+    printf("                       multistage cp.async; sm_80+), tensoropms (multistage\n");
+    printf("                       + m8n8k16; A/B and sm_75 validation)\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
@@ -446,6 +451,9 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
+    /* --cuda-mma (CP_CUTLASS_MMA_*): 0 auto, 1 simt dp4a, 2 tensorop (Sm75),
+     * 3 tensorop80 (Sm80 m16n8k32 multistage), 4 tensoropms. */
+    int cuda_mma = 0;
     int onednn_fused_jackpot = 0;
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
@@ -795,6 +803,18 @@ int main(int argc, char** argv)
 #endif
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
+        } else if(!strcmp(argv[i], "--cuda-mma") && i + 1 < argc){
+            const char* v = argv[++i];
+            if(!strcmp(v, "auto")) cuda_mma = 0;
+            else if(!strcmp(v, "simt")) cuda_mma = 1;
+            else if(!strcmp(v, "tensorop")) cuda_mma = 2;
+            else if(!strcmp(v, "tensorop80")) cuda_mma = 3;
+            else if(!strcmp(v, "tensoropms")) cuda_mma = 4;
+            else {
+                fprintf(stderr, "--cuda-mma requires auto, simt, tensorop, tensorop80, "
+                                "or tensoropms\n");
+                return 1;
+            }
         } else if(!strcmp(argv[i], "--fused-jackpot")){
             onednn_fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
@@ -1115,6 +1135,7 @@ int main(int argc, char** argv)
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){
         if(cutlass_fused < 0) cutlass_fused = 1;
+        cp_worker_set_cuda_mma(cuda_mma);
     } else {
         cutlass_fused = 0;
     }
