@@ -17,9 +17,6 @@
 
 static std::atomic<int> g_qpow_active{0};
 static char g_session_id[80] = {0};
-static std::mutex g_pending_mx;
-static CpQpowJob g_pending;
-static int g_pending_valid = 0;
 
 static int json_str_from(const char* json, const char* key, char* out, int outlen)
 {
@@ -36,13 +33,6 @@ static int json_object(const char* value, std::string& out)
     return 1;
 }
 
-static void queue_pending(const CpQpowJob* job)
-{
-    std::lock_guard<std::mutex> lk(g_pending_mx);
-    g_pending = *job;
-    g_pending_valid = 1;
-}
-
 void cp_qpow_pool_set_active(int on)
 {
     g_qpow_active.store(on ? 1 : 0);
@@ -50,9 +40,6 @@ void cp_qpow_pool_set_active(int on)
 
 void cp_qpow_pool_clear(void)
 {
-    std::lock_guard<std::mutex> lk(g_pending_mx);
-    g_pending_valid = 0;
-    memset(&g_pending, 0, sizeof(g_pending));
     g_session_id[0] = 0;
 }
 
@@ -131,7 +118,7 @@ int cp_qpow_pool_submit_share(const CpQpowJob* job, int sock, int* msg_id,
 
 int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
 {
-    if(!json || !out) return 0;
+    if(!cp_json_valid(json) || !out) return 0;
     memset(out, 0, sizeof(*out));
 
     std::string params, nested_job;
@@ -148,6 +135,7 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
         json = nested_job.c_str();
     }
     if(!clean) clean = cp_json_member(json, "clean_jobs");
+    if(clean && strncmp(clean, "true", 4) && strncmp(clean, "false", 5)) return 0;
     out->clean_jobs = clean && !strncmp(clean, "true", 4);
 
     if(!json_str_from(json, "job_id", out->job_id, (int)sizeof(out->job_id)) || !out->job_id[0])
@@ -175,8 +163,11 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
             return 0;
     }
 
-    out->difficulty = cp_json_num(json, "difficulty");
-    out->seq = (uint64_t)cp_json_num(json, "seq");
+    const char* difficulty = cp_json_member(json, "difficulty");
+    if(difficulty && (!cp_json_number_value(difficulty, &out->difficulty) || out->difficulty <= 0))
+        return 0;
+    const char* seq = cp_json_member(json, "seq");
+    if(seq && !cp_json_uint64_value(seq, &out->seq)) return 0;
 
     /* Canonical bytes: case-only hex changes are duplicates, but every work field matters. */
     cp_bin_to_hex(out->mining_hash, sizeof(out->mining_hash), mh);
@@ -264,25 +255,12 @@ int cp_qpow_pool_on_line(const char* line)
         return 1;
     }
 
-    if(cp_job_mining_active()){
-        if(cp_job_key_matches(job.job_key)) return 1;
-        cp_job_request_cancel();
-        queue_pending(&job);
+    if(cp_job_mining_active() && !cp_job_key_matches(job.job_key)){
         printf("[net] new quantus job %s while mining %s - cancelling\n",
                job.job_id, cp_job_mining_key());
         fflush(stdout);
-        return 1;
     }
 
-    /* Idle: push raw line to inbox for main wait loop. */
-    return 0; /* let default inbox push happen */
-}
-
-int cp_qpow_pool_take_pending(CpQpowJob* out)
-{
-    std::lock_guard<std::mutex> lk(g_pending_mx);
-    if(!g_pending_valid) return 0;
-    if(out) *out = g_pending;
-    g_pending_valid = 0;
+    cp_pool_publish_quantus(&job);
     return 1;
 }

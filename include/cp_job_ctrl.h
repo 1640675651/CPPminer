@@ -9,6 +9,9 @@ extern "C" {
 #endif
 
 void cp_job_mine_begin(const char* job_key);
+/* Publish before waking the consumer; a stale begin is cancelled atomically. */
+void cp_job_publish_work(const char* job_key);
+void cp_job_reset_work(void);
 void cp_job_mine_end(void);
 int cp_job_should_cancel(void);
 

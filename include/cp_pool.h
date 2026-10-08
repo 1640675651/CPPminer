@@ -6,6 +6,8 @@
 
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
+#include "cp_algo.h"
+#include "cp_qpow_pool.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,13 +31,10 @@ int cp_pool_send_tracked_submit(int sock, int msg_id, const char* json);
 
 void cp_pool_reader_start(void);
 void cp_pool_reader_stop(void);
-void cp_pool_inbox_clear(void);
 
 /* Blocking read of one JSON object (reader must be stopped). 1=ok, 0=timeout, -1=lost */
 int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms);
 
-/* 1 = line copied, 0 = timeout, -1 = connection lost */
-int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms);
 int cp_pool_conn_lost(void);
 
 void cp_pool_log_share_submit_outcome(void);
@@ -55,9 +54,19 @@ typedef struct {
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     uint32_t tgt[8];
     uint32_t cert_version; /* 1/2=legacy seeds, 3=salted */
-} CpPendingJob;
+    double difficulty;
+    int has_pool_target;
+} CpPearlJob;
 
-int cp_pool_take_pending_job(CpPendingJob* out);
+typedef struct {
+    CpAlgoId algo;
+    CpPearlJob pearl;
+    CpQpowJob quantus;
+} CpPoolWork;
+
+/* One latest parsed job, shared by idle and active mining. 1=work, 0=timeout, -1=lost. */
+int cp_pool_wait_work(CpPoolWork* out, int timeout_ms);
+void cp_pool_publish_quantus(const CpQpowJob* job);
 
 double cp_pool_difficulty(void);
 void cp_pool_set_difficulty(double d);

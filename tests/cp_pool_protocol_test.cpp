@@ -198,7 +198,7 @@ static void test_quantus_login()
     assert(!strcmp(session, "s") && !parsed.job_id[0]); // A notification may supply initial work.
     const std::string wrapped = "{\"method\" : \"job\",\"params\":{\"clean_jobs\":true,\"job\":" + job + "}}";
     assert(cp_qpow_pool_parse_job(wrapped.c_str(), &parsed) && parsed.clean_jobs);
-    const std::string nested_clean = "{\"method\":\"job\",\"params\":{\"job\":{\"clean_jobs\":true," + job.substr(1) + "}}}";
+    const std::string nested_clean = "{\"method\":\"job\",\"params\":{\"job\":{\"clean_jobs\":true," + job.substr(1) + "}}";
     assert(cp_qpow_pool_parse_job(nested_clean.c_str(), &parsed) && parsed.clean_jobs);
     assert(!cp_qpow_pool_parse_job(quantus_job_json(std::string(64, '0'), std::string(128, '0'),
                                                    std::string(100, 'a')).c_str(), &parsed));
@@ -316,6 +316,72 @@ static void test_quantus_submit_after_search()
     cp_job_mine_end();
 }
 
+static void test_strict_json_and_numbers()
+{
+    const char* complete = "{\"id\":7,\"text\":\"\\u0031\\u0410\\ud83d\\ude80\",\"x\":[true,null,-1.25e+2]}";
+    assert(cp_json_valid(complete));
+    size_t len = 0;
+    for(size_t i = 1; i < strlen(complete); ++i)
+        assert(cp_json_object_length(complete, i, &len) == 0);
+    assert(cp_json_object_length(complete, strlen(complete), &len) == 1);
+    char text[32];
+    assert(cp_json_str(complete, "text", text, sizeof(text)));
+    assert(!strcmp(text, "1\xd0\x90\xf0\x9f\x9a\x80"));
+    assert(cp_json_str("{\"\\u0069d\":\"decoded-key\"}", "id", text, sizeof(text)));
+    assert(!strcmp(text, "decoded-key"));
+    for(const char* invalid : {"{\"id\":1 \"result\":true}", "{\"result\":truex}",
+            "{\"result\":true,\"error\":nullx}", "{\"n\":0x10}", "{\"n\":01}",
+            "{\"n\":1.}", "{\"n\":.1}", "{\"n\":+1}", "{\"n\":1e}", "{\"a\":[1,]}",
+            "{\"a\":1,}", "{\"a\":\"\\x41\"}", "{\"a\":\"\\ud800\"}", "{\"a\":\"\\udc00\"}",
+            "{\"a\":\"\xc0\xaf\"}", "{\"id\":1,\"\\u0069d\":2}", "{}junk"})
+        assert(!cp_json_valid(invalid));
+    assert(!cp_json_str("{\"id\":\"\\u0000hidden\"}", "id", text, sizeof(text)) && !text[0]);
+    for(const char* result : {"0", "\"\"", "[]", "{\"status\":\"FAIL\"}", "{\"status\":null}"}){
+        const std::string json = "{\"id\":1,\"result\":" + std::string(result) + "}";
+        int accepted = 1;
+        assert(cp_json_rpc_response(json.c_str(), nullptr, &accepted) && !accepted);
+    }
+    const std::string base = quantus_job_json(std::string(64, '0'), std::string(128, '0'), "");
+    CpQpowJob job;
+    for(const char* seq : {"9007199254740993", "18446744073709551615"}){
+        const std::string json = base.substr(0, base.size() - 1) + ",\"seq\":" + seq + "}";
+        assert(cp_qpow_pool_parse_job(json.c_str(), &job));
+        assert(job.seq == (!strcmp(seq, "9007199254740993") ? UINT64_C(9007199254740993) : UINT64_MAX));
+    }
+    for(const char* seq : {"-1", "1e300", "1.5", "18446744073709551616", "\"1\"", "null"}){
+        const std::string json = base.substr(0, base.size() - 1) + ",\"seq\":" + seq + "}";
+        assert(!cp_qpow_pool_parse_job(json.c_str(), &job));
+    }
+    for(const char* difficulty : {"0", "-1", "1e309", "\"1\"", "null"}){
+        const std::string json = base.substr(0, base.size() - 1) + ",\"difficulty\":" + difficulty + "}";
+        assert(!cp_qpow_pool_parse_job(json.c_str(), &job));
+    }
+}
+
+static void test_latest_work_handoff()
+{
+    CpQpowJob old_job, new_job;
+    assert(cp_qpow_pool_parse_job(quantus_job_json(std::string(64, '0'), std::string(128, '0'), "").c_str(), &old_job));
+    assert(cp_qpow_pool_parse_job(quantus_job_json(std::string(64, '1'), std::string(128, '0'), "").c_str(), &new_job));
+    CpPoolWork work;
+    cp_pool_publish_quantus(&old_job);
+    cp_pool_publish_quantus(&new_job);
+    assert(cp_pool_wait_work(&work, 0) == 1 && work.algo == CP_ALGO_QUANTUS);
+    assert(!strcmp(work.quantus.job_key, new_job.job_key));
+    assert(cp_pool_wait_work(&work, 0) == 0);
+    cp_job_mine_begin(old_job.job_key); // A newer job arrived between taking work and beginning it.
+    assert(cp_job_should_cancel());
+    cp_job_mine_end();
+    cp_job_mine_begin(new_job.job_key);
+    assert(!cp_job_should_cancel());
+    cp_pool_publish_quantus(&old_job); // Also cancels after begin, including a reused pool id.
+    assert(cp_job_should_cancel());
+    cp_job_mine_end();
+    cp_pool_disconnect();
+    assert(cp_pool_wait_work(&work, 0) == 0);
+    cp_job_reset_work();
+}
+
 int main()
 {
     double difficulty = 0;
@@ -349,6 +415,8 @@ int main()
     test_quantus_work_identity();
     test_quantus_login();
     test_pearl_notify_validation();
+    test_strict_json_and_numbers();
+    test_latest_work_handoff();
     test_quantus_submit_after_search();
 #ifdef __linux__
     int pair[2];

@@ -35,7 +35,8 @@ const char* cp_json_member(const char* json, const char* key);
 int cp_json_str_value(const char* value, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);
 /* Response with a top-level integer id and no method. Nested ids do not
- * match outstanding requests. accepted is false on result:false or error. */
+ * match outstanding requests. Success requires result:true or an object with
+ * absent/OK status, and no non-null error. Wrong result types are rejected. */
 int cp_json_rpc_response(const char* json, int* id, int* accepted);
 
 /* Offline mock: unscaled target 2^(256 - D); the tile is applied once by cp_scale_jackpot_target. */

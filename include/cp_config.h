@@ -58,6 +58,7 @@
 #define CP_JOB_NONE        0
 #define CP_JOB_FEE_SWITCH  1 /* reconnect + re-authorize for developer fee wallet */
 #define CP_JOB_CANCELLED (-1)
+#define CP_JOB_ERROR     (-2) /* Fatal backend/resource failure; caller must not wait for a new job. */
 
 /* Offline --mock defaults (different difficulty definitions per algo).
  * Pearl: 2^(256 - D) unscaled target, tile applied once (~few–tens of seconds at --m 8 --n 8).

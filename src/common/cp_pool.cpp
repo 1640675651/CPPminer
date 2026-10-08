@@ -19,7 +19,6 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,11 +29,9 @@ static CpPoolSession g_session;
 static std::atomic<int> g_net_reader_run{0};
 static std::atomic<int> g_net_conn_lost{0};
 static std::mutex g_net_mx;
-static std::mutex g_pending_mx;
-static CpPendingJob g_pending_job;
-static int g_pending_valid = 0;
 static std::thread g_net_reader;
-static std::deque<std::string> g_pool_inbox;
+static CpPoolWork g_latest_work;
+static bool g_work_ready = false;
 static std::mutex g_inbox_mx;
 static std::condition_variable g_inbox_cv;
 static char net_buf[65536];
@@ -69,29 +66,21 @@ static int tcp_connect(const char* host, int port)
     return (int)s;
 }
 
-static void queue_pending_job(
-    const char* job_id, const char* job_key,
-    const uint8_t* header, const char* target_hex, const uint32_t tgt[8],
-    uint32_t cert_version)
-{
-    std::lock_guard<std::mutex> lk(g_pending_mx);
-    strncpy(g_pending_job.job_id, job_id, sizeof(g_pending_job.job_id) - 1);
-    g_pending_job.job_id[sizeof(g_pending_job.job_id) - 1] = 0;
-    strncpy(g_pending_job.job_key, job_key, sizeof(g_pending_job.job_key) - 1);
-    g_pending_job.job_key[sizeof(g_pending_job.job_key) - 1] = 0;
-    strncpy(g_pending_job.target_hex, target_hex, sizeof(g_pending_job.target_hex) - 1);
-    g_pending_job.target_hex[sizeof(g_pending_job.target_hex) - 1] = 0;
-    memcpy(g_pending_job.header, header, INCOMPLETE_HEADER_BYTES);
-    memcpy(g_pending_job.tgt, tgt, 8 * sizeof(uint32_t));
-    g_pending_job.cert_version = cp_resolve_cert_version(cert_version);
-    g_pending_valid = 1;
-}
-
-static void pool_inbox_push(const char* line)
+static void pool_publish_work(const CpPoolWork& work, const char* job_key)
 {
     std::lock_guard<std::mutex> lk(g_inbox_mx);
-    g_pool_inbox.emplace_back(line);
-    g_inbox_cv.notify_one();
+    g_latest_work = work;
+    g_work_ready = true;
+    cp_job_publish_work(job_key);
+    g_inbox_cv.notify_all();
+}
+
+void cp_pool_publish_quantus(const CpQpowJob* job)
+{
+    CpPoolWork work{};
+    work.algo = CP_ALGO_QUANTUS;
+    work.quantus = *job;
+    pool_publish_work(work, job->job_key);
 }
 
 static int net_wait_readable(int sock, int timeout_ms)
@@ -166,51 +155,41 @@ static void pool_dispatch_line(const char* line)
     }
 
     if(!strcmp(method, "mining.notify")){
-        char job_id[128] = {0};
+        CpPoolWork work{};
+        work.algo = CP_ALGO_PEARL;
+        CpPearlJob& job = work.pearl;
         char header_hex[320] = {0};
-        char target_hex[80] = {0};
-        uint32_t cert_version = 0;
-        if(!cp_pool_parse_notify(line, job_id, sizeof(job_id),
+        if(!cp_pool_parse_notify(line, job.job_id, sizeof(job.job_id),
                                 header_hex, sizeof(header_hex),
-                                target_hex, sizeof(target_hex),
-                                &cert_version)){
+                                job.target_hex, sizeof(job.target_hex),
+                                &job.cert_version)){
             return;
         }
-        cert_version = cp_resolve_cert_version(cert_version);
-
-        uint8_t header[INCOMPLETE_HEADER_BYTES];
-        int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
+        job.cert_version = cp_resolve_cert_version(job.cert_version);
+        int hlen = cp_hex_to_bytes(header_hex, job.header, INCOMPLETE_HEADER_BYTES);
         if(hlen != INCOMPLETE_HEADER_BYTES) return;
         g_session.received_job();
 
-        uint32_t tgt[8];
-        memset(tgt, 0, sizeof(tgt));
-        if(target_hex[0]){
-            if(!cp_be_target_hex_to_le_words(target_hex, tgt)) return;
-        }else cp_pool_target_from_difficulty(g_diff.load(), tgt);
-
-        char job_key[CP_JOB_KEY_CAP];
-        if(!cp_pearl_job_key(job_key, sizeof(job_key), job_id, header, hlen, tgt,
-                             cert_version)) return;
-
-        if(cp_job_mining_active()){
-            if(cp_job_key_matches(job_key)) return;
-            cp_job_request_cancel();
-            queue_pending_job(job_id, job_key, header, target_hex, tgt, cert_version);
-            printf("[net] new job %s while mining %s - cancelling stale work\n",
-                   job_id, cp_job_mining_key());
-            fflush(stdout);
-            return;
+        job.has_pool_target = job.target_hex[0] != 0;
+        job.difficulty = g_diff.load();
+        if(job.has_pool_target){
+            if(!cp_be_target_hex_to_le_words(job.target_hex, job.tgt)) return;
+        }else{
+            cp_pool_target_from_difficulty(job.difficulty, job.tgt);
+            cp_le_words_to_be_target_hex(job.tgt, job.target_hex);
         }
-
-        pool_inbox_push(line);
+        if(!cp_pearl_job_key(job.job_key, sizeof(job.job_key), job.job_id, job.header, hlen,
+                             job.tgt, job.cert_version)) return;
+        if(cp_job_mining_active() && !cp_job_key_matches(job.job_key)){
+            printf("[net] new job %s while mining %s - cancelling stale work\n",
+                   job.job_id, cp_job_mining_key());
+            fflush(stdout);
+        }
+        pool_publish_work(work, job.job_key);
         return;
     }
 
-    if(!cp_job_mining_active())
-        pool_inbox_push(line);
-    else
-        printf("[pool] (during mine) %s\n", line);
+    printf("[pool] (unhandled) %s\n", line);
     fflush(stdout);
 }
 
@@ -263,6 +242,8 @@ int cp_pool_connect(const char* host, int port)
 {
     g_session.reset();
     g_net_conn_lost.store(0);
+    g_diff.store(32.0);
+    cp_job_reset_work();
     tcp_sock = tcp_connect(host, port);
     return tcp_sock >= 0;
 }
@@ -275,8 +256,8 @@ void cp_pool_disconnect(void)
     }
     net_pos = 0;
     {
-        std::lock_guard<std::mutex> lock(g_pending_mx);
-        g_pending_valid = 0;
+        std::lock_guard<std::mutex> lock(g_inbox_mx);
+        g_work_ready = false;
     }
     g_session.reset();
 }
@@ -384,12 +365,6 @@ void cp_pool_reader_stop(void)
     if(g_net_reader.joinable()) g_net_reader.join();
 }
 
-void cp_pool_inbox_clear(void)
-{
-    std::lock_guard<std::mutex> lk(g_inbox_mx);
-    g_pool_inbox.clear();
-}
-
 int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
 {
     if(!out || out_cap == 0 || tcp_sock < 0) return -1;
@@ -421,31 +396,17 @@ int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms)
     }
 }
 
-int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
+int cp_pool_wait_work(CpPoolWork* out, int timeout_ms)
 {
-    if(!out || out_cap == 0) return -1;
+    if(!out) return -1;
     std::unique_lock<std::mutex> lk(g_inbox_mx);
-    for(;;){
-        if(g_net_conn_lost.load()) return -1;
-        if(!g_pool_inbox.empty()){
-            const std::string& line = g_pool_inbox.front();
-            if(line.size() >= out_cap){
-                g_pool_inbox.pop_front();
-                return -1;
-            }
-            memcpy(out, line.c_str(), line.size() + 1);
-            g_pool_inbox.pop_front();
-            return 1;
-        }
-        if(timeout_ms < 0){
-            g_inbox_cv.wait(lk);
-            continue;
-        }
-        if(g_inbox_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms))
-           == std::cv_status::timeout){
-            return 0;
-        }
-    }
+    const auto ready = [] { return g_net_conn_lost.load() || g_work_ready; };
+    if(timeout_ms < 0) g_inbox_cv.wait(lk, ready);
+    else if(!g_inbox_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready)) return 0;
+    if(g_net_conn_lost.load()) return -1;
+    *out = g_latest_work;
+    g_work_ready = false;
+    return 1;
 }
 
 int cp_pool_conn_lost(void)
@@ -470,15 +431,16 @@ static const char* skip_json_space(const char* p)
 
 int cp_pool_parse_difficulty(const char* json, double* difficulty_out)
 {
+    if(!cp_json_valid(json)) return 0;
     const char* p = cp_json_member(json, "params");
     if(!p || !difficulty_out) return 0;
     const int array = *p == '[';
     if(array) p = skip_json_space(p + 1);
-    if(*p != '-' && (*p < '0' || *p > '9')) return 0;
-    char* end = nullptr;
-    const double d = strtod(p, &end);
-    if(end == p || !std::isfinite(d) || d <= 0) return 0;
-    p = skip_json_space(end);
+    double d;
+    size_t len = 0;
+    if(!cp_json_number_value(p, &d) || d <= 0 ||
+       cp_json_value_length(p, strlen(p), &len) != 1) return 0;
+    p = skip_json_space(p + len);
     if(array){
         if(*p != ']') return 0;
         p = skip_json_space(p + 1);
@@ -545,7 +507,7 @@ int cp_pool_parse_notify(const char* json,
                          char* target_hex, int target_len,
                          uint32_t* cert_version_out)
 {
-    if(!json || !job_id || job_len <= 0 || !header_hex || header_len <= 0 ||
+    if(!cp_json_valid(json) || !job_id || job_len <= 0 || !header_hex || header_len <= 0 ||
        !target_hex || target_len <= 0) return 0;
     job_id[0] = header_hex[0] = target_hex[0] = 0;
     if(cert_version_out) *cert_version_out = 0;
@@ -588,15 +550,6 @@ int cp_pool_parse_notify(const char* json,
     uint32_t target[8];
     return job_id[0] && cp_hex_to_bytes(header_hex, header, sizeof(header)) == sizeof(header) &&
            (!target_hex[0] || cp_be_target_hex_to_le_words(target_hex, target));
-}
-
-int cp_pool_take_pending_job(CpPendingJob* out)
-{
-    std::lock_guard<std::mutex> lk(g_pending_mx);
-    if(!g_pending_valid) return 0;
-    *out = g_pending_job;
-    g_pending_valid = 0;
-    return 1;
 }
 
 double cp_pool_difficulty(void)

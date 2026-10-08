@@ -56,7 +56,6 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out);
 /* Called from Pearl pool reader when Quantus mode is active. Returns 1 if handled. */
 int cp_qpow_pool_on_line(const char* line);
 
-int cp_qpow_pool_take_pending(CpQpowJob* out);
 
 #ifdef __cplusplus
 }

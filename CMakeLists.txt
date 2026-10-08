@@ -60,6 +60,7 @@ if(BUILD_TESTING)
     add_test(NAME cp_pool_protocol COMMAND cp_pool_protocol_test)
     add_executable(cp_share_cancel_test
         tests/cp_share_cancel_test.cpp
+        src/common/cp_json_frame.cpp
         src/common/cp_share_queue.cpp
         src/common/cp_job_ctrl.cpp
         src/common/cp_util.cpp
