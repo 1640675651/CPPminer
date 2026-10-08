@@ -26,6 +26,9 @@ int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap);
 
 int cp_json_str(const char* json, const char* key, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);
+/* Response with a top-level integer id and no method. Nested ids do not
+ * match outstanding requests. accepted is false on result:false or error. */
+int cp_json_rpc_response(const char* json, int* id, int* accepted);
 
 /* Offline mock: unscaled target 2^(256 - D); the tile is applied once by cp_scale_jackpot_target. */
 void cp_mock_target_from_difficulty(double difficulty, uint32_t tgt[8]);

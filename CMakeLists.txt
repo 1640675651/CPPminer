@@ -34,12 +34,14 @@ project(cppminer LANGUAGES ${_cp_langs})
 set(CMAKE_CXX_STANDARD 17)
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
     add_executable(cp_pool_protocol_test
         tests/cp_pool_protocol_test.cpp
         src/common/cp_json_frame.cpp
         src/common/cp_util.cpp
         src/common/cp_state.cpp)
     target_include_directories(cp_pool_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(cp_pool_protocol_test PRIVATE Threads::Threads)
     if(WIN32)
         target_link_libraries(cp_pool_protocol_test PRIVATE bcrypt ws2_32)
     endif()

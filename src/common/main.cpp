@@ -1639,6 +1639,11 @@ reconnect:
 
     if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
+    cp_pool_reader_start();
+    if(!cp_pool_wait_authorized()){
+        cp_sleep(2);
+        goto reconnect;
+    }
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
         printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
@@ -1647,8 +1652,6 @@ reconnect:
                (unsigned long long)cp_fee_threshold());
         fflush(stdout);
     }
-
-    cp_pool_reader_start();
 
     while(1){
         char line_buf[65536];

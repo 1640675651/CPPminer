@@ -1,4 +1,5 @@
 #include "cp_util.h"
+#include <limits.h>
 #include "cp_config.h"
 #include "cp_state.h"
 #include "cp_platform.h"
@@ -268,11 +269,14 @@ int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap)
 
 /* Find a JSON member name, skipping string contents (including escapes).
  * The pool protocol uses unique member names for the fields read here. */
-static const char* cp_json_value(const char* json, const char* key)
+static const char* cp_json_value(const char* json, const char* key, int top_level_only = 0)
 {
     if(!json || !key || !*key) return NULL;
     const size_t key_len = strlen(key);
+    int depth = 0;
     for(const char* p = json; *p; ++p){
+        if(*p == '{' || *p == '[') ++depth;
+        else if(*p == '}' || *p == ']') --depth;
         if(*p != '"') continue;
         const char* begin = ++p;
         while(*p && *p != '"'){
@@ -282,7 +286,8 @@ static const char* cp_json_value(const char* json, const char* key)
         if(!*p) return NULL;
         const char* after = p + 1;
         while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
-        if((size_t)(p - begin) == key_len && !memcmp(begin, key, key_len) && *after == ':'){
+        if((!top_level_only || depth == 1) &&
+           (size_t)(p - begin) == key_len && !memcmp(begin, key, key_len) && *after == ':'){
             ++after;
             while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
             return after;
@@ -327,6 +332,26 @@ double cp_json_num(const char* json, const char* key)
     char* end = NULL;
     double value = strtod(p, &end);
     return end != p && isfinite(value) ? value : 0;
+}
+
+int cp_json_rpc_response(const char* json, int* id, int* accepted)
+{
+    if(cp_json_value(json, "method", 1)) return 0;
+    const char* p = cp_json_value(json, "id", 1);
+    const char* result = cp_json_value(json, "result", 1);
+    const char* error = cp_json_value(json, "error", 1);
+    if(!p || (!result && !error)) return 0;
+    char* end = nullptr;
+    const double value = strtod(p, &end);
+    if(end == p || !isfinite(value) || value < 0 || value > (double)INT_MAX ||
+       value != (double)(int)value) return 0;
+    while(*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    if(*end != ',' && *end != '}') return 0;
+    if(id) *id = (int)value;
+    if(accepted)
+        *accepted = result && strncmp(result, "false", 5) && strncmp(result, "null", 4)
+            && (!error || !strncmp(error, "null", 4));
+    return 1;
 }
 
 static int g_pp_hash_h_override = 0;

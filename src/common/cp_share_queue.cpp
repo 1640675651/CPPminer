@@ -374,7 +374,6 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
-    cp_pool_set_submit_inflight(1);
     printf("[net] plain_proof submit sent (nonce=%llu)\n", (unsigned long long)snap->nonce);
     cp_pool_log_share_submit_outcome();
     fflush(stdout);

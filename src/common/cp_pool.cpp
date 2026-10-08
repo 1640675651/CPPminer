@@ -1,4 +1,5 @@
 #include "cp_pool.h"
+#include "cp_pool_session.hpp"
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
 #include "cp_json_frame.h"
@@ -22,7 +23,7 @@
 
 static int tcp_sock = -1;
 static std::atomic<double> g_diff{32.0};
-static std::atomic<int> g_submit_inflight{0};
+static CpPoolSession g_session;
 static std::atomic<int> g_net_reader_run{0};
 static std::atomic<int> g_net_conn_lost{0};
 static std::mutex g_net_mx;
@@ -36,6 +37,27 @@ static std::condition_variable g_inbox_cv;
 static char net_buf[65536];
 static int net_pos = 0;
 static char json_msg[65536];
+
+static void pool_connection_lost(const char* reason)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_inbox_mx);
+        g_net_conn_lost.store(1);
+    }
+    cp_job_request_cancel();
+    /* Unblock a proof sender too: it may be waiting inside send() while
+     * the reader discovers a dead session. Close the descriptor after join. */
+    if(tcp_sock >= 0){
+#ifdef _WIN32
+        shutdown((cp_sock_t)tcp_sock, SD_BOTH);
+#else
+        shutdown(tcp_sock, SHUT_RDWR);
+#endif
+    }
+    g_inbox_cv.notify_all();
+    printf("[net] %s; reconnecting\n", reason);
+    fflush(stdout);
+}
 
 static int tcp_connect(const char* host, int port)
 {
@@ -148,13 +170,16 @@ static void pool_dispatch_line(const char* line)
         return;
     }
 
-    if(strstr(line, "result") || strstr(line, "error")){
-        if(g_submit_inflight.load())
+    if(cp_pool_on_authorize_response(line))
+        return;
+
+    int response_id = 0;
+    if(cp_json_rpc_response(line, &response_id, nullptr)){
+        if(g_session.finish_submit(response_id))
             printf("[pool] submit response: %s\n", line);
         else
             printf("[pool] jsonrpc: %s\n", line);
         fflush(stdout);
-        g_submit_inflight.store(0);
         return;
     }
 
@@ -177,6 +202,7 @@ static void pool_dispatch_line(const char* line)
         uint8_t header[INCOMPLETE_HEADER_BYTES];
         int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
         if(hlen != INCOMPLETE_HEADER_BYTES) return;
+        g_session.received_job();
 
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
@@ -209,7 +235,17 @@ static void pool_net_reader_thread(void)
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
     cp_cpu_affinity_release_thread();
 #endif
-    while(g_net_reader_run.load()){
+    while(g_net_reader_run.load() && !g_net_conn_lost.load()){
+        /* Deadlines also apply when the peer continuously sends other data. */
+        switch(g_session.expired(cp_now_sec())){
+            case CpPoolSession::Timeout::Authorize:
+                pool_connection_lost("no authorize response for 30 s"); return;
+            case CpPoolSession::Timeout::FirstJob:
+                pool_connection_lost("no valid first job for 30 s after authorize"); return;
+            case CpPoolSession::Timeout::Submit:
+                pool_connection_lost("no pool reply to a submit for 60 s"); return;
+            case CpPoolSession::Timeout::None: break;
+        }
         /* Drain buffered messages before waiting — pool often sends authorize
          * ack + mining.notify back-to-back in one TCP segment. */
         int state;
@@ -224,9 +260,7 @@ static void pool_net_reader_thread(void)
             }
         }
         if(state < 0 || net_pos >= (int)sizeof(net_buf) - 1){
-            g_net_conn_lost.store(1);
-            g_inbox_cv.notify_all();
-            printf("[net] invalid or oversized pool message\n"); fflush(stdout);
+            pool_connection_lost("invalid or oversized pool message");
             return;
         }
         if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load()) continue;
@@ -234,9 +268,7 @@ static void pool_net_reader_thread(void)
         int n = recv(tcp_sock, net_buf + net_pos,
                      (int)sizeof(net_buf) - net_pos - 1, 0);
         if(n <= 0){
-            g_net_conn_lost.store(1);
-            g_inbox_cv.notify_all();
-            printf("[net] connection lost (reader)\n"); fflush(stdout);
+            pool_connection_lost("connection lost (reader)");
             return;
         }
         net_pos += n;
@@ -245,6 +277,8 @@ static void pool_net_reader_thread(void)
 
 int cp_pool_connect(const char* host, int port)
 {
+    g_session.reset();
+    g_net_conn_lost.store(0);
     tcp_sock = tcp_connect(host, port);
     return tcp_sock >= 0;
 }
@@ -256,6 +290,7 @@ void cp_pool_disconnect(void)
         tcp_sock = -1;
     }
     net_pos = 0;
+    g_session.reset();
 }
 
 int cp_pool_socket(void)
@@ -266,6 +301,7 @@ int cp_pool_socket(void)
 int cp_pool_send_authorize(int msg_id, const char* wallet,
                            const char* worker, const char* agent)
 {
+    g_session.begin_authorize(msg_id, cp_now_sec());
     const std::string msg =
         "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(msg_id) +
         ",\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
@@ -273,6 +309,44 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
         "\",\"agent\":\"" + cp_json_escape(agent) + "\"}}";
     printf("[net] LuckyPool authorize (wallet/worker/agent)\n"); fflush(stdout);
     return cp_send_json(tcp_sock, msg.c_str());
+}
+
+int cp_pool_on_authorize_response(const char* line)
+{
+    int id = 0, accepted = 0;
+    if(!cp_json_rpc_response(line, &id, &accepted)) return 0;
+    if(!g_session.authorize_response(id, accepted != 0, cp_now_sec())) return 0;
+    printf("[pool] authorize response: %s\n", line);
+    if(!accepted){
+        pool_connection_lost("pool rejected authorization");
+        return 1;
+    }
+    fflush(stdout);
+    {
+        std::lock_guard<std::mutex> lock(g_inbox_mx);
+        g_inbox_cv.notify_all();
+    }
+    return 1;
+}
+
+int cp_pool_wait_authorized(void)
+{
+    std::unique_lock<std::mutex> lock(g_inbox_mx);
+    g_inbox_cv.wait(lock, [] { return g_net_conn_lost.load() || g_session.authorized(); });
+    return !g_net_conn_lost.load() && g_session.authorized();
+}
+
+int cp_pool_send_tracked_submit(int sock, int msg_id, const char* json)
+{
+    if(g_net_conn_lost.load()) return 0;
+    if(!g_session.begin_submit(msg_id, cp_now_sec())){
+        pool_connection_lost("duplicate submit id or too many unacknowledged shares");
+        return 0;
+    }
+    if(cp_send_json(sock, json)) return 1;
+    g_session.finish_submit(msg_id);
+    pool_connection_lost("share send failed");
+    return 0;
 }
 
 int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
@@ -299,7 +373,7 @@ int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
     printf("[net] plain_proof submit job=%s b64_len=%zu json_len=%d hs=%.0f\n",
            job_id, blen, nw, hs);
     fflush(stdout);
-    int ok = cp_send_json(sock, sub);
+    int ok = cp_pool_send_tracked_submit(sock, msg_id, sub);
     free(sub);
     return ok;
 }
@@ -364,6 +438,7 @@ int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
     if(!out || out_cap == 0) return -1;
     std::unique_lock<std::mutex> lk(g_inbox_mx);
     for(;;){
+        if(g_net_conn_lost.load()) return -1;
         if(!g_pool_inbox.empty()){
             const std::string& line = g_pool_inbox.front();
             if(line.size() >= out_cap){
@@ -374,7 +449,6 @@ int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
             g_pool_inbox.pop_front();
             return 1;
         }
-        if(g_net_conn_lost.load()) return -1;
         if(timeout_ms < 0){
             g_inbox_cv.wait(lk);
             continue;
@@ -391,14 +465,9 @@ int cp_pool_conn_lost(void)
     return g_net_conn_lost.load();
 }
 
-void cp_pool_set_submit_inflight(int on)
-{
-    g_submit_inflight.store(on);
-}
-
 void cp_pool_log_share_submit_outcome(void)
 {
-    if(g_submit_inflight.load())
+    if(g_session.has_pending_submits())
         printf("[plain] share submitted; pool ack pending (reader will log [pool] submit response)\n");
     else
         printf("[plain] share submitted; pool response already received\n");
