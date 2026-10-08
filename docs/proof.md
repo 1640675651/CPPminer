@@ -368,4 +368,3 @@ The pool already holds `header` from `mining.notify`. It parses the proof, recon
 | zk-pow noise | `third_party/zk-pow/src/circuit/pearl_noise.rs` |
 | zk-pow jackpot | `third_party/zk-pow/src/circuit/chip/jackpot/helper.rs` |
 | zk-pow verify | `third_party/zk-pow/src/api/verify.rs` |
-| CLI helper | `scripts/plain_proof_host.py` |

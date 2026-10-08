@@ -17,7 +17,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
-| Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-wgpu-ffi` | GpuEngine FFI |
+| Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
 
 ## Requirements
@@ -28,7 +28,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
-- **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
+- **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-quantus-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
 
 ## Build options (CMake)
 
@@ -47,7 +47,7 @@ cmake --build build --config Release
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
-| `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-wgpu-ffi`; fetches `third_party/quantus-miner`) |
+| `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-quantus-wgpu-ffi`; fetches `third_party/quantus-miner`) |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
@@ -77,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
-Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_wgpu_ffi.dll` when wgpu is enabled).
+Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_quantus_wgpu_ffi.dll` when wgpu is enabled).
 
 ## Build (*nix)
 ```bash
@@ -313,9 +313,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | zk-pow | `third_party/zk-pow` | Jackpot verify (`--verify`) |
 | plonky2 | `third_party/plonky2` | zk-pow compile dependency |
 
-`build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available. Artifacts:
-- Windows: `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`)
-- Linux/macOS: `libcp_proof_ffi.a` (linked into the miner) and `libcp_proof_ffi.dylib` / `.so` (for the host bridge)
+`build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available and links the static library into the miner (`cp_proof_ffi.lib` on Windows, `libcp_proof_ffi.a` on Linux/macOS). Proofs are built and verified in-process.
 
 If any are missing, copy from the Pearl repo:
 
@@ -324,9 +322,6 @@ Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
 Copy-Item -Recurse pearl\zk-pow       third_party\zk-pow
 Copy-Item -Recurse pearl\plonky2      third_party\plonky2
 ```
-
-Set `CP_PROOF_FFI` to override the shared library path for Python verify.
-
 ## Dev Fee
 
 A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
@@ -347,7 +342,6 @@ src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
 src/opencl/       OpenCL fused path + kernels
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
 third_party/      blake3, pearl-blake3, zk-pow, plonky2, opencl (+headers), cutlass (CUDA)
-scripts/          plain_proof_host.py (optional verify)
 ```
 
 ## Modules

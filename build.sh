@@ -394,9 +394,9 @@ if [[ -n "$CMAKE_EXE" ]]; then
     if (( ENABLE_WGPU )); then
         exe_dir=$(dirname "$exe")
         for runtime in \
-            cp_wgpu_ffi.dll cp_pearl_wgpu_ffi.dll \
-            libcp_wgpu_ffi.so libcp_pearl_wgpu_ffi.so \
-            libcp_wgpu_ffi.dylib libcp_pearl_wgpu_ffi.dylib; do
+            cp_quantus_wgpu_ffi.dll cp_pearl_wgpu_ffi.dll \
+            libcp_quantus_wgpu_ffi.so libcp_pearl_wgpu_ffi.so \
+            libcp_quantus_wgpu_ffi.dylib libcp_pearl_wgpu_ffi.dylib; do
             if [[ -f "${exe_dir}/${runtime}" ]]; then
                 cp -f "${exe_dir}/${runtime}" "${PROJECT_ROOT}/${runtime}"
                 log "Copied ${runtime} next to ${cp_out_name}"

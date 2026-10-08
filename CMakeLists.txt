@@ -553,21 +553,21 @@ endif()
 
 # Quantus wgpu GpuEngine FFI (cdylib preferred: bundles wgpu/DX12/Vulkan deps).
 if(CP_ENABLE_WGPU)
-    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-wgpu-ffi)
+    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-quantus-wgpu-ffi)
     set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
     set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/third_party/quantus-miner/crates/engine-gpu/Cargo.toml)
     if(WIN32)
         if(MSVC)
-            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll.lib)
         else()
-            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dll.a)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dll.a)
         endif()
-        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll)
-        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.lib)
+        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.lib)
     else()
-        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.so)
-        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dylib)
-        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.a)
+        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.so)
+        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dylib)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.a)
     endif()
 
     set(_cp_link_wgpu_ffi FALSE)
@@ -593,23 +593,23 @@ if(CP_ENABLE_WGPU)
                 ${CP_WGPU_FFI_DIR}/Cargo.lock
                 ${_cp_wgpu_rs}
                 ${_cp_engine_gpu}
-            COMMENT "Building cp-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            COMMENT "Building cp-quantus-wgpu-ffi (cargo ${_cp_cargo_profile})"
             VERBATIM
             USES_TERMINAL
         )
-        add_custom_target(cp_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
-        add_dependencies(cppminer cp_wgpu_ffi_build)
+        add_custom_target(cp_quantus_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
+        add_dependencies(cppminer cp_quantus_wgpu_ffi_build)
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
+        message(STATUS "cp_quantus_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
     elseif(WIN32 AND EXISTS ${_cp_wgpu_implib})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
     elseif(APPLE AND EXISTS ${_cp_wgpu_dylib})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
     elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_wgpu_so})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
     else()
         set(_cp_wgpu_use_stub TRUE)
         if(NOT CARGO_EXECUTABLE)
@@ -617,7 +617,7 @@ if(CP_ENABLE_WGPU)
         elseif(NOT EXISTS ${_cp_engine_gpu})
             message(WARNING "third_party/quantus-miner missing; wgpu stub (run build.ps1/build.sh -Backend Wgpu)")
         else()
-            message(WARNING "cp-wgpu-ffi unavailable; wgpu stub")
+            message(WARNING "cp-quantus-wgpu-ffi unavailable; wgpu stub")
         endif()
         target_sources(cppminer PRIVATE src/qpow/wgpu/cp_wgpu_stub.cpp)
     endif()
@@ -627,8 +627,8 @@ if(CP_ENABLE_WGPU)
             target_link_libraries(cppminer PRIVATE ${_cp_wgpu_implib})
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_wgpu_ffi.dll"
-                COMMENT "Copy cp_wgpu_ffi.dll next to cppminer")
+                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_quantus_wgpu_ffi.dll"
+                COMMENT "Copy cp_quantus_wgpu_ffi.dll next to cppminer")
             if(NOT _cp_link_proof_ffi)
                 target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
             endif()
@@ -652,8 +652,8 @@ if(CP_ENABLE_WGPU)
             endif()
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.dylib"
-                COMMENT "Copy libcp_wgpu_ffi.dylib next to cppminer")
+                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.dylib next to cppminer")
         else()
             target_link_libraries(cppminer PRIVATE ${_cp_wgpu_so})
             set_target_properties(cppminer PROPERTIES
@@ -664,8 +664,8 @@ if(CP_ENABLE_WGPU)
             endif()
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.so"
-                COMMENT "Copy libcp_wgpu_ffi.so next to cppminer")
+                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.so"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.so next to cppminer")
         endif()
     endif()
 

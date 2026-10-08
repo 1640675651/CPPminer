@@ -14,8 +14,6 @@ extern int g_cutlass_fused;
 extern int g_m_active;
 extern int g_n_active;
 extern char g_workdir[MAX_PATH];
-extern char g_python_exe[512];
-extern char g_host_bridge[512];
 extern int8_t* h_Ap_global;
 extern int8_t* h_BpT_global;
 extern char wallet_global[256];

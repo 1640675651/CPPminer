@@ -153,8 +153,6 @@ static void print_usage(void)
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
-    printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
-    printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
     printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
@@ -853,12 +851,6 @@ int main(int argc, char** argv)
             prepack_test = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
-        } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
-            strncpy(g_python_exe, argv[++i], sizeof(g_python_exe) - 1);
-            g_python_exe[sizeof(g_python_exe) - 1] = 0;
-        } else if(!strcmp(argv[i], "--host-bridge") && i + 1 < argc){
-            strncpy(g_host_bridge, argv[++i], sizeof(g_host_bridge) - 1);
-            g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
         } else if(!strcmp(argv[i], "--worker") && i + 1 < argc){
             strncpy(worker_global, argv[++i], sizeof(worker_global) - 1);
             worker_global[sizeof(worker_global) - 1] = 0;
@@ -1408,7 +1400,6 @@ int main(int argc, char** argv)
     }
 
     cp_init_workdir();
-    cp_resolve_paths(argc, argv);
 
     {
         double host_mib = ((double)g_m_active * K_DIM + (double)g_n_active * K_DIM)
