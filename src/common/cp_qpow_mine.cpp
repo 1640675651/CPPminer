@@ -36,8 +36,6 @@
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
 #endif
-/* Fee reconnect quantum: ~40s at 0.25 MH/s per thread. */
-static const uint64_t k_qpow_fee_hashes_per_unit = 10000000ull;
 static const uint64_t k_search_chunk = 8192ull;
 static const uint64_t k_gpu_search_chunk_default = 1000000ull;
 
@@ -188,6 +186,16 @@ static void qpow_target_from_difficulty(uint64_t difficulty, uint8_t target_be[6
             qlimb >>= 8;
         }
     }
+}
+
+/* Fee ledger unit for Quantus: whole microseconds of active hashing since *since;
+ * advances *since by the charged amount so sub-microsecond remainders carry over. */
+static uint64_t qpow_take_hash_us(std::chrono::steady_clock::time_point* since)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - *since);
+    *since += us;
+    return us.count() > 0 ? (uint64_t)us.count() : 0;
 }
 
 static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
@@ -369,16 +377,15 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
         uint8_t out_nonce[CP_QPOW_NONCE_BYTES];
         uint8_t out_hash[CP_QPOW_TARGET_BYTES];
         uint64_t hashes = 0;
+        auto t_search = std::chrono::steady_clock::now();
         const int st = cp_wgpu_worker_search(
             job->mining_hash, diff, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
-        cp_fee_note_tiles(hashes);
+        cp_fee_note_tiles(qpow_take_hash_us(&t_search));
         cp_fee_prepare_matrix();
-        if(cp_fee_needs_switch()){
-            stop_rc = CP_JOB_FEE_SWITCH;
-            break;
-        }
+        /* Switch only after this batch's share (if any) is submitted under the current wallet. */
+        const int fee_switch = cp_fee_needs_switch();
         if(st == CP_WGPU_OK_FOUND){
             if(on_qpow_share_found(job, sock, msg_id, out_nonce, 0)){
                 stop_rc = CP_JOB_NONE;
@@ -398,6 +405,10 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
         } else {
             fprintf(stderr, "[qpow] wgpu search error (%d)\n", st);
             stop_rc = CP_JOB_CANCELLED;
+            break;
+        }
+        if(fee_switch){
+            stop_rc = CP_JOB_FEE_SWITCH;
             break;
         }
         auto now = std::chrono::steady_clock::now();
@@ -447,16 +458,15 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
         uint8_t out_nonce[CP_QPOW_NONCE_BYTES];
         uint8_t out_hash[CP_QPOW_TARGET_BYTES];
         uint64_t hashes = 0;
+        auto t_search = std::chrono::steady_clock::now();
         const int st = cp_qpow_opencl_worker_search(
             job->mining_hash, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
-        cp_fee_note_tiles(hashes);
+        cp_fee_note_tiles(qpow_take_hash_us(&t_search));
         cp_fee_prepare_matrix();
-        if(cp_fee_needs_switch()){
-            stop_rc = CP_JOB_FEE_SWITCH;
-            break;
-        }
+        /* Switch only after this batch's share (if any) is submitted under the current wallet. */
+        const int fee_switch = cp_fee_needs_switch();
         if(st == CP_QPOW_OCL_OK_FOUND){
             if(on_qpow_share_found(job, sock, msg_id, out_nonce, 0)){
                 stop_rc = CP_JOB_NONE;
@@ -472,6 +482,10 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
         } else {
             fprintf(stderr, "[qpow] opencl search error (%d)\n", st);
             stop_rc = CP_JOB_CANCELLED;
+            break;
+        }
+        if(fee_switch){
+            stop_rc = CP_JOB_FEE_SWITCH;
             break;
         }
         auto now = std::chrono::steady_clock::now();
@@ -516,6 +530,8 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
     auto t_log = t0;
     std::vector<int> cpu_of((size_t)nthreads, -1);
     cp_job_mine_begin(job->job_key);
+    /* Threads hash concurrently: charge team wall time (guarded by fee_mx), not per-thread sums. */
+    auto t_fee = std::chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
 #endif
@@ -553,14 +569,15 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
             total_hashes.fetch_add(r.hashes, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(fee_mx);
-                cp_fee_note_tiles(r.hashes);
+                cp_fee_note_tiles(qpow_take_hash_us(&t_fee));
                 cp_fee_prepare_matrix();
                 if(cp_fee_needs_switch()){
                     stop_rc.store(CP_JOB_FEE_SWITCH, std::memory_order_relaxed);
                     running.store(0, std::memory_order_relaxed);
                 }
             }
-            if(!running.load(std::memory_order_relaxed)) break;
+            /* A share in this chunk is still submitted (current wallet) even if a switch was
+             * just requested; the thread exits at the running check below. */
             if(r.found){
                 std::lock_guard<std::mutex> lk(submit_mx);
                 if(on_qpow_share_found(job, sock, msg_id, r.nonce, tid)){
@@ -573,6 +590,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
             } else {
                 add_be_u64(cur, k_search_chunk);
             }
+            if(!running.load(std::memory_order_relaxed)) break;
             if(tid == 0){
                 auto now = std::chrono::steady_clock::now();
                 double elapsed =
@@ -599,7 +617,7 @@ int cp_qpow_mine_job(const CpQpowJob* job, int sock, int* msg_id,
                      const char* worker_name)
 {
     if(!job) return CP_JOB_CANCELLED;
-    cp_fee_set_tiles_per_matrix(k_qpow_fee_hashes_per_unit);
+    cp_fee_set_tiles_per_matrix(CP_FEE_QPOW_TURN_US);
     cp_fee_prepare_matrix();
     if(cp_fee_needs_switch()) return CP_JOB_FEE_SWITCH;
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
