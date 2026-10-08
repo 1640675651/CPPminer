@@ -485,9 +485,11 @@ extern "C" int cp_turing_scan_supported(int dev)
 {
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
-    /* sm_75 Turing kernel; sm_8x (Ampere/Ada) m16n8k32 kernel. Hopper and Blackwell keep
-     * the CUTLASS path until measured. */
-    return (prop.major == 7 && prop.minor == 5) || prop.major == 8;
+    /* sm_75: m8n8k16 kernel. sm_8x (Ampere/Ada) and sm_12x (Blackwell GeForce): m16n8k32
+     * kernel, the same mma.sync/cp.async/ldmatrix path. Datacenter Hopper/Blackwell
+     * (sm_90/sm_10x) can run it too but keep CUTLASS unless asked (2 = opt-in). */
+    if ((prop.major == 7 && prop.minor == 5) || prop.major == 8 || prop.major == 12) return 1;
+    return prop.major >= 9 ? 2 : 0;
 }
 
 extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m,

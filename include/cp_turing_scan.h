@@ -14,8 +14,8 @@
 extern "C" {
 #endif
 
-/* Nonzero if dev is sm_75 (the kernel is tuned for Turing; Ampere and newer
- * keep the CUTLASS tensorop80 path). */
+/* 1 if dev runs the packed kernel by default (sm_75, sm_8x, sm_12x), 2 if it can run it
+ * on request only (sm_90, sm_10x: CP_CUDA_PACKED=1, not measured yet), 0 otherwise. */
 int cp_turing_scan_supported(int dev);
 
 /* One period batch: rows [row_period0, +row_batch) x cols [col_period0,
