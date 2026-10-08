@@ -106,12 +106,22 @@ static struct {
     uint8_t bt_root[32];
 } g_zero_b = {};
 
-/* Signal A commitment of the last prepared attempt (sub-roots stay in g0->d_a_subroots). */
-static struct {
+/* Device-local signal A commitments (sub-roots stay in the owning GPU's buffers). */
+typedef struct {
     uint8_t root[32];
     int num_subroots;
     int valid;
-} g_attempt_a = {};
+} AttemptACommit;
+static AttemptACommit g_attempts[MAX_GPUS] = {};
+/* Device whose scan found the share; proof readback comes from it. */
+static int g_share_gpu = -1;
+/* CPU-prepared inputs are one attempt: distribute batches instead of replaying them. */
+static int g_shared_a = 0;
+
+static bool gpu_owns_batch(int gpu, int row_batch, int col_batch, int num_col_batches)
+{
+    return !g_shared_a || (row_batch * num_col_batches + col_batch) % g_ngpu == gpu;
+}
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
 {
@@ -339,7 +349,18 @@ void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_ver
 
 void cp_gpu_init(int* devs, int ndev)
 {
+    if(!devs || ndev < 1 || ndev > MAX_GPUS){
+        fprintf(stderr, "[gpu] invalid CUDA device count\n");
+        exit(1);
+    }
+    for(int i = 0; i < ndev; i++)
+        for(int j = 0; j < i; j++)
+            if(devs[i] == devs[j]){
+                fprintf(stderr, "[gpu] duplicate CUDA device %d\n", devs[i]);
+                exit(1);
+            }
     g_ngpu = ndev;
+    g_share_gpu = -1;
     printf("[gpu] Initializing %d GPU(s)...\n", ndev);
     fflush(stdout);
     /* Blocking sync: large period-batch kernels sleep the CPU instead of
@@ -436,7 +457,11 @@ void cp_gpu_shutdown(void)
     g_zero_b.bt_subroots = nullptr;
     g_zero_b.bt_num_subroots = 0;
     g_zero_b.ready = 0;
-    g_attempt_a.valid = 0;
+    for(int i = 0; i < g_ngpu; i++){
+        g_gpus[i] = GpuCtx{};
+        g_attempts[i] = AttemptACommit{};
+    }
+    g_share_gpu = -1;
     g_ngpu = 0;
 }
 
@@ -977,7 +1002,7 @@ static int gpu_prepare_job_b(GpuCtx* g, const uint8_t job_key[32], int m, int n)
         GpuCtx* gi = &g_gpus[i];
         ensure_buffers(gi, m, n);
         CU_CHECK(cudaSetDevice(gi->dev));
-        CU_CHECK(cudaMemcpy(gi->d_BpT, g->d_BpT, szBpT, cudaMemcpyDeviceToDevice));
+        CU_CHECK(cudaMemcpyPeer(gi->d_BpT, gi->dev, g->d_BpT, g->dev, szBpT));
     }
     CU_CHECK(cudaSetDevice(g->dev));
 
@@ -994,6 +1019,7 @@ static int gpu_prepare_job_b(GpuCtx* g, const uint8_t job_key[32], int m, int n)
 static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job_key[32],
                                  int m, int n, uint8_t a_key_out[32])
 {
+    AttemptACommit& commit = g_attempts[g - g_gpus];
     size_t szAp = (size_t)m * K_DIM;
     size_t pad_a = (szAp + 1023) / 1024 * 1024;
     const int tpb = 256;
@@ -1003,7 +1029,7 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
 
     CU_CHECK(cudaSetDevice(g->dev));
     t_total = cp_now_sec();
-    g_attempt_a.valid = 0;
+    commit.valid = 0;
 
     t_step = cp_now_sec();
     cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
@@ -1018,10 +1044,10 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
     t_step = cp_now_sec();
     if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, hash_a,
                                 g->d_a_subroots, cudaMemcpyDeviceToDevice,
-                                &g_attempt_a.num_subroots) != 0)
+                                &commit.num_subroots) != 0)
         return -1;
-    memcpy(g_attempt_a.root, hash_a, 32);
-    g_attempt_a.valid = 1;
+    memcpy(commit.root, hash_a, 32);
+    commit.valid = 1;
     printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
@@ -1708,7 +1734,7 @@ static int gpu_scan_device_period(
     const int col_periods = gpu_num_col_periods(n);
     const int row_parts = cp_pp_num_row_parts(m, g_contiguous);
     const int col_parts = cp_pp_num_col_parts(n, g_contiguous);
-    const int total_tiles = row_parts * col_parts;
+    const uint64_t total_tiles = (uint64_t)row_parts * col_parts * (g_shared_a ? 1 : g_ngpu);
     int found = 0;
     uint64_t tiles_scanned = 0;
     double scan_t0 = cp_now_sec();
@@ -1716,9 +1742,9 @@ static int gpu_scan_device_period(
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
     printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
-           "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %llu\n",
+           "(row_batch=%d col_batch=%d, %llu hash tiles), difficulty scaled by %llu\n",
            row_periods, col_periods, g_row_period_batch, g_col_period_batch,
-           total_tiles,
+           (unsigned long long)total_tiles,
            (unsigned long long)cp_jackpot_scale_factor());
     fflush(stdout);
 
@@ -1732,6 +1758,10 @@ static int gpu_scan_device_period(
             row_batch = row_periods - rpi0;
 
         for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
+            if(cp_job_should_cancel()){
+                if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
+                return -1;
+            }
             int col_batch = g_col_period_batch;
             if(cpi0 + col_batch > col_periods)
                 col_batch = col_periods - cpi0;
@@ -1739,6 +1769,9 @@ static int gpu_scan_device_period(
             const int batch_tiles = pp_batch_hash_tiles(row_batch, col_batch);
 
             for(int i = 0; i < g_ngpu; i++){
+                if(!gpu_owns_batch(i, rpi0 / g_row_period_batch, cpi0 / g_col_period_batch,
+                                  (col_periods + g_col_period_batch - 1) / g_col_period_batch))
+                    continue;
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
@@ -1748,6 +1781,9 @@ static int gpu_scan_device_period(
             }
 
             for(int i = 0; i < g_ngpu; i++){
+                if(!gpu_owns_batch(i, rpi0 / g_row_period_batch, cpi0 / g_col_period_batch,
+                                  (col_periods + g_col_period_batch - 1) / g_col_period_batch))
+                    continue;
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
@@ -1755,6 +1791,7 @@ static int gpu_scan_device_period(
                 CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
                 if(f && !found){
                     found = 1;
+                    g_share_gpu = i;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
                     printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
@@ -1763,7 +1800,7 @@ static int gpu_scan_device_period(
                 }
             }
 
-            tiles_scanned += (uint64_t)batch_tiles;
+            tiles_scanned += (uint64_t)batch_tiles * (g_shared_a ? 1 : g_ngpu);
         }
         if(rpi0 % 128 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
@@ -1771,9 +1808,9 @@ static int gpu_scan_device_period(
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
-            printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%d (%.1f%%) %s\n",
+            printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%llu (%.1f%%) %s\n",
                    rpi0 + row_batch, row_periods,
-                   (unsigned long long)tiles_scanned, total_tiles,
+                   (unsigned long long)tiles_scanned, (unsigned long long)total_tiles,
                    100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);
         }
@@ -1800,7 +1837,7 @@ static int gpu_scan_device(
     const int batch = 64;
     dim3 block(PP_HASH_W, PP_HASH_H);
     int found = 0;
-    const int total_tiles = row_parts * col_parts;
+    const uint64_t total_tiles = (uint64_t)row_parts * col_parts * (g_shared_a ? 1 : g_ngpu);
     uint64_t tiles_scanned = 0;
     double scan_t0 = cp_now_sec();
 
@@ -1829,6 +1866,9 @@ static int gpu_scan_device(
             const uint64_t batch_tiles = (uint64_t)rpb * (uint64_t)cpb;
 
             for(int i = 0; i < g_ngpu; i++){
+                if(!gpu_owns_batch(i, rp0 / batch, cp0 / batch,
+                                  (col_parts + batch - 1) / batch))
+                    continue;
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 plain_proof_jackpot_kernel<<<grid, block>>>(
@@ -1844,6 +1884,9 @@ static int gpu_scan_device(
             }
 
             for(int i = 0; i < g_ngpu; i++){
+                if(!gpu_owns_batch(i, rp0 / batch, cp0 / batch,
+                                  (col_parts + batch - 1) / batch))
+                    continue;
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
@@ -1851,6 +1894,7 @@ static int gpu_scan_device(
                 CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
                 if(f && !found){
                     found = 1;
+                    g_share_gpu = i;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
                     printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
@@ -1859,7 +1903,7 @@ static int gpu_scan_device(
                 }
             }
 
-            tiles_scanned += batch_tiles;
+            tiles_scanned += batch_tiles * (g_shared_a ? 1 : g_ngpu);
         }
         if((rp0 / batch) % 4 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
@@ -1867,9 +1911,9 @@ static int gpu_scan_device(
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
-            printf("[gpu] plain_proof progress: row parts %d/%d tiles %llu/%d (%.1f%%) %s\n",
+            printf("[gpu] plain_proof progress: row parts %d/%d tiles %llu/%llu (%.1f%%) %s\n",
                    rp0 + rpb, row_parts,
-                   (unsigned long long)tiles_scanned, total_tiles,
+                   (unsigned long long)tiles_scanned, (unsigned long long)total_tiles,
                    100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);
         }
@@ -1885,6 +1929,9 @@ int cp_gpu_mine_plain_proof(
     int* out_t_rows, int* out_t_cols,
     uint64_t* out_tiles_scanned)
 {
+    if(g_ngpu <= 0) return -1;
+    g_share_gpu = -1;
+    g_shared_a = 1;
     uint32_t a_key32[8];
     memcpy(a_key32, a_key, 32);
     int zero = 0;
@@ -1919,7 +1966,8 @@ int cp_gpu_mine_attempt(
     (void)h_A_sig;
     (void)h_Bt_sig;
     const double attempt_t0 = cp_now_sec();
-    size_t szAp = (size_t)m * K_DIM;
+    g_share_gpu = -1;
+    g_shared_a = cpu_matrices != 0;
     uint8_t a_key_local[32];
     const uint8_t* scan_key = a_key;
     int zero = 0;
@@ -1957,9 +2005,13 @@ int cp_gpu_mine_attempt(
             GpuCtx* g = &g_gpus[i];
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
-            CU_CHECK(cudaMemcpy(g->d_Ap, g0->d_Ap, szAp, cudaMemcpyDeviceToDevice));
-            /* d_BpT already mirrored in gpu_prepare_job_b. */
-            CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
+            uint8_t device_key[32];
+            if(gpu_prepare_attempt_a(g, cp_gpu_fresh_rng_seed(), job_key, m, n,
+                                     device_key) != 0)
+                return -1;
+            /* B is job-constant (mirrored in gpu_prepare_job_b); A, its key and
+             * proof commitment are device-local, so every device scans new work. */
+            CU_CHECK(cudaMemcpy(g->d_a_key8, device_key, 32, cudaMemcpyHostToDevice));
             CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
         }
     }
@@ -1976,8 +2028,8 @@ int cp_gpu_mine_attempt(
 
 int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
 {
-    if(g_ngpu <= 0 || !h_A_sig) return -1;
-    GpuCtx* g0 = &g_gpus[0];
+    if(g_share_gpu < 0 || g_share_gpu >= g_ngpu || !h_A_sig) return -1;
+    GpuCtx* g0 = &g_gpus[g_share_gpu];
     if(!g0->d_A_sig) return -1;
     const int m = g_m_active;
     const int n = g_n_active;
@@ -1998,9 +2050,11 @@ int cp_gpu_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareW
     (void)t_cols;
     if(!out) return -1;
     *out = NULL;
-    if(g_ngpu <= 0 || !g_attempt_a.valid || !g_zero_b.ready || !g_zero_b.bt_subroots)
+    if(g_shared_a || g_share_gpu < 0 || g_share_gpu >= g_ngpu ||
+       !g_attempts[g_share_gpu].valid || !g_zero_b.ready || !g_zero_b.bt_subroots)
         return -1;
-    GpuCtx* g0 = &g_gpus[0];
+    GpuCtx* g0 = &g_gpus[g_share_gpu];
+    const AttemptACommit& commit = g_attempts[g_share_gpu];
     const int m = g_m_active;
     if(m <= 0 || !g0->d_A_sig) return -1;
     const size_t szAp = (size_t)m * K_DIM;
@@ -2034,17 +2088,17 @@ int cp_gpu_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareW
                             g0->d_A_sig + off, len, cudaMemcpyDeviceToHost));
     }
 
-    if(g_attempt_a.num_subroots > 0){
-        size_t bytes = (size_t)g_attempt_a.num_subroots * 32;
+    if(commit.num_subroots > 0){
+        size_t bytes = (size_t)commit.num_subroots * 32;
         w->a_subroots = (uint8_t*)malloc(bytes);
         if(!w->a_subroots){
             cp_share_witness_free(w);
             return -1;
         }
         CU_CHECK(cudaMemcpy(w->a_subroots, g0->d_a_subroots, bytes, cudaMemcpyDeviceToHost));
-        w->a_num_subroots = (size_t)g_attempt_a.num_subroots;
+        w->a_num_subroots = (size_t)commit.num_subroots;
     }
-    memcpy(w->a_root, g_attempt_a.root, 32);
+    memcpy(w->a_root, commit.root, 32);
 
     if(g_zero_b.bt_num_subroots > 0){
         size_t bytes = (size_t)g_zero_b.bt_num_subroots * 32;
