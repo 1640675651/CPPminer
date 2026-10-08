@@ -39,6 +39,8 @@ int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms);
 int cp_pool_conn_lost(void);
 
 void cp_pool_log_share_submit_outcome(void);
+/* Positive finite difficulty from direct params or a singleton array. */
+int cp_pool_parse_difficulty(const char* json, double* difficulty_out);
 
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,

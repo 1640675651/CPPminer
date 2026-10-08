@@ -17,6 +17,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -137,16 +139,11 @@ static void pool_dispatch_line(const char* line)
     if(cp_qpow_pool_on_line(line))
         return;
 
-    if(strstr(line, "mining.set_difficulty")){
-        double d = cp_json_num(line, "params");
-        if(!d){
-            const char* p = strstr(line, "\"params\":[");
-            if(p){
-                p = strchr(p, '[');
-                if(p) d = atof(p + 1);
-            }
-        }
-        if(d > 0.0){
+    char method[64] = {0};
+    cp_json_str_value(cp_json_member(line, "method"), method, sizeof(method));
+    if(!strcmp(method, "mining.set_difficulty")){
+        double d;
+        if(cp_pool_parse_difficulty(line, &d)){
             g_diff.store(d);
             printf("[pool] mining.set_difficulty %.0f%s\n", d,
                    cp_job_mining_active() ? " (during mine)" : "");
@@ -168,7 +165,7 @@ static void pool_dispatch_line(const char* line)
         return;
     }
 
-    if(strstr(line, "mining.notify")){
+    if(!strcmp(method, "mining.notify")){
         char job_id[128] = {0};
         char header_hex[320] = {0};
         char target_hex[80] = {0};
@@ -462,6 +459,32 @@ void cp_pool_log_share_submit_outcome(void)
     else
         printf("[plain] share submitted; pool response already received\n");
     fflush(stdout);
+}
+
+static const char* skip_json_space(const char* p)
+{
+    while(p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+}
+
+int cp_pool_parse_difficulty(const char* json, double* difficulty_out)
+{
+    const char* p = cp_json_member(json, "params");
+    if(!p || !difficulty_out) return 0;
+    const int array = *p == '[';
+    if(array) p = skip_json_space(p + 1);
+    if(*p != '-' && (*p < '0' || *p > '9')) return 0;
+    char* end = nullptr;
+    const double d = strtod(p, &end);
+    if(end == p || !std::isfinite(d) || d <= 0) return 0;
+    p = skip_json_space(end);
+    if(array){
+        if(*p != ']') return 0;
+        p = skip_json_space(p + 1);
+    }
+    if(*p != ',' && *p != '}') return 0;
+    *difficulty_out = d;
+    return 1;
 }
 
 int cp_pool_parse_notify(const char* json,

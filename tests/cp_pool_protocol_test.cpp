@@ -206,6 +206,14 @@ static void test_quantus_login()
 
 int main()
 {
+    double difficulty = 0;
+    for(const char* json : {"{\"params\":[123]}", "{\"params\" : [ \n 1.23e2 \t ]}", "{\"params\":123}"}){
+        assert(cp_pool_parse_difficulty(json, &difficulty) && difficulty == 123);
+    }
+    for(const char* json : {"{\"params\":[]}", "{\"params\":[1,2]}", "{\"params\":[0]}",
+                            "{\"params\":[-1]}", "{\"params\":[1e309]}", "{\"params\":[\"123\"]}",
+                            "{\"metadata\":{\"params\":[123]}}"})
+        assert(!cp_pool_parse_difficulty(json, &difficulty));
     std::vector<std::thread> clocks;
     for(int i = 0; i < 4; ++i){
         clocks.emplace_back([] {
