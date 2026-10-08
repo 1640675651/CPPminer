@@ -222,26 +222,30 @@ std::vector<CatalogCandidate> fallback_candidates(HW hw) {
 // Arc A380 (XeHPG, s8 TN, 131072^2 with milestone XOR): this 8x4-workgroup
 // 16x32 systolic kernel scanned at 15.0 TMAC/s vs 9.7 for oneDNN's top pick.
 // The catalog repeats the strategy string with other unrolls, so match both.
+// `tuned` replaces the catalog string: dropping `af` (atomic FMA) measured
+// +1.06% at 131072^2 in an ABAB comparison.
 struct PreferredKernel {
     int unroll_m, unroll_n;
     const char *strategy;
+    const char *tuned;
 };
 
-bool is_preferred_entry(HW hw, const Entry &entry) {
+const PreferredKernel *preferred_entry(HW hw, const Entry &entry) {
     static const PreferredKernel kXeHPG[] = {
-            {16, 32, "sB64 sB32 aB wg 8x4 cab4 ks64 af dw vav bo bk0 sm sn grf256 sys pab l4 sr"},
+            {16, 32, "sB64 sB32 aB wg 8x4 cab4 ks64 af dw vav bo bk0 sm sn grf256 sys pab l4 sr",
+             "sB64 sB32 aB wg 8x4 cab4 ks64 dw vav bo bk0 sm sn grf256 sys pab l4 sr"},
     };
     if (hw != HW::XeHPG) {
-        return false;
+        return nullptr;
     }
     for (const auto &p : kXeHPG) {
         if (entry.driverInfo.unroll[LoopM] == p.unroll_m
                 && entry.driverInfo.unroll[LoopN] == p.unroll_n
                 && std::string(entry.strategy) == p.strategy) {
-            return true;
+            return &p;
         }
     }
-    return false;
+    return nullptr;
 }
 
 void append_catalog_candidate(std::vector<CatalogCandidate> &out, const Entry *entry) {
@@ -301,10 +305,12 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         if (!entry || !entry_case5_compatible(*entry)) {
             continue;
         }
-        (is_preferred_entry(hw, *entry) ? preferred : rest).push_back(entry);
+        (preferred_entry(hw, *entry) ? preferred : rest).push_back(entry);
     }
-    for (const Entry *entry : preferred)
+    for (const Entry *entry : preferred) {
         append_catalog_candidate(result.candidates, entry);
+        result.candidates.back().strategy = preferred_entry(hw, *entry)->tuned;
+    }
     for (const Entry *entry : rest)
         append_catalog_candidate(result.candidates, entry);
 
@@ -339,7 +345,8 @@ bool prepare_case5_strategy(HW hw, const Product &product, GEMMProblem &problem,
             strategy = GEMMStrategy(hw, product.stepping);
             strategy.unroll[LoopM] = entry.driverInfo.unroll[LoopM];
             strategy.unroll[LoopN] = entry.driverInfo.unroll[LoopN];
-            parseStrategy(entry.strategy, hw, problem, strategy);
+            // candidate.strategy is the entry's string unless a preferred entry is tuned.
+            parseStrategy(candidate.strategy.c_str(), hw, problem, strategy);
         } else {
             strategy = GEMMStrategy(hw, product.stepping);
             if (candidate.unroll_m > 0 && candidate.unroll_n > 0) {
