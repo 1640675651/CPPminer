@@ -116,6 +116,7 @@ private:
     cl_kernel k_compute_blake_mt_ = nullptr;
     cl_kernel k_reduce_roots_ = nullptr;
     cl_kernel k_fused_prepack_a_ = nullptr;
+    cl_kernel k_fused_prepack_a_wg_ = nullptr; // optional: 256-wide blocks, needs el rows
     cl_kernel k_fused_prepack_b_ = nullptr;
     cl_kernel k_noisy_rowmajor_ = nullptr;
     cl_kernel k_uniform_rows_ = nullptr;      // optional: work-group row-major noise path
@@ -140,6 +141,10 @@ private:
     size_t noisy_scratch_cap_ = 0;
     cl_mem d_el_rows_ = nullptr; // rows x R_RANK uniform noise for the work-group path
     size_t el_rows_cap_ = 0;
+    bool ensure_el_rows_(size_t bytes);
+    bool uniform_rows_(int rows, int is_b);
+    bool fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, int K, int blocks_k,
+                                 int macro_rows);
 };
 
 std::string cp_ocl_kernel_dir();

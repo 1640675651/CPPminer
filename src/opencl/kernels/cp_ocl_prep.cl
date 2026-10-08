@@ -195,6 +195,75 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
     }
 }
 
+/* Same bytes as ocl_fused_prepack_a, one 256-wide work group per (im, kb) block.
+ * The rows' uniform noise (el_rows, R_RANK bytes per row, from ocl_uniform_rows) and the
+ * signal tile are staged in local memory with a 4-byte row pad, so lanes that read the same
+ * k of neighbouring rows hit different banks. Output word w of the block is
+ * kg * MACRO_M + r (byte offset kg * MACRO_KG_STRIP_A + r * 4), so stores are coalesced. */
+#define FPA_WG 256
+#define FPA_SW (KR / 4 + 1)
+#define FPA_EW (R_RANK / 4 + 1)
+__kernel __attribute__((reqd_work_group_size(FPA_WG, 1, 1))) void
+ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
+                       __global const uint *pairs, __global const char *a_signal, int K,
+                       int blocks_k) {
+    __local uint sig[MACRO_M * FPA_SW];
+    __local uint el[MACRO_M * FPA_EW];
+    __local uchar p0[KR];
+    __local uchar p1[KR];
+
+    const int blk = (int)get_group_id(0);
+    const int kb = blk % blocks_k;
+    const int im = blk / blocks_k;
+    const int t = (int)get_local_id(0);
+    const int row0 = im * MACRO_M;
+    const int k0 = kb * KR;
+
+    for (int i = t; i < MACRO_M * (KR / 16); i += FPA_WG) {
+        const int r = i / (KR / 16);
+        const int c = i % (KR / 16);
+        const uint4 v =
+                *(__global const uint4 *)(a_signal + (size_t)(row0 + r) * (size_t)K + k0 + c * 16);
+        __local uint *d = sig + r * FPA_SW + c * 4;
+        d[0] = v.x;
+        d[1] = v.y;
+        d[2] = v.z;
+        d[3] = v.w;
+    }
+    for (int i = t; i < MACRO_M * (R_RANK / 16); i += FPA_WG) {
+        const int r = i / (R_RANK / 16);
+        const int c = i % (R_RANK / 16);
+        const uint4 v = *(__global const uint4 *)(el_rows + (size_t)(row0 + r) * (R_RANK / 4) +
+                                                   c * 4);
+        __local uint *d = el + r * FPA_EW + c * 4;
+        d[0] = v.x;
+        d[1] = v.y;
+        d[2] = v.z;
+        d[3] = v.w;
+    }
+    for (int i = t; i < KR; i += FPA_WG) {
+        p0[i] = (uchar)pairs[(size_t)(k0 + i) * 2];
+        p1[i] = (uchar)pairs[(size_t)(k0 + i) * 2 + 1];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    __global uint *dst = a_pre_out + ((size_t)im * (size_t)blocks_k + (size_t)kb) *
+                                             (size_t)(MACRO_KB_BLOCK_A / 4);
+    for (int w = t; w < MACRO_M * K_GROUPS; w += FPA_WG) {
+        const int kg = w / MACRO_M;
+        const int r = w % MACRO_M;
+        const uint s = sig[r * FPA_SW + kg];
+        const __local uchar *e = (const __local uchar *)(el + r * FPA_EW);
+        uint out = 0;
+        for (int b = 0; b < 4; ++b) {
+            const int k = kg * 4 + b;
+            const uint v = (s >> (8 * b)) + (uint)e[p0[k]] - (uint)e[p1[k]];
+            out |= (v & 0xffu) << (8 * b);
+        }
+        dst[w] = out;
+    }
+}
+
 /* Pearl noisy matrix in native row layout: A is M×K (row*K+k), B^T is N×K (col*K+k). */
 __kernel void ocl_noisy_matrix_rowmajor(__global char *out, __global const uchar *noise_seed,
                                         __global const uint *pairs, int rows, int K, int rank,
