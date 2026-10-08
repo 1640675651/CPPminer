@@ -417,7 +417,7 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
-#if !defined(CASE32_WMMA)
+#if !defined(CASE32_WMMA) && !defined(CASE32_DPAS)
 #ifdef CASE32_REQD_WG
 /* Host passes the exact launch local size when one macro block fits a work-group. */
 __attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
@@ -735,7 +735,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         *out_t_cols = t_cols;
     }
 }
-#else /* CASE32_WMMA */
+#elif defined(CASE32_WMMA)
 
 /* =====================================================================================
  * AMD WMMA (matrix core) path: --ocl-dot wmma, -DCASE32_WMMA=11 (gfx11, RDNA3) or
@@ -1531,4 +1531,511 @@ __kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
         words[32 + lane] = w;
     }
 }
-#endif /* CASE32_WMMA */
+#else /* CASE32_DPAS */
+
+/* =====================================================================================
+ * Intel XMX (DPAS) path: --ocl-dot dpas, -DCASE32_DPAS=8 (Xe-HPG: Arc A-series DG2,
+ * Arrow Lake-H; minimum sub-group size 8) or -DCASE32_DPAS=16 (Xe2: Battlemage B580/B570,
+ * Lunar Lake; minimum sub-group size 16). Needs the 8x16 hash tile and the RANK=4 prepack.
+ *
+ * Builtins: cl_intel_subgroup_matrix_multiply_accumulate (Khronos registry, rev 1.1.0).
+ * Quoted from the spec (the parts this path relies on):
+ *   "// These functions are available to devices where the minimum subgroup size is 8.
+ *    // For these devices, the subgroup size must be 8 (the minimum supported subgroup
+ *    // size). [...]
+ *    int8 intel_sub_group_i8_i8_matrix_mad_k32(int8  a, int8  b, int8 acc);  // M = 8"
+ *   "// These functions are available to devices where the minimum subgroup size is 16.
+ *    [...]
+ *    int8 intel_sub_group_i8_i8_matrix_mad_k32(short8  a, int8  b, int8 acc);  // M = 8"
+ *   "The value for M is determined by the number of vector components in the source
+ *    operand a." "[...] since each work item is contributing 32 bits (the size of a uint)
+ *    of data per row of this matrix, each work item is contributing four 8-bit integer
+ *    values per row." (sub-group size 8)
+ *   "b [...] Each work item contributes one column of this matrix. Therefore, the number
+ *    of columns N is equivalent to the subgroup size." "[...] each work item must
+ *    contribute 256 bits of source data to contribute K values. The 256 bits of source
+ *    data are packed and passed as the int8 argument b."
+ *   "acc [...] each work item contributes one column of accumulation values." "[...] each
+ *    work item will receive one column of result values."
+ *   "These functions must be encountered by all work items in the subgroup executing the
+ *    kernel." "For 8-bit matrices, K must be equal to 32." "[...] the accumulation value
+ *    acc and result value are signed 32-bit integers."
+ *   Coding sample (sub-group size 8): result = acc + sum over i = 0..7 of
+ *    dot(as_char4(sub_group_broadcast(a_row, i)), as_char4(b.s<i>))
+ *    -> lane i's A dword holds k 4i..4i+3; b.s<i> holds k 4i..4i+3 of this lane's column.
+ *
+ * Layout assumptions (lane = get_sub_group_local_id(); one DPAS = M 8 x N SG x K 32):
+ *   SG 8  (int8 a):   a.s<m> = row m, k 4*lane .. 4*lane+3          (spec coding sample)
+ *   SG 16 (short8 a): a.s<m> = row m, two k bytes per lane (low byte = lower k):
+ *                       CASE32_DPAS_AK=0: k 2*lane, 2*lane+1         (natural extension of
+ *                                         the sample: 32 k / 16 lanes, register word = lane)
+ *                       CASE32_DPAS_AK=1: k 4*(lane%8) + 2*(lane/8) + {0,1} (alternative,
+ *                                         tried by the self-test)
+ *   both: b.s<i> = column `lane` of the block, k 4i..4i+3 (byte j = k 4i+j);
+ *         acc.s<m> / result.s<m> = C[row m][column `lane`].
+ *   Unverified until CP_OCL_DPAS_SELFTEST=1 runs on the device; the self-test checks every
+ *   D element and prints which A variant passes.
+ *
+ * Work split. One sub-group owns DPAS_TM x DPAS_TN hash tiles (8x16 each; defaults 4x1
+ * for SG 8 = 32x16 of C, 4x2 for SG 16 = 32x32), i.e. DPAS_TM row blocks x
+ * DPAS_TN*16/SG column blocks of DPAS results. The work-group is one macro block of
+ * (MACRO_M/(8*DPAS_TM)) * (MACRO_N/(16*DPAS_TN)) sub-groups: 256 WIs for both defaults at
+ * 128x128. Per 32-k step a lane loads one 8-dword column slice of B per column block and
+ * one 8-row A slice per row block straight from the default coalesced prepack (flat
+ * k-group g of row r / column c = dword g*STRIP + r, STRIP = MACRO_M dwords), no new
+ * layout: a lane's A slice is 8 consecutive dwords (rows r0..r0+7 at one k-group).
+ *
+ *   sub-group (SG 16, TM=4, TN=2)       hash tile t = tj*TM + ti  ->  lane t after the
+ *             tj=0       tj=1           milestone reduce-scatter (lanes >= TM*TN idle
+ *   ti=0  | t0       | t4       |       for msg[16]/BLAKE3 but take part in every DPAS
+ *   ti=1  | t1       | t5       |       and shuffle)
+ *   ti=2  | t2       | t6       |       SG 8: each 8x16 hash tile = 2 DPAS column blocks
+ *   ti=3  | t3       | t7       |       (lanes hold columns h*8 + lane, h = 0, 1)
+ *
+ * Milestones (every KR = 128 k = 4 DPAS steps): each lane XORs its 8 (SG 16) or 16 (SG 8)
+ * accumulator elements per hash tile, then an XOR reduce-scatter over
+ * intel_sub_group_shuffle_xor (masks SG/2 .. 1) leaves hash tile t's word in lane t.
+ * XOR and int32 wrap-around accumulation are order-independent, so the words equal the
+ * dot4 kernel's bit for bit.
+ * ===================================================================================== */
+#if CASE32_DPAS != 8 && CASE32_DPAS != 16
+#error CASE32_DPAS must be 8 (Xe-HPG) or 16 (Xe2)
+#endif
+#if MR != 8 || NR != 16 || HASH_NR != 16 || RANK != 4 || KR != 128
+#error DPAS path needs the 8x16 hash tile, RANK=4 prepack and KR=128
+#endif
+#if CASE32_USE_LDS
+#error DPAS path reads the coalesced prepack directly (no LDS staging)
+#endif
+
+#define DPAS_SG CASE32_DPAS
+
+#if defined(CP_DPAS_SYNTAX_CHECK)
+/* Host-side syntax check with stock clang (-DCP_DPAS_SYNTAX_CHECK): declare the Intel
+   builtins the device compiler provides. */
+#define DPAS_OVL __attribute__((overloadable))
+int8 DPAS_OVL intel_sub_group_i8_i8_matrix_mad_k32(int8 a, int8 b, int8 acc);
+int8 DPAS_OVL intel_sub_group_i8_i8_matrix_mad_k32(short8 a, int8 b, int8 acc);
+uint DPAS_OVL intel_sub_group_shuffle_xor(uint x, uint m);
+#define DPAS_REQD_SG __attribute__((intel_reqd_sub_group_size(DPAS_SG)))
+#elif defined(CP_DPAS_EMULATE)
+/* Functional emulation on an AMD GPU (host: CP_OCL_DPAS_EMULATE=8|16 with --ocl-dot dpas).
+   A "sub-group" is DPAS_SG consecutive local ids = consecutive hardware lanes of one
+   wave; cross-lane reads use ds_bpermute. The DPAS builtin follows the spec's coding
+   sample (SG 8) and its natural SG 16 extension (CASE32_DPAS_AK=0 layout), so this
+   validates the GEMM indexing, reduce-scatter, milestone words and jackpot of this path
+   -- not the Intel hardware layout, which only the self-test on the device can confirm. */
+#define DPAS_REQD_SG
+#define get_sub_group_local_id() ((uint)get_local_id(0) % (uint)DPAS_SG)
+#define get_sub_group_id() ((uint)get_local_id(0) / (uint)DPAS_SG)
+#define get_sub_group_size() ((uint)DPAS_SG)
+#ifdef CP_DPAS_EMULATE_HOST
+/* Value of x in emulated lane `src` of this lane's sub-group: provided by a host-side
+   harness that runs the kernel source compiled for the CPU (one thread per lane). */
+int dpas_emu_read(int x, uint src);
+#else
+inline uint dpas_emu_hw_lane(void) {
+    return __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
+}
+/* Value of x in emulated lane `src` of this lane's sub-group. */
+inline int dpas_emu_read(int x, uint src) {
+    const uint base = dpas_emu_hw_lane() - get_sub_group_local_id();
+    return __builtin_amdgcn_ds_bpermute((int)((base + src) << 2), x);
+}
+#endif
+#define intel_sub_group_shuffle_xor(x, m)                                              \
+    as_uint(dpas_emu_read(as_int(x), get_sub_group_local_id() ^ (uint)(m)))
+inline int dpas_emu_dot4(int a, int b, int acc) {
+    const char4 x = as_char4(a);
+    const char4 y = as_char4(b);
+    return acc + (int)x.s0 * (int)y.s0 + (int)x.s1 * (int)y.s1 + (int)x.s2 * (int)y.s2 +
+           (int)x.s3 * (int)y.s3;
+}
+/* Dword i (k 4i..4i+3) of one A row, gathered across the sub-group. */
+inline int dpas_emu_a_dword(int a_lane_bits, int i) {
+#if DPAS_SG == 8
+    return dpas_emu_read(a_lane_bits, (uint)i);
+#else
+    const int lo = dpas_emu_read(a_lane_bits, (uint)(2 * i)) & 0xffff;
+    const int hi = dpas_emu_read(a_lane_bits, (uint)(2 * i + 1)) << 16;
+    return lo | hi;
+#endif
+}
+/* spec __intel_vector_matrix_multiply_accumulate_k32 */
+inline int dpas_emu_row(int a_lane_bits, int8 b, int acc) {
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 0), b.s0, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 1), b.s1, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 2), b.s2, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 3), b.s3, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 4), b.s4, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 5), b.s5, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 6), b.s6, acc);
+    acc = dpas_emu_dot4(dpas_emu_a_dword(a_lane_bits, 7), b.s7, acc);
+    return acc;
+}
+#if DPAS_SG == 8
+inline int8 intel_sub_group_i8_i8_matrix_mad_k32(int8 a, int8 b, int8 acc) {
+    const int8 x = a;
+#else
+inline int8 intel_sub_group_i8_i8_matrix_mad_k32(short8 a, int8 b, int8 acc) {
+    const int8 x = convert_int8(a);
+#endif
+    int8 r;
+    r.s0 = dpas_emu_row(x.s0, b, acc.s0);
+    r.s1 = dpas_emu_row(x.s1, b, acc.s1);
+    r.s2 = dpas_emu_row(x.s2, b, acc.s2);
+    r.s3 = dpas_emu_row(x.s3, b, acc.s3);
+    r.s4 = dpas_emu_row(x.s4, b, acc.s4);
+    r.s5 = dpas_emu_row(x.s5, b, acc.s5);
+    r.s6 = dpas_emu_row(x.s6, b, acc.s6);
+    r.s7 = dpas_emu_row(x.s7, b, acc.s7);
+    return r;
+}
+#else
+/* Intel device compiler: the builtins come with cl_intel_subgroup_matrix_multiply_accumulate
+   (the host checked CL_DEVICE_EXTENSIONS). The extension macro is deliberately not
+   required, so a driver that omits it still builds; missing builtins fail loudly anyway. */
+#define DPAS_REQD_SG __attribute__((intel_reqd_sub_group_size(DPAS_SG)))
+#endif
+
+#ifndef DPAS_TM
+#define DPAS_TM 4
+#endif
+#ifndef DPAS_TN
+#if DPAS_SG == 8
+#define DPAS_TN 1
+#else
+#define DPAS_TN 2
+#endif
+#endif
+#ifndef CASE32_DPAS_AK
+#define CASE32_DPAS_AK 0
+#endif
+#define DPAS_TILES (DPAS_TM * DPAS_TN) /* hash tiles per sub-group */
+#define DPAS_NB (16 / DPAS_SG)         /* DPAS column blocks per 16-wide hash tile */
+#define DPAS_BN (DPAS_TN * DPAS_NB)    /* DPAS column blocks per sub-group */
+#define DPAS_SG_ROWS (8 * DPAS_TM)
+#define DPAS_SG_COLS (16 * DPAS_TN)
+#if DPAS_TILES > DPAS_SG || (MACRO_M % DPAS_SG_ROWS) != 0 || (MACRO_N % DPAS_SG_COLS) != 0
+#error DPAS_TM x DPAS_TN must fit the sub-group size and divide the macro block
+#endif
+#define DPAS_SGS_M (MACRO_M / DPAS_SG_ROWS)
+#define DPAS_KG_DW_A (MACRO_KG_STRIP_A / 4) /* dwords between consecutive k-groups */
+#define DPAS_KG_DW_B (MACRO_KG_STRIP_B / 4)
+#define DPAS_KSTEPS (KGROUPS / 8)          /* 32-k DPAS steps per KR panel */
+
+#if DPAS_SG == 8
+typedef int8 dpas_a;
+#else
+typedef short8 dpas_a;
+#endif
+typedef int8 dpas_b;
+typedef int8 dpas_acc;
+
+/* First k-group (relative to the 32-k step) of this lane's A bytes. */
+inline int dpas_a_lane_kg(uint lane, int ak) {
+#if DPAS_SG == 8
+    (void)ak;
+    return (int)lane;
+#else
+    return ak ? (int)(lane & 7u) : (int)(lane >> 1);
+#endif
+}
+
+/* Which 16-bit half of that k-group dword (SG 16 only). */
+inline int dpas_a_lane_half(uint lane, int ak) {
+#if DPAS_SG == 8
+    (void)lane;
+    (void)ak;
+    return 0;
+#else
+    return ak ? (int)(lane >> 3) : (int)(lane & 1u);
+#endif
+}
+
+/* One lane's A operand: p = dword of row 0 of the 8-row block at this lane's k-group;
+   rows are consecutive dwords. */
+inline dpas_a dpas_load_a(__global const int *p, int hi16) {
+    const int8 v = vload8(0, p);
+#if DPAS_SG == 8
+    (void)hi16;
+    return v;
+#else
+    /* sign-extend the selected 16-bit half so the conversion is in range */
+    const int8 h = hi16 ? (v >> 16) : ((v << 16) >> 16);
+    return convert_short8(h);
+#endif
+}
+
+/* One lane's B operand: p = dword of this lane's column at the step's first k-group;
+   kg = dword stride between k-groups. b.s<i> = k-group i = k 4i..4i+3. */
+inline dpas_b dpas_load_b(__global const int *p, int kg) {
+    return (int8)(p[0], p[kg], p[2 * kg], p[3 * kg], p[4 * kg], p[5 * kg], p[6 * kg],
+                  p[7 * kg]);
+}
+
+inline dpas_acc dpas_mac(dpas_a a, dpas_b b, dpas_acc c) {
+    return intel_sub_group_i8_i8_matrix_mad_k32(a, b, c);
+}
+
+inline uint dpas_xor8(dpas_acc c) {
+    return as_uint(c.s0 ^ c.s1 ^ c.s2 ^ c.s3 ^ c.s4 ^ c.s5 ^ c.s6 ^ c.s7);
+}
+
+/* This lane's XOR partial of hash tile (ti, tj): DPAS_NB accumulators of 8 rows each. */
+inline uint dpas_tile_partial(__private const dpas_acc *acc, int ti, int tj) {
+    uint x = 0u;
+    #pragma unroll
+    for (int h = 0; h < DPAS_NB; ++h) {
+        x ^= dpas_xor8(acc[ti * DPAS_BN + tj * DPAS_NB + h]);
+    }
+    return x;
+}
+
+/* Reduce-scatter stage over lane bit m (see WMMA_RS_STAGE), via cl_intel_subgroups. */
+#define DPAS_RS_STAGE(p, lane, n, m)                                                  \
+    do {                                                                              \
+        const int hi_ = ((lane) & (m)) != 0u;                                         \
+        _Pragma("unroll") for (int j_ = 0; j_ < (n) / 2; ++j_) {                      \
+            const uint keep_ = hi_ ? (p)[j_ + (n) / 2] : (p)[j_];                     \
+            const uint send_ = hi_ ? (p)[j_] : (p)[j_ + (n) / 2];                     \
+            (p)[j_] = keep_ ^ intel_sub_group_shuffle_xor(send_, (uint)(m));          \
+        }                                                                             \
+    } while (0)
+
+/* p[t] (t = 0..SG-1): this lane's partial of word t. Returns the XOR over all lanes of
+   p[lane]: lane t receives the complete word t. All lanes of the sub-group must call. */
+inline uint dpas_reduce_scatter(uint *p, uint lane) {
+#if DPAS_SG == 16
+    DPAS_RS_STAGE(p, lane, 16, 8);
+#endif
+    DPAS_RS_STAGE(p, lane, 8, 4);
+    DPAS_RS_STAGE(p, lane, 4, 2);
+    DPAS_RS_STAGE(p, lane, 2, 1);
+    return p[0];
+}
+
+/* One 32-k step (k-groups g..g+7) for the sub-group's DPAS_TM x DPAS_BN blocks. */
+inline void dpas_step(__private dpas_acc *acc, __global const int *a_lane,
+                      __global const int *b_lane, int g, int a_half) {
+    dpas_b b[DPAS_BN];
+    #pragma unroll
+    for (int j = 0; j < DPAS_BN; ++j) {
+        b[j] = dpas_load_b(b_lane + g * DPAS_KG_DW_B + j * DPAS_SG, DPAS_KG_DW_B);
+    }
+    #pragma unroll
+    for (int i = 0; i < DPAS_TM; ++i) {
+        const dpas_a a = dpas_load_a(a_lane + g * DPAS_KG_DW_A + i * 8, a_half);
+        #pragma unroll
+        for (int j = 0; j < DPAS_BN; ++j) {
+            acc[i * DPAS_BN + j] = dpas_mac(a, b[j], acc[i * DPAS_BN + j]);
+        }
+    }
+}
+
+DPAS_REQD_SG
+#ifdef CASE32_REQD_WG
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
+__kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
+                                    __global uint *tile_xor, int N, int blocks_k,
+                                    int blocks_per_milestone, int num_milestones, int tile_count,
+                                    int macro_rows, int macro_cols, int xor_after_milestone,
+                                    int mb_begin, int compact_xor, __global const uint *a_key8,
+                                    __global const uint *bound, __global int *found_flag,
+                                    __global int *out_t_rows, __global int *out_t_cols,
+                                    int fuse_jackpot, int micro_m_begin, int micro_m_count) {
+    /* The host launches exactly one full macro block per work-group here. */
+    (void)blocks_per_milestone;
+    (void)micro_m_begin;
+    (void)micro_m_count;
+    if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
+        return;
+    }
+
+    const int mb = mb_begin + (int)get_group_id(0);
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
+
+    const uint lane = get_sub_group_local_id();
+    const int sg = (int)get_sub_group_id();
+    const int sg_m = sg % DPAS_SGS_M;
+    const int sg_n = sg / DPAS_SGS_M;
+
+    /* Per-lane operand streams inside the macro block. A: rows sg_m*DPAS_SG_ROWS.. at
+       this lane's k-group; B: column sg_n*DPAS_SG_COLS + lane (block j adds j*SG). */
+    const int a_half = dpas_a_lane_half(lane, CASE32_DPAS_AK);
+    __global const int *a_lane =
+            (__global const int *)(a_pre + (size_t)im * (size_t)blocks_k *
+                                                   (size_t)MACRO_KB_BLOCK_A) +
+            dpas_a_lane_kg(lane, CASE32_DPAS_AK) * DPAS_KG_DW_A + sg_m * DPAS_SG_ROWS;
+    __global const int *b_lane =
+            (__global const int *)(b_pre + (size_t)jm * (size_t)blocks_k *
+                                                   (size_t)MACRO_KB_BLOCK_B) +
+            sg_n * DPAS_SG_COLS + (int)lane;
+
+    /* Hash tile owned by this lane after the reduce-scatter: t = tj*DPAS_TM + ti. */
+    const int owns_tile = lane < (uint)DPAS_TILES;
+    const int own_ti = (int)lane % DPAS_TM;
+    const int own_tj = (int)lane / DPAS_TM;
+    const int hash_row = sg_m * DPAS_TM + own_ti; /* in macro */
+    const int hash_col = sg_n * DPAS_TN + own_tj; /* in macro */
+    const int tr_global = im * MICRO_M + hash_row;
+    const int hash_tc_global = jm * HASH_MICRO_N + hash_col;
+    const int hash_spatial_id = tr_global * (N / HASH_NR) + hash_tc_global;
+
+    uint msg[PP_JACKPOT_WORDS];
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg[i] = 0u;
+    }
+    dpas_acc acc[DPAS_TM * DPAS_BN];
+    #pragma unroll
+    for (int i = 0; i < DPAS_TM * DPAS_BN; ++i) {
+        acc[i] = (dpas_acc)(0);
+    }
+
+    int kg_flat = 0;
+    for (int ms = 0; ms < blocks_k; ++ms) {
+        for (int ks = 0; ks < DPAS_KSTEPS; ++ks) {
+            dpas_step(acc, a_lane, b_lane, kg_flat, a_half);
+            kg_flat += 8;
+        }
+
+        /* Milestone (one per KR panel, cumulative C): word of hash tile `lane`. */
+        uint p[DPAS_SG];
+        #pragma unroll
+        for (int t = 0; t < DPAS_SG; ++t) {
+            p[t] = t < DPAS_TILES ? dpas_tile_partial(acc, t % DPAS_TM, t / DPAS_TM) : 0u;
+        }
+        const uint x = dpas_reduce_scatter(p, lane);
+
+        if (owns_tile && xor_after_milestone) {
+            if (fuse_jackpot) {
+                if (ms < PP_MAX_MILESTONES) {
+                    const int tid = ms % PP_JACKPOT_WORDS;
+                    const uint contribution =
+                            (ms + PP_JACKPOT_WORDS < num_milestones) ? pp_rotl32(x, PP_LROT) : x;
+                    msg[tid] ^= contribution;
+                }
+            } else {
+                ulong out_idx;
+                if (compact_xor) {
+                    const int hash_local_id = hash_row * HASH_MICRO_N + hash_col;
+                    const ulong batch_stride =
+                            (ulong)(MICRO_M * HASH_MICRO_N) * (ulong)num_milestones;
+                    out_idx = (ulong)get_group_id(0) * batch_stride +
+                              (ulong)hash_local_id * (ulong)num_milestones + (ulong)ms;
+                } else {
+                    out_idx = (ulong)ms * (ulong)tile_count + (ulong)hash_spatial_id;
+                }
+                tile_xor[out_idx] = x;
+            }
+        }
+    }
+
+    if (!owns_tile || !fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
+        return;
+    }
+
+    uint digest[8];
+    b3_compress64(a_key8, msg, digest);
+    if (!digest_beats_target(digest, bound)) {
+        return;
+    }
+    if (found_flag == 0) {
+        return;
+    }
+    if (atomic_cmpxchg(found_flag, 0, 1) != 0) {
+        return;
+    }
+    if (out_t_rows != 0) {
+        *out_t_rows = im * MACRO_M + hash_row * MR;
+    }
+    if (out_t_cols != 0) {
+        *out_t_cols = jm * MACRO_N + hash_col * HASH_NR;
+    }
+}
+
+/* Layout self-test (host: CP_OCL_DPAS_SELFTEST=1), one sub-group, through the same
+   helpers as the GEMM kernel. One 8x16 hash tile = DPAS_NB DPAS calls (1 on SG 16, 2 on
+   SG 8). a: 8x32 int8 as dwords [k-group q][row m] (q*8 + m, k 4q..4q+3); b: 32x16 int8
+   as dwords [q][column n] (q*16 + n); c_in, d_out: int32 [m][n] row-major.
+   words[0..SG-1]: reduce-scatter of a synthetic pattern; words[SG]: the hash-tile XOR of D
+   via dpas_tile_partial + reduce-scatter (lane 0); words[SG+1]: get_sub_group_size();
+   words[SG+2]: lanes whose get_sub_group_local_id() == get_local_id(0) (via shuffles).
+   ak: SG 16 A k mapping (CASE32_DPAS_AK). */
+DPAS_REQD_SG
+__kernel void case33_dpas_selftest(__global const int *a, __global const int *b,
+                                   __global const int *c_in, __global int *d_out,
+                                   __global uint *words, int ak) {
+    const uint lane = get_sub_group_local_id();
+    const dpas_a av = dpas_load_a(a + dpas_a_lane_kg(lane, ak) * 8, dpas_a_lane_half(lane, ak));
+    dpas_acc d[DPAS_NB];
+    #pragma unroll
+    for (int h = 0; h < DPAS_NB; ++h) {
+        const int col = h * DPAS_SG + (int)lane;
+        const dpas_b bv = dpas_load_b(b + col, 16);
+        dpas_acc c;
+        c.s0 = c_in[0 * 16 + col];
+        c.s1 = c_in[1 * 16 + col];
+        c.s2 = c_in[2 * 16 + col];
+        c.s3 = c_in[3 * 16 + col];
+        c.s4 = c_in[4 * 16 + col];
+        c.s5 = c_in[5 * 16 + col];
+        c.s6 = c_in[6 * 16 + col];
+        c.s7 = c_in[7 * 16 + col];
+        d[h] = dpas_mac(av, bv, c);
+        d_out[0 * 16 + col] = d[h].s0;
+        d_out[1 * 16 + col] = d[h].s1;
+        d_out[2 * 16 + col] = d[h].s2;
+        d_out[3 * 16 + col] = d[h].s3;
+        d_out[4 * 16 + col] = d[h].s4;
+        d_out[5 * 16 + col] = d[h].s5;
+        d_out[6 * 16 + col] = d[h].s6;
+        d_out[7 * 16 + col] = d[h].s7;
+    }
+
+    uint p[DPAS_SG];
+    #pragma unroll
+    for (int t = 0; t < DPAS_SG; ++t) {
+        p[t] = (lane * 2654435761u + (uint)t * 2246822519u) ^ ((lane + 1u) * (uint)(t + 3));
+    }
+    words[lane] = dpas_reduce_scatter(p, lane);
+
+    /* hash tile (0, 0) = d[0..DPAS_NB): partial into word 0, reduce-scatter to lane 0 */
+    uint q[DPAS_SG];
+    #pragma unroll
+    for (int t = 0; t < DPAS_SG; ++t) {
+        q[t] = 0u;
+    }
+    q[0] = dpas_tile_partial(d, 0, 0);
+    const uint w = dpas_reduce_scatter(q, lane);
+
+    /* Lane-id sanity: bit l set when lane l == get_local_id(0) (distinct bits, so the
+       XOR reduction is their OR); the host expects all SG bits. */
+    uint same[DPAS_SG];
+    #pragma unroll
+    for (int t = 0; t < DPAS_SG; ++t) {
+        same[t] = 0u;
+    }
+    same[0] = (lane == (uint)get_local_id(0)) ? (1u << lane) : 0u;
+    const uint same_mask = dpas_reduce_scatter(same, lane);
+    if (lane == 0u) {
+        words[DPAS_SG] = w;
+        words[DPAS_SG + 1] = get_sub_group_size();
+        words[DPAS_SG + 2] = same_mask;
+    }
+}
+#endif /* CASE32_DPAS */

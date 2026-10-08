@@ -5,6 +5,7 @@
 #include "cp_config.h"
 
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -18,6 +19,10 @@
 #else
 #include <limits.h>
 #include <unistd.h>
+#endif
+
+#ifndef CL_KERNEL_SPILL_MEM_SIZE_INTEL
+#define CL_KERNEL_SPILL_MEM_SIZE_INTEL 0x4109
 #endif
 
 namespace {
@@ -83,6 +88,8 @@ const char *dot_backend_label(Case32OclDotBackend b, int issue_mode, bool cpm_in
         return "force cl_khr_integer_dot_product";
     case Case32OclDotBackend::Wmma:
         return "WMMA __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32";
+    case Case32OclDotBackend::Dpas:
+        return "DPAS intel_sub_group_i8_i8_matrix_mad_k32";
     case Case32OclDotBackend::Scalar:
         if (issue_mode == 1) {
             return cpm_int ? "broadcast int (cpm)" : "broadcast float (cpm)";
@@ -108,6 +115,8 @@ const char *dot_kind_short(Case32OclDotBackend b, int issue_mode, bool cpm_int) 
         return "dot_acc_sat";
     case Case32OclDotBackend::Wmma:
         return "wmma iu8";
+    case Case32OclDotBackend::Dpas:
+        return "dpas i8";
     case Case32OclDotBackend::Scalar:
         if (issue_mode == 2) {
             return "packed scalar";
@@ -188,6 +197,10 @@ std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, 
         /* No scalar fallback: a silent ~50x slower kernel would hide the failure. */
         push_unique(B::Wmma);
         return out;
+    case Case32OclDotPolicy::PinDpas:
+        /* Same: no scalar fallback behind an explicit --ocl-dot dpas. */
+        push_unique(B::Dpas);
+        return out;
     case Case32OclDotPolicy::Auto:
     default:
         /* AMD: WMMA on gfx11 (RDNA3: ~1.7x sudot4 on a 780M, verified bit-exact) and
@@ -195,7 +208,9 @@ std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, 
          * → sudot4 (RDNA3/4) → sdot4 (GFX9/RDNA2) → KHR if advertised → scalar.
          * WMMA refuses non-8x16 tiles / LDS staging, so those configurations fall
          * through to sudot4.
-         * Intel/NVIDIA/other: KHR if advertised → scalar.
+         * Intel/NVIDIA/other: KHR if advertised → scalar. Intel XMX (DPAS) stays
+         * opt-in (--ocl-dot dpas, which also switches the auto tile to 8x16) until its
+         * lane layout is confirmed on hardware (CP_OCL_DPAS_SELFTEST=1).
          * Asm stays opt-in via PinAsm only. */
         if (vendor_amd) {
             if (wmma_arch == 11 || wmma_arch == 12) {
@@ -301,7 +316,12 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         const bool scalar = backend == Case32OclDotBackend::Scalar;
         const bool use_wmma = backend == Case32OclDotBackend::Wmma;
         bool wmma_ksplit_forced = false; /* CP_OCL_WMMA_G12_KSPLIT set: no auto switch */
+        const bool use_dpas = backend == Case32OclDotBackend::Dpas;
         const char *label = dot_backend_label(backend, issue_mode_, use_cpm_int_);
+
+        if (use_dpas && !configure_dpas_(label)) {
+            return false;
+        }
 
         /* CP_OCL_WMMA_EMU=11|12: build the WMMA path for that arch with the instruction and
            ds_swizzle emulated in LDS, on any OpenCL device (a correctness test of the WMMA
@@ -369,8 +389,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DCASE32_WI_ROWMAJOR=" +
                       std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
-        /* WMMA launches its own work-group shape (waves x 32). */
-        const int reqd_wg = use_wmma ? wmma_wg_size_ : reqd_wg_size_;
+        /* WMMA and DPAS launch their own work-group shapes (waves x 32 /
+           sub-groups x sub-group size). */
+        const int reqd_wg = use_dpas ? dpas_wg_size_ : (use_wmma ? wmma_wg_size_ : reqd_wg_size_);
         if (reqd_wg > 0) {
             build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg);
         }
@@ -403,6 +424,17 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             }
             if (wmma_emu) {
                 build_opts += " -DCASE32_WMMA_EMU=1";
+            }
+        } else if (use_dpas) {
+            build_opts += " -DCASE32_DPAS=" + std::to_string(dpas_sg_);
+            build_opts += " -DCASE32_DPAS_AK=" + std::to_string(dpas_ak_);
+            build_opts += " -DDPAS_TM=" + std::to_string(dpas_tm_);
+            build_opts += " -DDPAS_TN=" + std::to_string(dpas_tn_);
+            /* NEO advertises cl_khr_integer_dot_product but dot_acc_sat needs CL3.0; the
+               DPAS section does not use case32_dot4, keep it out of the build. */
+            build_opts += " -DCASE32_NO_DPI=1";
+            if (dpas_emulate_) {
+                build_opts += " -DCP_DPAS_EMULATE=1";
             }
         } else if (use_sudot) {
             build_opts += " -DCASE32_USE_BUILTIN_SUDOT4=1";
@@ -490,6 +522,46 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             return false;
         }
 
+        if (use_dpas) {
+            bool ok = ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str());
+            if (!ok && !dpas_emulate_) {
+                std::fprintf(stderr, "[ocl] %s: CL1.2 build failed, retrying with -cl-std=CL3.0\n",
+                             label);
+                ok = ocl_.safe_build_program_from_file(kernel_cl_path,
+                                                       with_cl_std(build_opts, "CL3.0").c_str());
+            }
+            if (!ok) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
+                return false;
+            }
+            /* Validate the selected lane layout before enabling this opt-in backend. */
+            if (!run_dpas_selftest_()) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: SELF-TEST FAILED", label);
+                return false;
+            }
+            char dl[160];
+            std::snprintf(dl, sizeof(dl), "%s (SG %d, A layout ak=%d, %dx%d hash tiles/SG, %d WI%s)",
+                          label, dpas_sg_, dpas_ak_, dpas_tm_, dpas_tn_, dpas_wg_size_,
+                          dpas_emulate_ ? ", EMULATED on AMD" : "");
+            if (!adopt_kernel(dl)) {
+                return false;
+            }
+            size_t kwg = 0;
+            if (clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(kwg), &kwg, nullptr) == CL_SUCCESS &&
+                kwg > 0 && kwg < static_cast<size_t>(dpas_wg_size_)) {
+                std::snprintf(dpi_status_, sizeof(dpi_status_),
+                              "%s: kernel allows only %zu WIs/work-group (< %d); raise "
+                              "CP_OCL_DPAS_TM/TN",
+                              label, kwg, dpas_wg_size_);
+                std::fprintf(stderr, "[ocl] %s\n", dpi_status_);
+                clReleaseKernel(kernel_);
+                kernel_ = nullptr;
+                return false;
+            }
+            return true;
+        }
+
         if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
             return false;
@@ -546,7 +618,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     }
 
     std::vector<Case32OclDotBackend> candidates;
-    if (issue_mode_ == 1 && dot_policy_ != Case32OclDotPolicy::PinWmma) {
+    if (issue_mode_ == 1 && dot_policy_ != Case32OclDotPolicy::PinWmma &&
+        dot_policy_ != Case32OclDotPolicy::PinDpas) {
         /* --ocl-issue broadcast: force CLBlast cpm (beignet-fix scalar nest). */
         candidates = {Case32OclDotBackend::Scalar};
     } else {
@@ -571,6 +644,14 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                                        sizeof(priv_b), &priv_b, nullptr);
         std::printf("[ocl] kernel mem: local=%llu B/WG private=%llu B/WI\n",
                     (unsigned long long)local_b, (unsigned long long)priv_b);
+        cl_ulong spill_b = 0;
+        if (adopted_backend_ == Case32OclDotBackend::Dpas && !dpas_emulate_ &&
+            clGetKernelWorkGroupInfo(kernel_, ocl_.device, CL_KERNEL_SPILL_MEM_SIZE_INTEL,
+                                     sizeof(spill_b), &spill_b, nullptr) == CL_SUCCESS) {
+            /* Non-zero = register spills: try smaller CP_OCL_DPAS_TM / CP_OCL_DPAS_TN. */
+            std::printf("[ocl] DPAS kernel register spill: %llu B/WI\n",
+                        (unsigned long long)spill_b);
+        }
         std::fflush(stdout);
     }
     return built;
@@ -696,6 +777,299 @@ bool Case33GemmOcl::run_wmma_selftest_(int *pass_mask) {
         }
     }
     std::printf("[ocl] WMMA self-test: %s\n", io_ok && pass_compiled ? "PASS" : "FAIL");
+    std::fflush(stdout);
+    for (cl_mem m : {a_buf, b_buf, c_buf, d_buf, w_buf}) {
+        if (m) {
+            clReleaseMemObject(m);
+        }
+    }
+    clReleaseKernel(k);
+    return io_ok && pass_compiled;
+}
+
+namespace {
+
+/* Integer environment override; `def` when unset or empty. */
+int env_int(const char *name, int def) {
+    const char *v = std::getenv(name);
+    if (!v || !v[0]) return def;
+    char *end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(v, &end, 10);
+    if (errno || *end || parsed < 0 || parsed > 256) {
+        std::fprintf(stderr, "[ocl] %s must be an integer in [0,256]\n", name);
+        std::exit(1);
+    }
+    return static_cast<int>(parsed);
+}
+
+bool is_pow2(int v) { return v > 0 && (v & (v - 1)) == 0; }
+
+} // namespace
+
+/* Pick the DPAS sub-group size, A layout variant and sub-group tile for this device, or
+   refuse with a message in dpi_status_. Env overrides: CP_OCL_DPAS_SG=8|16,
+   CP_OCL_DPAS_AK=0|1 (SG 16 A packing), CP_OCL_DPAS_TM / CP_OCL_DPAS_TN (hash tiles per
+   sub-group), CP_OCL_DPAS_FORCE=1 (build even if the device reports no XMX),
+   CP_OCL_DPAS_EMULATE=8|16 (functional model on an AMD GPU, see the kernel). */
+bool Case33GemmOcl::configure_dpas_(const char *label) {
+    auto refuse = [&](const std::string &why) {
+        std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: %s", label, why.c_str());
+        std::fprintf(stderr, "[ocl] %s\n", dpi_status_);
+        return false;
+    };
+    const IntelDpasInfo info = query_intel_dpas(ocl_.device);
+    const bool vendor_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
+                            ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+    const int emulate = env_int("CP_OCL_DPAS_EMULATE", 0);
+    dpas_emulate_ = false;
+    int sg = info.sub_group;
+    if (!info.extension) {
+        if (vendor_amd && (emulate == 8 || emulate == 16)) {
+            dpas_emulate_ = true;
+            sg = emulate;
+        } else {
+            return refuse("refused on '" + ocl_.device_name +
+                          "' (needs an Intel GPU exposing "
+                          "cl_intel_subgroup_matrix_multiply_accumulate: Arc A/B, Arrow Lake-H, "
+                          "Lunar Lake)");
+        }
+    }
+    if (case32::kMR != 8 || case32::kNR != 16 || case32::hash_tile_nr() != 16 || use_lds_) {
+        return refuse("needs --ocl-tile 8x16 (the auto tile with --ocl-dot dpas) and --ocl-lds off");
+    }
+    if (!dpas_emulate_ && info.hw_dpas == 0 && env_int("CP_OCL_DPAS_FORCE", 0) == 0) {
+        return refuse("device reports no XMX/DPAS units (e.g. Meteor Lake Xe-LPG); "
+                      "CP_OCL_DPAS_FORCE=1 builds anyway");
+    }
+    const int sg_env = env_int("CP_OCL_DPAS_SG", 0);
+    if (sg_env != 0) {
+        if (sg_env != 8 && sg_env != 16) {
+            return refuse("CP_OCL_DPAS_SG must be 8 or 16");
+        }
+        if (sg != 0 && sg_env != sg) {
+            return refuse("CP_OCL_DPAS_SG must equal the device's minimum sub-group size " +
+                          std::to_string(sg));
+        }
+        sg = sg_env;
+    }
+    if (sg != 8 && sg != 16) {
+        return refuse("cannot determine the DPAS sub-group size; set CP_OCL_DPAS_SG=8 or 16");
+    }
+    if (!dpas_emulate_ && !info.sub_group_sizes.empty()) {
+        bool listed = false;
+        for (size_t s : info.sub_group_sizes) {
+            listed = listed || s == static_cast<size_t>(sg);
+        }
+        if (!listed) {
+            return refuse("sub-group size " + std::to_string(sg) + " not supported by the device");
+        }
+    }
+    dpas_sg_ = sg;
+    dpas_ak_ = env_int("CP_OCL_DPAS_AK", 0) ? 1 : 0;
+    dpas_tm_ = env_int("CP_OCL_DPAS_TM", 4);
+    dpas_tn_ = env_int("CP_OCL_DPAS_TN", sg == 8 ? 1 : 2);
+    if (!is_pow2(dpas_tm_) || !is_pow2(dpas_tn_) || dpas_tm_ > sg || dpas_tn_ > sg ||
+        dpas_tm_ * dpas_tn_ > sg ||
+        case32::kMacroM % (8 * dpas_tm_) != 0 || case32::kMacroN % (16 * dpas_tn_) != 0) {
+        return refuse("invalid CP_OCL_DPAS_TM/TN " + std::to_string(dpas_tm_) + "x" +
+                      std::to_string(dpas_tn_) + " (powers of two, TM*TN <= " +
+                      std::to_string(sg) + ", must divide the macro block)");
+    }
+    dpas_wg_size_ = (case32::kMacroM / (8 * dpas_tm_)) * (case32::kMacroN / (16 * dpas_tn_)) * sg;
+    if (static_cast<size_t>(dpas_wg_size_) > ocl_.max_work_group_size) {
+        return refuse("work-group of " + std::to_string(dpas_wg_size_) + " WIs exceeds the device max " +
+                      std::to_string(ocl_.max_work_group_size) + "; raise CP_OCL_DPAS_TM/TN");
+    }
+    std::string sizes;
+    for (size_t s : info.sub_group_sizes) {
+        sizes += (sizes.empty() ? "" : ",") + std::to_string(s);
+    }
+    std::printf("[ocl] DPAS: %s, IP %s, sub-group sizes {%s}, XMX %s -> SG %d, A layout ak=%d, "
+                "%dx%d hash tiles (%dx%d C) per sub-group, %d WIs per %dx%d macro block\n",
+                dpas_emulate_ ? "EMULATED on AMD (functional model, not an Intel test)"
+                              : "cl_intel_subgroup_matrix_multiply_accumulate",
+                intel_ip_version_string(info.ip_version).c_str(),
+                sizes.empty() ? "?" : sizes.c_str(),
+                info.hw_dpas < 0 ? "unknown" : (info.hw_dpas ? "yes" : "NO"), dpas_sg_, dpas_ak_,
+                dpas_tm_, dpas_tn_, 8 * dpas_tm_, 16 * dpas_tn_, dpas_wg_size_, case32::kMacroM,
+                case32::kMacroN);
+    std::fflush(stdout);
+    return true;
+}
+
+/* CP_OCL_DPAS_SELFTEST=1: one sub-group multiplies a known 8x32 int8 A by a 32x16 B
+   (one 8x16 hash tile: one DPAS on SG 16, two on SG 8) through the kernel's own operand /
+   accumulator helpers and compares every element with a scalar loop; it also checks the
+   shuffle reduce-scatter, the hash-tile XOR, the sub-group size and the lane ids. On
+   SG 16 both candidate A packings are tried, so one run tells which one the hardware
+   uses (CP_OCL_DPAS_AK selects the one the GEMM is built with). */
+bool Case33GemmOcl::run_dpas_selftest_() {
+    cl_kernel k = ocl_.create_kernel("case33_dpas_selftest");
+    if (!k) {
+        std::fprintf(stderr, "[ocl] DPAS self-test: kernel create failed\n");
+        return false;
+    }
+    const int sg = dpas_sg_;
+    int8_t a[8 * 32];  /* [m][k] */
+    int8_t b[16 * 32]; /* [n][k] */
+    int32_t c[8 * 16]; /* [m][n] */
+    uint64_t s = 0x2545F4914F6CDD1DULL;
+    auto next = [&]() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return static_cast<uint32_t>(s >> 32);
+    };
+    for (int8_t &v : a) {
+        v = static_cast<int8_t>(next());
+    }
+    for (int8_t &v : b) {
+        v = static_cast<int8_t>(next());
+    }
+    for (int32_t &v : c) {
+        v = static_cast<int32_t>(next() % 2000001u) - 1000000;
+    }
+    for (int kk = 0; kk < 32; ++kk) { /* int8 extremes: row 0 of A, column 0 of B */
+        a[kk] = static_cast<int8_t>((kk & 1) ? 127 : -128);
+        b[kk] = static_cast<int8_t>((kk & 2) ? -128 : 127);
+    }
+    /* Device layouts (see the kernel): A dword q*8 + m, B dword q*16 + n, byte j = k 4q+j. */
+    uint32_t a_dw[8 * 8];
+    uint32_t b_dw[8 * 16];
+    for (int q = 0; q < 8; ++q) {
+        for (int m = 0; m < 8; ++m) {
+            uint32_t w = 0;
+            for (int j = 0; j < 4; ++j) {
+                w |= static_cast<uint32_t>(static_cast<uint8_t>(a[m * 32 + 4 * q + j])) << (8 * j);
+            }
+            a_dw[q * 8 + m] = w;
+        }
+        for (int n = 0; n < 16; ++n) {
+            uint32_t w = 0;
+            for (int j = 0; j < 4; ++j) {
+                w |= static_cast<uint32_t>(static_cast<uint8_t>(b[n * 32 + 4 * q + j])) << (8 * j);
+            }
+            b_dw[q * 16 + n] = w;
+        }
+    }
+    int32_t d_ref[8 * 16];
+    uint32_t tile_ref = 0;
+    for (int m = 0; m < 8; ++m) {
+        for (int n = 0; n < 16; ++n) {
+            int32_t acc = c[m * 16 + n];
+            for (int kk = 0; kk < 32; ++kk) {
+                acc += static_cast<int32_t>(a[m * 32 + kk]) * static_cast<int32_t>(b[n * 32 + kk]);
+            }
+            d_ref[m * 16 + n] = acc;
+            tile_ref ^= static_cast<uint32_t>(acc);
+        }
+    }
+    uint32_t rs_ref[16] = {};
+    for (uint32_t l = 0; l < static_cast<uint32_t>(sg); ++l) {
+        for (uint32_t t = 0; t < static_cast<uint32_t>(sg); ++t) {
+            rs_ref[t] ^= (l * 2654435761u + t * 2246822519u) ^ ((l + 1u) * (t + 3u));
+        }
+    }
+
+    const size_t n_words = static_cast<size_t>(sg) + 3;
+    cl_mem a_buf = ocl_.alloc_buffer(sizeof(a_dw), CL_MEM_READ_ONLY);
+    cl_mem b_buf = ocl_.alloc_buffer(sizeof(b_dw), CL_MEM_READ_ONLY);
+    cl_mem c_buf = ocl_.alloc_buffer(sizeof(c), CL_MEM_READ_ONLY);
+    cl_mem d_buf = ocl_.alloc_buffer(sizeof(d_ref), CL_MEM_READ_WRITE);
+    cl_mem w_buf = ocl_.alloc_buffer(n_words * sizeof(uint32_t), CL_MEM_READ_WRITE);
+    bool pass_compiled = false;
+    int passing = -1;
+    bool io_ok = a_buf && b_buf && c_buf && d_buf && w_buf &&
+                 ocl_.write_buffer(a_buf, a_dw, sizeof(a_dw)) &&
+                 ocl_.write_buffer(b_buf, b_dw, sizeof(b_dw)) &&
+                 ocl_.write_buffer(c_buf, c, sizeof(c));
+    const int variants = sg == 16 ? 2 : 1;
+    for (int v = 0; io_ok && v < variants; ++v) {
+        cl_int err = CL_SUCCESS;
+        err |= clSetKernelArg(k, 0, sizeof(cl_mem), &a_buf);
+        err |= clSetKernelArg(k, 1, sizeof(cl_mem), &b_buf);
+        err |= clSetKernelArg(k, 2, sizeof(cl_mem), &c_buf);
+        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_buf);
+        err |= clSetKernelArg(k, 4, sizeof(cl_mem), &w_buf);
+        err |= clSetKernelArg(k, 5, sizeof(int), &v);
+        const size_t gsz = static_cast<size_t>(sg);
+        const int32_t poison_d[8 * 16] = {};
+        uint32_t poison_w[19] = {};
+        if (err == CL_SUCCESS && (!ocl_.write_buffer(d_buf, poison_d, sizeof(poison_d)) ||
+                                  !ocl_.write_buffer(w_buf, poison_w, n_words * sizeof(uint32_t)))) {
+            err = CL_OUT_OF_RESOURCES;
+        }
+        if (err == CL_SUCCESS) {
+            err = clEnqueueNDRangeKernel(ocl_.queue, k, 1, nullptr, &gsz, &gsz, 0, nullptr,
+                                         nullptr);
+        }
+        int32_t d[8 * 16];
+        uint32_t w[19];
+        if (err != CL_SUCCESS || clFinish(ocl_.queue) != CL_SUCCESS ||
+            !ocl_.read_buffer(d_buf, d, sizeof(d)) ||
+            !ocl_.read_buffer(w_buf, w, n_words * sizeof(uint32_t))) {
+            std::fprintf(stderr, "[ocl] DPAS self-test: launch failed (%s)\n",
+                         OpenClContext::error_string(err).c_str());
+            io_ok = false;
+            break;
+        }
+        int bad_d = 0;
+        int first_bad = -1;
+        for (int i = 0; i < 8 * 16; ++i) {
+            if (d[i] != d_ref[i]) {
+                if (first_bad < 0) {
+                    first_bad = i;
+                }
+                ++bad_d;
+            }
+        }
+        int bad_rs = 0;
+        for (int t = 0; t < sg; ++t) {
+            bad_rs += w[t] != rs_ref[t];
+        }
+        const bool tile_ok = w[sg] == tile_ref;
+        const bool sg_ok = w[sg + 1] == static_cast<uint32_t>(sg);
+        const uint32_t all_lanes = (1u << sg) - 1u;
+        const bool lanes_ok = w[sg + 2] == all_lanes;
+        const bool pass = bad_d == 0 && bad_rs == 0 && tile_ok && sg_ok && lanes_ok;
+        const char *name = sg == 8 ? "SG 8 (A: k 4*lane..+3, spec sample)"
+                           : v ? "SG 16 ak=1 (A: k 4*(lane%8)+2*(lane/8)..+1)"
+                               : "SG 16 ak=0 (A: k 2*lane..+1)";
+        std::printf("[ocl] DPAS self-test %s%s: %s (D %d/128 wrong, reduce-scatter %d/%d wrong, "
+                    "hash-tile XOR %s, sub-group size %u%s, lane ids %s)\n",
+                    name, dpas_emulate_ ? " [EMULATED]" : "", pass ? "PASS" : "FAIL", bad_d,
+                    bad_rs, sg, tile_ok ? "ok" : "WRONG", w[sg + 1], sg_ok ? "" : " WRONG",
+                    lanes_ok ? "ok" : "WRONG");
+        if (first_bad >= 0) {
+            std::printf("[ocl]   first wrong D[%d][%d] = %d, expected %d; wrong-element map "
+                        "(rows m, columns n):\n",
+                        first_bad / 16, first_bad % 16, d[first_bad], d_ref[first_bad]);
+            for (int m = 0; m < 8; ++m) {
+                char row[17];
+                for (int n = 0; n < 16; ++n) {
+                    row[n] = d[m * 16 + n] == d_ref[m * 16 + n] ? '.' : 'X';
+                }
+                row[16] = '\0';
+                std::printf("[ocl]     m=%d %s\n", m, row);
+            }
+        }
+        if (!lanes_ok) {
+            std::printf("[ocl]   lane-id mask %08x, expected %08x (sub-group lanes != local ids)\n",
+                        w[sg + 2], all_lanes);
+        }
+        if (pass && passing < 0) {
+            passing = v;
+        }
+        if (v == dpas_ak_ || sg == 8) {
+            pass_compiled = pass;
+        }
+    }
+    if (io_ok && !pass_compiled && passing >= 0) {
+        std::printf("[ocl] DPAS self-test: the A layout ak=%d passes; rerun with CP_OCL_DPAS_AK=%d\n",
+                    passing, passing);
+    }
+    std::printf("[ocl] DPAS self-test: %s\n", io_ok && pass_compiled ? "PASS" : "FAIL");
     std::fflush(stdout);
     for (cl_mem m : {a_buf, b_buf, c_buf, d_buf, w_buf}) {
         if (m) {
@@ -936,8 +1310,11 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count, cl_mem tile_
     }
 
     int slice_m = micro_m;
+    const bool dpas = adopted_backend_ == Case32OclDotBackend::Dpas;
     const bool wmma = adopted_backend_ == Case32OclDotBackend::Wmma;
-    if (reqd_wg_size_ > 0) {
+    if (dpas) {
+        /* One macro block per work-group of dpas_wg_size_ WIs (checked at build time). */
+    } else if (reqd_wg_size_ > 0) {
         /* Compiled with reqd_work_group_size(kMacroWorkItems): launch exactly that. */
         if (reqd_wg_size_ != case32::kMacroWorkItems) {
             std::fprintf(stderr, "[ocl] reqd work-group size %d != macro work-items %d\n",
@@ -985,8 +1362,9 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count, cl_mem tile_
         const int micro_m_begin = m0;
         const int micro_m_count = (m0 + slice_m <= micro_m) ? slice_m : (micro_m - m0);
         const size_t local =
-                wmma ? static_cast<size_t>(wmma_wg_size_)
-                     : static_cast<size_t>(micro_m_count) * static_cast<size_t>(micro_n);
+                dpas   ? static_cast<size_t>(dpas_wg_size_)
+                : wmma ? static_cast<size_t>(wmma_wg_size_)
+                       : static_cast<size_t>(micro_m_count) * static_cast<size_t>(micro_n);
         const size_t global = static_cast<size_t>(batch_count) * local;
 
         err = CL_SUCCESS;

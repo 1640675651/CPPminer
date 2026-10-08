@@ -100,7 +100,7 @@ static void print_usage(void)
     printf("  --ocl-macro MxN    OpenCL macro block: 64x64 or 128x128 (default 128x128)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-dot MODE     OpenCL dot backend: auto (default), sudot, sdot4, khr,\n");
-    printf("                     force-khr, asm, wmma (AMD gfx11/gfx12 matrix cores), or off\n");
+    printf("                     force-khr, asm, wmma (AMD gfx11/gfx12 matrix cores), dpas (Intel XMX), or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
 #endif
@@ -621,9 +621,11 @@ int main(int argc, char** argv)
                 ocl_dot_policy = 6;
             } else if(!strcmp(v, "wmma")){
                 ocl_dot_policy = 7;
+            } else if(!strcmp(v, "dpas") || !strcmp(v, "xmx")){
+                ocl_dot_policy = 8;
             } else {
                 fprintf(stderr,
-                        "invalid --ocl-dot %s (expected auto, sudot, sdot4, khr, force-khr, asm, wmma, or off)\n",
+                        "invalid --ocl-dot %s (expected auto, sudot, sdot4, khr, force-khr, asm, wmma, dpas, or off)\n",
                         v);
                 return 1;
             }

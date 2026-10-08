@@ -111,6 +111,10 @@ private:
     /* pass_mask (optional): bit v set when layout variant v passed (gfx12: v = ksplit). */
     bool run_wmma_selftest_(int *pass_mask = nullptr);
 
+    bool configure_dpas_(const char *label);
+
+    bool run_dpas_selftest_();
+
     bool setup_dims_(int M, int N, int K);
 
     bool ensure_jackpot_bufs_();
@@ -166,6 +170,12 @@ private:
     int wmma_pipeline_ = 0;   /* register double buffer (CP_OCL_WMMA_PIPELINE) */
     int wmma_wave_n_ = 64;    /* wave sub-tile width: 64 or 32 (CP_OCL_WMMA_WAVE_N) */
     int wmma_wg_size_ = 0;    /* WIs per macro-block work-group on the Wmma backend */
+    int dpas_sg_ = 0;         /* Dpas backend: sub-group size 8 (Xe-HPG) or 16 (Xe2) */
+    int dpas_ak_ = 0;         /* SG 16 A packing variant (CP_OCL_DPAS_AK) */
+    int dpas_tm_ = 0;         /* hash tiles per sub-group: rows x cols */
+    int dpas_tn_ = 0;
+    int dpas_wg_size_ = 0;    /* WIs per macro-block work-group */
+    bool dpas_emulate_ = false; /* CP_OCL_DPAS_EMULATE functional model on AMD */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
@@ -215,7 +225,7 @@ private:
 
     char backend_[192] = {};
 
-    char dpi_status_[128] = {};
+    char dpi_status_[192] = {};
 
 };
 

@@ -270,7 +270,7 @@ extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
     if (policy < 0) {
         policy = 0;
     }
-    if (policy > 7) {
+    if (policy > 8) {
         policy = 0;
     }
     g_dot_policy = policy;
@@ -324,6 +324,17 @@ extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) 
             tile_mr = g_tile_mr;
             tile_nr = g_tile_nr;
             source = "CLI override";
+        }
+    } else if (g_dot_policy == static_cast<int>(Case32OclDotPolicy::PinDpas)) {
+        /* Intel XMX (DPAS) works on the 8x16 hash tile only. Opt-in for now: the Intel
+           auto default stays 4x8 + KHR dot until the DPAS layout self-test has passed on
+           Xe-HPG and Xe2 hardware. */
+        tile_mr = PP_HASH_H;
+        tile_nr = 16;
+        source = "--ocl-dot dpas auto 8x16";
+        if (!case32::configure(tile_mr, tile_nr, macro_m, macro_n)) {
+            fprintf(stderr, "[ocl] hash tile / macro configure failed\n");
+            return;
         }
     } else {
         const std::vector<OclDeviceInfo> devices =
