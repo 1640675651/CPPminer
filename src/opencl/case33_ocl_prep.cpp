@@ -168,6 +168,21 @@ bool Case33OclPrep::build_program_(const std::string &kernel_dir) {
     opts += " -DMACRO_M=" + std::to_string(case32::kMacroM);
     opts += " -DMACRO_N=" + std::to_string(case32::kMacroN);
     opts += " -DR_RANK=" + std::to_string(R_RANK);
+    {
+        /* ocl_fused_prepack_a_wg stages 1/FPA_SPLIT of a block's rows; split until they fit
+           the work group's local memory (AMD's Windows driver allows 32 KB, ROCm 64 KB). */
+        cl_ulong lds = 0;
+        clGetDeviceInfo(ocl_->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lds), &lds, nullptr);
+        auto need = [](int rows) {
+            return static_cast<cl_ulong>(rows) * (case32::kKR / 4 + 1 + R_RANK / 4 + 1) * 4 +
+                   2 * static_cast<cl_ulong>(case32::kKR) + 1024;
+        };
+        fpa_split_ = 1;
+        while (need(case32::kMacroM / fpa_split_) > lds && case32::kMacroM / fpa_split_ > 32) {
+            fpa_split_ *= 2;
+        }
+        opts += " -DFPA_SPLIT=" + std::to_string(fpa_split_);
+    }
 
     cl_int err = CL_SUCCESS;
     const char *srcs[] = {src.c_str()};
@@ -209,6 +224,18 @@ bool Case33OclPrep::create_kernels_() {
     k_reduce_roots_ = mk("ocl_reduce_roots");
     k_fused_prepack_a_ = fused_prepack_ ? mk("ocl_fused_prepack_a") : nullptr;
     k_fused_prepack_a_wg_ = fused_prepack_ ? mk("ocl_fused_prepack_a_wg") : nullptr;
+    if (k_fused_prepack_a_wg_) {
+        /* the kernel needs exactly 256 work-items per group */
+        size_t max_wg = 0;
+        clGetKernelWorkGroupInfo(k_fused_prepack_a_wg_, ocl_->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(max_wg), &max_wg, nullptr);
+        if (max_wg < 256) {
+            std::fprintf(stderr, "[ocl-prep] fused_prepack_a_wg allows %zu work-items; using the "
+                                 "8-lane kernel\n", max_wg);
+            clReleaseKernel(k_fused_prepack_a_wg_);
+            k_fused_prepack_a_wg_ = nullptr;
+        }
+    }
     k_fused_prepack_b_ = fused_prepack_ ? mk("ocl_fused_prepack_b") : nullptr;
     k_noisy_rowmajor_ = mk("ocl_noisy_matrix_rowmajor");
     k_uniform_rows_ = mk("ocl_uniform_rows");
@@ -1108,7 +1135,8 @@ bool Case33OclPrep::fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, in
         err |= clSetKernelArg(k, 4, sizeof(int), &K);
         err |= clSetKernelArg(k, 5, sizeof(int), &blocks_k);
         l2 = 256;
-        g2 = static_cast<size_t>(macro_rows) * static_cast<size_t>(blocks_k) * l2;
+        g2 = static_cast<size_t>(macro_rows) * static_cast<size_t>(blocks_k) *
+             static_cast<size_t>(fpa_split_) * l2;
     } else {
         err |= clSetKernelArg(k, 0, sizeof(cl_mem), &a_buf);
         err |= clSetKernelArg(k, 1, sizeof(cl_mem), &d_noise_seed_);
@@ -1126,9 +1154,10 @@ bool Case33OclPrep::fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, in
     if (err != CL_SUCCESS) {
         return false;
     }
-    if (clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g2, &l2, 0, nullptr, nullptr) !=
-        CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl-prep] fused_prepack_a launch failed\n");
+    err = clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g2, &l2, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "[ocl-prep] fused_prepack_a%s launch failed (%d)\n",
+                     k == k_fused_prepack_a_wg_ ? "_wg" : "", (int)err);
         return false;
     }
     return true;
@@ -1148,8 +1177,14 @@ bool Case33OclPrep::fused_prepack_a(cl_mem a_buf, int m, int K, int blocks_k, in
     const int rows = macro_rows * case32::kMacroM;
     const bool wg = k_fused_prepack_a_wg_ && fpa_wg_enabled() && R_RANK <= 256 &&
                     K % case32::kKR == 0 && uniform_rows_(rows, 0);
-    if (!fused_prepack_a_launch_(wg ? k_fused_prepack_a_wg_ : k_fused_prepack_a_, a_buf, m, K,
-                                 blocks_k, macro_rows)) {
+    if (wg && !fused_prepack_a_launch_(k_fused_prepack_a_wg_, a_buf, m, K, blocks_k, macro_rows)) {
+        /* a driver that refuses the 256-wide kernel keeps mining on the 8-lane one */
+        std::fprintf(stderr, "[ocl-prep] disabling fused_prepack_a_wg; using the 8-lane kernel\n");
+        clReleaseKernel(k_fused_prepack_a_wg_);
+        k_fused_prepack_a_wg_ = nullptr;
+        return fused_prepack_a(a_buf, m, K, blocks_k, macro_rows);
+    }
+    if (!wg && !fused_prepack_a_launch_(k_fused_prepack_a_, a_buf, m, K, blocks_k, macro_rows)) {
         return false;
     }
     clFinish(ocl_->queue);

@@ -195,31 +195,40 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
     }
 }
 
-/* Same bytes as ocl_fused_prepack_a, one 256-wide work group per (im, kb) block.
- * The rows' uniform noise (el_rows, R_RANK bytes per row, from ocl_uniform_rows) and the
- * signal tile are staged in local memory with a 4-byte row pad, so lanes that read the same
- * k of neighbouring rows hit different banks. Output word w of the block is
- * kg * MACRO_M + r (byte offset kg * MACRO_KG_STRIP_A + r * 4), so stores are coalesced. */
+/* Same bytes as ocl_fused_prepack_a, one 256-wide work group per (im, kb) block, or per
+ * 1/FPA_SPLIT of its rows. The rows' uniform noise (el_rows, R_RANK bytes per row, from
+ * ocl_uniform_rows) and the signal tile are staged in local memory with a 4-byte row pad, so
+ * lanes that read the same k of neighbouring rows hit different banks. Output word of block row
+ * r and k group kg is kg * MACRO_M + r (byte offset kg * MACRO_KG_STRIP_A + r * 4), so stores
+ * are coalesced. FPA_SPLIT (host, from the device's local memory size): 1 needs ~34 KB at
+ * MACRO_M 128; AMD's Windows driver gives a work group 32 KB, so it gets 2. */
+#ifndef FPA_SPLIT
+#define FPA_SPLIT 1
+#endif
 #define FPA_WG 256
+#define FPA_ROWS (MACRO_M / FPA_SPLIT)
 #define FPA_SW (KR / 4 + 1)
 #define FPA_EW (R_RANK / 4 + 1)
 __kernel __attribute__((reqd_work_group_size(FPA_WG, 1, 1))) void
 ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
                        __global const uint *pairs, __global const char *a_signal, int K,
                        int blocks_k) {
-    __local uint sig[MACRO_M * FPA_SW];
-    __local uint el[MACRO_M * FPA_EW];
+    __local uint sig[FPA_ROWS * FPA_SW];
+    __local uint el[FPA_ROWS * FPA_EW];
     __local uchar p0[KR];
     __local uchar p1[KR];
 
-    const int blk = (int)get_group_id(0);
+    const int g = (int)get_group_id(0);
+    const int part = g % FPA_SPLIT;
+    const int blk = g / FPA_SPLIT;
     const int kb = blk % blocks_k;
     const int im = blk / blocks_k;
     const int t = (int)get_local_id(0);
-    const int row0 = im * MACRO_M;
+    const int rbase = part * FPA_ROWS; /* first block row of this group */
+    const int row0 = im * MACRO_M + rbase;
     const int k0 = kb * KR;
 
-    for (int i = t; i < MACRO_M * (KR / 16); i += FPA_WG) {
+    for (int i = t; i < FPA_ROWS * (KR / 16); i += FPA_WG) {
         const int r = i / (KR / 16);
         const int c = i % (KR / 16);
         const uint4 v =
@@ -230,7 +239,7 @@ ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
         d[2] = v.z;
         d[3] = v.w;
     }
-    for (int i = t; i < MACRO_M * (R_RANK / 16); i += FPA_WG) {
+    for (int i = t; i < FPA_ROWS * (R_RANK / 16); i += FPA_WG) {
         const int r = i / (R_RANK / 16);
         const int c = i % (R_RANK / 16);
         const uint4 v = *(__global const uint4 *)(el_rows + (size_t)(row0 + r) * (R_RANK / 4) +
@@ -249,9 +258,9 @@ ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
 
     __global uint *dst = a_pre_out + ((size_t)im * (size_t)blocks_k + (size_t)kb) *
                                              (size_t)(MACRO_KB_BLOCK_A / 4);
-    for (int w = t; w < MACRO_M * K_GROUPS; w += FPA_WG) {
-        const int kg = w / MACRO_M;
-        const int r = w % MACRO_M;
+    for (int w = t; w < FPA_ROWS * K_GROUPS; w += FPA_WG) {
+        const int kg = w / FPA_ROWS;
+        const int r = w % FPA_ROWS;
         const uint s = sig[r * FPA_SW + kg];
         const __local uchar *e = (const __local uchar *)(el + r * FPA_EW);
         uint out = 0;
@@ -260,7 +269,7 @@ ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
             const uint v = (s >> (8 * b)) + (uint)e[p0[k]] - (uint)e[p1[k]];
             out |= (v & 0xffu) << (8 * b);
         }
-        dst[w] = out;
+        dst[kg * MACRO_M + rbase + r] = out;
     }
 }
 

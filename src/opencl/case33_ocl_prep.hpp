@@ -117,6 +117,7 @@ private:
     cl_kernel k_reduce_roots_ = nullptr;
     cl_kernel k_fused_prepack_a_ = nullptr;
     cl_kernel k_fused_prepack_a_wg_ = nullptr; // optional: 256-wide blocks, needs el rows
+    int fpa_split_ = 1; // work groups per block in k_fused_prepack_a_wg_ (local memory)
     cl_kernel k_fused_prepack_b_ = nullptr;
     cl_kernel k_noisy_rowmajor_ = nullptr;
     cl_kernel k_uniform_rows_ = nullptr;      // optional: work-group row-major noise path
