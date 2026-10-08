@@ -1,3 +1,4 @@
+#include "cp_api.h"
 #include "cp_qpow_mine.h"
 #include "cp_config.h"
 #include "cp_fee.h"
@@ -401,6 +402,7 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
             job->mining_hash, diff, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
+        cp_api_add_work((double)hashes);
         cp_fee_note_tiles(qpow_take_hash_us(&t_search));
         cp_fee_prepare_matrix();
         /* Switch only after this batch's share (if any) is submitted under the current wallet. */
@@ -482,6 +484,7 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
             job->mining_hash, job->target, cur, search_chunk,
             out_nonce, out_hash, &hashes);
         total_hashes += hashes;
+        cp_api_add_work((double)hashes);
         cp_fee_note_tiles(qpow_take_hash_us(&t_search));
         cp_fee_prepare_matrix();
         /* Switch only after this batch's share (if any) is submitted under the current wallet. */
@@ -586,6 +589,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
             qpow::SearchResult r = qpow::search_range(
                 job->mining_hash, cur, k_search_chunk, job->target, isa);
             total_hashes.fetch_add(r.hashes, std::memory_order_relaxed);
+            cp_api_add_work((double)r.hashes);
             {
                 std::lock_guard<std::mutex> lk(fee_mx);
                 cp_fee_note_tiles(qpow_take_hash_us(&t_fee));

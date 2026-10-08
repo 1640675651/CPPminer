@@ -1,3 +1,4 @@
+#include "cp_api.h"
 #include "cp_pool_session.h"
 #include "cp_config.h"
 #include "cp_fee.h"
@@ -205,6 +206,7 @@ reconnect:
     cp_pool_reader_stop();
     cp_pool_disconnect();
     cp_pool_inbox_clear();
+    cp_api_set_pool_connected(0);
     cp_qpow_pool_clear();
     cur_job_key[0] = 0;
 
@@ -232,6 +234,7 @@ reconnect:
     }
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
+    cp_api_set_pool(pool_host, pool_port, 1);
     if(cp_fee_enabled()){
         char debt_s[48], thr_s[48];
         printf("[fee] logged in as %s (debt=%s / 100*T=%s of hashing time)\n",
@@ -295,6 +298,7 @@ reconnect:
     cp_pool_reader_stop();
     cp_pool_disconnect();
     cp_pool_inbox_clear();
+    cp_api_set_pool_connected(0);
     cur_job_key[0] = 0;
 
     while(1){
@@ -307,6 +311,7 @@ reconnect:
                                pool_pass_global))
         goto reconnect;
     cp_fee_on_authorized();
+    cp_api_set_pool(pool_host, pool_port, 1);
     if(cp_fee_enabled()){
         printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",

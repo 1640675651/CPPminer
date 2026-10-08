@@ -3,6 +3,7 @@
 #include "cp_backend_setup.h"
 #include "cp_diagnostics.h"
 #include "cp_fee.h"
+#include "cp_api.h"
 #include "cp_mine.h"
 #include "cp_options.h"
 #include "cp_pool_session.h"
@@ -102,10 +103,14 @@ int main(int argc, char** argv)
 
     /* Offline runs skip the pool; no fee reconnects. */
     cp_fee_init(wallet_global, offline ? 0 : 1, opt.algo_sel);
+    cp_api_set_algo(cp_algo_name(opt.algo_sel), NULL);
+    if(opt.api_port > 0) cp_api_start(opt.api_bind, opt.api_port);
 
     if(opt.algo_sel == CP_ALGO_QUANTUS){
         if(cp_quantus_backend_init(&opt) != 0)
             return 1;
+        cp_api_set_algo(NULL, cp_worker_backend_name());
+        if(cp_api_device_count() == 0) cp_api_add_device(cp_worker_backend_name(), NULL);
         int qrc;
         if(g_mock){
             qrc = cp_qpow_mine_mock(worker_global);
@@ -139,6 +144,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "[%s] backend init failed; exiting\n", cp_worker_backend_name());
         return 1;
     }
+    cp_api_set_algo(NULL, cp_worker_backend_name());
+    if(cp_api_device_count() == 0) cp_api_add_device(cp_worker_backend_name(), NULL);
     {
         const int contiguous = cp_worker_uses_contiguous_tiles();
         const uint64_t t_tiles =

@@ -96,6 +96,10 @@ struct OpenClContext {
 
     static std::string error_string(cl_int err);
 
+    /* "dddd:bb:dd.f" of a device (cl_khr_pci_bus_info, AMD topology or NVIDIA ids), "" if the
+       driver reports none. */
+    static std::string pci_bus_id(cl_device_id dev);
+
     /* Command queue with the cl_khr_throttle_hints level set by cp_ocl_set_queue_throttle (LOW:
        Intel's runtime then sleeps in clFinish / clWaitForEvents / blocking reads instead of spinning
        a CPU core) when the device advertises the extension; otherwise, or if the driver rejects the

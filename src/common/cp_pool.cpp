@@ -1,3 +1,5 @@
+#include "cp_api.h"
+#include "cp_fee.h"
 #include "cp_pool.h"
 #include "cp_config.h"
 #include "cp_job_ctrl.h"
@@ -34,6 +36,15 @@ static std::atomic<double> g_diff{32.0};
 /* Every submit waits here until the pool replies to its id; the reader gives up on the
  * connection when the oldest one has no reply within CP_SUBMIT_ACK_TIMEOUT_SEC. */
 static CpSubmitTable g_submits;
+
+/* A submit reply accepts the share: no error and "result" true, or a result object with
+ * "status":"OK" (Quantus). */
+static int pool_submit_accepted(const char* line)
+{
+    if(cp_json_rpc_rejected(line)) return 0;
+    const char* r = cp_json_member(line, "result");
+    return r && (strncmp(r, "true", 4) == 0 || (*r == '{' && strstr(r, "\"OK\"") != nullptr));
+}
 #define CP_SUBMIT_ACK_TIMEOUT_SEC 60.0
 
 /* Session deadlines. A pool that keeps the connection open but never answers the
@@ -258,9 +269,10 @@ static void pool_dispatch_line(const char* line)
     if(strstr(line, "result") || strstr(line, "error")){
         /* Only the reply carrying a submit's own id answers that submit. */
         int response_id = 0;
-        if(cp_json_rpc_response_id(line, &response_id) && g_submits.finish(response_id))
+        if(cp_json_rpc_response_id(line, &response_id) && g_submits.finish(response_id)){
             printf("[pool] submit response: %s\n", line);
-        else
+            if(!cp_fee_session_is_dev()) cp_api_on_share(pool_submit_accepted(line));
+        } else
             printf("[pool] jsonrpc: %s\n", line);
         fflush(stdout);
         return;
