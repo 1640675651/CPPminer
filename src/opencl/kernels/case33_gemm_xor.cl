@@ -1013,6 +1013,16 @@ inline void wmma_tile_partials(wmma_acc c, uint lane, uint *top, uint *bot) {
 /* The halves are picked with a lane mask, not `hi ? p[a] : p[b]`: LLVM turns that select of
    two elements into one load at a select-ed index, which forces p[] out of registers into
    scratch (gfx11/gfx12: ~70 scratch ops per milestone). */
+/* CASE32_WMMA_RS_MASK (default: on for gfx12, off for gfx11): lane-mask halves (above) or the
+   per-element select, which measured faster on gfx11 (Radeon 780M: 6.32 vs 6.17 TMAC/s). */
+#ifndef CASE32_WMMA_RS_MASK
+#if CASE32_WMMA == 12
+#define CASE32_WMMA_RS_MASK 1
+#else
+#define CASE32_WMMA_RS_MASK 0
+#endif
+#endif
+#if CASE32_WMMA_RS_MASK
 #define WMMA_RS_STAGE(p, lane, n, m)                                                  \
     do {                                                                              \
         const uint hm_ = (((lane) & (m)) != 0u) ? 0xFFFFFFFFu : 0u;                   \
@@ -1024,6 +1034,17 @@ inline void wmma_tile_partials(wmma_acc c, uint lane, uint *top, uint *bot) {
             (p)[j_] = keep_ ^ WMMA_SWZ_XOR(send_, m);                                 \
         }                                                                             \
     } while (0)
+#else
+#define WMMA_RS_STAGE(p, lane, n, m)                                                  \
+    do {                                                                              \
+        const int hi_ = ((lane) & (m)) != 0u;                                         \
+        _Pragma("unroll") for (int j_ = 0; j_ < (n) / 2; ++j_) {                      \
+            const uint keep_ = hi_ ? (p)[j_ + (n) / 2] : (p)[j_];                     \
+            const uint send_ = hi_ ? (p)[j_] : (p)[j_ + (n) / 2];                     \
+            (p)[j_] = keep_ ^ WMMA_SWZ_XOR(send_, m);                                 \
+        }                                                                             \
+    } while (0)
+#endif
 
 /* p[t] (t = 0..31): this lane's partial of word t. Returns XOR over all 32 lanes of
    p[lane], i.e. lane t receives the complete word t. Whole wave must be active. */
