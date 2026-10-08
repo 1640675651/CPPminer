@@ -460,39 +460,51 @@ elseif(CP_ENABLE_ONEDNN)
 endif()
 
 # Optional ESIMD XMX scan for the onednn backend: a SYCL shared library built
-# with icpx and loaded at runtime (kernels/libcp_esimd.so), so cppminer itself
-# keeps building with the regular compiler.
-option(CP_ENABLE_ESIMD "Build libcp_esimd (Intel XMX ESIMD scan; needs oneAPI icpx)" OFF)
+# with oneAPI's icpx/icx and loaded at runtime from kernels/, so cppminer itself
+# keeps building with the regular compiler. Without the library (or on a GPU
+# or driver it cannot use) the backend keeps gemmstone.
+option(CP_ENABLE_ESIMD "Build libcp_esimd (Intel XMX ESIMD scan; needs oneAPI icpx/icx)" OFF)
 if(CP_ENABLE_ESIMD)
     if(NOT CP_ENABLE_ONEDNN)
         message(FATAL_ERROR "CP_ENABLE_ESIMD requires CP_ENABLE_ONEDNN")
     endif()
-    find_program(CP_ICPX icpx HINTS "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
-                 "/opt/intel/oneapi/compiler/latest/bin")
-    if(NOT CP_ICPX)
-        message(FATAL_ERROR "CP_ENABLE_ESIMD: icpx not found (source oneAPI setvars.sh)")
+    if(WIN32)
+        find_program(CP_ICPX NAMES icx HINTS "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
+                     "$ENV{ProgramFiles\(x86\)}/Intel/oneAPI/compiler/latest/bin")
+        set(_cp_esimd_lib "${CMAKE_BINARY_DIR}/kernels/cp_esimd.dll")
+        set(_cp_esimd_link
+            -fsycl -O3 -shared -I${_OCL_HDR}
+            "$<TARGET_PROPERTY:OpenCL::OpenCL,IMPORTED_LOCATION>")
+    else()
+        find_program(CP_ICPX icpx HINTS "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
+                     "/opt/intel/oneapi/compiler/latest/bin")
+        set(_cp_esimd_lib "${CMAKE_BINARY_DIR}/kernels/libcp_esimd.so")
+        get_filename_component(_cp_icpx_lib "${CP_ICPX}/../../lib" ABSOLUTE)
+        get_filename_component(_cp_umf_lib "${CP_ICPX}/../../../../umf/latest/lib" ABSOLUTE)
+        get_filename_component(_cp_tcm_lib "${CP_ICPX}/../../../../tcm/latest/lib" ABSOLUTE)
+        # $ORIGIN first: a release bundles the SYCL runtime next to the library
+        # (scripts/package_esimd_runtime.sh); the oneAPI tree is the fallback.
+        # The UR adapters libsycl loads at startup need libumf and its libhwloc,
+        # so both are direct dependencies; DT_RPATH is inherited by them.
+        set(_cp_esimd_link
+            -fsycl -O3 -fPIC -shared -Wl,--disable-new-dtags
+            "-Wl,-rpath,$ORIGIN:${_cp_icpx_lib}:${_cp_umf_lib}:${_cp_tcm_lib}"
+            -lOpenCL -Wl,--no-as-needed -L${_cp_tcm_lib} -lhwloc -L${_cp_umf_lib} -lumf)
     endif()
-    get_filename_component(_cp_icpx_lib "${CP_ICPX}/../../lib" ABSOLUTE)
-    # libumf (and its libhwloc from tcm) as direct dependencies with an inherited
-    # DT_RPATH: the UR adapters libsycl loads at startup need them, and without
-    # oneAPI's setvars.sh nothing else puts them on the library path.
-    get_filename_component(_cp_umf_lib "${CP_ICPX}/../../../../umf/latest/lib" ABSOLUTE)
-    get_filename_component(_cp_tcm_lib "${CP_ICPX}/../../../../tcm/latest/lib" ABSOLUTE)
-    # Built straight into kernels/ next to the binary (single-config generators).
-    set(_cp_esimd_lib "${CMAKE_BINARY_DIR}/kernels/libcp_esimd.so")
+    if(NOT CP_ICPX)
+        message(FATAL_ERROR "CP_ENABLE_ESIMD: oneAPI DPC++ compiler not found (source setvars)")
+    endif()
     add_custom_command(OUTPUT "${_cp_esimd_lib}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/kernels"
-        COMMAND "${CP_ICPX}" -fsycl -O3 -fPIC -shared -Wl,--disable-new-dtags
-                -Wl,-rpath,${_cp_icpx_lib}:${_cp_umf_lib}:${_cp_tcm_lib}
-                -o "${_cp_esimd_lib}" "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.cpp" -lOpenCL
-                -Wl,--no-as-needed -L${_cp_tcm_lib} -lhwloc -L${_cp_umf_lib} -lumf
+        COMMAND "${CP_ICPX}" -o "${_cp_esimd_lib}"
+                "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.cpp" ${_cp_esimd_link}
         DEPENDS "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.cpp"
                 "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.h"
-        COMMENT "Building libcp_esimd with icpx")
+        COMMENT "Building the ESIMD scan library with ${CP_ICPX}"
+        VERBATIM)
     add_custom_target(cp_esimd ALL DEPENDS "${_cp_esimd_lib}")
     add_dependencies(cppminer cp_esimd)
 endif()
-
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
 set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi)
 set(CP_PROOF_FFI_MANIFEST ${CP_PROOF_FFI_DIR}/Cargo.toml)

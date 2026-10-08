@@ -240,6 +240,9 @@ ESIMD_INLINE void scan_thread(const AccA &a, const AccB &b, const AccF &found, c
 
 using ByteBuf = sycl::buffer<char, 1>;
 
+class ScanEs8;  // kernel names, for the prebuilt bundle
+class ScanEs16;
+
 } // namespace
 
 struct CpEsimdScan {
@@ -263,13 +266,19 @@ struct CpEsimdScan {
     }
 };
 
+#ifdef _WIN32
+#define CP_ESIMD_EXPORT __declspec(dllexport)
+#else
+#define CP_ESIMD_EXPORT __attribute__((visibility("default")))
+#endif
+
 extern "C" {
 
-__attribute__((visibility("default"))) int cp_esimd_abi_version(void) {
+CP_ESIMD_EXPORT int cp_esimd_abi_version(void) {
     return CP_ESIMD_ABI_VERSION;
 }
 
-__attribute__((visibility("default"))) CpEsimdScan *cp_esimd_create(void *cl_ctx, void *cl_dev,
+CP_ESIMD_EXPORT CpEsimdScan *cp_esimd_create(void *cl_ctx, void *cl_dev,
                                                                      void *cl_queue, CpEsimdInfo *info,
                                                                      char *err, int err_len) {
     auto fail = [&](const char *msg) -> CpEsimdScan * {
@@ -288,6 +297,11 @@ __attribute__((visibility("default"))) CpEsimdScan *cp_esimd_create(void *cl_ctx
         s->info.dpasw = s->info.exec_size == 8 ? 1 : 0;
         s->info.tile_m = TM * WGM;
         s->info.tile_n = TN * WGN;
+        // Compile the kernel now: a driver that cannot build ESIMD fails here, and
+        // the miner keeps gemmstone, instead of failing in the first scan.
+        const sycl::kernel_id kid = s->info.exec_size == 8 ? sycl::get_kernel_id<ScanEs8>()
+                                                             : sycl::get_kernel_id<ScanEs16>();
+        (void)sycl::get_kernel_bundle<sycl::bundle_state::executable>(s->ctx, {dev}, {kid});
         if (info) *info = s->info;
         return s.release();
     } catch (const std::exception &e) {
@@ -295,7 +309,7 @@ __attribute__((visibility("default"))) CpEsimdScan *cp_esimd_create(void *cl_ctx
     }
 }
 
-__attribute__((visibility("default"))) int cp_esimd_scan_panel(CpEsimdScan *s, void *a_blocked,
+CP_ESIMD_EXPORT int cp_esimd_scan_panel(CpEsimdScan *s, void *a_blocked,
                                                                void *bt_vnni, void *found, int m0,
                                                                int n0, int m, int n,
                                                                const uint32_t key[8],
@@ -317,7 +331,7 @@ __attribute__((visibility("default"))) int cp_esimd_scan_panel(CpEsimdScan *s, v
             auto f = fb.get_access<sycl::access::mode::read_write>(h);
             syclex::properties props{intelex::grf_size<256>};
             if (es == 8) {
-                h.parallel_for(r, props, [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+                h.parallel_for<ScanEs8>(r, props, [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
                     // A fused pair (consecutive ids) shares rows: dpasw splits A between them.
                     const int lin = (int)it.get_local_linear_id();
                     const int tn = lin % WGN, tm = lin / WGN;
@@ -325,7 +339,7 @@ __attribute__((visibility("default"))) int cp_esimd_scan_panel(CpEsimdScan *s, v
                                          (int)it.get_group(1) * WGN + tn, lin & 1);
                 });
             } else {
-                h.parallel_for(r, props, [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+                h.parallel_for<ScanEs16>(r, props, [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
                     const int lin = (int)it.get_local_linear_id();
                     const int tn = lin % WGN, tm = lin / WGN;
                     scan_thread<16, false>(a, b, f, args, (int)it.get_group(0) * WGM + tm,
@@ -348,7 +362,7 @@ __attribute__((visibility("default"))) int cp_esimd_scan_panel(CpEsimdScan *s, v
     }
 }
 
-__attribute__((visibility("default"))) void cp_esimd_wait(CpEsimdScan *s) {
+CP_ESIMD_EXPORT void cp_esimd_wait(CpEsimdScan *s) {
     if (!s) return;
     try {
         s->q.wait();
@@ -357,7 +371,7 @@ __attribute__((visibility("default"))) void cp_esimd_wait(CpEsimdScan *s) {
     }
 }
 
-__attribute__((visibility("default"))) void cp_esimd_destroy(CpEsimdScan *s) {
+CP_ESIMD_EXPORT void cp_esimd_destroy(CpEsimdScan *s) {
     if (!s) return;
     try {
         s->q.wait();

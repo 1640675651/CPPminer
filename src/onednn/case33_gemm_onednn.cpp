@@ -45,7 +45,9 @@ const char *intel_gemm_mode() {
 
 void *esimd_dlopen(const std::string &path) {
 #ifdef _WIN32
-    return reinterpret_cast<void *>(LoadLibraryA(path.c_str()));
+    /* Resolve the bundled SYCL runtime DLLs from the library's own folder. */
+    return reinterpret_cast<void *>(
+            LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
 #else
     return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
