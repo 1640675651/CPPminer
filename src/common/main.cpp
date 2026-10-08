@@ -2,6 +2,7 @@
  * CPminer 鈥?cross-platform LuckyPool plain_proof miner (CPU / CUDA / 鈥?.
  */
 #include "cp_config.h"
+#include "cp_cli.h"
 #include "cp_algo.h"
 #include "cp_fee.h"
 #include "cp_mine.h"
@@ -498,9 +499,14 @@ int main(int argc, char** argv)
     if(simd_env_invalid)
         return 1;
 
+    std::string parsing_option;
+    try {
     for(int i = 1; i < argc; i++){
-        if(!strcmp(argv[i], "--pool") && i + 1 < argc){
-            const char* u = argv[++i];
+        parsing_option = argv[i];
+        const size_t equals = parsing_option.find('=');
+        if(equals != std::string::npos) parsing_option.resize(equals);
+        if(cp_cli_option(argv[i], "--pool")){
+            const char* u = cp_cli_value(argc, argv, i);
             const char* h = strstr(u, "://");
             if(h){
                 h += 3;
@@ -514,15 +520,16 @@ int main(int argc, char** argv)
                     pool_specified = 1;
                 }
             }
-        } else if(!strcmp(argv[i], "--algo") && i + 1 < argc){
-            if(cp_algo_parse(argv[++i], &algo_sel) != 0){
-                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", argv[i]);
+        } else if(cp_cli_option(argv[i], "--algo")){
+            const char* algo = cp_cli_value(argc, argv, i);
+            if(cp_algo_parse(algo, &algo_sel) != 0){
+                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", algo);
                 return 1;
             }
-        } else if(!strcmp(argv[i], "--wallet") && i + 1 < argc){
-            wallet = argv[++i];
-        } else if(!strcmp(argv[i], "--backend") && i + 1 < argc){
-            const char* b = argv[++i];
+        } else if(cp_cli_option(argv[i], "--wallet")){
+            wallet = cp_cli_value(argc, argv, i, sizeof(wallet_global));
+        } else if(cp_cli_option(argv[i], "--backend")){
+            const char* b = cp_cli_value(argc, argv, i);
             if(!strcmp(b, "cpu")) backend_sel = CP_BACKEND_CPU;
             else if(!strcmp(b, "cuda")) backend_sel = CP_BACKEND_CUDA;
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
@@ -532,30 +539,19 @@ int main(int argc, char** argv)
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
             }
-        } else if((!strcmp(argv[i], "--device") || !strcmp(argv[i], "--devices")) && i + 1 < argc){
-            const char* s = argv[++i];
-            char tmp[256];
-            strncpy(tmp, s, 255); tmp[255] = 0;
-            char* tok = strtok(tmp, ",");
-            while(tok && ndev < MAX_GPUS){ devs[ndev++] = atoi(tok); tok = strtok(NULL, ","); }
+        } else if(cp_cli_option(argv[i], "--device") || cp_cli_option(argv[i], "--devices")){
+            cp_cli_devices(cp_cli_value(argc, argv, i), devs, ndev, MAX_GPUS);
             devices_specified = 1;
         } else if(!strcmp(argv[i], "--list-devices")){
             list_devices = 1;
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-        } else if(!strcmp(argv[i], "--ocl-platform") && i + 1 < argc){
-            ocl_platform = atoi(argv[++i]);
-        } else if(!strncmp(argv[i], "--ocl-tile", 10)){
-            const char* v = argv[i] + 10;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-tile requires MxN or MxN/MACROMxMACRON "
-                                "(e.g. 4x8, 4x8/64x64)\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-platform")){
+            ocl_platform = cp_cli_int(cp_cli_value(argc, argv, i));
+        } else if(cp_cli_option(argv[i], "--ocl-tile")){
+            const char* v = cp_cli_value(argc, argv, i);
             int tile_macro_m = 0, tile_macro_n = 0;
-            const int nfields = sscanf(v, "%dx%d/%dx%d", &ocl_tile_mr, &ocl_tile_nr,
-                                       &tile_macro_m, &tile_macro_n);
+            const int nfields = cp_cli_dimensions(v, &ocl_tile_mr, &ocl_tile_nr,
+                                                   &tile_macro_m, &tile_macro_n);
             if(nfields == 2){
                 /* tile only */
             } else if(nfields == 4){
@@ -582,29 +578,17 @@ int main(int argc, char** argv)
                         v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-macro", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-macro requires MxN (64x64 or 128x128)\n");
-                return 1;
-            }
-            if(sscanf(v, "%dx%d", &ocl_macro_m, &ocl_macro_n) != 2 ||
+        } else if(cp_cli_option(argv[i], "--ocl-macro")){
+            const char* v = cp_cli_value(argc, argv, i);
+            if(cp_cli_dimensions(v, &ocl_macro_m, &ocl_macro_n) != 2 ||
                !((ocl_macro_m == 64 && ocl_macro_n == 64) ||
                  (ocl_macro_m == 128 && ocl_macro_n == 128))){
                 fprintf(stderr,
                         "invalid --ocl-macro %s (expected 64x64 or 128x128)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-issue", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-issue requires auto, broadcast, or packed\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-issue")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "auto")){
                 ocl_issue_mode = 0;
             } else if(!strcmp(v, "broadcast")){
@@ -615,14 +599,8 @@ int main(int argc, char** argv)
                 fprintf(stderr, "invalid --ocl-issue %s (expected auto, broadcast, or packed)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-dot", 9)){
-            const char* v = argv[i] + 9;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-dot requires auto, sudot, sdot4, khr, force-khr, asm, or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-dot")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "auto")){
                 ocl_dot_policy = 0;
             } else if(!strcmp(v, "force-khr") || !strcmp(v, "force")){
@@ -643,14 +621,8 @@ int main(int argc, char** argv)
                         v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-cpm-type", 14)){
-            const char* v = argv[i] + 14;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-cpm-type requires float or int\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-cpm-type")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "float") || !strcmp(v, "fp32")){
                 ocl_cpm_int = 0;
             } else if(!strcmp(v, "int") || !strcmp(v, "int32")){
@@ -659,14 +631,8 @@ int main(int argc, char** argv)
                 fprintf(stderr, "invalid --ocl-cpm-type %s (expected float or int)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-lds", 9)){
-            const char* v = argv[i] + 9;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-lds requires on or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-lds")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
                 ocl_lds = 1;
             } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
@@ -677,14 +643,8 @@ int main(int argc, char** argv)
             }
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
-        } else if(!strncmp(argv[i], "--wgpu-lds", 10)){
-            const char* v = argv[i] + 10;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-lds requires on or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--wgpu-lds")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
                 wgpu_lds = 1;
             } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
@@ -693,18 +653,11 @@ int main(int argc, char** argv)
                 fprintf(stderr, "invalid --wgpu-lds %s (expected on or off)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--wgpu-tile", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-tile requires MxN or MxN/MACROMxMACRON "
-                                "(e.g. 4x8, 4x8/64x64)\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--wgpu-tile")){
+            const char* v = cp_cli_value(argc, argv, i);
             int tile_macro_m = 0, tile_macro_n = 0;
-            const int nfields = sscanf(v, "%dx%d/%dx%d", &wgpu_tile_mr, &wgpu_tile_nr,
-                                       &tile_macro_m, &tile_macro_n);
+            const int nfields = cp_cli_dimensions(v, &wgpu_tile_mr, &wgpu_tile_nr,
+                                                   &tile_macro_m, &tile_macro_n);
             if(nfields != 2 && nfields != 4){
                 fprintf(stderr,
                         "invalid --wgpu-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
@@ -729,15 +682,9 @@ int main(int argc, char** argv)
                 wgpu_macro_m = tile_macro_m;
                 wgpu_macro_n = tile_macro_n;
             }
-        } else if(!strncmp(argv[i], "--wgpu-macro", 12)){
-            const char* v = argv[i] + 12;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-macro requires MxN (64x64 or 128x128)\n");
-                return 1;
-            }
-            if(sscanf(v, "%dx%d", &wgpu_macro_m, &wgpu_macro_n) != 2 ||
+        } else if(cp_cli_option(argv[i], "--wgpu-macro")){
+            const char* v = cp_cli_value(argc, argv, i);
+            if(cp_cli_dimensions(v, &wgpu_macro_m, &wgpu_macro_n) != 2 ||
                !((wgpu_macro_m == 64 && wgpu_macro_n == 64) ||
                  (wgpu_macro_m == 128 && wgpu_macro_n == 128))){
                 fprintf(stderr,
@@ -745,40 +692,24 @@ int main(int argc, char** argv)
                 return 1;
             }
 #endif
-        } else if(!strcmp(argv[i], "--m") || !strncmp(argv[i], "--m=", 4) ||
-                  !strcmp(argv[i], "--n") || !strncmp(argv[i], "--n=", 4)){
+        } else if(cp_cli_option(argv[i], "--m") || cp_cli_option(argv[i], "--n")){
             const int is_m = argv[i][2] == 'm';
-            const char* v = argv[i][3] == '=' ? argv[i] + 4 : (i + 1 < argc ? argv[++i] : NULL);
-            char* end = NULL;
-            const long units = v ? strtol(v, &end, 10) : 0;
-            if(!v || end == v || *end || units < 1 || units > CP_MATRIX_UNITS_MAX){
-                fprintf(stderr, "%s requires 1..%d (units of %d)\n", is_m ? "--m" : "--n",
-                        CP_MATRIX_UNITS_MAX, CP_MATRIX_UNIT);
-                return 1;
-            }
+            const int units = cp_cli_int(cp_cli_value(argc, argv, i), 1, CP_MATRIX_UNITS_MAX);
             if(is_m) m_units = (int)units;
             else n_units = (int)units;
         } else if(!strcmp(argv[i], "--no-period-gemm")){
             no_period_gemm = 1;
-        } else if(!strncmp(argv[i], "--batch-size", 12)){
-            const char* v = argv[i] + 12;
-            if(*v == '=') batch_size = atoi(v + 1);
-            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--batch-size")){
+            batch_size = cp_cli_int(cp_cli_value(argc, argv, i), 1);
             batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--period-batch", 14)){
-            const char* v = argv[i] + 14;
-            if(*v == '=') batch_size = atoi(v + 1);
-            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--period-batch")){
+            batch_size = cp_cli_int(cp_cli_value(argc, argv, i), 1);
             batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--col-period-batch", 18)){
-            const char* v = argv[i] + 18;
-            if(*v == '=') batch_size = atoi(v + 1);
-            else if(i + 1 < argc) batch_size = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--col-period-batch")){
+            batch_size = cp_cli_int(cp_cli_value(argc, argv, i), 1);
             batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--row-period-batch", 18)){
-            const char* v = argv[i] + 18;
-            if(*v == '=') row_period_batch = atoi(v + 1);
-            else if(i + 1 < argc) row_period_batch = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--row-period-batch")){
+            row_period_batch = cp_cli_int(cp_cli_value(argc, argv, i), 1);
         } else if(!strcmp(argv[i], "--row-major-ap")){
             step_major_ap = 0;
         } else if(!strcmp(argv[i], "--step-major")){
@@ -800,18 +731,17 @@ int main(int argc, char** argv)
             onednn_fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
             onednn_fused_jackpot = 0;
-        } else if(!strcmp(argv[i], "--onednn-layout")){
-            if(i + 1 >= argc){
-                fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
-                return 1;
-            }
-            onednn_layout = argv[++i];
+        } else if(cp_cli_option(argv[i], "--onednn-layout")){
+            onednn_layout = cp_cli_value(argc, argv, i);
+            if(strcmp(onednn_layout, "TN") && strcmp(onednn_layout, "TT") &&
+               strcmp(onednn_layout, "NT") && strcmp(onednn_layout, "NN"))
+                throw std::invalid_argument("--onednn-layout requires TN, TT, NT, or NN");
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
             prepack_mode = CP_PREPACK_REUSE;
-        } else if(!strcmp(argv[i], "--prepack") && i + 1 < argc){
-            const char* mode = argv[++i];
+        } else if(cp_cli_option(argv[i], "--prepack")){
+            const char* mode = cp_cli_value(argc, argv, i);
             if(!strcmp(mode, "separate"))
                 prepack_mode = CP_PREPACK_SEPARATE;
             else if(!strcmp(mode, "reuse") || !strcmp(mode, "inplace"))
@@ -822,8 +752,8 @@ int main(int argc, char** argv)
                 fprintf(stderr, "unknown --prepack mode %s (separate|reuse|fused)\n", mode);
                 return 1;
             }
-        } else if(!strcmp(argv[i], "--simd") && i + 1 < argc){
-            const char* isa = argv[++i];
+        } else if(cp_cli_option(argv[i], "--simd")){
+            const char* isa = cp_cli_value(argc, argv, i);
             if(!strcmp(isa, "auto"))
                 simd_isa = CP_SIMD_AUTO;
             else if(!strcmp(isa, "avxvnni") || !strcmp(isa, "vnni") ||
@@ -851,26 +781,26 @@ int main(int argc, char** argv)
             simd_test = 1;
         } else if(!strcmp(argv[i], "--prepack-test")){
             prepack_test = 1;
-        } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
-            g_max_nonce = atoi(argv[++i]);
-        } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
-            strncpy(g_python_exe, argv[++i], sizeof(g_python_exe) - 1);
+        } else if(cp_cli_option(argv[i], "--max-nonce")){
+            g_max_nonce = cp_cli_int(cp_cli_value(argc, argv, i));
+        } else if(cp_cli_option(argv[i], "--python")){
+            strncpy(g_python_exe, cp_cli_value(argc, argv, i, sizeof(g_python_exe)), sizeof(g_python_exe) - 1);
             g_python_exe[sizeof(g_python_exe) - 1] = 0;
-        } else if(!strcmp(argv[i], "--host-bridge") && i + 1 < argc){
-            strncpy(g_host_bridge, argv[++i], sizeof(g_host_bridge) - 1);
+        } else if(cp_cli_option(argv[i], "--host-bridge")){
+            strncpy(g_host_bridge, cp_cli_value(argc, argv, i, sizeof(g_host_bridge)), sizeof(g_host_bridge) - 1);
             g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
-        } else if(!strcmp(argv[i], "--worker") && i + 1 < argc){
-            strncpy(worker_global, argv[++i], sizeof(worker_global) - 1);
+        } else if(cp_cli_option(argv[i], "--worker")){
+            strncpy(worker_global, cp_cli_value(argc, argv, i, sizeof(worker_global)), sizeof(worker_global) - 1);
             worker_global[sizeof(worker_global) - 1] = 0;
-        } else if(!strcmp(argv[i], "--agent") && i + 1 < argc){
-            strncpy(agent_global, argv[++i], sizeof(agent_global) - 1);
+        } else if(cp_cli_option(argv[i], "--agent")){
+            strncpy(agent_global, cp_cli_value(argc, argv, i, sizeof(agent_global)), sizeof(agent_global) - 1);
             agent_global[sizeof(agent_global) - 1] = 0;
         } else if(!strcmp(argv[i], "--dry-run")){
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--verify")){
             g_plain_verify = 1;
-        } else if(!strcmp(argv[i], "--cert-version") && i + 1 < argc){
-            int v = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--cert-version")){
+            int v = cp_cli_int(cp_cli_value(argc, argv, i), 1, 3);
             if(v < 1 || v > 3){
                 fprintf(stderr, "--cert-version must be 1, 2, or 3 (got %d)\n", v);
                 return 1;
@@ -879,37 +809,29 @@ int main(int argc, char** argv)
             g_cert_version_forced = 1;
         } else if(!strcmp(argv[i], "--mock") || !strcmp(argv[i], "-mock")){
             g_mock = 1;
-        } else if(!strcmp(argv[i], "--mock-diff") && i + 1 < argc){
-            g_mock_diff = atof(argv[++i]);
-            if(g_mock_diff < 1.0) g_mock_diff = 1.0;
+        } else if(cp_cli_option(argv[i], "--mock-diff")){
+            g_mock_diff = cp_cli_real(cp_cli_value(argc, argv, i), 1.0);
             g_mock_diff_forced = 1;
         } else if(!strcmp(argv[i], "--align-test")){
             align_test = 1;
         } else if(!strcmp(argv[i], "--align-test-prod")){
             align_test = 1;
             align_test_prod = 1;
-        } else if(!strncmp(argv[i], "--profile-scan", 14)){
+        } else if(cp_cli_option(argv[i], "--profile-scan")){
             profile_scan = 1;
-            const char* v = argv[i] + 14;
-            if(*v == '=') profile_runs = atoi(v + 1);
-            else if(i + 1 < argc && argv[i + 1][0] != '-')
-                profile_runs = atoi(argv[++i]);
-            if(profile_runs < 1) profile_runs = 1;
+            if(strchr(argv[i], '=') || (i + 1 < argc && argv[i + 1][0] != '-'))
+                profile_runs = cp_cli_int(cp_cli_value(argc, argv, i), 1);
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-        } else if(!strncmp(argv[i], "--profile-prep", 14)){
+        } else if(cp_cli_option(argv[i], "--profile-prep")){
             profile_prep = 1;
-            const char* v = argv[i] + 14;
-            if(*v == '=') profile_prep_runs = atoi(v + 1);
-            else if(i + 1 < argc && argv[i + 1][0] != '-')
-                profile_prep_runs = atoi(argv[++i]);
-            if(profile_prep_runs < 1) profile_prep_runs = 1;
+            if(strchr(argv[i], '=') || (i + 1 < argc && argv[i + 1][0] != '-'))
+                profile_prep_runs = cp_cli_int(cp_cli_value(argc, argv, i), 1);
 #endif
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
-        } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
-            int n = atoi(argv[++i]);
-            if(n < 0) n = 0;
+        } else if(cp_cli_option(argv[i], "--threads")){
+            int n = cp_cli_int(cp_cli_value(argc, argv, i));
             g_qpow_threads = n;
             g_cpu_threads = n;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
@@ -981,7 +903,14 @@ int main(int argc, char** argv)
             }
             printf("qpow selftest passed\n");
             return 0;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", parsing_option.c_str());
+            return 1;
         }
+    }
+    } catch(const std::invalid_argument& error){
+        fprintf(stderr, "invalid command line %s: %s\n", parsing_option.c_str(), error.what());
+        return 1;
     }
 
     {
