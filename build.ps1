@@ -17,7 +17,8 @@ param(
     [string[]]$Backend = @("Cpu"),
     [string]$CudaArch = "",
     [string]$CudaRoot = "",
-    [switch]$EnableCublas
+    [switch]$EnableCublas,
+    [switch]$EnableEsimd
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +58,9 @@ if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $En
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
+}
+if ($EnableEsimd -and -not $EnableOneDnn) {
+    throw "-EnableEsimd requires -Backend OneDnn (or Cpu,Cuda,OpenCl,OneDnn)"
 }
 $script:VcvarsBat = $null
 $script:ClExe = $null
@@ -322,8 +326,8 @@ function Ensure-OneDnnDeps {
     }
     Push-Location $onednnDir
     try {
-        cmd /c "prepare_onednn_deps.bat"
-        if ($LASTEXITCODE -ne 0) { throw "prepare_onednn_deps.bat failed" }
+        Invoke-External -Command { cmd /c "prepare_onednn_deps.bat" } `
+            -FailureMessage "prepare_onednn_deps.bat failed"
     } finally {
         Pop-Location
     }
@@ -385,6 +389,19 @@ $buildExitCode = 0
 try {
     Clear-CondaToolchainOverrides
     Initialize-MSVC
+    if ($EnableEsimd -and $env:CP_ONEAPI_ROOT) {
+        # The conda DPC++ package needs LIB for its internal SYCL link stages;
+        # a compiler -L option only reaches the final host link. Restore these
+        # variables with the rest of the caller's environment in finally.
+        $intelBin = Join-Path $env:CP_ONEAPI_ROOT 'Library\bin'
+        $intelLib = Join-Path $env:CP_ONEAPI_ROOT 'Library\lib'
+        if (-not (Test-Path (Join-Path $intelBin 'icx.exe')) -or
+            -not (Test-Path (Join-Path $intelLib 'libircmt.lib'))) {
+            throw 'CP_ONEAPI_ROOT must point to the complete Windows oneAPI conda prefix'
+        }
+        $env:PATH = "$intelBin;$env:PATH"
+        $env:LIB = "$intelLib;$env:LIB"
+    }
     $script:CmakeExe = Find-CMake
     if (-not $script:CmakeExe) {
         throw "cmake not found. Install VS 'CMake tools for Windows' or add cmake to PATH (same as build.sh)."
@@ -433,7 +450,8 @@ try {
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_WGPU=$(if ($EnableWgpu) { 'ON' } else { 'OFF' })",
-        "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
+        "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_ESIMD=$(if ($EnableEsimd) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {
         $cmakeArgs += "-DCP_CUDA_ARCH=$CudaArch"
@@ -452,6 +470,11 @@ try {
     Copy-Item $built $OutExe -Force
     if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
+    }
+    if ($EnableEsimd) {
+        $esimdDll = Join-Path $CmakeBuild "kernels\cp_esimd.dll"
+        if (-not (Test-Path $esimdDll)) { throw "ESIMD library missing at $esimdDll" }
+        Copy-Item $esimdDll (Join-Path $Root "kernels\cp_esimd.dll") -Force
     }
     if ($EnableWgpu) {
         $wgpuDll = @(

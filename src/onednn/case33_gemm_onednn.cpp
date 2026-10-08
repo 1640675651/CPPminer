@@ -44,7 +44,15 @@ const char *intel_gemm_mode() {
 
 void *esimd_dlopen(const std::string &path) {
 #ifdef _WIN32
-    /* Resolve the bundled SYCL runtime DLLs from the library's own folder. */
+    /* UR's Windows proxy loads the real loader and adapters by name, outside
+     * the PE import chain. Keep the trusted kernels directory in the process
+     * search path for these later loads; LOAD_WITH_ALTERED_SEARCH_PATH alone
+     * only resolves the initial imports. This also removes cwd from DLL search. */
+    if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) return nullptr;
+    const size_t slash = path.find_last_of("/\\");
+    if (slash == std::string::npos || !SetDllDirectoryA(path.substr(0, slash).c_str())) {
+        return nullptr;
+    }
     return reinterpret_cast<void *>(
             LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
 #else

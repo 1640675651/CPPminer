@@ -468,13 +468,22 @@ if(CP_ENABLE_ESIMD)
     if(NOT CP_ENABLE_ONEDNN)
         message(FATAL_ERROR "CP_ENABLE_ESIMD requires CP_ENABLE_ONEDNN")
     endif()
+    set(_cp_esimd_launcher)
     if(WIN32)
-        find_program(CP_ICPX NAMES icx HINTS "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
+        find_program(CP_ICPX NAMES icx HINTS "$ENV{CP_ONEAPI_ROOT}/Library/bin"
+                     "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
                      "$ENV{ProgramFiles\(x86\)}/Intel/oneAPI/compiler/latest/bin")
         set(_cp_esimd_lib "${CMAKE_BINARY_DIR}/kernels/cp_esimd.dll")
         set(_cp_esimd_link
-            -fsycl -O3 -shared -I${_OCL_HDR}
+            -fsycl -O3 /LD /EHsc -I${_OCL_HDR}
             "$<TARGET_PROPERTY:OpenCL::OpenCL,IMPORTED_LOCATION>")
+        if(EXISTS "$ENV{CP_ONEAPI_ROOT}/Library/lib/libircmt.lib")
+            # MSBuild resets LIB from its VC toolset properties. Restore Intel's
+            # runtime path inside the custom command, including SYCL link stages.
+            string(REPLACE ";" "\\;" _cp_esimd_lib_env
+                   "LIB=$ENV{CP_ONEAPI_ROOT}/Library/lib;$ENV{LIB}")
+            set(_cp_esimd_launcher ${CMAKE_COMMAND} -E env "${_cp_esimd_lib_env}")
+        endif()
     else()
         find_program(CP_ICPX icpx HINTS "$ENV{ONEAPI_ROOT}/compiler/latest/bin"
                      "/opt/intel/oneapi/compiler/latest/bin")
@@ -496,7 +505,7 @@ if(CP_ENABLE_ESIMD)
     endif()
     add_custom_command(OUTPUT "${_cp_esimd_lib}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/kernels"
-        COMMAND "${CP_ICPX}" -o "${_cp_esimd_lib}"
+        COMMAND ${_cp_esimd_launcher} "${CP_ICPX}" -o "${_cp_esimd_lib}"
                 "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.cpp" ${_cp_esimd_link}
         DEPENDS "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.cpp"
                 "${CMAKE_SOURCE_DIR}/src/esimd/cp_esimd_scan.h"
