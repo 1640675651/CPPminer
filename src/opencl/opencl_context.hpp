@@ -80,7 +80,22 @@ struct OpenClContext {
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
+
+private:
+    static void dump_program_binary_(cl_program prog);
 };
+
+/* Intel XMX (DPAS) capability of a device (cl_intel_subgroup_matrix_multiply_accumulate). */
+struct IntelDpasInfo {
+    bool extension = false;              /* builtins available */
+    std::vector<size_t> sub_group_sizes; /* CL_DEVICE_SUB_GROUP_SIZES_INTEL (may be empty) */
+    unsigned ip_version = 0;             /* CL_DEVICE_IP_VERSION_INTEL, 0 = not reported */
+    int hw_dpas = -1;                    /* CL_DEVICE_FEATURE_FLAG_DPAS_INTEL: 1/0, -1 unknown */
+    int sub_group = 0; /* sub-group size the builtins need (spec: the minimum), 0 = none */
+};
+IntelDpasInfo query_intel_dpas(cl_device_id device);
+/* "12.55.8" style decoding of CL_DEVICE_IP_VERSION_INTEL ("unknown" for 0). */
+std::string intel_ip_version_string(unsigned ip_version);
 
 std::string read_text_file(const char *path);
 std::string exe_directory(const char *argv0);
