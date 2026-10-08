@@ -36,6 +36,7 @@ int cp_algo_supports(CpAlgoId algo, CpBackendId backend)
     if(algo == CP_ALGO_QUANTUS){
         if(backend == CP_BACKEND_CPU) return cp_worker_has_cpu();
         if(backend == CP_BACKEND_OPENCL) return cp_worker_has_opencl();
+        if(backend == CP_BACKEND_CUDA) return cp_worker_has_cuda();
         return 0;
     }
     /* Pearl backends. */
