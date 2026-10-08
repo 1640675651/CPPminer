@@ -1,4 +1,4 @@
-// Case 5: gemmstone int8 GEMM → OpenCL binary "case5_igemm" (Gen12LP or XeHPG).
+// Case 5: gemmstone int8 GEMM в†’ OpenCL binary "case5_igemm" (Gen12LP or XeHPG).
 
 #include "case5_ngen_gemm.hpp"
 #include "case5_gemm_launch.hpp"
@@ -217,6 +217,10 @@ void log_candidate_rejection(const CatalogCandidate &candidate, const std::strin
     }
     line += ": ";
     line += reason;
+    if (case5_debug_select()) {
+        std::fprintf(stderr, "Case5 rejected %s\n", line.c_str());
+        std::fflush(stderr);
+    }
     if (rejected) {
         rejected->push_back(std::move(line));
     }
@@ -252,6 +256,19 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
     product.stepping = selection.stepping;
 
     std::vector<CatalogCandidate> candidates = selection.candidates;
+    // CASE5_KERNEL=<label> (e.g. catalog-337) keeps only that candidate, for tuning sweeps.
+    if (const char *only = std::getenv("CASE5_KERNEL"); only && *only) {
+        std::vector<CatalogCandidate> kept;
+        for (auto &candidate : candidates)
+            if (candidate.label == only)
+                kept.push_back(candidate);
+        if (kept.empty()) {
+            if (err)
+                *err = std::string("CASE5_KERNEL=") + only + " is not among the selected candidates";
+            return nullptr;
+        }
+        candidates = std::move(kept);
+    }
 
     std::string last_err;
     std::vector<std::string> rejected;
@@ -272,15 +289,30 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             last_err = candidate.label + ": " + prep_err;
             if (candidate.from_catalog) {
                 log_candidate_rejection(candidate, prep_err, &rejected);
+            } else if (case5_debug_select()) {
+                std::fprintf(stderr, "Case5 rejected %s: %s\n", candidate.label.c_str(), prep_err.c_str());
             }
             continue;
         }
 
         try {
-            if (strategy.unroll[LoopK] <= 0 || (kMilestoneK % strategy.unroll[LoopK]) != 0) {
-                throw std::runtime_error("Case5 milestone_k must be a multiple of unrollK");
+            const int unroll_k = strategy.unroll[LoopK];
+            if (unroll_k <= 0
+                    || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)
+                    || (dims.k > 0 && (dims.k % unroll_k) != 0)) {
+                throw std::runtime_error("Case5 milestone_k and unrollK must divide one another "
+                        "and K (unrollK=" + std::to_string(unroll_k) + ", ka_load="
+                        + std::to_string(strategy.ka_load) + ", kb_load="
+                        + std::to_string(strategy.kb_load) + ")");
             }
-            problem.case5XorPeriod = kMilestoneK / strategy.unroll[LoopK];
+            if (unroll_k <= kMilestoneK) {
+                problem.case5XorPeriod = kMilestoneK / unroll_k;
+                problem.case5XorEveryK = 0;
+            } else {
+                // Systolic kernels unroll K past one milestone: XOR inside the panel.
+                problem.case5XorPeriod = 1;
+                problem.case5XorEveryK = kMilestoneK;
+            }
             const auto xsd =
                     compute_xor_subtile_dims(strategy.unroll[LoopM], strategy.unroll[LoopN]);
             problem.case5XorSubM = xsd.subM;
@@ -325,6 +357,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             last_err = candidate.label + ": " + e.what();
             if (candidate.from_catalog) {
                 log_candidate_rejection(candidate, e.what(), &rejected);
+            } else if (case5_debug_select()) {
+                std::fprintf(stderr, "Case5 rejected %s: %s\n", candidate.label.c_str(), e.what());
             }
         }
     }
@@ -344,7 +378,7 @@ bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) 
     if (err) {
         *err = std::string("Case 5 requires XeLP/Gen12LP or XeHPG (Core Ultra MTL/ARL). Detected ")
                + product_family_name(product.family)
-               + " — unsupported ISA for Case 5.";
+               + " вЂ” unsupported ISA for Case 5.";
     }
     return false;
 }
@@ -355,6 +389,11 @@ cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildPar
     BuildParams build_dims;
     if (dims) {
         build_dims = *dims;
+    }
+    // CASE5_XOR_NOP=1: keep the milestone schedule but skip the C fold. Diagnostic
+    // ceiling only -- the resulting tile hashes are wrong and shares will not verify.
+    if (const char *nop = std::getenv("CASE5_XOR_NOP"); nop && nop[0] == '1') {
+        xor_nop = true;
     }
     build_dims.a_row_major = a_row_major;
     build_dims.b_row_major = b_row_major;

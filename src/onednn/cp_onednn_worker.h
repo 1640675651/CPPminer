@@ -14,6 +14,10 @@ int cp_onednn_worker_is_ready(void);
 void cp_onednn_worker_shutdown(void);
 void cp_onednn_worker_set_row_period_batch(int batch);
 void cp_onednn_worker_set_col_period_batch(int batch);
+/* Batches the user did not set: init raises them for systolic (XMX) kernels. */
+void cp_onednn_worker_set_auto_batch(int col_auto, int row_auto);
+int cp_onednn_worker_row_period_batch(void);
+int cp_onednn_worker_col_period_batch(void);
 void cp_onednn_worker_set_fused_jackpot(int on);
 void cp_onednn_worker_set_gemm_layout(const char *name);
 void cp_onednn_worker_set_platform(int platform_index);
