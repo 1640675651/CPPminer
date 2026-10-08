@@ -3,6 +3,7 @@
 #include "cp_config.h"
 #include "cp_cpu_affinity.h"
 #include "cp_jackpot.hpp"
+#include "cp_state.h"
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
 #include "cp_util.h"
@@ -17,6 +18,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -278,7 +283,27 @@ extern "C" void cp_cpu_worker_init(void)
         fprintf(stderr, "[cpu] %s\n", g_gemm.simd_error());
         return;
     }
-    if(cp_cpu_affinity_init() == 0)
+    /* Topology first (thread count depends on it), then the team size, then the
+     * pins; the bind pass sizes the pool it pins from the team size set here. */
+    const int affinity_ok = (cp_cpu_affinity_init() == 0);
+#ifdef _OPENMP
+    {
+        /* --threads N wins; otherwise respect an explicit OMP_NUM_THREADS; else
+         * one thread per logical CPU the process may use. Threads fill physical
+         * cores first, so --threads <= cores keeps one thread per core. Measured
+         * on a Zen4 8C/16T at 8192^2: AVX2 is indifferent to SMT (~875 GMAC/s
+         * either way), AVX512-VNNI gains ~30% (1.2 -> 1.6 TMAC/s) from the second
+         * thread hiding dpbusd and load latency. If the topology is unknown keep
+         * the runtime default. */
+        int n = g_cpu_threads;
+        const char* env_threads = getenv("OMP_NUM_THREADS");
+        if(n <= 0 && !(env_threads && *env_threads))
+            n = cp_cpu_affinity_logical_cpus();
+        if(n > 0)
+            omp_set_num_threads(n);
+    }
+#endif
+    if(affinity_ok)
         cp_cpu_affinity_bind_openmp_pool();
     printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
     printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
@@ -376,6 +401,7 @@ extern "C" int cp_cpu_worker_mine_attempt(
     constexpr auto kProgressInterval = std::chrono::seconds(2);
 
     std::thread progress_thread([&]() {
+        cp_cpu_affinity_release_thread();
         uint64_t last_tiles = 0;
         double last_report = scan_t0;
         for (;;) {
