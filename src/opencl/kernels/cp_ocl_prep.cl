@@ -136,18 +136,17 @@ __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const ucha
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (col == 0) {
+    /* every column's work-item stores its own 4-byte k-group words */
+    {
         const size_t block_base =
                 ((size_t)jm * (size_t)blocks_k + (size_t)kb) * (size_t)MACRO_KB_BLOCK_B;
         for (int kg = 0; kg < K_GROUPS; ++kg) {
             const size_t dst = block_base + (size_t)kg * (size_t)MACRO_KG_STRIP_B +
-                               (size_t)tc * (size_t)KG_SLICE_B;
-            for (int j = 0; j < NR; ++j) {
-                for (int ko = 0; ko < 4; ++ko) {
-                    b_pre_out[dst + (size_t)j * 4 + (size_t)ko] =
-                            stripe[(size_t)j][(size_t)kg * 4 + (size_t)ko];
-                }
-            }
+                               (size_t)tc * (size_t)KG_SLICE_B + (size_t)col * 4;
+            const uint w = (uint)stripe[col][kg * 4] | ((uint)stripe[col][kg * 4 + 1] << 8) |
+                           ((uint)stripe[col][kg * 4 + 2] << 16) |
+                           ((uint)stripe[col][kg * 4 + 3] << 24);
+            *(__global uint *)(b_pre_out + dst) = w;
         }
     }
 }
@@ -180,18 +179,18 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (row == 0) {
+    /* Every row's work-item stores its own 4-byte k-group words (thread 0 storing the whole
+       stripe byte by byte took 7 ms per 512 MB A on an R9700). */
+    {
         const size_t block_base =
                 ((size_t)im * (size_t)blocks_k + (size_t)kb) * (size_t)MACRO_KB_BLOCK_A;
         for (int kg = 0; kg < K_GROUPS; ++kg) {
             const size_t dst = block_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
-                               (size_t)tr * (size_t)KG_BYTES_A;
-            for (int r = 0; r < MR; ++r) {
-                for (int ko = 0; ko < 4; ++ko) {
-                    a_pre_out[dst + (size_t)r * 4 + (size_t)ko] =
-                            stripe[r][(size_t)kg * 4 + (size_t)ko];
-                }
-            }
+                               (size_t)tr * (size_t)KG_BYTES_A + (size_t)row * 4;
+            const uint w = (uint)stripe[row][kg * 4] | ((uint)stripe[row][kg * 4 + 1] << 8) |
+                           ((uint)stripe[row][kg * 4 + 2] << 16) |
+                           ((uint)stripe[row][kg * 4 + 3] << 24);
+            *(__global uint *)(a_pre_out + dst) = w;
         }
     }
 }
