@@ -360,10 +360,11 @@ reconnect:
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
-        printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
+        char debt_s[48], thr_s[48];
+        printf("[fee] logged in as %s (debt=%s / 100*T=%s of hashing time)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
-               (unsigned long long)cp_fee_debt(),
-               (unsigned long long)cp_fee_threshold());
+               cp_fee_format(cp_fee_debt(), debt_s, sizeof(debt_s)),
+               cp_fee_format(cp_fee_threshold(), thr_s, sizeof(thr_s)));
         fflush(stdout);
     }
     printf("[net] session=%s first_job=%s\n", session, first_job.job_id);

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5 (tentative)
+## v0.5
 ### New features
 - Experimental OneDNN (gemmstone+nGEN) backend for intel GPU
 - Wgpu backend
@@ -10,14 +10,14 @@
 ### Fixes & Enhancements
 - Reduce host memory usage (All backends)
 - Fix OpenCL dot product extension on intel GPU
-- Shrink OpenCL macro size to 64x64 in 4x8 tile mode, prevent too many work items per work group 
-- MinGW and MSYS2 support (thanks to @danifest751)
-- Fix Cuda compilation on Linux (thanks to @danifest751)
-- Fix OpenCL compilation on Adreno GPU (thanks to @danifest751)
-- Pearl CPU: scan macro blocks scheduled one at a time, better B reuse and better core utilization on hetrogeneous CPU (thanks to @danifest751)
-- Added `--threads N` option and unpin main thread from CPU 0 (thanks to @danifest751)
-- Fix difficulty calculation for mock (thanks to @danifest751)
-
+- Shrink OpenCL macro size to 64x64 in 4x8 tile mode, prevent too many work items per work group
+- (6 fixes below thanks to @danifest751)
+- MinGW and MSYS2 support
+- Fix CUDA compilation on Linux
+- Fix OpenCL compilation on Adreno GPU
+- Pearl CPU: scan macro blocks scheduled one at a time, better B cache reuse and better core utilization on hetrogeneous CPU
+- Added `--threads N` option and unpin main thread from CPU 0
+- Fix difficulty calculation for mock test
 
 ### Pearl wgpu
 - vec4<u32> A/B panel loads in the GEMM shader
