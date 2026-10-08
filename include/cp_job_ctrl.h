@@ -15,6 +15,7 @@ int cp_job_should_cancel(void);
 /* Used by pool reader when a newer job arrives during mining. */
 void cp_job_request_cancel(void);
 int cp_job_mining_active(void);
+/* Thread-local snapshot; remains valid until this thread calls it again. */
 const char* cp_job_mining_key(void);
 int cp_job_key_matches(const char* job_key);
 

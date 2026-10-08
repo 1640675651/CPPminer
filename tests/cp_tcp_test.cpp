@@ -78,6 +78,29 @@ static void test_address_fallback()
     CP_SOCK_CLOSE(server);
 }
 
+static void test_ipv6()
+{
+    cp_sock_t server = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if(server == CP_INVALID_SOCK){ puts("SKIP IPv6: unavailable"); return; }
+    sockaddr_in6 address = {};
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_loopback;
+    if(bind(server, (sockaddr*)&address, sizeof(address)) != 0){
+        CP_SOCK_CLOSE(server);
+        puts("SKIP IPv6: loopback unavailable");
+        return;
+    }
+#ifdef _WIN32
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    assert(getsockname(server, (sockaddr*)&address, &size) == 0);
+    assert(listen(server, 2) == 0);
+    transfer(server, cp_tcp_connect("::1", ntohs(address.sin6_port), 1000));
+    CP_SOCK_CLOSE(server);
+}
+
 #ifdef __linux__
 static void test_silent_address_timeout()
 {
@@ -115,6 +138,7 @@ int main()
     const std::string long_uri = "stratum+tcp://" + std::string(256, 'a') + ":1200";
     assert(!cp_pool_parse_uri(long_uri.c_str(), host, sizeof(host), &port));
     test_address_fallback();
+    test_ipv6();
 #ifdef __linux__
     test_silent_address_timeout();
 #endif

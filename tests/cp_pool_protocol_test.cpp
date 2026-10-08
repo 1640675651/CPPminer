@@ -133,6 +133,10 @@ static void test_work_identity_and_cancellation()
     cp_job_mine_end();
     cp_job_mine_begin(key);
     assert(!cp_job_should_cancel()); // A new mining epoch clears the old cancellation.
+    const char* snapshot = cp_job_mining_key();
+    cp_job_mine_begin("next-job");
+    assert(!strcmp(snapshot, key)); // Logging reads a snapshot, not concurrently mutable storage.
+    assert(cp_job_key_matches("next-job"));
     cp_job_mine_end();
 }
 
