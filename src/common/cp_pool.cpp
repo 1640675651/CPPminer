@@ -185,8 +185,9 @@ static void pool_dispatch_line(const char* line)
 
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
-        if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
-            cp_pool_target_from_difficulty(g_diff.load(), tgt);
+        if(target_hex[0]){
+            if(!cp_be_target_hex_to_le_words(target_hex, tgt)) return;
+        }else cp_pool_target_from_difficulty(g_diff.load(), tgt);
 
         char job_key[CP_JOB_KEY_CAP];
         if(!cp_pearl_job_key(job_key, sizeof(job_key), job_id, header, hlen, tgt,
@@ -487,59 +488,106 @@ int cp_pool_parse_difficulty(const char* json, double* difficulty_out)
     return 1;
 }
 
+/* Legacy positional notifications: job id, header/target strings, optional scalar flags. */
+static int parse_notify_array(const char* p, char* job_id, int job_len,
+                              char* header_hex, int header_len, char* target_hex, int target_len)
+{
+    p = skip_json_space(p + 1);
+    int first = 1;
+    if(*p == ']') return 0;
+    for(;;){
+        if(*p == '"'){
+            char text[320];
+            if(!cp_json_str_value(p, text, sizeof(text))) return 0;
+            const size_t len = strlen(text);
+            char* out = nullptr;
+            int cap = 0;
+            if(first){ out = job_id; cap = job_len; }
+            else if(len == HEADER_HEX_LEN && !header_hex[0]){ out = header_hex; cap = header_len; }
+            else if(len == TARGET_HEX_LEN && !target_hex[0]){ out = target_hex; cap = target_len; }
+            else return 0;
+            if(!len || len >= (size_t)cap) return 0;
+            memcpy(out, text, len + 1);
+            ++p;
+            while(*p && *p != '"'){
+                if(*p == '\\' && p[1]) ++p;
+                ++p;
+            }
+            if(*p != '"') return 0;
+            ++p;
+        }else{
+            if(first) return 0;
+            if(!strncmp(p, "true", 4)) p += 4;
+            else if(!strncmp(p, "false", 5)) p += 5;
+            else if(!strncmp(p, "null", 4)) p += 4;
+            else{
+                char* end = nullptr;
+                if(*p != '-' && (*p < '0' || *p > '9')) return 0;
+                const double scalar = strtod(p, &end);
+                if(end == p || !std::isfinite(scalar)) return 0;
+                p = end;
+            }
+        }
+        first = 0;
+        p = skip_json_space(p);
+        if(*p == ']'){
+            p = skip_json_space(p + 1);
+            return *p == ',' || *p == '}';
+        }
+        if(*p != ',') return 0;
+        p = skip_json_space(p + 1);
+    }
+}
+
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,
                          char* header_hex, int header_len,
                          char* target_hex, int target_len,
                          uint32_t* cert_version_out)
 {
+    if(!json || !job_id || job_len <= 0 || !header_hex || header_len <= 0 ||
+       !target_hex || target_len <= 0) return 0;
     job_id[0] = header_hex[0] = target_hex[0] = 0;
+    if(cert_version_out) *cert_version_out = 0;
+    char method[64];
+    if(cp_json_member(json, "method") &&
+       (!cp_json_str_value(cp_json_member(json, "method"), method, sizeof(method)) ||
+        strcmp(method, "mining.notify"))) return 0;
+    std::string fields;
+    const char* params = cp_json_member(json, "params");
+    const int array = params && *params == '[';
+    if(params && !array){
+        size_t len = 0;
+        if(*params != '{' || cp_json_object_length(params, strlen(params), &len) != 1) return 0;
+        fields.assign(params, len);
+        json = fields.c_str();
+    }
     uint32_t cert_version = 0;
-    double cv = cp_json_num(json, "cert_version");
-    if(cv >= 1.0 && cv <= 3.0)
+    const char* cert = cp_json_member(json, "cert_version");
+    if(cert){
+        char* number_end = nullptr;
+        const double cv = strtod(cert, &number_end);
+        const char* end = skip_json_space(number_end);
+        if(number_end == cert || (*end != ',' && *end != '}') || cv < 1 || cv > 3 ||
+           !std::isfinite(cv) || cv != floor(cv)) return 0;
         cert_version = (uint32_t)cv;
+    }
     if(cert_version_out)
         *cert_version_out = cert_version;
 
-    if(strstr(json, "\"header\"")){
-        cp_json_str(json, "job_id", job_id, job_len);
-        cp_json_str(json, "header", header_hex, header_len);
-        cp_json_str(json, "target", target_hex, target_len);
-        return header_hex[0] != 0;
+    if(array){
+        if(!parse_notify_array(params, job_id, job_len, header_hex, header_len, target_hex, target_len))
+            return 0;
+    }else{
+        if(!cp_json_str_value(cp_json_member(json, "job_id"), job_id, job_len) || !job_id[0] ||
+           !cp_json_str_value(cp_json_member(json, "header"), header_hex, header_len)) return 0;
+        const char* target = cp_json_member(json, "target");
+        if(target && (!cp_json_str_value(target, target_hex, target_len) || !target_hex[0])) return 0;
     }
-
-    const char* p = strstr(json, "\"params\":[");
-    if(!p) return 0;
-    p = strchr(p, '[');
-    if(!p) return 0;
-    p++;
-    while(*p && *p != ']'){
-        while(*p==' ' || *p=='\t' || *p==',') p++;
-        if(*p == '"'){
-            p++;
-            char tmp[320];
-            int i = 0;
-            while(*p && *p != '"' && i < (int)sizeof(tmp) - 1) tmp[i++] = *p++;
-            tmp[i] = 0;
-            if(i == 0){ if(*p=='"') p++; continue; }
-            if(!job_id[0]){
-                strncpy(job_id, tmp, job_len - 1);
-                job_id[job_len - 1] = 0;
-            } else if((int)strlen(tmp) == TARGET_HEX_LEN && !target_hex[0]){
-                strncpy(target_hex, tmp, target_len - 1);
-                target_hex[target_len - 1] = 0;
-            } else if((int)strlen(tmp) == HEADER_HEX_LEN && !header_hex[0]){
-                strncpy(header_hex, tmp, header_len - 1);
-                header_hex[header_len - 1] = 0;
-            }
-            if(*p=='"') p++;
-        } else if(*p=='{' ){
-            break;
-        } else {
-            while(*p && *p != ',' && *p != ']') p++;
-        }
-    }
-    return header_hex[0] != 0;
+    uint8_t header[INCOMPLETE_HEADER_BYTES];
+    uint32_t target[8];
+    return job_id[0] && cp_hex_to_bytes(header_hex, header, sizeof(header)) == sizeof(header) &&
+           (!target_hex[0] || cp_be_target_hex_to_le_words(target_hex, target));
 }
 
 int cp_pool_take_pending_job(CpPendingJob* out)

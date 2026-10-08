@@ -204,6 +204,42 @@ static void test_quantus_login()
                                                    std::string(100, 'a')).c_str(), &parsed));
 }
 
+static void test_pearl_notify_validation()
+{
+    char id[128], header[320], target[80];
+    uint32_t cert;
+    auto parse = [&](const std::string& json) {
+        return cp_pool_parse_notify(json.c_str(), id, sizeof(id), header, sizeof(header),
+                                    target, sizeof(target), &cert);
+    };
+    const std::string h(152, '0'), t(64, '0');
+    auto object = [&](const std::string& job, const std::string& fields) {
+        return "{\"method\":\"mining.notify\",\"params\":{\"job_id\":\"" + job +
+               "\",\"header\":\"" + h + "\"" + fields + "}}";
+    };
+    assert(parse(object(std::string(127, 'j'), ",\"target\":\"" + t + "\",\"cert_version\":3")));
+    assert(strlen(id) == 127 && cert == 3 && !strcmp(target, t.c_str()));
+    assert(parse(object("absent-target", "")) && !target[0] && cert == 0);
+    for(const std::string& fields : {",\"target\":\"zz\"", ",\"target\":\"\"", ",\"target\":null",
+                                    ",\"cert_version\":1.5", ",\"cert_version\":4"})
+        assert(!parse(object("bad-fields", fields)));
+    assert(!parse(object("", "")));
+    assert(!parse(object(std::string(128, 'j'), "")));
+    assert(!parse(object("nested-target", ",\"target\":{},\"other\":{\"target\":\"" + t + "\"}")));
+    assert(!parse("{\"params\":{\"other\":{\"job_id\":\"fake\",\"header\":\"" + h + "\"}}}"));
+    assert(!parse("{\"params\":{\"job_id\":\"bad-header\",\"header\":\"" + std::string(152, 'g') + "\"}}"));
+    auto array = [&](const std::string& job, const std::string& values) {
+        return "{\"method\":\"mining.notify\",\"params\" : [\"" + job + "\", " + values + "]}";
+    };
+    assert(parse(array("legacy", "\"" + h + "\",\"" + t + "\",true")));
+    assert(parse(array("legacy", "\"" + t + "\",\"" + h + "\"")));
+    assert(parse(array("escaped\\\"id", "\"" + h + "\"")) && !strcmp(id, "escaped\"id"));
+    assert(!parse(array(std::string(128, 'j'), "\"" + h + "\"")));
+    assert(!parse(array("", "\"" + h + "\"")));
+    assert(!parse(array("legacy", "\"" + h + "\",\"zz\"")));
+    assert(!parse(array("legacy", "\"" + h + "\",\"" + std::string(64, 'g') + "\"")));
+}
+
 int main()
 {
     double difficulty = 0;
@@ -236,6 +272,7 @@ int main()
     test_work_identity_and_cancellation();
     test_quantus_work_identity();
     test_quantus_login();
+    test_pearl_notify_validation();
 #ifdef __linux__
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);

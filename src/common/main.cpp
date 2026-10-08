@@ -206,7 +206,8 @@ static int handle_notify_line(const char* line, int* msg_id, char (&cur_job_key)
 
     uint32_t tgt[8];
     memset(tgt, 0, sizeof(tgt));
-    if(target_hex[0] && cp_be_target_hex_to_le_words(target_hex, tgt)){
+    if(target_hex[0]){
+        if(!cp_be_target_hex_to_le_words(target_hex, tgt)) return CP_JOB_NONE;
         printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
@@ -1646,22 +1647,17 @@ reconnect:
         }
         if(got == 0) continue;
 
-        if(strstr(line_buf, "mining.notify")){
+        char method[64] = {0};
+        cp_json_str_value(cp_json_member(line_buf, "method"), method, sizeof(method));
+        if(!strcmp(method, "mining.notify")){
             int rc = handle_notify_line(line_buf, &msg_id, cur_job_key);
             if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
         }
 
-        if(strstr(line_buf, "mining.set_difficulty")){
-            double d = cp_json_num(line_buf, "params");
-            if(!d){
-                const char* p = strstr(line_buf, "\"params\":[");
-                if(p){
-                    p = strchr(p, '[');
-                    if(p) d = atof(p + 1);
-                }
-            }
-            if(d > 0.0){
+        if(!strcmp(method, "mining.set_difficulty")){
+            double d;
+            if(cp_pool_parse_difficulty(line_buf, &d)){
                 cp_pool_set_difficulty(d);
                 printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
             }
