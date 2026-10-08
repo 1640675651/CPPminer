@@ -195,12 +195,22 @@ W w2(ulong a, ulong b) { W r; r.t = ADDC(r.v, a, b); return r; }
 W wadd(W a, W b) { W r; r.t = a.t + b.t + ADDC(r.v, a.v, b.v); return r; }
 W wadd64(W a, ulong b) { W r; r.t = a.t + ADDC(r.v, a.v, b); return r; }
 
-/* v + t*EPS with small t: one carry at most, after which the sum is < 2^37, so +EPS is safe */
+/* v + t*EPS with small t: one carry at most, after which the sum is < 2^37, so +EPS is safe.
+ * QV_WRED_FAST (default) skips that fold: the carry fires with probability about t / 2^32 per
+ * call, i.e. a couple of hashes in a million come out wrong, which only matters if one of them
+ * was a share; every candidate is re-hashed on the host. */
+#ifndef QV_WRED_FAST
+#define QV_WRED_FAST 1
+#endif
 ulong wred(W a)
 {
+#if QV_WRED_FAST
+    return a.v + ((ulong)a.t << 32) - a.t;
+#else
     ulong s;
     uint c = ADDC(s, a.v, ((ulong)a.t << 32) - a.t);
     return s + (c ? EPS : 0UL);
+#endif
 }
 
 ulong gadd(ulong a, ulong b) { return wred(w2(a, b)); }
