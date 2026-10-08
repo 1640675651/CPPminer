@@ -850,6 +850,12 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #define WMMA_BM (WMMA_WAVE_ROWS / 16)
 #define WMMA_BN (WMMA_WAVE_COLS / 16)
 #define WMMA_TILES (WMMA_BM * WMMA_BN * 2) /* 8x16 hash tiles per wave: 32 or 16 */
+/* CASE32_WMMA_G12_HALFRS=1 (gfx12, 64x64 wave tile): tile ownership by lane half, milestone
+   reduce-scatter over 16 lanes (15 exchanges instead of 31). */
+#ifndef CASE32_WMMA_G12_HALFRS
+#define CASE32_WMMA_G12_HALFRS 1
+#endif
+#define WMMA_G12_HALFRS (CASE32_WMMA == 12 && WMMA_TILES == 32 && CASE32_WMMA_G12_HALFRS)
 #define WMMA_WAVES_M (MACRO_M / WMMA_WAVE_ROWS)
 #define WMMA_KG_DW_A (MACRO_KG_STRIP_A / 4) /* dwords between consecutive k-groups */
 #define WMMA_KG_DW_B (MACRO_KG_STRIP_B / 4)
@@ -1041,6 +1047,17 @@ inline uint wmma_reduce_scatter16(uint *p, uint lane WMMA_EMU_ARG) {
     return p[0] ^ WMMA_SWZ_XOR(p[0], 16);
 }
 
+/* gfx12 half-wave reduce-scatter (WMMA_G12_HALFRS): p[k] (k = 0..15) this lane's partial of
+   word k of its half-wave. Four stages over lane bits 8..1: lane l returns word l%16 summed
+   over the 16 lanes of its half (15 exchanges). */
+inline uint wmma_reduce_scatter_half16(uint *p, uint lane WMMA_EMU_ARG) {
+    WMMA_RS_STAGE(p, lane, 16, 8);
+    WMMA_RS_STAGE(p, lane, 8, 4);
+    WMMA_RS_STAGE(p, lane, 4, 2);
+    WMMA_RS_STAGE(p, lane, 2, 1);
+    return p[0];
+}
+
 /* Operands of one 16-k step (k-groups g..g+3) for the wave's 4 row and WMMA_BN column blocks. */
 inline void wmma_load_step(__private wmma_ab *a, __private wmma_ab *b, __global const int *a_lane,
                            __global const int *b_lane, int g) {
@@ -1223,9 +1240,17 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     /* Hash tile owned by this lane after the reduce-scatter: t = bj*8 + bi*2 + half. With the
        64x32 wave tile (16 tiles) lanes t and t+16 hold the same tile; only the lower one
        (`owner`) writes results. */
+#if WMMA_G12_HALFRS
+    /* gfx12 half-wave reduce-scatter: lanes 0..15 own the top tiles, 16..31 the bottom ones;
+       lane l owns block k = l%16 (bj = k/4, bi = k%4) */
+    const int own_bj = (int)((lane >> 2) & 3u);
+    const int own_bi = (int)(lane & 3u);
+    const int own_half = (int)(lane >> 4);
+#else
     const int own_bj = (int)((lane >> 3) & (uint)(WMMA_BN - 1));
     const int own_bi = (int)((lane >> 1) & 3u);
     const int own_half = (int)(lane & 1u);
+#endif
     const int owner = WMMA_TILES == 32 || lane < 16u;
     const int hash_row = wm * (WMMA_WAVE_ROWS / MR) + own_bi * 2 + own_half; /* in macro */
     const int hash_col = wn * (WMMA_WAVE_COLS / HASH_NR) + own_bj;            /* in macro */
@@ -1334,6 +1359,21 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
         /* Milestone (one per KR panel, cumulative C): word of hash tile `lane` (% 16). */
+#if WMMA_G12_HALFRS
+        /* gfx12: a lane's 8 accumulator rows all belong to its half's hash tile, so the lane
+           partial of block k is one XOR of the block; the word of tile (k, half) sums over the
+           16 lanes of that half only: 15 exchanges instead of 31. */
+        uint p[16];
+        #pragma unroll
+        for (int bi = 0; bi < WMMA_BM; ++bi) {
+            #pragma unroll
+            for (int bj = 0; bj < WMMA_BN; ++bj) {
+                const wmma_acc c = acc[bi * WMMA_BN + bj];
+                p[bj * 4 + bi] = as_uint(c.s0 ^ c.s1 ^ c.s2 ^ c.s3 ^ c.s4 ^ c.s5 ^ c.s6 ^ c.s7);
+            }
+        }
+        const uint x = wmma_reduce_scatter_half16(p, lane WMMA_EMU_PASS);
+#else
         uint p[WMMA_TILES];
         #pragma unroll
         for (int bi = 0; bi < WMMA_BM; ++bi) {
@@ -1348,6 +1388,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #else
         const uint x = wmma_reduce_scatter16(p, lane WMMA_EMU_PASS);
 #endif
+#endif /* WMMA_G12_HALFRS */
 
         if (xor_after_milestone) {
             if (fuse_jackpot) {
