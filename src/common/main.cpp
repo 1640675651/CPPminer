@@ -14,6 +14,7 @@
 #include "cp_share_queue.h"
 #include "cp_state.h"
 #include "cp_util.h"
+#include "cp_tcp.h"
 #include "cp_worker.h"
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_qpow_opencl_worker.h"
@@ -500,19 +501,13 @@ int main(int argc, char** argv)
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--pool") && i + 1 < argc){
             const char* u = argv[++i];
-            const char* h = strstr(u, "://");
-            if(h){
-                h += 3;
-                const char* colon = strchr(h, ':');
-                if(colon){
-                    int hlen = (int)(colon - h);
-                    static char hbuf[256];
-                    strncpy(hbuf, h, hlen); hbuf[hlen] = 0;
-                    pool_host = hbuf;
-                    pool_port = atoi(colon + 1);
-                    pool_specified = 1;
-                }
+            static char hbuf[256];
+            if(!cp_pool_parse_uri(u, hbuf, sizeof(hbuf), &pool_port)){
+                fprintf(stderr, "invalid --pool URI (expected scheme://host:port)\n");
+                return 1;
             }
+            pool_host = hbuf;
+            pool_specified = 1;
         } else if(!strcmp(argv[i], "--algo") && i + 1 < argc){
             if(cp_algo_parse(argv[++i], &algo_sel) != 0){
                 fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", argv[i]);

@@ -4,6 +4,7 @@
 #include "cp_pool_session.hpp"
 #include "cp_job_ctrl.h"
 #include "cp_pool.h"
+#include "cp_platform.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -139,6 +140,13 @@ int main()
     test_submit_deadlines();
     test_handshake_deadlines();
     test_work_identity_and_cancellation();
+#ifdef __linux__
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    close(pair[1]);
+    assert(!cp_send_all(pair[0], "test", 4)); // Broken peer returns an error, not SIGPIPE exit.
+    close(pair[0]);
+#endif
     size_t len = 0;
     const char* combined = "{\"job_id\":\"a}b\\\"{c\",\"target\":[1,2]}{\"id\":2}";
     assert(cp_json_object_length(combined, strlen(combined), &len) == 1);

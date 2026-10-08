@@ -46,6 +46,7 @@ if(BUILD_TESTING)
         src/common/cp_json_frame.cpp
         src/common/cp_util.cpp
         src/common/cp_pool.cpp
+        src/common/cp_tcp.cpp
         src/common/cp_job_ctrl.cpp
         src/common/cp_qpow_pool.cpp
         src/common/cp_state.cpp
@@ -72,6 +73,14 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME cp_share_cancel COMMAND cp_share_cancel_test)
     set_tests_properties(cp_share_cancel PROPERTIES TIMEOUT 15)
+    add_executable(cp_tcp_test tests/cp_tcp_test.cpp src/common/cp_tcp.cpp)
+    target_include_directories(cp_tcp_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(cp_tcp_test PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_libraries(cp_tcp_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME cp_tcp COMMAND cp_tcp_test)
+    set_tests_properties(cp_tcp PROPERTIES TIMEOUT 15)
 endif()
 if(CP_ENABLE_CUDA)
     set(CMAKE_CUDA_STANDARD 17)
@@ -82,6 +91,7 @@ set(CP_COMMON_SOURCES
     src/common/cp_util.cpp
     src/common/cp_json_frame.cpp
     src/common/cp_pool.cpp
+    src/common/cp_tcp.cpp
     src/common/cp_job_ctrl.cpp
     src/common/cp_mine.cpp
     src/common/cp_fee.cpp

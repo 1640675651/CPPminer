@@ -10,6 +10,7 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <errno.h>
 #include <sys/time.h>
 #include <unistd.h>
 #else
@@ -536,7 +537,12 @@ int cp_send_all(int sock, const void* data, size_t len)
         int chunk = (len > 65536) ? 65536 : (int)len;
         int n = send(sock, p, chunk, 0);
 #else
-        ssize_t n = send(sock, p, len, 0);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(sock, p, len, flags);
+        if(n < 0 && errno == EINTR) continue;
 #endif
         if(n <= 0){
             perror("send");

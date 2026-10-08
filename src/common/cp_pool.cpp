@@ -8,6 +8,7 @@
 #include "cp_qpow_pool.h"
 #include "cp_state.h"
 #include "cp_util.h"
+#include "cp_tcp.h"
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
 #endif
@@ -61,24 +62,8 @@ static void pool_connection_lost(const char* reason)
 
 static int tcp_connect(const char* host, int port)
 {
-    if(cp_net_init() != 0){
-        fprintf(stderr, "WSAStartup failed\n");
-        return (int)CP_INVALID_SOCK;
-    }
-    struct hostent* he = gethostbyname(host);
-    if(!he){ perror("gethostbyname"); return (int)CP_INVALID_SOCK; }
-    cp_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
-    if(s == CP_INVALID_SOCK){ perror("socket"); return (int)CP_INVALID_SOCK; }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((u_short)port);
-    memcpy(&sa.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-    if(connect(s, (struct sockaddr*)&sa, sizeof(sa)) < 0){
-        perror("connect");
-        CP_SOCK_CLOSE(s);
-        return (int)CP_INVALID_SOCK;
-    }
+    cp_sock_t s = cp_tcp_connect(host, port, 10000);
+    if(s == CP_INVALID_SOCK) return -1;
     return (int)s;
 }
 
