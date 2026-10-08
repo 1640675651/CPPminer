@@ -85,8 +85,24 @@ DEV void mul128(u64 a, u64 b, u32& r0, u32& r1, u32& r2, u32& r3)
     r0 = p0;
 }
 
-/* a^2 from three wide products: a0^2 + 2*a0*a1*2^32 + a1^2*2^64. The middle product is doubled
- * by a one-bit funnel shift (65 bits d2:d1:d0), which leaves a single 3-word add. */
+/* CP_QPOW_ADD64: the lazy sums and the squaring's 128-bit add as 64-bit add.cc/addc chains
+ * (what a 128-bit integer lowers to) instead of 32-bit ones. ptxas then merges some adds into
+ * 3-input IADD3s with two carries and folds the doubled middle product of the square into
+ * IMAD.WIDE.U32.X chains, which it never does for 32-bit add.cc chains. RTX 2080 Ti (sm_75):
+ * -5% SM cycles per hash with four blocks per SM. The sm_8x SASS shows the same trade (fewer
+ * ALU ops, more IMADs). RTX 5070 (sm_120, driver JIT from PTX as shipped): +8..11% cycles, the
+ * adds become IADD.64 plus extra moves, so Blackwell keeps the 32-bit chains. Not a 128-bit C
+ * integer: MSVC has none, and the Windows build parses this file on the host side too. */
+#ifndef CP_QPOW_ADD64
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#define CP_QPOW_ADD64 0
+#else
+#define CP_QPOW_ADD64 1
+#endif
+#endif
+
+/* a^2 from three wide products: a0^2 + 2*a0*a1*2^32 + a1^2*2^64. Without CP_QPOW_ADD64 the
+ * middle product is doubled by a one-bit funnel shift, which leaves a single 3-word add. */
 DEV void sqr128(u64 a, u32& r0, u32& r1, u32& r2, u32& r3)
 {
     u32 a0, a1; sp64(a, a0, a1);
@@ -94,6 +110,17 @@ DEV void sqr128(u64 a, u32& r0, u32& r1, u32& r2, u32& r3)
     asm("mul.wide.u32 %0, %1, %1;" : "=l"(P) : "r"(a0));
     asm("mul.wide.u32 %0, %1, %1;" : "=l"(Q) : "r"(a1));
     asm("mul.wide.u32 %0, %1, %2;" : "=l"(T) : "r"(a0), "r"(a1));
+#if CP_QPOW_ADD64
+    u64 L, H;
+    asm("{.reg .u64 s, h;\n\t"
+        "shl.b64    s, %2, 33;\n\t"
+        "shr.u64    h, %2, 31;\n\t"
+        "add.cc.u64 %0, %3, s;\n\t"
+        "addc.u64   %1, %4, h;}"
+        : "=l"(L), "=l"(H) : "l"(T), "l"(P), "l"(Q));
+    sp64(L, r0, r1); sp64(H, r2, r3);
+    return;
+#endif
     u32 p0, p1, q0, q1, t0, t1; sp64(P, p0, p1); sp64(Q, q0, q1); sp64(T, t0, t1);
     u32 d0, d1, d2;
     asm("shl.b32 %0, %1, 1;" : "=r"(d0) : "r"(t0));
@@ -110,7 +137,34 @@ DEV u64 gmul(u64 a, u64 b) { u32 r0, r1, r2, r3; mul128(a, b, r0, r1, r2, r3); r
 DEV u64 gsqr(u64 a) { u32 r0, r1, r2, r3; sqr128(a, r0, r1, r2, r3); return red128(r0, r1, r2, r3); }
 
 /* Lazy sum for the linear layers: value = (hi:lo) + t*2^64. */
+#if CP_QPOW_ADD64
+struct W { u64 v; u32 t; };
+#define W_LO(w) ((u32)(w).v)
+#define W_HI(w) ((u32)((w).v >> 32))
+#define W_T(w) ((w).t)
+DEV W w2(u64 a, u64 b)
+{
+    W r;
+    asm("add.cc.u64 %0, %2, %3;\n\t addc.u32 %1, 0, 0;" : "=l"(r.v), "=r"(r.t) : "l"(a), "l"(b));
+    return r;
+}
+DEV W wadd(W a, W b)
+{
+    W r;
+    asm("add.cc.u64 %0, %2, %4;\n\t addc.u32 %1, %3, %5;" : "=l"(r.v), "=r"(r.t) : "l"(a.v), "r"(a.t), "l"(b.v), "r"(b.t));
+    return r;
+}
+DEV W wadd64(W a, u64 b)
+{
+    W r;
+    asm("add.cc.u64 %0, %2, %4;\n\t addc.u32 %1, %3, 0;" : "=l"(r.v), "=r"(r.t) : "l"(a.v), "r"(a.t), "l"(b));
+    return r;
+}
+#else
 struct W { u32 lo, hi, t; };
+#define W_LO(w) ((w).lo)
+#define W_HI(w) ((w).hi)
+#define W_T(w) ((w).t)
 
 DEV W w2(u64 a, u64 b)
 {
@@ -134,6 +188,7 @@ DEV W wadd64(W a, u64 b)
         : "=r"(r.lo), "=r"(r.hi), "=r"(r.t) : "r"(a.lo), "r"(a.hi), "r"(a.t), "r"(b0), "r"(b1));
     return r;
 }
+#endif
 /* (hi:lo) + t*2^64 with t < 2^31 -> 64 bits. w = t*EPS + lo < 2^63; adding hi*2^32 carries at
  * most once, and then the high word is < 2^31, so the +EPS fold cannot carry again. */
 DEV u64 wred(W a)
@@ -143,7 +198,7 @@ DEV u64 wred(W a)
         "madc.hi.u32    %1, %3, %6, 0;\n\t"
         "add.cc.u32     %1, %1, %5;\n\t"
         "addc.u32       %2, 0, 0;\n\t"
-        : "=r"(w0), "=r"(w1), "=r"(c) : "r"(a.t), "r"(a.lo), "r"(a.hi), "r"(c_eps));
+        : "=r"(w0), "=r"(w1), "=r"(c) : "r"(W_T(a)), "r"(W_LO(a)), "r"(W_HI(a)), "r"(c_eps));
     u32 n = 0u - c;
     asm("add.cc.u32 %0, %0, %2;\n\t addc.u32 %1, %1, 0;" : "+r"(w0), "+r"(w1) : "r"(n));
     return mk64(w0, w1);
@@ -232,7 +287,7 @@ DEV u64 gfma_w(u64 a, u64 b, W w)
         "addc.cc.u32    %2, %2, %12;\n\t"
         "addc.u32       %3, %3, %13;"
         : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-        : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "r"(w.lo), "r"(w.hi), "r"(w.t), "r"(x0), "r"(x1), "r"(x2));
+        : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "r"(W_LO(w)), "r"(W_HI(w)), "r"(W_T(w)), "r"(x0), "r"(x1), "r"(x2));
     return red128(r0, r1, r2, r3);
 }
 
@@ -305,7 +360,13 @@ DEV u64 hash_out0(const Params& p, u32 t)
     return canon(wred(acc));
 }
 
-__global__ void __launch_bounds__(k_tpb) qpow_cuda_scan(const Params p)
+/* sm_75: four blocks per SM (64 registers) measured 0.8% fewer cycles per hash than three. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#define CP_QPOW_MIN_BLOCKS 4
+#else
+#define CP_QPOW_MIN_BLOCKS 1
+#endif
+__global__ void __launch_bounds__(k_tpb, CP_QPOW_MIN_BLOCKS) qpow_cuda_scan(const Params p)
 {
     const u32 stride = gridDim.x * blockDim.x;
     for (u32 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < p.count; idx += stride) {
