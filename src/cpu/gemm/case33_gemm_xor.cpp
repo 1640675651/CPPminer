@@ -539,14 +539,21 @@ int case33_test_fused_prepack_impl(int M, int N, int K, int rank) {
         return 3;
     }
 
-    std::vector<int8_t> ref_a;
-    std::vector<int8_t> ref_b;
-    prepack_a_all(noisy_a.data(), M, K, blocks_k, true, &ref_a);
-    prepack_b_all(noisy_b.data(), N, K, blocks_k, tile_cols, &ref_b);
-
     Case33GemmXor gemm;
     gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     gemm.set_prepack_mode(Case33PrepackMode::Fused);
+    if (!gemm.resolve_runtime_isa()) {
+        return 4;
+    }
+
+    /* The reference must pack A the way the resolved ISA expects: x86 u8s8
+     * kernels take A+128, ARM (DotProd/NEON) and scalar take signed A. Passing
+     * `true` unconditionally made the test fail on every ARM device. */
+    std::vector<int8_t> ref_a;
+    std::vector<int8_t> ref_b;
+    prepack_a_all(noisy_a.data(), M, K, blocks_k, gemm.fast_u8s8_active(), &ref_a);
+    prepack_b_all(noisy_b.data(), N, K, blocks_k, tile_cols, &ref_b);
+
     std::vector<int8_t> fused_b;
     std::vector<int8_t> fused_a;
     if (!gemm.prepare_job_b(M, N, K, &fused_b, nullptr, seed_b, rank)) {
