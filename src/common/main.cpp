@@ -216,7 +216,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
         printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
-        cp_target_from_difficulty(cp_pool_difficulty(), tgt);
+        cp_pool_target_from_difficulty(cp_pool_difficulty(), tgt);
         printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
                job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
     }
@@ -1559,7 +1559,7 @@ int main(int argc, char** argv)
         /* Mock difficulty → pool target (same path as mining.set_difficulty). */
         const double mock_diff = cp_resolve_mock_diff(0);
         uint32_t tgt[8];
-        cp_target_from_difficulty(mock_diff, tgt);
+        cp_mock_target_from_difficulty(mock_diff, tgt);
         char target_hex[65];
         cp_le_words_to_be_target_hex(tgt, target_hex);
 

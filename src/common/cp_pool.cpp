@@ -178,7 +178,7 @@ static void pool_dispatch_line(const char* line)
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
         if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
-            cp_target_from_difficulty(g_diff.load(), tgt);
+            cp_pool_target_from_difficulty(g_diff.load(), tgt);
 
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
