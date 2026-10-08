@@ -145,6 +145,8 @@ This scipt pulls third-party dependencies and execute cmake.
 
 ### Options
 
+Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown option (including one for a backend that is not compiled in), a missing value, or a malformed, out-of-range or too long value stops the miner with status 1 before it starts.
+
 | Flag | Description |
 |------|-------------|
 | `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
