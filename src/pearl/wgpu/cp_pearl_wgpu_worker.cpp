@@ -185,7 +185,7 @@ extern "C" int cp_pearl_wgpu_worker_mine_attempt(
     if (!scan_key) {
         if (!zero_b_cache_matches(job_key, m, n)) {
             if (zero_b_prepare_job(job_key, m, n) != 0) {
-                return cp_job_should_cancel() ? -1 : 0;
+                return -1;
             }
         }
 
@@ -203,7 +203,7 @@ extern "C" int cp_pearl_wgpu_worker_mine_attempt(
         uint8_t hash_a[32];
         if (cp_pearl_wgpu_prep_a_signal(a_rng, (int)sizeof(a_rng), job_key, hash_a) != 0) {
             fprintf(stderr, "[pearl-wgpu] prep_a_signal failed\n");
-            return cp_job_should_cancel() ? -1 : 0;
+            return -1;
         }
 
         pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, hash_a, static_cast<uint32_t>(m),

@@ -479,7 +479,7 @@ extern "C" int cp_opencl_worker_mine_attempt(
             prep_rc = zero_b_prepare_attempt_gpu(ab_seed, ab_seed_len, job_key, m, n, a_key_local);
         }
         if (prep_rc != 0) {
-            return cp_job_should_cancel() ? -1 : 0;
+            return -1;
         }
         scan_key = a_key_local;
     }

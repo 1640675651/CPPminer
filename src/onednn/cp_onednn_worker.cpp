@@ -369,7 +369,7 @@ extern "C" int cp_onednn_worker_mine_attempt(
         const int prep_rc =
                 zero_b_prepare_attempt(ab_seed, ab_seed_len, job_key, m, n, h_A_sig, a_key_local);
         if (prep_rc != 0) {
-            return cp_job_should_cancel() ? -1 : 0;
+            return -1;
         }
         scan_key = a_key_local;
     }

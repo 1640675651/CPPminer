@@ -190,7 +190,7 @@ static void qpow_target_from_difficulty(uint64_t difficulty, uint8_t target_be[6
     }
 }
 
-static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
+static int build_start_nonce(const CpQpowJob* job, const char* worker_name,
                               uint8_t start[CP_QPOW_NONCE_BYTES])
 {
     memset(start, 0, CP_QPOW_NONCE_BYTES);
@@ -200,7 +200,7 @@ static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
     if(en > CP_QPOW_NONCE_BYTES) en = CP_QPOW_NONCE_BYTES;
     if(en > 0) memcpy(start, job->extranonce, (size_t)en);
     /* Mock: keep nonce deterministic (zeros + thread stamp only). */
-    if(g_mock) return;
+    if(g_mock) return 0;
     /* Leave room after extranonce for a thread stamp; a 32-byte extranonce
      * moves that stamp into the low half of the nonce. */
     int salt_off = en + 4;
@@ -213,7 +213,10 @@ static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
         memcpy(salt, worker_name, n);
     }
     uint64_t rnd = 0;
-    (void)cp_random_u64(&rnd);
+    if(cp_random_u64(&rnd) != 0){
+        fprintf(stderr, "[qpow] nonce entropy source failed\n");
+        return -1;
+    }
     memcpy(salt + 16, &rnd, sizeof(rnd));
     int free_len = CP_QPOW_NONCE_BYTES - salt_off;
     if(free_len > 24){
@@ -222,6 +225,7 @@ static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
         if(copy > (int)sizeof(salt)) copy = (int)sizeof(salt);
         if(copy > 0) memcpy(start + salt_off, salt, (size_t)copy);
     }
+    return 0;
 }
 
 /* Handle a found nonce. Returns 1 if mining should stop (mock done). */
@@ -320,11 +324,11 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
 {
     if(!cp_wgpu_worker_is_ready()){
         fprintf(stderr, "[qpow] wgpu worker not ready\n");
-        return CP_JOB_CANCELLED;
+        return CP_JOB_ERROR;
     }
     const uint64_t diff = difficulty_u64(job->difficulty);
     uint8_t cur[CP_QPOW_NONCE_BYTES];
-    build_start_nonce(job, worker_name, cur);
+    if(build_start_nonce(job, worker_name, cur) != 0) return CP_JOB_ERROR;
     /* Single GPU stream: stamp tid=0 for nonce salt consistency with CPU path. */
     stamp_thread_id(cur, job->extranonce_len, 0);
     const uint64_t search_chunk = qpow_gpu_search_chunk();
@@ -367,14 +371,14 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
             add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_WGPU_DEVICE_LOST){
             fprintf(stderr, "[qpow] wgpu device lost\n");
-            stop_rc = CP_JOB_CANCELLED;
+            stop_rc = CP_JOB_ERROR;
             break;
         } else if(st == CP_WGPU_CANCELLED){
-            stop_rc = CP_JOB_CANCELLED;
+            stop_rc = cp_job_should_cancel() || cp_pool_conn_lost() ? CP_JOB_CANCELLED : CP_JOB_ERROR;
             break;
         } else {
             fprintf(stderr, "[qpow] wgpu search error (%d)\n", st);
-            stop_rc = CP_JOB_CANCELLED;
+            stop_rc = CP_JOB_ERROR;
             break;
         }
         auto now = std::chrono::steady_clock::now();
@@ -400,10 +404,10 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
 {
     if(!cp_qpow_opencl_worker_is_ready()){
         fprintf(stderr, "[qpow] opencl worker not ready\n");
-        return CP_JOB_CANCELLED;
+        return CP_JOB_ERROR;
     }
     uint8_t cur[CP_QPOW_NONCE_BYTES];
-    build_start_nonce(job, worker_name, cur);
+    if(build_start_nonce(job, worker_name, cur) != 0) return CP_JOB_ERROR;
     stamp_thread_id(cur, job->extranonce_len, 0);
     const uint64_t search_chunk = qpow_gpu_search_chunk();
     printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=opencl batch=%llu%s\n",
@@ -444,11 +448,11 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
         } else if(st == CP_QPOW_OCL_OK_EXHAUSTED){
             add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_QPOW_OCL_CANCELLED){
-            stop_rc = CP_JOB_CANCELLED;
+            stop_rc = cp_job_should_cancel() || cp_pool_conn_lost() ? CP_JOB_CANCELLED : CP_JOB_ERROR;
             break;
         } else {
             fprintf(stderr, "[qpow] opencl search error (%d)\n", st);
-            stop_rc = CP_JOB_CANCELLED;
+            stop_rc = CP_JOB_ERROR;
             break;
         }
         auto now = std::chrono::steady_clock::now();
@@ -483,7 +487,7 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     uint8_t base[CP_QPOW_NONCE_BYTES];
-    build_start_nonce(job, worker_name, base);
+    if(build_start_nonce(job, worker_name, base) != 0) return CP_JOB_ERROR;
     std::atomic<uint64_t> total_hashes{0};
     std::atomic<int> stop_rc{CP_JOB_NONE};
     std::atomic<int> running{1};
@@ -617,6 +621,10 @@ int cp_qpow_mine_mock(const char* worker_name)
     const int rc = cp_qpow_mine_job(&job, -1, NULL, worker_name);
     const int outcome = g_qpow_mock_outcome.load(std::memory_order_relaxed);
 
+    if(rc == CP_JOB_ERROR){
+        fprintf(stderr, "[mock] FAIL: backend/resource failure\n");
+        return 1;
+    }
     if(rc == CP_JOB_CANCELLED && outcome == CP_SHARE_OUTCOME_NONE){
         fprintf(stderr, "[mock] cancelled before share\n");
         return 1;
@@ -635,4 +643,3 @@ int cp_qpow_mine_mock(const char* worker_name)
     }
     return 1;
 }
-
