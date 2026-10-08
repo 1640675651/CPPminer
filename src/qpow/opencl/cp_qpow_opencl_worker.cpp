@@ -131,11 +131,14 @@ bool build_variant(int mul, int red)
     release_kernel();
     /* CP_QPOW_OCL_OPTS: extra kernel build options (variants without a rebuild) */
     std::string opts = "-DQV_MUL=" + std::to_string(mul) + " -DQV_RED=" + std::to_string(red);
-    /* gfx12 inline assembly (QV_RED=3) is only valid on RDNA4 */
-    if(g_ctx.device_name.compare(0, 5, "gfx12") == 0) opts += " -DQV_GFX12=1";
+    /* gfx12 inline assembly (QV_RED=3) is only valid on RDNA4. There two nonces per work-item
+     * also pay off (R9700: 204.8 -> 211.3 MH/s with the kernel's gfx12 defaults). */
+    const bool gfx12 = g_ctx.device_name.compare(0, 5, "gfx12") == 0;
+    if(gfx12) opts += " -DQV_GFX12=1";
     if(const char* x = getenv("CP_QPOW_OCL_OPTS")){
         if(x[0]){ opts += " "; opts += x; }
     }
+    if(gfx12 && opts.find("QV_NPW=") == std::string::npos) opts += " -DQV_NPW=2";
     g_npw = 1;
     if(const char* p = strstr(opts.c_str(), "QV_NPW=")){
         const int v = atoi(p + 7);

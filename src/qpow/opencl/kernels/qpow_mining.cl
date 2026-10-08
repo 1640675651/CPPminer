@@ -19,12 +19,14 @@
  *                    2 = signed form with shift-derived borrows (exact; best on Intel Xe-HPG),
  *                    3 = form 1 in gfx12 inline assembly around one carry-out multiply-add
  *                    (AMD RDNA4, with -DQV_GFX12 from the host; elsewhere it builds as form 1)
- *   -DQV_EXT22=0|1   linear layers in lazy 96-bit sums, or in carry-free 22-bit limbs (default)
+ *   -DQV_EXT22=0|1   linear layers in lazy 96-bit sums, or in carry-free 22-bit limbs (default;
+ *                    0 on gfx12)
  *   -DQV_OVF=0|1     carry detection by compare or by __builtin_add_overflow (default 1 where
  *                    the compiler has the builtin: +3-4% on Intel and NVIDIA, same on AMD)
  *   -DQV_WRED_FAST=0|1  exact lazy-sum reduction, or skip its ~t/2^32 carry fold (default 1)
  *   -DQV_NPW=N       hash N consecutive nonces per work-item in lockstep (default 1; the host
- *                    reads N from CP_QPOW_OCL_OPTS and launches 1/N of the work-items)
+ *                    passes 2 on gfx12, reads N from CP_QPOW_OCL_OPTS and launches 1/N of the
+ *                    work-items)
  *   -DQV_TEST        also build the field-op test kernel
  */
 
@@ -324,7 +326,11 @@ ulong sbox(ulong x)
 /* ------------------------------------------------------------------ permutation */
 
 #ifndef QV_EXT22
+#if defined(QV_GFX12)
+#define QV_EXT22 0 /* R9700 with QV_RED=3 and QV_NPW=2: 211.3 vs 210.0 MH/s */
+#else
 #define QV_EXT22 1
+#endif
 #endif
 
 #if QV_EXT22
