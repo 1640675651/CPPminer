@@ -40,6 +40,9 @@ int cp_qpow_pool_send_login(int msg_id, const char* login, const char* worker,
 
 int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
                              const uint8_t nonce[CP_QPOW_NONCE_BYTES]);
+/* Recheck the mining epoch/connection after search and before allocating a submit id. */
+int cp_qpow_pool_submit_share(const CpQpowJob* job, int sock, int* msg_id,
+                               const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid);
 
 /* Parse login ack or job notify. Returns 1 on success. */
 int cp_qpow_pool_parse_login_result(const char* json, int expected_id, char* session_out, int session_len,

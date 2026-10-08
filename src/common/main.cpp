@@ -290,7 +290,7 @@ static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char (&cur_job_key
     }
 
     CpQpowJob pj;
-    while(rc == CP_JOB_CANCELLED && cp_qpow_pool_take_pending(&pj)){
+    while(rc == CP_JOB_CANCELLED && !cp_pool_conn_lost() && cp_qpow_pool_take_pending(&pj)){
         strncpy(cur_job_key, pj.job_key, sizeof(cur_job_key) - 1);
         cur_job_key[sizeof(cur_job_key) - 1] = 0;
         printf("[qpow] mining queued job=%s%s...\n", pj.job_id,

@@ -4,6 +4,7 @@
 #include "cp_json_frame.h"
 #include "cp_json_text.hpp"
 #include "cp_pool.h"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <atomic>
@@ -100,6 +101,32 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
     printf("[net] quantus submit job=%s nonce=%.16s...\n", job_id ? job_id : "", nonce_hex);
     fflush(stdout);
     return cp_pool_send_tracked_submit(sock, msg_id, msg.c_str());
+}
+
+int cp_qpow_pool_submit_share(const CpQpowJob* job, int sock, int* msg_id,
+                               const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid)
+{
+    if(!job || cp_job_should_cancel() || !cp_job_key_matches(job->job_key) || cp_pool_conn_lost()){
+        printf("[qpow] stale share dropped before submit (tid=%d)\n", tid);
+        fflush(stdout);
+        return 0;
+    }
+    if(g_dry_run){
+        char nh[CP_QPOW_NONCE_BYTES * 2 + 1];
+        cp_bin_to_hex(nonce, CP_QPOW_NONCE_BYTES, nh);
+        printf("[qpow] dry-run share nonce=%s (tid=%d)\n", nh, tid);
+        fflush(stdout);
+        return 1;
+    }
+    if(sock < 0 || !msg_id) return 0;
+    const int sid = (*msg_id)++;
+    if(!cp_qpow_pool_send_submit(sock, sid, job->job_id, nonce)){
+        printf("[qpow] submit send failed\n");
+        fflush(stdout);
+        return 0;
+    }
+    cp_pool_log_share_submit_outcome();
+    return 1;
 }
 
 int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)

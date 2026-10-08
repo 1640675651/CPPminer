@@ -224,9 +224,6 @@ static void build_start_nonce(const CpQpowJob* job, const char* worker_name,
     }
 }
 
-static int submit_qpow_share(const CpQpowJob* job, int sock, int* msg_id,
-                             const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid);
-
 /* Handle a found nonce. Returns 1 if mining should stop (mock done). */
 static int on_qpow_share_found(const CpQpowJob* job, int sock, int* msg_id,
                                const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid)
@@ -258,7 +255,7 @@ static int on_qpow_share_found(const CpQpowJob* job, int sock, int* msg_id,
         }
         return 1;
     }
-    submit_qpow_share(job, sock, msg_id, nonce, tid);
+    cp_qpow_pool_submit_share(job, sock, msg_id, nonce, tid);
     return 0;
 }
 static void stamp_thread_id(uint8_t nonce[CP_QPOW_NONCE_BYTES], int extranonce_len,
@@ -316,26 +313,6 @@ static uint64_t difficulty_u64(double d)
     if(d < 1.0) return 1ull;
     if(d >= (double)UINT64_MAX) return UINT64_MAX;
     return (uint64_t)(d + 0.5);
-}
-static int submit_qpow_share(const CpQpowJob* job, int sock, int* msg_id,
-                             const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid)
-{
-    if(g_dry_run){
-        char nh[CP_QPOW_NONCE_BYTES * 2 + 1];
-        cp_bin_to_hex(nonce, CP_QPOW_NONCE_BYTES, nh);
-        printf("[qpow] dry-run share nonce=%s (tid=%d)\n", nh, tid);
-        fflush(stdout);
-        return 1;
-    }
-    if(sock < 0 || !msg_id) return 0;
-    int sid = (*msg_id)++;
-    if(!cp_qpow_pool_send_submit(sock, sid, job->job_id, nonce)){
-        printf("[qpow] submit send failed\n");
-        fflush(stdout);
-        return 0;
-    }
-    cp_pool_log_share_submit_outcome();
-    return 1;
 }
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
 static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,

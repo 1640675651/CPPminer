@@ -240,6 +240,82 @@ static void test_pearl_notify_validation()
     assert(!parse(array("legacy", "\"" + h + "\",\"" + std::string(64, 'g') + "\"")));
 }
 
+static bool readable(cp_sock_t sock, int millis)
+{
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(sock, &set);
+    timeval timeout = {millis / 1000, (millis % 1000) * 1000};
+#ifdef _WIN32
+    return select(0, &set, nullptr, nullptr, &timeout) > 0;
+#else
+    return select(sock + 1, &set, nullptr, nullptr, &timeout) > 0;
+#endif
+}
+
+static void test_quantus_submit_after_search()
+{
+    assert(cp_net_init() == 0);
+    cp_sock_t listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(listener != CP_INVALID_SOCK);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(listener, (sockaddr*)&address, sizeof(address)) == 0);
+#ifdef _WIN32
+    int len = sizeof(address);
+#else
+    socklen_t len = sizeof(address);
+#endif
+    assert(getsockname(listener, (sockaddr*)&address, &len) == 0);
+    assert(listen(listener, 1) == 0);
+    assert(cp_pool_connect("127.0.0.1", ntohs(address.sin_port)));
+    cp_sock_t peer = accept(listener, nullptr, nullptr);
+    assert(peer != CP_INVALID_SOCK);
+    CpQpowJob job = {};
+    strcpy(job.job_id, "submit-guard");
+    strcpy(job.job_key, "submit-guard-key");
+    cp_qpow_pool_set_session_id("test-session");
+    uint8_t nonce[CP_QPOW_NONCE_BYTES] = {};
+    int msg_id = 1;
+    auto submit = [&] { return cp_qpow_pool_submit_share(&job, cp_pool_socket(), &msg_id, nonce, 0); };
+    auto receive = [&](int expected) {
+        std::string json;
+        while(json.find('\n') == std::string::npos){
+            assert(readable(peer, 2000));
+            char buf[1024];
+            const int n = recv(peer, buf, sizeof(buf), 0);
+            assert(n > 0);
+            json.append(buf, n);
+        }
+        assert(json.find("\"id\":" + std::to_string(expected) + ",") != std::string::npos);
+        assert(json.find("\"job_id\":\"submit-guard\"") != std::string::npos);
+    };
+    cp_job_mine_begin(job.job_key);
+    assert(submit() && msg_id == 2);
+    receive(1);
+    // Search has returned a nonce, then a notify cancels the same mining key.
+    cp_job_request_cancel();
+    assert(!submit() && msg_id == 2 && !readable(peer, 50));
+    cp_job_mine_begin("different-work");
+    assert(!submit() && msg_id == 2 && !readable(peer, 50));
+    cp_job_mine_begin(job.job_key);
+    assert(submit() && msg_id == 3); // A fresh epoch can submit normally.
+    receive(2);
+    cp_pool_reader_start();
+    CP_SOCK_CLOSE(peer);
+    const double deadline = cp_now_sec() + 2;
+    while(!cp_pool_conn_lost() && cp_now_sec() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    assert(cp_pool_conn_lost());
+    cp_job_mine_begin(job.job_key); // Connection guard must hold even if cancel was reset.
+    assert(!submit() && msg_id == 3);
+    cp_pool_reader_stop();
+    cp_pool_disconnect();
+    CP_SOCK_CLOSE(listener);
+    cp_job_mine_end();
+}
+
 int main()
 {
     double difficulty = 0;
@@ -273,6 +349,7 @@ int main()
     test_quantus_work_identity();
     test_quantus_login();
     test_pearl_notify_validation();
+    test_quantus_submit_after_search();
 #ifdef __linux__
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
