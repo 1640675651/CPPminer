@@ -1033,6 +1033,74 @@ inline void wmma_load_step(__private wmma_ab *a, __private wmma_ab *b, __global 
     }
 }
 
+/* ---- CASE32_WMMA_LDS=1: operands staged through LDS (double buffered).
+   One 16-k step of a 128x128 macro block needs k-groups g..g+3 of all 128 rows of A and
+   all 128 columns of B: in the coalesced prepack that is one contiguous 2 KB range each
+   (k-group stride = STRIP = MACRO_M dwords). The group loads it with one int4 per WI
+   (MACRO_M / WG of them), stores it to LDS as [k-group][row] with a padded row stride,
+   and every lane then reads its 2 (gfx12) or 4 (gfx11) k-group dwords per block, one
+   ds_load_2addr per block. The next step is fetched before this step's WMMAs, so only
+   the int4s are in flight (no register double buffer of 16 operands). */
+#ifndef CASE32_WMMA_LDS
+#define CASE32_WMMA_LDS 0
+#endif
+#define WMMA_LSTR (MACRO_M + 8)                 /* LDS dwords per k-group row: halves of a wave
+                                                   (k-groups 2 apart) land 16 banks apart */
+#define WMMA_LDS_BUF (4 * WMMA_LSTR)            /* one step of A (or B) */
+#define WMMA_LDS_V4 (MACRO_M / WMMA_WG)         /* int4 per WI per step per operand */
+#if CASE32_WMMA_LDS && (WMMA_KG_DW_A != MACRO_M || WMMA_KG_DW_B != MACRO_N || MACRO_M % WMMA_WG != 0)
+#error CASE32_WMMA_LDS assumes a k-group strip of exactly MACRO_M (MACRO_N) dwords
+#endif
+
+inline void wmma_lds_fetch(__private int4 *na, __private int4 *nb, __global const int4 *a_blk,
+                           __global const int4 *b_blk, int g, int lid) {
+    #pragma unroll
+    for (int v = 0; v < WMMA_LDS_V4; ++v) {
+        na[v] = a_blk[g * (WMMA_KG_DW_A / 4) + lid + v * WMMA_WG];
+        nb[v] = b_blk[g * (WMMA_KG_DW_B / 4) + lid + v * WMMA_WG];
+    }
+}
+
+inline void wmma_lds_store(__local int *la, __local int *lb, __private const int4 *na,
+                           __private const int4 *nb, int lid) {
+    #pragma unroll
+    for (int v = 0; v < WMMA_LDS_V4; ++v) {
+        const int d = (lid + v * WMMA_WG) * 4; /* dword within the 4 k-group strips */
+        const int q = d / MACRO_M;
+        const int r = d - q * MACRO_M;
+        *(__local int4 *)(la + q * WMMA_LSTR + r) = na[v];
+        *(__local int4 *)(lb + q * WMMA_LSTR + r) = nb[v];
+    }
+}
+
+inline void wmma_lds_operands(__private wmma_ab *a, __private wmma_ab *b, __local const int *la,
+                              __local const int *lb, int wm, int wn, uint lane) {
+    const int m = (int)(lane & 15u);
+#if CASE32_WMMA == 12
+    const int h = (int)(lane >> 4);
+    const int g0 = CASE32_WMMA_G12_KSPLIT ? 2 * h : h;
+    const int g1 = CASE32_WMMA_G12_KSPLIT ? 2 * h + 1 : 2 + h;
+#endif
+    #pragma unroll
+    for (int bi = 0; bi < WMMA_BM; ++bi) {
+        const int r = wm * WMMA_WAVE_ROWS + bi * 16 + m;
+#if CASE32_WMMA == 11
+        a[bi] = (int4)(la[r], la[WMMA_LSTR + r], la[2 * WMMA_LSTR + r], la[3 * WMMA_LSTR + r]);
+#else
+        a[bi] = (int2)(la[g0 * WMMA_LSTR + r], la[g1 * WMMA_LSTR + r]);
+#endif
+    }
+    #pragma unroll
+    for (int bj = 0; bj < WMMA_BN; ++bj) {
+        const int c = wn * WMMA_WAVE_COLS + bj * 16 + m;
+#if CASE32_WMMA == 11
+        b[bj] = (int4)(lb[c], lb[WMMA_LSTR + c], lb[2 * WMMA_LSTR + c], lb[3 * WMMA_LSTR + c]);
+#else
+        b[bj] = (int2)(lb[g0 * WMMA_LSTR + c], lb[g1 * WMMA_LSTR + c]);
+#endif
+    }
+}
+
 inline void wmma_mac_step(__private wmma_acc *acc, __private const wmma_ab *a,
                           __private const wmma_ab *b WMMA_EMU_ARG) {
     #pragma unroll
@@ -1143,6 +1211,27 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     wmma_ab a1[WMMA_BM];
     wmma_ab b1[WMMA_BN];
     wmma_load_step(a0, b0, a_lane, b_lane, 0);
+#elif CASE32_WMMA_LDS
+    (void)a_lane;
+    (void)b_lane;
+    /* int4 arrays: the staging stores are 16-byte vector stores (an int array need not be
+       16-byte aligned) */
+    __local int4 lds_a4[2 * WMMA_LDS_BUF / 4];
+    __local int4 lds_b4[2 * WMMA_LDS_BUF / 4];
+    __local int *lds_a = (__local int *)lds_a4;
+    __local int *lds_b = (__local int *)lds_b4;
+    __global const int4 *a_blk =
+            (__global const int4 *)(a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A);
+    __global const int4 *b_blk =
+            (__global const int4 *)(b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B);
+    const int total_steps = blocks_k * WMMA_KSTEPS;
+    {
+        int4 na[WMMA_LDS_V4];
+        int4 nb[WMMA_LDS_V4];
+        wmma_lds_fetch(na, nb, a_blk, b_blk, 0, (int)lid);
+        wmma_lds_store(lds_a, lds_b, na, nb, (int)lid);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
 #endif
     for (int ms = 0; ms < blocks_k; ++ms) {
 #if CASE32_WMMA_PIPELINE
@@ -1154,6 +1243,30 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             wmma_mac_step(acc, a1, b1 WMMA_EMU_PASS);
             kg_flat += 8;
         }
+#elif CASE32_WMMA_LDS
+        WMMA_KLOOP_UNROLL
+        for (int ks = 0; ks < WMMA_KSTEPS; ++ks) {
+            const int s = ms * WMMA_KSTEPS + ks;
+            const int cur = s & 1;
+            const int more = s + 1 < total_steps; /* uniform across the group */
+            int4 na[WMMA_LDS_V4];
+            int4 nb[WMMA_LDS_V4];
+            if (more) {
+                wmma_lds_fetch(na, nb, a_blk, b_blk, (s + 1) * 4, (int)lid);
+            }
+            wmma_ab a[WMMA_BM];
+            wmma_ab b[WMMA_BN];
+            wmma_lds_operands(a, b, lds_a + cur * WMMA_LDS_BUF, lds_b + cur * WMMA_LDS_BUF, wm, wn,
+                              lane);
+            wmma_mac_step(acc, a, b WMMA_EMU_PASS);
+            if (more) {
+                /* buffer cur^1 was last read in step s-1; the barrier ending s-1 freed it */
+                wmma_lds_store(lds_a + (cur ^ 1) * WMMA_LDS_BUF, lds_b + (cur ^ 1) * WMMA_LDS_BUF, na,
+                               nb, (int)lid);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        kg_flat += KGROUPS;
 #else
         WMMA_KLOOP_UNROLL
         for (int ks = 0; ks < WMMA_KSTEPS; ++ks) {
