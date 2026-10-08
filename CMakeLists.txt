@@ -77,6 +77,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
     ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
     ${CMAKE_SOURCE_DIR}/src/qpow/opencl
+    ${CMAKE_SOURCE_DIR}/src/qpow/cuda
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
 
@@ -205,6 +206,7 @@ if(CP_ENABLE_CUDA)
         src/cuda/cp_gpu.cu
         src/cuda/cp_cutlass_gemm.cu
         src/cuda/cp_cuda_worker.cpp
+        src/qpow/cuda/cp_qpow_cuda.cu
     )
     list(APPEND CP_INCLUDE_DIRS
         ${CMAKE_SOURCE_DIR}/src/cuda/cutlass

@@ -33,6 +33,14 @@
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_qpow_opencl_worker.h"
 #endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+#include "cp_qpow_cuda_worker.h"
+#ifndef CP_QPOW_OCL_OK_FOUND
+#define CP_QPOW_OCL_OK_FOUND     CP_QPOW_CUDA_OK_FOUND
+#define CP_QPOW_OCL_OK_EXHAUSTED CP_QPOW_CUDA_OK_EXHAUSTED
+#define CP_QPOW_OCL_CANCELLED    CP_QPOW_CUDA_CANCELLED
+#endif
+#endif
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
 #endif
@@ -136,6 +144,10 @@ static uint64_t qpow_gpu_search_chunk(void)
         uint32_t b = cp_qpow_opencl_worker_batch_size();
         return b ? (uint64_t)b : k_gpu_search_chunk_default;
     }
+#endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return cp_qpow_cuda_worker_batch_size();
 #endif
     return k_gpu_search_chunk_default;
 }
@@ -417,21 +429,32 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
 }
 #endif
 
-#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
-                           const char* worker_name)
+#if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA)
+/* One GPU backend's search entry points. Return codes share the CP_QPOW_OCL_* values. */
+struct QpowGpuOps {
+    const char* name;
+    int (*ready)(void);
+    int (*search)(const uint8_t header[32], const uint8_t target_be[64],
+                  const uint8_t start_be[64], uint64_t count,
+                  uint8_t out_nonce_be[64], uint8_t out_hash_be[64], uint64_t* out_hashes);
+    /* Where to continue after a found nonce: search() counts nonce-line counters
+     * (qpow/nonce_line.hpp) and reports the mapped nonce. */
+    void (*resume)(const uint8_t found_be[64], uint8_t next_be[64]);
+};
+
+static int mine_job_gpu(const QpowGpuOps& ops, const CpQpowJob* job, int sock, int* msg_id,
+                        const char* worker_name)
 {
-    if(!cp_qpow_opencl_worker_is_ready()){
-        fprintf(stderr, "[qpow] opencl worker not ready\n");
+    if(!ops.ready()){
+        fprintf(stderr, "[qpow] %s worker not ready\n", ops.name);
         return CP_JOB_CANCELLED;
     }
     uint8_t cur[CP_QPOW_NONCE_BYTES];
     build_start_nonce(job, worker_name, cur);
     stamp_thread_id(cur, job->extranonce_len, 0);
-    const uint64_t search_chunk = qpow_gpu_search_chunk();
-    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=opencl batch=%llu%s\n",
-           job->job_id, job->difficulty, job->extranonce_len,
-           (unsigned long long)search_chunk,
+    printf("[qpow] mine job=%s diff=%.0f extranonce_len=%d backend=%s batch=%llu%s\n",
+           job->job_id, job->difficulty, job->extranonce_len, ops.name,
+           (unsigned long long)qpow_gpu_search_chunk(),
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     cp_job_mine_begin(job->job_key);
@@ -444,12 +467,13 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
             stop_rc = CP_JOB_CANCELLED;
             break;
         }
+        /* Re-read each step: the CUDA worker tunes its launch size while mining. */
+        const uint64_t search_chunk = qpow_gpu_search_chunk();
         uint8_t out_nonce[CP_QPOW_NONCE_BYTES];
         uint8_t out_hash[CP_QPOW_TARGET_BYTES];
         uint64_t hashes = 0;
-        const int st = cp_qpow_opencl_worker_search(
-            job->mining_hash, job->target, cur, search_chunk,
-            out_nonce, out_hash, &hashes);
+        const int st = ops.search(job->mining_hash, job->target, cur, search_chunk,
+                                  out_nonce, out_hash, &hashes);
         total_hashes += hashes;
         cp_fee_note_tiles(hashes);
         cp_fee_prepare_matrix();
@@ -463,14 +487,14 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
                 break;
             }
             /* out_nonce is the mapped nonce; continue after its line counter */
-            cp_qpow_opencl_worker_resume(out_nonce, cur);
+            ops.resume(out_nonce, cur);
         } else if(st == CP_QPOW_OCL_OK_EXHAUSTED){
             add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
         } else if(st == CP_QPOW_OCL_CANCELLED){
             stop_rc = CP_JOB_CANCELLED;
             break;
         } else {
-            fprintf(stderr, "[qpow] opencl search error (%d)\n", st);
+            fprintf(stderr, "[qpow] %s search error (%d)\n", ops.name, st);
             stop_rc = CP_JOB_CANCELLED;
             break;
         }
@@ -479,8 +503,8 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
         if(elapsed >= 5.0){
             double total_sec = std::chrono::duration<double>(now - t0).count();
             double hs = total_sec > 0 ? (double)total_hashes / total_sec : 0;
-            printf("[qpow] %.3f MH/s  (%llu hashes in %.1fs, opencl)\n",
-                   hs / 1e6, (unsigned long long)total_hashes, total_sec);
+            printf("[qpow] %.3f MH/s  (%llu hashes in %.1fs, %s)\n",
+                   hs / 1e6, (unsigned long long)total_hashes, total_sec, ops.name);
             fflush(stdout);
             t_log = now;
         }
@@ -488,6 +512,31 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
     if(stop_rc == CP_JOB_NONE && !g_mock) stop_rc = CP_JOB_CANCELLED;
     cp_job_mine_end();
     return stop_rc;
+}
+#endif
+
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
+                           const char* worker_name)
+{
+    static const QpowGpuOps ops = {
+        "opencl", cp_qpow_opencl_worker_is_ready, cp_qpow_opencl_worker_search,
+        cp_qpow_opencl_worker_resume};
+    return mine_job_gpu(ops, job, sock, msg_id, worker_name);
+}
+#endif
+
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+static_assert(CP_QPOW_CUDA_OK_FOUND == 1 && CP_QPOW_CUDA_OK_EXHAUSTED == 0 &&
+              CP_QPOW_CUDA_CANCELLED == -1 && CP_QPOW_CUDA_ERROR == -2,
+              "CUDA and OpenCL Quantus workers share return codes");
+static int mine_job_cuda(const CpQpowJob* job, int sock, int* msg_id,
+                         const char* worker_name)
+{
+    static const QpowGpuOps ops = {
+        "cuda", cp_qpow_cuda_worker_is_ready, cp_qpow_cuda_worker_search,
+        cp_qpow_cuda_worker_resume};
+    return mine_job_gpu(ops, job, sock, msg_id, worker_name);
 }
 #endif
 
@@ -609,6 +658,10 @@ int cp_qpow_mine_job(const CpQpowJob* job, int sock, int* msg_id,
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
         return mine_job_opencl(job, sock, msg_id, worker_name);
+#endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return mine_job_cuda(job, sock, msg_id, worker_name);
 #endif
     return mine_job_cpu(job, sock, msg_id, worker_name);
 }

@@ -5,7 +5,7 @@ Cross-Platform Pearl (now multi-algo) miner written in C++. Select the algorithm
 | Algo | Backends | PoW |
 |------|----------|-----|
 | `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` | GEMM+XOR jackpot + `plain_proof` |
-| `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
+| `quantus` | `cpu` / `cuda` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
 Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
 
@@ -17,6 +17,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
+| Quantus CUDA | `src/qpow/cuda/` | Poseidon2 kernel on the nonce line, self-tested per device |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device |
 
@@ -56,7 +57,7 @@ Enable multiple backends in one binary; select at runtime with `--backend`. Both
 | | cpu | cuda | opencl | onednn | wgpu |
 |--|-----|------|--------|--------|------|
 | pearl | ✓ | ✓ | ✓ | ✓ | ✓ |
-| quantus | ✓ | ✗ | ✓ | ✗ | ✓ |
+| quantus | ✓ | ✓ | ✓ | ✗ | ✓ |
 
 ## Build (Windows)
 
@@ -105,6 +106,10 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend opencl --list-devices
 .\cppminer.exe --algo quantus --backend opencl --devices 0 `
   --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
+
+# Quantus CUDA (requires -Backend Cuda / CP_ENABLE_CUDA)
+.\cppminer.exe --algo quantus --backend cuda --devices 0 `
+  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
 ```
 
 ```powershell
@@ -140,6 +145,7 @@ This scipt pulls third-party dependencies and execute cmake.
 .\cppminer.exe --backend cpu --mock
 .\cppminer.exe --algo quantus --backend cpu --mock
 .\cppminer.exe --algo quantus --backend opencl --devices 0 --mock
+.\cppminer.exe --algo quantus --backend cuda --devices 0 --mock
 .\cppminer.exe --algo quantus --backend wgpu --devices 0 --mock
 ```
 
@@ -147,7 +153,7 @@ This scipt pulls third-party dependencies and execute cmake.
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `cuda` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
@@ -159,7 +165,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
-| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus: **nonces per launch** (wgpu default 1000000; OpenCL default automatic, about 100 ms per launch). Aliases: `--period-batch`, `--col-period-batch` |
+| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus: **nonces per launch** (wgpu default 1000000; CUDA/OpenCL default automatic, about 100 ms per launch). Aliases: `--period-batch`, `--col-period-batch` |
 | `--period-batch N` | Alias for `--batch-size` |
 | `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |

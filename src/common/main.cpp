@@ -29,6 +29,7 @@
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_gpu.h"
 #include "cp_cutlass.h"
+#include "cp_qpow_cuda_worker.h"
 #endif
 
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
@@ -1261,9 +1262,10 @@ int main(int argc, char** argv)
     if(algo_sel == CP_ALGO_QUANTUS){
         printf("[mode] algo=%s\n", cp_algo_name(algo_sel));
         fflush(stdout);
-        /* Quantus launch batch: --batch-size, else automatic (OpenCL) or 1e6 nonces. */
+        /* Quantus launch batch: --batch-size, else automatic (CUDA, OpenCL) or 1e6 nonces. */
         {
-            uint32_t qbatch = cp_worker_backend_id() == CP_BACKEND_OPENCL ? 0u : 1000000u;
+            uint32_t qbatch = (cp_worker_backend_id() == CP_BACKEND_CUDA ||
+                              cp_worker_backend_id() == CP_BACKEND_OPENCL) ? 0u : 1000000u;
             if(batch_size_set){
                 if(batch_size < 1) batch_size = 1;
                 qbatch = (uint32_t)batch_size;
@@ -1295,6 +1297,15 @@ int main(int argc, char** argv)
             }
         }
 #endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+        else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
+            if(!ndev){ devs[0] = 0; ndev = 1; }
+            if(cp_qpow_cuda_worker_init(devs, ndev) != 0){
+                fprintf(stderr, "quantus cuda backend init failed\n");
+                return 1;
+            }
+        }
+#endif
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
             /* Pin the OpenMP pool physical cores first, then SMT siblings (one
@@ -1319,6 +1330,10 @@ int main(int argc, char** argv)
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
         else if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
             cp_qpow_opencl_worker_shutdown();
+#endif
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+        else if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+            cp_qpow_cuda_worker_shutdown();
 #endif
         return qrc;
     }

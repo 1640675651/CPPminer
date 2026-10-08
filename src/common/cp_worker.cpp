@@ -13,6 +13,7 @@
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_cuda_worker.h"
 #include "cp_gpu.h"
+#include "cp_qpow_cuda_worker.h"
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
 #include "cp_opencl_worker.h"
@@ -438,8 +439,12 @@ extern "C" void cp_worker_set_period_gemm(int on)
 extern "C" void cp_worker_set_period_batch(int batch)
 {
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
-    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
-        cp_cuda_worker_set_period_batch(batch);
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA){
+        if(g_algo == 1)
+            cp_qpow_cuda_worker_set_batch_size((uint32_t)(batch < 0 ? 0 : batch));
+        else
+            cp_cuda_worker_set_period_batch(batch);
+    }
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
