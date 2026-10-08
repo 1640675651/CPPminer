@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+/* Monotonic seconds for durations/deadlines; the origin is not calendar time. */
 double cp_now_sec(void);
 int cp_file_exists(const char* path);
 void cp_path_to_posix(char* path);

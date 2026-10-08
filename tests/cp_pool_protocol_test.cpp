@@ -12,6 +12,8 @@
 #include <cassert>
 #include <cstring>
 #include <thread>
+#include <chrono>
+#include <vector>
 
 static void test_response_ids()
 {
@@ -136,6 +138,22 @@ static void test_work_identity_and_cancellation()
 
 int main()
 {
+    std::vector<std::thread> clocks;
+    for(int i = 0; i < 4; ++i){
+        clocks.emplace_back([] {
+            double previous = cp_now_sec();
+            for(int j = 0; j < 1000; ++j){
+                const double before = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const double now = cp_now_sec();
+                const double after = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                assert(now >= previous && now >= before && now <= after);
+                previous = now;
+            }
+        });
+    }
+    for(auto& clock : clocks) clock.join();
     test_response_ids();
     test_submit_deadlines();
     test_handshake_deadlines();

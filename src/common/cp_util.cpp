@@ -8,10 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <chrono>
 
 #ifndef _WIN32
 #include <errno.h>
-#include <sys/time.h>
 #include <unistd.h>
 #else
 #include <bcrypt.h>
@@ -20,17 +20,8 @@
 
 double cp_now_sec(void)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER freq = {0};
-    LARGE_INTEGER t;
-    if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t);
-    return (double)t.QuadPart / (double)freq.QuadPart;
-#else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
-#endif
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 int cp_random_bytes(void* buf, size_t n)
