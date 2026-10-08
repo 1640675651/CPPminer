@@ -149,7 +149,7 @@ This scipt pulls third-party dependencies and execute cmake.
 |------|-------------|
 | `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
-| `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
+| `--pool` | `stratum+tcp://host:port`, IPv6 as `stratum+tcp://[addr]:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
@@ -164,8 +164,8 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
-| `--dry-run` | Build proof without submitting |
-| `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
+| `--dry-run` | Build proof without submitting; saves `pp_<pid>_<n>_header.bin` / `pp_<pid>_<n>_proof.b64` in the working directory |
+| `--verify` | In-process zk-pow jackpot verify before submit, in memory (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
 | `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **44** (unscaled target 2^(256-D)); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
@@ -173,6 +173,8 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--simd ISA` | CPU: `auto` (default), `hybrid`, `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar`. Quantus: `hybrid` runs one scalar and one AVX2 Poseidon2 worker per physical core (SMT siblings); `auto` is the best available mode (currently `hybrid`; may select a wider kernel such as AVX-512 in the future); `avx2` forces AVX2 on every thread; any other value runs scalar. Pearl: `hybrid` is the same as `auto` |
 | `--simd-test` | Compare every available CPU SIMD kernel against scalar and exit (Quantus: AVX2 Poseidon2 field ops and hash parity vs scalar) |
 | `--prepack-test` | Check CPU fused and reuse prepack against separate at m=n=8192 (prepacked bytes + full tile XOR) and exit |
+
+**Pool connection.** A TCP connect tries every resolved IPv4/IPv6 address of the pool within 10 seconds. The miner reconnects when the pool does not answer `mining.authorize` (Quantus: `login`) within 30 seconds, sends no valid job within 30 seconds after accepting it, or leaves a submitted share without a reply for 60 seconds; replies are matched to shares by JSON-RPC id. Jobs with a malformed header, target or certificate version are ignored. A fatal backend or resource error (out of memory, device or entropy failure) exits with status 1, so a supervisor can restart the miner.
 
 ### OpenCL options
 
