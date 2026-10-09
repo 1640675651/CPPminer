@@ -1624,7 +1624,7 @@ reconnect:
 
     printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
     while(1){
-        if(cp_pool_connect(pool_host, pool_port) >= 0) break;
+        if(cp_pool_connect(pool_host, pool_port)) break;
         printf("[main] Reconnecting in 5 sec...\n"); fflush(stdout);
         cp_sleep(5);
     }
