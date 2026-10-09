@@ -1,0 +1,34 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface pearlx : remote_handle64 {
+   // Pearl GEMM + milestone XOR on the Hexagon cDSP (gemm_xor Case 1.1). All
+   // values are int8, multiplied signed x signed. Hash tiles are 4 rows x 64
+   // columns: each half of a 4 x 128 register tile.
+
+   // Job setup: noisy B^T, n rows of k values each (row j = column j of B).
+   // The DSP packs it into its own memory and keeps it until the next set_b or
+   // close. n must be a multiple of 128, k a multiple of 128 and at most 4096.
+   long set_b(in sequence<int8> bt, in long n, in long k, rout uint64 dsp_us);
+
+   // Row panel: noisy A rows (row-major, `rows` x k; rows a multiple of 4),
+   // packed into DSP memory for the gemm_xor calls that follow. nthreads <= 0
+   // uses every HVX context.
+   long set_a(in sequence<int8> a, in long rows, in long nthreads, rout uint64 dsp_us);
+
+   // The packed row panel against columns [col0, col0 + ncols) of B (both
+   // multiples of 128). After each milestone ms (k < 128 * (ms + 1)) the int32
+   // partials of every 4 x 64 hash tile are XORed into one word.
+   // xr: one record of lines * 32 words per register tile, column tile nt
+   // (128 columns, counted from col0) major then row tile t (4 rows),
+   // lines = ceil(k / 128 * 2 / 32): word ms * 2 + h of the record at
+   // (nt * rows / 4 + t) * lines * 32 is hash tile (rows 4t.., columns
+   // col0 + 128 nt + 64 h ..) after milestone ms. xr must be 128-byte aligned.
+   long gemm_xor(in long col0, in long ncols, rout sequence<uint32> xr, rout uint64 dsp_us);
+
+   // hvx_contexts: 128-byte HVX units available. clock_vote_err: 0 if the
+   // max-clock request made at open succeeded. clock_mhz: current DSP core clock.
+   // vtcm_kb: total VTCM on this DSP (-1 if the query fails).
+   long info(rout long hvx_contexts, rout long clock_vote_err, rout long clock_mhz,
+             rout long vtcm_kb);
+};

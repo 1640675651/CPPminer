@@ -72,6 +72,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("|wgpu");
 #endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("|hexagon");
+#endif
     printf(" (built: ");
     {
         int first = 1;
@@ -80,6 +83,7 @@ static void print_usage(void)
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
         if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
         if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
+        if(cp_worker_has_hexagon()){ printf("%shexagon", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
@@ -110,6 +114,12 @@ static void print_usage(void)
     printf("  --wgpu-tile MxN[/MmMm]  wgpu (pearl) register tile: 4x4, 4x8, 8x8 (default), 8x16;\n");
     printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
+#endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; default --m 32 --n 32;\n");
+    printf("                     DSP launch = --row-period-batch x --batch-size 128x128 macro\n");
+    printf("                     blocks (default %d x %d)\n", CP_HEXAGON_LAUNCH_MACROS_DEFAULT,
+           CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
 #endif
     printf("  --m N, --n N         matrix rows/cols in units of %d (default %d; each <= %d,\n",
            CP_MATRIX_UNIT, M_DIM / CP_MATRIX_UNIT, CP_MATRIX_UNITS_MAX);
@@ -526,6 +536,7 @@ int main(int argc, char** argv)
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
             else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
             else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
+            else if(!strcmp(b, "hexagon")) backend_sel = CP_BACKEND_HEXAGON;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -977,6 +988,12 @@ int main(int argc, char** argv)
     }
 
     {
+        if(backend_sel == CP_BACKEND_HEXAGON){
+            /* Phone memory: noisy B^T is built on the host and kept packed in DSP memory,
+             * next to the host signal A (m*k each). 32 units = 128 MiB per matrix. */
+            if(!m_units) m_units = CP_HEXAGON_MATRIX_UNITS_DEFAULT;
+            if(!n_units) n_units = CP_HEXAGON_MATRIX_UNITS_DEFAULT;
+        }
         if(!m_units) m_units = M_DIM / CP_MATRIX_UNIT;
         if(!n_units) n_units = N_DIM / CP_MATRIX_UNIT;
         if(m_units * n_units > CP_MATRIX_AREA_MAX){
@@ -1345,6 +1362,14 @@ int main(int argc, char** argv)
 #endif
     cp_worker_set_period_batch(batch_size);
     cp_worker_set_row_period_batch(row_period_batch);
+    if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+        /* Launch = row x col 128x128 macro blocks; the shared defaults mean "not set". */
+        if(batch_size == CP_PERIOD_BATCH_DEFAULT)
+            batch_size = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT)
+            row_period_batch = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        cp_worker_set_hexagon_launch(row_period_batch, batch_size);
+    }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
      * Period batch must be set before init (backend banner + scan loop read batch at init). */
@@ -1411,6 +1436,7 @@ int main(int argc, char** argv)
         const char *tile_layout_name =
             cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) ? "contiguous 16x16 blocks"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x64) ? "contiguous 4x64 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -1474,6 +1500,15 @@ int main(int argc, char** argv)
                 }
                 printf("[mode] device layout %s on Intel GPU\n", layout_msg);
             }
+        } else if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+            const int lrows = row_period_batch * 128 < g_m_active ? row_period_batch * 128
+                                                                   : g_m_active;
+            const int lcols = batch_size * 128 < g_n_active ? batch_size * 128 : g_n_active;
+            printf("[mode] scan: cDSP HVX fused GEMM + XOR (4x64 hash tiles) + host jackpot\n");
+            printf("[mode] DSP launch: %dx%d macro blocks of 128x128 = %dx%d "
+                   "(--row-period-batch x --batch-size), %d hash tiles\n",
+                   lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
+            printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");

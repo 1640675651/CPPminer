@@ -205,6 +205,8 @@ static const uint8_t *mining_cfg_for_layout(int tile_layout) {
         return PEARL_CONTIGUOUS_4x8_CONFIG;
     case CP_TILE_LAYOUT_CONTIGUOUS_16x16:
         return PEARL_CONTIGUOUS_16x16_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS_4x64:
+        return PEARL_CONTIGUOUS_4x64_CONFIG;
     case CP_TILE_LAYOUT_CONTIGUOUS:
         return PEARL_CONTIGUOUS_CONFIG;
     default:

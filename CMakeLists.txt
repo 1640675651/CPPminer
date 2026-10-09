@@ -6,6 +6,7 @@ option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
 option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
+option(CP_ENABLE_HEXAGON "Build Pearl Hexagon cDSP (HVX) worker (Android/Linux on Snapdragon)" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -21,8 +22,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU AND NOT CP_ENABLE_HEXAGON)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU, CP_ENABLE_HEXAGON")
 endif()
 
 set(_cp_langs CXX C)
@@ -76,6 +77,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/onednn
     ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
     ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/hexagon
     ${CMAKE_SOURCE_DIR}/src/qpow/opencl
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
@@ -403,8 +405,25 @@ else()
     add_compile_definitions(CP_ENABLE_WGPU=0)
 endif()
 
+# Hexagon cDSP: the host side needs no SDK (libcdsprpc.so is loaded at run time). The DSP
+# library (libpearlx_skel.so) is built separately with the Hexagon SDK: src/pearl/hexagon/dsp.
+if(CP_ENABLE_HEXAGON)
+    if(WIN32 OR APPLE)
+        message(FATAL_ERROR "CP_ENABLE_HEXAGON targets Android/Linux on Snapdragon")
+    endif()
+    list(APPEND CP_SOURCES
+        src/pearl/hexagon/cp_pearl_hexagon_worker.cpp
+        src/pearl/hexagon/cp_pearlx_client.c)
+    add_compile_definitions(CP_ENABLE_HEXAGON=1)
+else()
+    add_compile_definitions(CP_ENABLE_HEXAGON=0)
+endif()
+
 add_executable(cppminer ${CP_SOURCES} ${CP_QPOW_AVX2_OBJECTS})
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
+if(CP_ENABLE_HEXAGON)
+    target_link_libraries(cppminer PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(CP_ENABLE_CUDA)
     target_link_libraries(cppminer PRIVATE CUDA::cudart)
@@ -909,4 +928,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} HEXAGON=${CP_ENABLE_HEXAGON} CUBLAS=${CP_ENABLE_CUBLAS}")
