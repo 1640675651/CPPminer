@@ -517,10 +517,14 @@ static void gemmx_job_run(gemmx_job *j) {
     const int last = kb == p->nkb - 1;
     const int rs = gx_rstride(p, kb);
 
-    // This column tile's slice of B is contiguous in Bz: copy it to VTCM.
+    // This column tile's slice of B is contiguous in Bz: copy it to VTCM. Starting an
+    // l2fetch of the whole slice first lets the copy's loads run ahead of RAM latency:
+    // the copy then costs ~1.1% of the scan at 4096 rows instead of ~1.6%.
     const HVX_Vector *src =
         p->Bz + ((size_t)(p->nt0 + j->nt) * p->Kg + (size_t)kb * p->kblk * 8) * NV;
-    for (int i = 0; i < nch * 8 * NV; i++)
+    const int nv = nch * 8 * NV;
+    l2fetch(src, VBYTES, VBYTES, (uint32)nv);
+    for (int i = 0; i < nv; i++)
         j->slot[i] = src[i];
 
     // The block's milestones 8kb .. 8kb + nmile - 1 land in words

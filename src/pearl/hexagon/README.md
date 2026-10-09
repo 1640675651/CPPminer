@@ -37,7 +37,8 @@ Where the scan rate goes, against the kernel's ~413 GMAC/s peak:
 
 | Cost | Share |
 |---|---|
-| Copying a 128 KB slice of B into VTCM per 128-column tile and K block, amortized over the launch's 1024 row tiles | ~1.9% |
+| Copying a 128 KB slice of B into VTCM per 128-column tile and K block, amortized over the launch's 1024 row tiles. An `l2fetch` of the slice before the copy cut this from ~1.6%; v66 has no user DMA (`dmstart` is v68+) to overlap it with compute | ~1.1% |
+| Other fixed costs per column tile and K block (kernel entry, the first row tile's A) | ~0.3% |
 | Generating and packing each row panel's noisy A (`set_a_gen`, ~9.7 ms per 8 launches) | ~0.7% |
 | FastRPC call per launch (~1.1 ms of 170 ms) and the gap between launches | ~1.4% |
 
@@ -127,6 +128,33 @@ each half's 8 accumulators lane-wise, packs both halves into one vector with a
 `vdeal`, and reduces the 8 milestones to words between tiles. The XOR costs
 about 4.5% over the plain GEMM.
 
+## Memory
+
+All of it is phone RAM: the cDSP has no memory of its own, and its heap comes
+from system memory. Signal A and noisy B dominate; the rest depends only on the
+launch size. With r rows and c columns per launch (`--row-period-batch` x 128,
+`--batch-size` x 128) and k = 4096:
+
+| Buffer | Size | Default (m = n = 131072) | `--m 32 --n 32` | Held in | Kept |
+|---|---|---|---|---|---|
+| Signal A | m·k | 512 MiB | 128 MiB | rpcmem, shared by host and DSP | whole run |
+| Signal A's hash tree (every chunk value and complete parent) | ~m·k / 16 | 32 MiB | 8 MiB | host heap | whole run |
+| Noisy packed B | n·k | 512 MiB | 128 MiB | DSP heap | one job; freed before the next job's B |
+| Panel buffer: packed A of one row panel plus partial sums | (r/4 + 2) x 28 KiB | 28 MiB | 28 MiB | DSP heap | reused by every panel |
+| Tile-XOR records, 2 buffers | r·c in total | 16 MiB | 16 MiB | rpcmem, uncached | whole run |
+| **Total** | | **~1.07 GiB** | **~310 MiB** | | |
+
+The panel buffer holds, for each 4-row tile, 16 KiB of packed A and 12 KiB of
+partial sums. The kernel walks k in 4 blocks of 1024, the size of the B slice
+that fits in VTCM, so after each of the first 3 blocks a tile's int32
+accumulators (4 x 128, 2 KiB) are stored next to its A, one slot per DSP
+thread. Each record buffer has 256 bytes per 4 x 128 register tile.
+
+Job setup briefly needs another ~48 MiB at the default size, freed before the
+scan: the chunk hashes from the DSP (max(m, n)·k / 32, rpcmem) and the zero B's
+temporary hash tree (n·k / 16, host). VTCM (128 KB per thread) is on-chip and
+not counted.
+
 ## Files
 
 | Path | Contents |
@@ -169,8 +197,14 @@ There are two parts:
      cmake --build build/android-hexagon
      ```
 
-     A cross-build without an Android Rust target falls back to the proof stub,
-     which can't submit shares. Build in Termux, which has Rust, to get proofs.
+     The proof library (`rust/cp-proof-ffi`) is cross-built by CMake for
+     `aarch64-linux-android` when cargo is found and has that target's standard
+     library: `rustup target add aarch64-linux-android`, or with conda's Rust,
+     `conda install -c conda-forge rust-std-aarch64-linux-android=<rustc version>`.
+     Pass `-DCARGO_EXECUTABLE=<path to cargo>` if cargo is not on `PATH`. Without
+     it the build falls back to the proof stub, which can't submit shares. On the
+     phone, a `--m 32 --n 32` share's proof builds in ~0.14 s and verifies in
+     ~0.03 s.
 
 ## Run
 
@@ -179,15 +213,15 @@ FastRPC finds the skel through `ADSP_LIBRARY_PATH`:
 
 ```sh
 export ADSP_LIBRARY_PATH=/path/to/dir/with/libpearlx_skel.so   # and libworker_pool.so
-# the default 128x128 size needs ~1 GiB; --m 32 --n 32 needs ~300 MiB
+# the default 128x128 size needs ~1.07 GiB; --m 32 --n 32 needs ~310 MiB
 ./cppminer --backend hexagon --m 32 --n 32 --pool stratum+tcp://HOST:PORT --wallet prl1... --worker phone
 ./cppminer --backend hexagon --m 32 --n 32 --mock --mock-diff 40   # offline: first share + verify
 ```
 
 | Option | Hexagon meaning |
 |---|---|
-| `--m N --n N` | Matrix size in units of 1024 (default 128, as for every backend). Memory is about m·k + n·k bytes: signal A (shared with the DSP) plus packed B in DSP memory, plus ~50 MiB of buffers. The default 131072 needs ~1 GiB; the measurements here use `--m 32 --n 32` (~300 MiB) |
-| `--row-period-batch N` | 128-row macros per DSP launch (default 32 = 4096 rows). Rows set how far each VTCM slice of B is amortized. Per row panel: 2048 rows ~770 GOPS, 4096 ~792 |
+| `--m N --n N` | Matrix size in units of 1024 (default 128, as for every backend). Memory is about m·k + n·k bytes plus 50–80 MiB (see [Memory](#memory)): ~1.07 GiB at the default 131072; the measurements here use `--m 32 --n 32` (~310 MiB) |
+| `--row-period-batch N` | 128-row macros per DSP launch (default 32 = 4096 rows). Rows set how far each VTCM slice of B and each FastRPC call are amortized. `pearlx_test` per call: 4096 rows 802 GOPS, 8192 rows 813, 16384 rows 818; each doubling also doubles the panel buffer and the record buffers (see [Memory](#memory)) |
 | `--batch-size N` / `--col-period-batch N` | 128-column macros per DSP launch (default 32 = 4096 columns). Columns barely matter: a full-width launch is only 0.3% faster than 4096 columns |
 
 Testing was done from `adb shell` (`/data/local/tmp`). Running from Termux has
