@@ -331,7 +331,7 @@ function Ensure-OneDnnDeps {
         throw "OneDNN deps missing after prepare_onednn_deps.bat ($kernelDb)"
     }
     if (-not (Select-String -Path $problemHpp -Pattern "case5TileXor" -Quiet)) {
-        throw "Case5 patches missing in $problemHpp — run: cd src\onednn && prepare_onednn_deps.bat refresh"
+        throw "Case5 patches missing in $problemHpp - run: cd src\onednn && prepare_onednn_deps.bat refresh"
     }
 }
 
@@ -455,13 +455,13 @@ try {
     }
     if ($EnableWgpu) {
         $wgpuDll = @(
-            (Join-Path $CmakeBuild "Release\cp_wgpu_ffi.dll"),
-            (Join-Path $CmakeBuild "cp_wgpu_ffi.dll"),
-            (Join-Path $Root "rust\cp-wgpu-ffi\target\release\cp_wgpu_ffi.dll")
+            (Join-Path $CmakeBuild "Release\cp_quantus_wgpu_ffi.dll"),
+            (Join-Path $CmakeBuild "cp_quantus_wgpu_ffi.dll"),
+            (Join-Path $Root "rust\cp-quantus-wgpu-ffi\target\release\cp_quantus_wgpu_ffi.dll")
         ) | Where-Object { Test-Path $_ } | Select-Object -First 1
         if ($wgpuDll) {
-            Copy-Item $wgpuDll (Join-Path $Root "cp_wgpu_ffi.dll") -Force
-            Write-Host "=== Copied cp_wgpu_ffi.dll ==="
+            Copy-Item $wgpuDll (Join-Path $Root "cp_quantus_wgpu_ffi.dll") -Force
+            Write-Host "=== Copied cp_quantus_wgpu_ffi.dll ==="
         }
         $pearlWgpuDll = @(
             (Join-Path $CmakeBuild "Release\cp_pearl_wgpu_ffi.dll"),

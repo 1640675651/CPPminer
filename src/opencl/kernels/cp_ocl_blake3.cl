@@ -65,7 +65,7 @@ inline void d_b3_g(uint *s, int a, int b, int c, int d, uint x, uint y) {
     s[b] = d_b3_rotr32(s[b] ^ s[c], 7);
 }
 
-inline void d_b3_round(uint s[16], const uint m[16], int round) {
+inline void d_b3_round(uint *s, const uint *m, int round) {
     d_b3_g(s, 0, 4, 8, 12, m[D_B3_MSG_SCHEDULE[round][0]], m[D_B3_MSG_SCHEDULE[round][1]]);
     d_b3_g(s, 1, 5, 9, 13, m[D_B3_MSG_SCHEDULE[round][2]], m[D_B3_MSG_SCHEDULE[round][3]]);
     d_b3_g(s, 2, 6, 10, 14, m[D_B3_MSG_SCHEDULE[round][4]], m[D_B3_MSG_SCHEDULE[round][5]]);
@@ -76,7 +76,7 @@ inline void d_b3_round(uint s[16], const uint m[16], int round) {
     d_b3_g(s, 3, 4, 9, 14, m[D_B3_MSG_SCHEDULE[round][14]], m[D_B3_MSG_SCHEDULE[round][15]]);
 }
 
-inline void d_b3_compress_pre(uint s[16], const uint cv[8], const uchar block[D_B3_BLOCK],
+inline void d_b3_compress_pre(uint *s, const uint *cv, const uchar *block,
                               uchar block_len, ulong counter, uchar flags) {
     uint m[16];
     for (int i = 0; i < 16; i++) {
@@ -103,7 +103,7 @@ inline void d_b3_compress_pre(uint s[16], const uint cv[8], const uchar block[D_
     }
 }
 
-inline void d_b3_compress_in_place(uint cv[8], const uchar block[D_B3_BLOCK], uchar block_len,
+inline void d_b3_compress_in_place(uint *cv, const uchar *block, uchar block_len,
                                    ulong counter, uchar flags) {
     uint s[16];
     d_b3_compress_pre(s, cv, block, block_len, counter, flags);
@@ -117,13 +117,13 @@ inline void d_b3_compress_in_place(uint cv[8], const uchar block[D_B3_BLOCK], uc
     cv[7] = s[7] ^ s[15];
 }
 
-inline void d_b3_key_words_priv(const uchar key[32], uint kw[8]) {
+inline void d_b3_key_words_priv(const uchar *key, uint *kw) {
     for (int i = 0; i < 8; i++) {
         kw[i] = d_b3_load32_priv(key + 4 * i);
     }
 }
 
-inline void d_b3_key_words_g(__global const uchar *key, uint kw[8]) {
+inline void d_b3_key_words_g(__global const uchar *key, uint *kw) {
     for (int i = 0; i < 8; i++) {
         kw[i] = d_b3_load32_g(key + 4 * i);
     }
@@ -135,6 +135,41 @@ inline uchar d_b3_mat_padded_byte_g(__global const uchar *mat, ulong mat_off, ul
     return (gi < raw_len) ? mat[gi] : (uchar)0;
 }
 
+/* Word-based compression, fully unrolled: the message permutation between rounds is a register
+   renaming, so m[] stays in VGPRs (the table-driven d_b3_round indexes m[] at run time). */
+#define D_B3_G(a, b, c, d, x, y)                     \
+    do {                                             \
+        a += b + (x); d = rotate(d ^ a, 16u);        \
+        c += d;       b = rotate(b ^ c, 20u);        \
+        a += b + (y); d = rotate(d ^ a, 24u);        \
+        c += d;       b = rotate(b ^ c, 25u);        \
+    } while (0)
+
+inline void d_b3_compress_words(uint *cv, uint *m, uint block_len, ulong counter, uint flags) {
+    uint s0 = cv[0], s1 = cv[1], s2 = cv[2], s3 = cv[3], s4 = cv[4], s5 = cv[5], s6 = cv[6], s7 = cv[7];
+    uint s8 = D_B3_IV[0], s9 = D_B3_IV[1], s10 = D_B3_IV[2], s11 = D_B3_IV[3];
+    uint s12 = (uint)counter, s13 = (uint)(counter >> 32), s14 = block_len, s15 = flags;
+    #pragma unroll
+    for (int r = 0; r < 7; r++) {
+        D_B3_G(s0, s4, s8, s12, m[0], m[1]);
+        D_B3_G(s1, s5, s9, s13, m[2], m[3]);
+        D_B3_G(s2, s6, s10, s14, m[4], m[5]);
+        D_B3_G(s3, s7, s11, s15, m[6], m[7]);
+        D_B3_G(s0, s5, s10, s15, m[8], m[9]);
+        D_B3_G(s1, s6, s11, s12, m[10], m[11]);
+        D_B3_G(s2, s7, s8, s13, m[12], m[13]);
+        D_B3_G(s3, s4, s9, s14, m[14], m[15]);
+        if (r < 6) { /* BLAKE3 message permutation {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8} */
+            const uint t0 = m[0], t1 = m[1], t2 = m[2], t3 = m[3], t4 = m[4], t5 = m[5], t6 = m[6], t7 = m[7];
+            const uint t8 = m[8], t9 = m[9], t10 = m[10], t11 = m[11], t12 = m[12], t13 = m[13], t14 = m[14], t15 = m[15];
+            m[0] = t2; m[1] = t6; m[2] = t3; m[3] = t10; m[4] = t7; m[5] = t0; m[6] = t4; m[7] = t13;
+            m[8] = t1; m[9] = t11; m[10] = t12; m[11] = t5; m[12] = t9; m[13] = t14; m[14] = t15; m[15] = t8;
+        }
+    }
+    cv[0] = s0 ^ s8; cv[1] = s1 ^ s9; cv[2] = s2 ^ s10; cv[3] = s3 ^ s11;
+    cv[4] = s4 ^ s12; cv[5] = s5 ^ s13; cv[6] = s6 ^ s14; cv[7] = s7 ^ s15;
+}
+
 inline void d_b3_keyed_chunk_cv_glob(__global const uchar *key, ulong chunk_idx,
                                      __global const uchar *mat, ulong mat_off, ulong raw_len,
                                      int chunk_len, uchar cv_out[32]) {
@@ -143,6 +178,47 @@ inline void d_b3_keyed_chunk_cv_glob(__global const uchar *key, ulong chunk_idx,
     uint cv[8];
     for (int i = 0; i < 8; i++) {
         cv[i] = kw[i];
+    }
+    /* Fast path: a full 1 KB chunk inside the matrix. mat_off is a multiple of 1024 and the
+       buffer is at least 4-byte aligned, so the 16 message words of each block are 4 vector
+       loads (little endian as BLAKE3 expects). */
+    if (chunk_len == D_B3_CHUNK && mat_off + (ulong)D_B3_CHUNK <= raw_len) {
+        __global const uint4 *q = (__global const uint4 *)(mat + mat_off);
+        #pragma unroll 1
+        for (int b = 0; b < D_B3_CHUNK / D_B3_BLOCK; b++) {
+            uint m[16];
+            const uint4 v0 = q[4 * b], v1 = q[4 * b + 1], v2 = q[4 * b + 2], v3 = q[4 * b + 3];
+            m[0] = v0.x; m[1] = v0.y; m[2] = v0.z; m[3] = v0.w;
+            m[4] = v1.x; m[5] = v1.y; m[6] = v1.z; m[7] = v1.w;
+            m[8] = v2.x; m[9] = v2.y; m[10] = v2.z; m[11] = v2.w;
+            m[12] = v3.x; m[13] = v3.y; m[14] = v3.z; m[15] = v3.w;
+            const uint fl = D_B3_KEYED | (b == 0 ? D_B3_CHUNK_START : 0u) |
+                            (b == D_B3_CHUNK / D_B3_BLOCK - 1 ? D_B3_CHUNK_END : 0u);
+            d_b3_compress_words(cv, m, D_B3_BLOCK, chunk_idx, fl);
+        }
+        for (int i = 0; i < 8; i++) {
+            d_b3_store32_priv(cv_out + 4 * i, cv[i]);
+        }
+        return;
+    }
+    /* Zero path: a full chunk entirely past the data (zero padding, e.g. the all-zero B of
+       zero-B mining): no loads. */
+    if (chunk_len == D_B3_CHUNK && mat_off >= raw_len) {
+        #pragma unroll 1
+        for (int b = 0; b < D_B3_CHUNK / D_B3_BLOCK; b++) {
+            uint m[16];
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                m[i] = 0u;
+            }
+            const uint fl = D_B3_KEYED | (b == 0 ? D_B3_CHUNK_START : 0u) |
+                            (b == D_B3_CHUNK / D_B3_BLOCK - 1 ? D_B3_CHUNK_END : 0u);
+            d_b3_compress_words(cv, m, D_B3_BLOCK, chunk_idx, fl);
+        }
+        for (int i = 0; i < 8; i++) {
+            d_b3_store32_priv(cv_out + 4 * i, cv[i]);
+        }
+        return;
     }
     int pos = 0;
     int blocks_compressed = 0;
@@ -177,7 +253,7 @@ typedef struct {
     uchar flags;
 } d_b3_chunk_state;
 
-inline void d_b3_chunk_init(d_b3_chunk_state *st, const uint key[8], uchar flags) {
+inline void d_b3_chunk_init(d_b3_chunk_state *st, const uint *key, uchar flags) {
     for (int i = 0; i < 8; i++) {
         st->cv[i] = key[i];
     }
@@ -227,8 +303,8 @@ inline void d_b3_chunk_update(d_b3_chunk_state *st, const uchar *input, ulong in
     st->buf_len = (uchar)(st->buf_len + input_len);
 }
 
-inline void d_b3_compress_xof(const uint cv[8], const uchar block[D_B3_BLOCK], uchar block_len,
-                              ulong counter, uchar flags, uchar out[64]) {
+inline void d_b3_compress_xof(const uint *cv, const uchar *block, uchar block_len,
+                              ulong counter, uchar flags, uchar *out) {
     uint s[16];
     d_b3_compress_pre(s, cv, block, block_len, counter, flags);
     d_b3_store32_priv(out + 0, s[0] ^ s[8]);
@@ -249,7 +325,7 @@ inline void d_b3_compress_xof(const uint cv[8], const uchar block[D_B3_BLOCK], u
     d_b3_store32_priv(out + 60, s[15] ^ cv[7]);
 }
 
-inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar out[32]) {
+inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar *out) {
     uchar f = (uchar)(st->flags | D_B3_CHUNK_END | D_B3_ROOT);
     if (st->blocks_compressed == 0) {
         f = (uchar)(f | D_B3_CHUNK_START);
@@ -261,7 +337,7 @@ inline void d_b3_chunk_root_out(const d_b3_chunk_state *st, uchar out[32]) {
     }
 }
 
-inline void d_keyed_digest_priv(const uchar *data, int len, const uchar key[32], uchar out[32]) {
+inline void d_keyed_digest_priv(const uchar *data, int len, const uchar *key, uchar *out) {
     uint kw[8];
     d_b3_key_words_priv(key, kw);
     d_b3_chunk_state st;
@@ -270,14 +346,14 @@ inline void d_keyed_digest_priv(const uchar *data, int len, const uchar key[32],
     d_b3_chunk_root_out(&st, out);
 }
 
-inline void d_copy_label_priv(int is_b, uchar key[32]) {
+inline void d_copy_label_priv(int is_b, uchar *key) {
     for (int i = 0; i < 32; i++) {
         key[i] = is_b ? CP_SEED_LABEL_B[i] : CP_SEED_LABEL_A[i];
     }
 }
 
-inline void d_get_random_hash_priv(int index, const uchar seed[32], const uchar key[32],
-                                   int prepend_index, uchar out[32]) {
+inline void d_get_random_hash_priv(int index, const uchar *seed, const uchar *key,
+                                   int prepend_index, uchar *out) {
     uchar msg[64];
     for (int i = 0; i < 64; i++) {
         msg[i] = 0;

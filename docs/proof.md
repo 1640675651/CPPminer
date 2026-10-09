@@ -254,7 +254,7 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | `bt` | Full **signal** B^T, row-major `int8[n×k]` |
 | `m`, `n`, `k`, `rank` | Dimensions (`PlainProof` metadata) |
 | `t_rows`, `t_cols` | Tile anchor from jackpot hit |
-| `tile_layout` | `0` scattered, `1` contiguous 8×16, `2` CUTLASS, `3` contiguous 8×8, `4` contiguous 4×8 |
+| `tile_layout` | `0` scattered, `1` contiguous 8×16, `2` CUTLASS, `3` contiguous 8×8, `4` contiguous 4×8, `5` contiguous 16×16, `6` contiguous 4×64 |
 
 **Not required:** noisy A/B, `a_noise_seed`, pool target, stratum nonce (nonce only affects CPU `pearl_generate_ab` seeding; CUDA proof uses GPU-generated signal matrices from the hit attempt).
 
@@ -279,8 +279,10 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | 2 CUTLASS | 8 | 8 | `PEARL_CUTLASS_CONFIG` |
 | 3 contiguous 8×8 | 8 | 8 | `PEARL_CONTIGUOUS_8x8_CONFIG` |
 | 4 contiguous 4×8 | 4 | 8 | `PEARL_CONTIGUOUS_4x8_CONFIG` |
+| 5 contiguous 16×16 | 16 | 16 | `PEARL_CONTIGUOUS_16x16_CONFIG` |
+| 6 contiguous 4×64 | 4 | 64 | `PEARL_CONTIGUOUS_4x64_CONFIG` |
 
-Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x4` and `--ocl-tile 4x8` both use the contiguous 4×8 layout 4.
+Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x4` and `--ocl-tile 4x8` both use the contiguous 4×8 layout 4. The Hexagon backend uses layout 6: each 4×64 half of its 4×128 HVX register tile, at zk-pow's limit of h·w = 256.
 
 ### `PlainProof` payload
 
@@ -368,4 +370,3 @@ The pool already holds `header` from `mining.notify`. It parses the proof, recon
 | zk-pow noise | `third_party/zk-pow/src/circuit/pearl_noise.rs` |
 | zk-pow jackpot | `third_party/zk-pow/src/circuit/chip/jackpot/helper.rs` |
 | zk-pow verify | `third_party/zk-pow/src/api/verify.rs` |
-| CLI helper | `scripts/plain_proof_host.py` |

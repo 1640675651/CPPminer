@@ -235,7 +235,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cp-wgpu-ffi"
+name = "cp-quantus-wgpu-ffi"
 version = "0.1.0"
 dependencies = [
  "engine-cpu",

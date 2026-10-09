@@ -72,6 +72,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("|wgpu");
 #endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("|hexagon");
+#endif
     printf(" (built: ");
     {
         int first = 1;
@@ -80,6 +83,7 @@ static void print_usage(void)
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
         if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
         if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
+        if(cp_worker_has_hexagon()){ printf("%shexagon", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
@@ -110,6 +114,14 @@ static void print_usage(void)
     printf("  --wgpu-tile MxN[/MmMm]  wgpu (pearl) register tile: 4x4, 4x8, 8x8 (default), 8x16;\n");
     printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
+#endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
+    printf("                     bytes (1 GiB at the default size; smaller --m/--n on phones);\n");
+    printf("                     DSP launch = --row-period-batch x --batch-size 128x128 macro\n");
+    printf("                     blocks (default %d x %d); --fused-jackpot runs the jackpot on\n",
+           CP_HEXAGON_LAUNCH_MACROS_DEFAULT, CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
+    printf("                     the DSP (~1%% slower, almost no CPU)\n");
 #endif
     printf("  --m N, --n N         matrix rows/cols in units of %d (default %d; each <= %d,\n",
            CP_MATRIX_UNIT, M_DIM / CP_MATRIX_UNIT, CP_MATRIX_UNITS_MAX);
@@ -153,8 +165,6 @@ static void print_usage(void)
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
-    printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
-    printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
     printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
@@ -176,7 +186,9 @@ static void print_usage(void)
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
     printf("  --simd-test          compare every available CPU SIMD kernel with scalar and exit\n");
     printf("  --prepack-test       check CPU fused/reuse prepack against separate (dev size) and exit\n");
-    printf("  --threads N          Quantus OpenMP threads (default: all HW threads)\n");
+    printf("  --threads N          OpenMP threads for the CPU backend (pearl and quantus).\n");
+    printf("                       Default: all CPUs the process may use; OMP_NUM_THREADS\n");
+    printf("                       overrides it. Threads fill physical cores first\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
@@ -217,7 +229,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
         printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
-        cp_target_from_difficulty(cp_pool_difficulty(), tgt);
+        cp_pool_target_from_difficulty(cp_pool_difficulty(), tgt);
         printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
                job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
     }
@@ -359,10 +371,11 @@ reconnect:
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
-        printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
+        char debt_s[48], thr_s[48];
+        printf("[fee] logged in as %s (debt=%s / 100*T=%s of hashing time)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
-               (unsigned long long)cp_fee_debt(),
-               (unsigned long long)cp_fee_threshold());
+               cp_fee_format(cp_fee_debt(), debt_s, sizeof(debt_s)),
+               cp_fee_format(cp_fee_threshold(), thr_s, sizeof(thr_s)));
         fflush(stdout);
     }
     printf("[net] session=%s first_job=%s\n", session, first_job.job_id);
@@ -411,6 +424,21 @@ reconnect:
 
 int main(int argc, char** argv)
 {
+#ifdef __MINGW32__
+    /* MinGW/MSYS2 only: buffer stdout before anything prints.
+     *
+     * MinGW builds use the MinGW printf (__USE_MINGW_ANSI_STDIO=1), which
+     * emits each %-conversion as its own write to the stream. The MS CRT
+     * leaves a console stdout unbuffered, so every fragment of a status line
+     * becomes a separate WriteConsole and the log crawls out piece by piece.
+     * MSVC builds are not affected (the CRT printf writes a call at once) and
+     * other platforms keep their default buffering.
+     *
+     * On Win32, _IOLBF behaves as _IOFBF (full buffering), so prompt output
+     * relies on the fflush(stdout) that follows every log line. */
+    setvbuf(stdout, NULL, _IOLBF, 8192);
+#endif
+
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
     int pool_specified = 0;
@@ -430,7 +458,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
-    int onednn_fused_jackpot = 0;
+    int fused_jackpot = 0;
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
@@ -516,6 +544,7 @@ int main(int argc, char** argv)
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
             else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
             else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
+            else if(!strcmp(b, "hexagon")) backend_sel = CP_BACKEND_HEXAGON;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -785,9 +814,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--fused-jackpot")){
-            onednn_fused_jackpot = 1;
+            fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
-            onednn_fused_jackpot = 0;
+            fused_jackpot = 0;
         } else if(!strcmp(argv[i], "--onednn-layout")){
             if(i + 1 >= argc){
                 fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
@@ -846,12 +875,6 @@ int main(int argc, char** argv)
             prepack_test = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
-        } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
-            strncpy(g_python_exe, argv[++i], sizeof(g_python_exe) - 1);
-            g_python_exe[sizeof(g_python_exe) - 1] = 0;
-        } else if(!strcmp(argv[i], "--host-bridge") && i + 1 < argc){
-            strncpy(g_host_bridge, argv[++i], sizeof(g_host_bridge) - 1);
-            g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
         } else if(!strcmp(argv[i], "--worker") && i + 1 < argc){
             strncpy(worker_global, argv[++i], sizeof(worker_global) - 1);
             worker_global[sizeof(worker_global) - 1] = 0;
@@ -901,8 +924,10 @@ int main(int argc, char** argv)
             print_usage();
             return 0;
         } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
-            g_qpow_threads = atoi(argv[++i]);
-            if(g_qpow_threads < 0) g_qpow_threads = 0;
+            int n = atoi(argv[++i]);
+            if(n < 0) n = 0;
+            g_qpow_threads = n;
+            g_cpu_threads = n;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             const char* login =
                 "{\"id\":1,\"result\":{\"extensions\":[\"keepalive\"],"
@@ -1145,6 +1170,7 @@ int main(int argc, char** argv)
             const int pm = g_m_active;
             const int pn = g_n_active;
             printf("[align-test-prod] m=%d n=%d\n", pm, pn);
+            fflush(stdout);
             if(pearl_run_alignment_tests_prod(pm, pn, K_DIM) != 0) return 1;
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
             if(bid == CP_BACKEND_CUDA &&
@@ -1179,6 +1205,7 @@ int main(int argc, char** argv)
         cp_worker_set_cutlass_fused(cutlass_fused);
         pearl_set_cutlass_fused(cutlass_fused);
         printf("[profile-scan] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         return cp_gpu_run_scan_profile(devs[0], g_m_active, g_n_active, 2, profile_runs) != 0;
     }
 #else
@@ -1194,6 +1221,7 @@ int main(int argc, char** argv)
         }
         if(!ndev){ devs[0] = 0; ndev = 1; }
         printf("[profile-prep] m=%d n=%d\n", g_m_active, g_n_active);
+        fflush(stdout);
         const int warmup = profile_prep_runs > 1 ? 1 : 0;
         return cp_opencl_run_prep_profile(devs[0], g_m_active, g_n_active, warmup,
                                           profile_prep_runs) != 0;
@@ -1283,8 +1311,9 @@ int main(int argc, char** argv)
 #endif
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
-            /* Pin the OpenMP pool physical cores first, then SMT siblings, so
-             * the --simd auto scalar/AVX2 split pairs one of each per core. */
+            /* Pin the OpenMP pool physical cores first, then SMT siblings (one
+             * thread per logical CPU), so the --simd auto scalar/AVX2 split pairs
+             * one of each per core. */
             if(cp_cpu_affinity_init() == 0)
                 cp_cpu_affinity_bind_openmp_pool();
             printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
@@ -1340,11 +1369,20 @@ int main(int argc, char** argv)
 #endif
     cp_worker_set_period_batch(batch_size);
     cp_worker_set_row_period_batch(row_period_batch);
+    if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+        /* Launch = row x col 128x128 macro blocks; the shared defaults mean "not set". */
+        if(batch_size == CP_PERIOD_BATCH_DEFAULT)
+            batch_size = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT)
+            row_period_batch = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        cp_worker_set_hexagon_launch(row_period_batch, batch_size);
+        cp_worker_set_hexagon_fused_jackpot(fused_jackpot);
+    }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
      * Period batch must be set before init (backend banner + scan loop read batch at init). */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-        cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
+        cp_onednn_worker_set_fused_jackpot(fused_jackpot);
         if(onednn_layout){
             cp_onednn_worker_set_gemm_layout(onednn_layout);
         }
@@ -1375,6 +1413,7 @@ int main(int argc, char** argv)
                                                          K_DIM);
         printf("[cpu] reuse prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
                rc_reuse == 0 ? "passed" : "failed", rc_reuse);
+        fflush(stdout);
         const int rc_fused = case33_test_fused_prepack(CP_PREPACK_TEST_DIM, CP_PREPACK_TEST_DIM,
                                                        K_DIM, R_RANK);
         printf("[cpu] fused prepack test (m=n=%d): %s (rc=%d)\n", CP_PREPACK_TEST_DIM,
@@ -1394,7 +1433,6 @@ int main(int argc, char** argv)
     }
 
     cp_init_workdir();
-    cp_resolve_paths(argc, argv);
 
     {
         double host_mib = ((double)g_m_active * K_DIM + (double)g_n_active * K_DIM)
@@ -1406,6 +1444,7 @@ int main(int argc, char** argv)
         const char *tile_layout_name =
             cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) ? "contiguous 16x16 blocks"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x64) ? "contiguous 4x64 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -1450,7 +1489,7 @@ int main(int argc, char** argv)
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
             const double panel_tiles =
                     (double)row_period_batch * (double)batch_size;
-            if(onednn_fused_jackpot){
+            if(fused_jackpot){
                 printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
                 printf("[mode] period batch: row=%d col=%d\n", row_period_batch, batch_size);
             } else {
@@ -1469,6 +1508,16 @@ int main(int argc, char** argv)
                 }
                 printf("[mode] device layout %s on Intel GPU\n", layout_msg);
             }
+        } else if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+            const int lrows = row_period_batch * 128 < g_m_active ? row_period_batch * 128
+                                                                   : g_m_active;
+            const int lcols = batch_size * 128 < g_n_active ? batch_size * 128 : g_n_active;
+            printf("[mode] scan: cDSP HVX fused GEMM + XOR (4x64 hash tiles) + %s\n",
+                   fused_jackpot ? "DSP jackpot (--fused-jackpot)" : "host jackpot");
+            printf("[mode] DSP launch: %dx%d macro blocks of 128x128 = %dx%d "
+                   "(--row-period-batch x --batch-size), %d hash tiles\n",
+                   lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
+            printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
@@ -1570,7 +1619,7 @@ int main(int argc, char** argv)
         /* Mock difficulty → pool target (same path as mining.set_difficulty). */
         const double mock_diff = cp_resolve_mock_diff(0);
         uint32_t tgt[8];
-        cp_target_from_difficulty(mock_diff, tgt);
+        cp_mock_target_from_difficulty(mock_diff, tgt);
         char target_hex[65];
         cp_le_words_to_be_target_hex(tgt, target_hex);
 

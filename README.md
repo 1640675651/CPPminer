@@ -4,7 +4,7 @@ Cross-Platform Pearl (now multi-algo) miner written in C++. Select the algorithm
 
 | Algo | Backends | PoW |
 |------|----------|-----|
-| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` | GEMM+XOR jackpot + `plain_proof` |
+| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` | GEMM+XOR jackpot + `plain_proof` |
 | `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
 Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
@@ -16,8 +16,9 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
+| Pearl Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
-| Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-wgpu-ffi` | GpuEngine FFI |
+| Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
 
 ## Requirements
@@ -28,7 +29,8 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
-- **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
+- **Hexagon build:** Android/Linux on a Snapdragon with a cDSP (tested: Snapdragon 480, Hexagon v66). The miner needs no SDK; the DSP library `libpearlx_skel.so` is built with the Hexagon SDK (see [`src/pearl/hexagon/README.md`](src/pearl/hexagon/README.md)).
+- **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-quantus-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
 
 ## Build options (CMake)
 
@@ -47,16 +49,17 @@ cmake --build build --config Release
 | `CP_ENABLE_CUDA` | OFF | CUDA/CUTLASS worker |
 | `CP_ENABLE_OPENCL` | OFF | OpenCL worker |
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
-| `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-wgpu-ffi`; fetches `third_party/quantus-miner`) |
+| `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-quantus-wgpu-ffi`; fetches `third_party/quantus-miner`) |
+| `CP_ENABLE_HEXAGON` | OFF | Pearl Snapdragon cDSP (HVX) worker; Android/Linux only |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
 Enable multiple backends in one binary; select at runtime with `--backend`. Both algos are always compiled in; use `--algo pearl|quantus`. Runtime and compile-time **algo×backend matrix**:
 
-| | cpu | cuda | opencl | onednn | wgpu |
-|--|-----|------|--------|--------|------|
-| pearl | ✓ | ✓ | ✓ | ✓ | ✓ |
-| quantus | ✓ | ✗ | ✓ | ✗ | ✓ |
+| | cpu | cuda | opencl | onednn | wgpu | hexagon |
+|--|-----|------|--------|--------|------|---------|
+| pearl | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| quantus | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ |
 
 ## Build (Windows)
 
@@ -77,85 +80,58 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
-Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_wgpu_ffi.dll` when wgpu is enabled).
+Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_quantus_wgpu_ffi.dll` when wgpu is enabled).
 
 ## Build (*nix)
 ```bash
 ./build.sh --backend cpu,opencl,onednn,cuda
 ./build.sh --backend cpu,wgpu
 ```
-This scipt pulls third-party dependencies and execute cmake.
+This script pulls third-party dependencies and runs CMake.
+
+### Hexagon
+
+`./build.sh --backend cpu,hexagon` builds only the miner (its Hexagon worker and FastRPC client), and `build.ps1` has no Hexagon option. Neither script builds the DSP libraries the miner loads on the cDSP, `libpearlx_skel.so` and `libworker_pool.so`: they need the Hexagon SDK on an x86 machine. See [Build in the Hexagon README](src/pearl/hexagon/README.md#build) for those, and for cross-compiling the miner for Android.
 ## Run
 
-```powershell
-# Pearl CPU (default --algo pearl)
-.\cppminer.exe --algo pearl --backend cpu --wallet prl1... --worker worker_name
-
-# Quantus CPU (LuckyPool / compatible stratum; --pool required, no default host)
-.\cppminer.exe --algo quantus --backend cpu --threads 8 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
-
-# Quantus wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU build)
-.\cppminer.exe --backend wgpu --list-devices
-.\cppminer.exe --algo quantus --backend wgpu --devices 0 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
-# Omit --devices to use all mining adapters (discrete preferred).
-
-# Quantus OpenCL (requires -Backend OpenCl / CP_ENABLE_OPENCL)
-.\cppminer.exe --backend opencl --list-devices
-.\cppminer.exe --algo quantus --backend opencl --devices 0 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
+```
+cppminer [--algo pearl|quantus] --backend BACKEND [--devices IDS]
+         [--pool stratum+tcp://HOST:PORT] --wallet ADDRESS [--worker NAME] [backend options]
 ```
 
-```powershell
-# CUDA (CUTLASS fused GEMM+jackpot)
-.\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker worker_name --devices 0
+- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu` and `hexagon`; Quantus on `cpu`, `opencl` and `wgpu`. The backend must be enabled in the build.
+- Pearl defaults to the LuckyPool Pearl pool; Quantus needs `--pool`.
+- `--list-devices` prints the device indices that `--devices` takes.
+- `--mock` mines a fixed job offline until the first share, verifies it and exits; it needs no pool or wallet.
 
-# CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (requires -EnableCublas build)
-.\cppminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker worker_name --devices 0
+Examples (`.\cppminer.exe` on Windows, `./cppminer` elsewhere):
 
-# OpenCL (LuckyPool production layout)
-.\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
+```sh
+# Pearl on GPU 0 (CUDA build)
+cppminer --backend cuda --devices 0 --wallet prl1... --worker rig01
 
-# Pearl wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU; LDS staging auto-on for discrete GPUs)
-.\cppminer.exe --backend wgpu --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name --devices 0
+# Quantus on the CPU
+cppminer --algo quantus --backend cpu --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker rig01
 
-# OneDNN (Intel GPU gemmstone + GPU jackpot)
-.\cppminer.exe --backend onednn --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
-
-# OneDNN fused path (single kernel: IGEMM + fold + BLAKE3 + in-kernel jackpot)
-.\cppminer.exe --backend onednn --fused-jackpot --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
-
-# Offline mock: first share + verify (no pool)
-.\cppminer.exe --backend onednn --mock
-.\cppminer.exe --backend cuda --mock
-.\cppminer.exe --backend opencl --mock
-.\cppminer.exe --backend wgpu --devices 0 --mock
-.\cppminer.exe --backend cpu --mock
-.\cppminer.exe --algo quantus --backend cpu --mock
-.\cppminer.exe --algo quantus --backend opencl --devices 0 --mock
-.\cppminer.exe --algo quantus --backend wgpu --devices 0 --mock
+# Find a GPU, then test it offline
+cppminer --backend opencl --list-devices
+cppminer --backend opencl --devices 0 --mock
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu`. `--pool` required for Quantus unless `--mock` |
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` (must be compiled in; must be valid for `--algo`) |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon`. `--pool` required for Quantus unless `--mock` |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`).
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
-| `--threads N` | Quantus: OpenMP mine threads (default: all hardware threads / `OMP_NUM_THREADS`) |
+| `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
 | `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
-| `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) || `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
+| `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) |
+| `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
@@ -167,7 +143,7 @@ This scipt pulls third-party dependencies and execute cmake.
 | `--dry-run` | Build proof without submitting |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
-| `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **58** (jackpot curve); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
+| `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **44** (unscaled target 2^(256-D)); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |
 | `--cert-version N` | Force certificate / noise-seed version: `1`/`2` = legacy, `3` = salted (V3). Default **3**. Without this flag, pool `mining.notify` `cert_version` wins when present (1–3); otherwise default 3 |
 | `--prepack MODE` | CPU: `fused` (default), `reuse`, or `separate` matrix prepack |
 | `--simd ISA` | CPU: `auto` (default), `hybrid`, `avx512vnni`, `avxvnni`, `avx512` (base AVX512F+BW, `avx512bw` alias), `avx2`, `ssse3` (`sse` alias), `dotprod`, `neon`, `scalar`. Quantus: `hybrid` runs one scalar and one AVX2 Poseidon2 worker per physical core (SMT siblings); `auto` is the best available mode (currently `hybrid`; may select a wider kernel such as AVX-512 in the future); `avx2` forces AVX2 on every thread; any other value runs scalar. Pearl: `hybrid` is the same as `auto` |
@@ -214,18 +190,6 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 
 **Batching:** `--row-period-batch` and `--batch-size` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
 
-```powershell
-# List Intel GPUs, then mine with fused jackpot
-.\cppminer.exe --backend onednn --list-devices
-.\cppminer.exe --backend onednn --fused-jackpot --devices 0 --mock --mock-diff 50
-
-# Default two-kernel path, smaller panels (less VRAM per launch)
-.\cppminer.exe --backend onednn --row-period-batch 16 --batch-size 512 --mock
-
-# Alternate device layouts (GPU prep fuses transpose + noise)
-.\cppminer.exe --backend onednn --onednn-layout TT --mock --mock-diff 50
-```
-
 ### Scan batching (`--batch-size`)
 
 Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
@@ -255,6 +219,8 @@ CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C windo
 
 Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logical unroll grid, e.g. 16×16 → 8192×8192 tiles at `m=n=131072`). Each panel = one gemmstone GEMM launch (+ separate jackpot kernel unless `--fused-jackpot`).
 
+`--fused-jackpot` also applies to `--backend hexagon`: the jackpot runs on the DSP instead of the host CPU, ~1% slower with almost no CPU use (see [the Hexagon README](src/pearl/hexagon/README.md)).
+
 | Flag | Role | Default |
 |------|------|---------|
 | `--row-period-batch` | Hash-tile rows per panel | 256 |
@@ -262,35 +228,52 @@ Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logica
 
 At defaults with 16×16 hash tiles and production dims, one panel covers 256×256 = 65536 hash tiles before host sync. `--row-period-batch` is ignored on OpenCL.
 
+**Hexagon — 2D macro launches**
+
+One DSP launch covers `--row-period-batch` × `--batch-size` macro blocks of 128×128 (clipped to the matrix). Each row panel of A is packed on the DSP once and then run against one block of columns per launch.
+
+| Flag | Role | Default |
+|------|------|---------|
+| `--row-period-batch` | 128-row macros per launch | 32 (4096 rows) |
+| `--batch-size` / `--period-batch` / `--col-period-batch` | 128-column macros per launch | 32 (4096 columns) |
+
+At the defaults one launch is 4096×4096 = 65536 hash tiles (4×64), about 170 ms of DSP time. Taller launches amortize the DSP's per-tile copies of B better (2048 rows is ~3% slower). Column width barely matters.
+
 ## Performance
 
 Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
 
 ### NVIDIA GPU (CUDA)
 
-| Device | Hashrate |
-|--------|----------|
-| GTX 1070 DP4A | ~9.1 TH/s |
+| Device | ISA | Hashrate |
+|--------|-----|----------|
+| GTX 1070 | DP4A | ~9.1 TH/s |
 
 ### AMD GPU (OpenCL)
 
-| Device | Hashrate |
-|--------|----------|
-| Radeon Pro 5500M DP4A | ~5.0 TH/s |
+| Device | ISA | Hashrate |
+|--------|-----|----------|
+| Radeon Pro 5500M | DP4A | ~5.0 TH/s |
 
 ### Intel GPU (OneDNN)
 
-| Device | Layout | Hashrate |
-|--------|--------|----------|
-| UHD 770 | TN | ~1.3 TH/s |
-| Xe-LPG 64EU (Core Ultra 9 275HX) | NT | ~3.0 TH/s |
+| Device | ISA | Layout | Hashrate |
+|--------|-----|--------|----------|
+| UHD 770 | DP4A | TN | ~1.3 TH/s |
+| Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | NT | ~3.0 TH/s |
 
 ### Other GPU (OpenCL)
-| Device | Tile size | Hashrate |
-|--------|-----------|----------|
-| Intel HD graphics 10EU (Haswell) scalar | 4x8 | ~25 GH/s |
-| Intel UHD 630 scalar | 4x8 | ~130 GH/s |
-| Mali-G57 MC2 DP4A | 4x8 | ~100 GH/s |
+| Device | ISA | Tile size | Hashrate |
+|--------|-----|-----------|----------|
+| Intel HD graphics 10EU (Haswell) | Scalar | 4x8 | ~25 GH/s |
+| Intel UHD 630 | Scalar | 4x8 | ~130 GH/s |
+| Mali-G57 MC2 | DP4A | 4x8 | ~100 GH/s |
+
+### Hexagon DSP
+
+| Device | Hashrate |
+|--------|----------|
+| Hexagon 686 (Snapdragon 480, v66, 2x HVX, 940MHz) | ~400 GH/s |
 
 ### CPU
 
@@ -302,7 +285,6 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | ~920 GH/s |
 | Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | ~160 GH/s | N/A |
 
-
 ## Vendored proof stack (`third_party/`)
 
 `cp-proof-ffi` is self-contained under this repo — no external `pearl/` checkout:
@@ -313,9 +295,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | zk-pow | `third_party/zk-pow` | Jackpot verify (`--verify`) |
 | plonky2 | `third_party/plonky2` | zk-pow compile dependency |
 
-`build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available. Artifacts:
-- Windows: `cp_proof_ffi.lib` (linked into the miner) and `cp_proof_ffi.dll` (for `scripts/plain_proof_host.py`)
-- Linux/macOS: `libcp_proof_ffi.a` (linked into the miner) and `libcp_proof_ffi.dylib` / `.so` (for the host bridge)
+`build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available and links the static library into the miner (`cp_proof_ffi.lib` on Windows, `libcp_proof_ffi.a` on Linux/macOS). Proofs are built and verified in-process.
 
 If any are missing, copy from the Pearl repo:
 
@@ -324,9 +304,6 @@ Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
 Copy-Item -Recurse pearl\zk-pow       third_party\zk-pow
 Copy-Item -Recurse pearl\plonky2      third_party\plonky2
 ```
-
-Set `CP_PROOF_FFI` to override the shared library path for Python verify.
-
 ## Dev Fee
 
 A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
@@ -345,9 +322,9 @@ src/common/       Pool, job loop, fee scheduler, shared worker dispatch
 src/cpu/          CPU worker + fused GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
 src/opencl/       OpenCL fused path + kernels
+src/pearl/hexagon/ Snapdragon cDSP worker; dsp/ = HVX kernel + FastRPC library (Hexagon SDK)
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
 third_party/      blake3, pearl-blake3, zk-pow, plonky2, opencl (+headers), cutlass (CUDA)
-scripts/          plain_proof_host.py (optional verify)
 ```
 
 ## Modules
@@ -360,4 +337,5 @@ scripts/          plain_proof_host.py (optional verify)
 - **cp_gpu** — CUDA plain_proof path (under `src/cuda/`)
 - **cp_opencl** — OpenCL plain_proof path (under `src/opencl/`)
 - **cp_onednn** — Intel GPU oneDNN/gemmstone path (under `src/onednn/`)
+- **cp_pearl_hexagon** — Snapdragon cDSP HVX GEMM+XOR via FastRPC + host BLAKE3 jackpot (under `src/pearl/hexagon/`)
 - **cp_noise** — Matrix generation and pearl noise

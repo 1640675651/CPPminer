@@ -66,6 +66,9 @@ struct Case33GemmXor {
     void set_sse_tile(Case33SseTile tile) { sse_tile_ = tile; }
     Case33Isa isa() const { return isa_pref_; }
     Case33Isa isa_used() const { return isa_used_; }
+    /* True when the resolved ISA runs the u8s8 fast path, i.e. A is packed with
+     * the +128 offset and B carries compensation sums. ARM kernels are s8s8. */
+    bool fast_u8s8_active() const { return use_fast_u8s8_(); }
     Case33SseTile sse_tile() const { return sse_tile_; }
     /* Resolve the requested ISA against compiled and runtime capabilities. */
     bool resolve_runtime_isa();

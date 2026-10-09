@@ -1,22 +1,37 @@
 # Changelog
 
-## v0.5 (tentative)
-- Experimental OneDNN backend for intel GPU
-- Fix OpenCL dot product extension on intel GPU
-- Shrink opencl macro size to 64x64 in 4x8 tile mode, prevent to many work item per work group 
-- Introduce quantus algorithm
-- Quantus wgpu backend via quantus-miner GpuEngine FFI
-- Quantus OpenCL Poseidon2 worker under src/qpow/opencl
-- Pearl wgpu backend
-- Reduce host memory usage (CPU, CUDA, OpenCL, OneDNN, Wgpu)
-- MinGW and MSYS2 support (thanks to @danifest751)
-- AVX512-VNNI CPU kernel (`--simd avx512vnni`, auto-selected on Zen4-class CPUs): ~2x the AVX2 kernel per core
+## v0.6 (tentative)
+### New features
+- Experimental hexagon backend for qualcomm devices
+- AVX512-VNNI CPU kernel (`--simd avx512vnni`, auto-selected on Zen4-class CPUs)
 - Base AVX-512 CPU kernel (AVX512F + AVX512BW, no VNNI; `--simd avx512`, auto-selected on e.g. Skylake-X/SP)
-- Configurable matrix size: `--m` / `--n` in units of 1024 (default 128x128)
+
+### Pearl Hexagon
+- Self-guided loop on the DSP, negligible kernel launch overhead
+- Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
+
+## v0.5
+### New features
+- Experimental OneDNN (gemmstone+nGEN) backend for intel GPU
+- Wgpu backend
+- Configurable matrix size: `--m` / `--n` in units of 1024 (default m=n=128)
+- Introduce quantus algorithm
+
+### Fixes & Enhancements
+- Reduce host memory usage (All backends)
+- Fix OpenCL dot product extension on intel GPU
+- Shrink OpenCL macro size to 64x64 in 4x8 tile mode, prevent too many work items per work group
+- (6 fixes below thanks to @danifest751)
+- MinGW and MSYS2 support
+- Fix CUDA compilation on Linux
+- Fix OpenCL compilation on Adreno GPU
+- Pearl CPU: scan macro blocks scheduled one at a time, better B cache reuse and better core utilization on hetrogeneous CPU
+- Added `--threads N` option and unpin main thread from CPU 0
+- Fix difficulty calculation for mock test
 
 ### Pearl wgpu
 - vec4<u32> A/B panel loads in the GEMM shader
-- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4 TMAC/s)
+- Disable naga loop bounding on the GEMM shader (~36x faster, GTX 1070 86 GMAC/s -> ~4.0 TMAC/s)
 - Rewrite prepack_a (one 256-WI group per 8 rows, noise hashed once, packed u32 stores); per-attempt prep 1.3s -> ~0.13s on GTX 1070
 - GEMM accumulator tile as named vec4<i32> locals instead of array<i32, 64>; fixes Intel iGPU (UHD 770 35 -> ~540 GMAC/s)
 - Single-buffered LDS GEMM (one 32 KiB k-block panel per barrier pair), `--wgpu-lds on|off`, default on for discrete GPUs (GTX 1070 ~4.0 -> ~5.0 TMAC/s)
@@ -29,6 +44,11 @@
 - CPU, OpenCL `--cpu-gen` and oneDNN host fallback: drop the 512 MiB all-zero host B^T buffer; proofs use zero-matrix Merkle sub-roots cached per job
 - CPU `--prepack fused` is now the default (~1.5 GiB steady vs ~2.5 GiB for separate)
 - Host-matrix proofs hash A/B^T in place: transient per-share peak ~1.5 GiB -> < 1 MiB (no flatten/pad/MerkleTree copies of the 512 MiB matrix)
+
+### Quantus
+- Quantus wgpu backend via quantus-miner GpuEngine FFI
+- Quantus OpenCL Poseidon2 worker under src/qpow/opencl
+- Optimized CPU backend with scalar + AVX2 hybrid ISA
 
 ## v0.4
 - ARM CPU + NEON support.

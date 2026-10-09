@@ -15,7 +15,8 @@ typedef enum {
     CP_BACKEND_CUDA   = 2,
     CP_BACKEND_OPENCL = 3,
     CP_BACKEND_ONEDNN = 4,
-    CP_BACKEND_WGPU   = 5
+    CP_BACKEND_WGPU   = 5,
+    CP_BACKEND_HEXAGON = 6
 } CpBackendId;
 
 /* Compile-time availability (1 if linked). */
@@ -24,6 +25,7 @@ int cp_worker_has_cuda(void);
 int cp_worker_has_opencl(void);
 int cp_worker_has_onednn(void);
 int cp_worker_has_wgpu(void);
+int cp_worker_has_hexagon(void);
 
 const char* cp_worker_backend_name(void);
 CpBackendId cp_worker_backend_id(void);
@@ -64,6 +66,10 @@ void cp_worker_set_wgpu_lds(int mode);
 /* wgpu-only (pearl): register tile 4x4/4x8/8x8/8x16 (default 8x8), macro 64x64/128x128. */
 void cp_worker_set_wgpu_tile(int mr, int nr);
 void cp_worker_set_wgpu_macro(int macro_m, int macro_n);
+/* hexagon-only: DSP launch in 128x128 macro blocks, rows x columns (<= 0 = default 32). */
+void cp_worker_set_hexagon_launch(int row_macros, int col_macros);
+/* hexagon-only: --fused-jackpot, the jackpot on the DSP instead of the host. */
+void cp_worker_set_hexagon_fused_jackpot(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 
@@ -110,6 +116,12 @@ int cp_worker_prefers_host_matrices(void);
 /* Non-zero when the worker writes signal A into h_Ap_global every attempt (CPU, oneDNN host
  * fallback), so the host slot must be reclaimed before each attempt rather than on a share. */
 int cp_worker_writes_host_signal_a(void);
+
+/* Host signal A (h_Ap_global, zero-filled). A backend whose device reads it in place
+ * (Hexagon: shared rpcmem) allocates it; every other backend gets calloc/free. Anything
+ * that frees an A buffer (mine loop, share queue) must use cp_worker_free_host_signal_a. */
+int8_t* cp_worker_alloc_host_signal_a(size_t bytes);
+void cp_worker_free_host_signal_a(int8_t* p);
 
 /* Worker generates noisy matrices internally (CPU zero-B). */
 int cp_worker_worker_handles_matrix_prep(void);

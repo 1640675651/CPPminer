@@ -7,6 +7,9 @@
 #include "cp_qpow_pool.h"
 #include "cp_state.h"
 #include "cp_util.h"
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+#include "cp_cpu_affinity.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -178,7 +181,7 @@ static void pool_dispatch_line(const char* line)
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
         if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
-            cp_target_from_difficulty(g_diff.load(), tgt);
+            cp_pool_target_from_difficulty(g_diff.load(), tgt);
 
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
@@ -203,6 +206,9 @@ static void pool_dispatch_line(const char* line)
 
 static void pool_net_reader_thread(void)
 {
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    cp_cpu_affinity_release_thread();
+#endif
     while(g_net_reader_run.load()){
         /* Drain buffered messages before waiting — pool often sends authorize
          * ack + mining.notify back-to-back in one TCP segment. */

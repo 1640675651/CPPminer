@@ -411,10 +411,13 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
     const int macro_blocks = macro_cols * macro_rows;
     const bool pair = micro_gemm_xor_pair_capable(isa);
 
-    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~1k amortizes dispatch
-     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
+    /* Dynamic: rebalance across hybrid P/E cores. Chunk 1: one 128x128 macro is
+     * ~67M MAC (~1 ms/core), so per-chunk dispatch (an atomic add) is noise, while
+     * a large chunk starves the pool on small matrices (8k×8k = 4096 macros gave a
+     * single chunk, i.e. one thread did the whole scan) and leaves a multi-second
+     * tail at 128k×128k. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1024)
+#pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         const int jm = mb / macro_rows;
@@ -491,10 +494,11 @@ bool run_online_tile_scan(
     const bool pair = micro_gemm_xor_pair_capable(isa);
     std::atomic<int> stop{0};
 
-    /* Dynamic: rebalance across hybrid P/E cores. Chunk ~4k amortizes dispatch
-     * on ~1M macros (128k×128k) while leaving enough steal opportunities. */
+    /* Dynamic, chunk 1: see run_hardcoded_macro_xor. With chunk 4096 an 8k×8k
+     * scan (exactly 4096 macros) ran on ONE thread (118 GMAC/s = one Zen4 core)
+     * and 16k×16k on four; the ~1 ms macro makes per-block dispatch free. */
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 4096)
+#pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int mb = 0; mb < macro_blocks; ++mb) {
         if (stop.load(std::memory_order_relaxed)) {
@@ -636,14 +640,21 @@ int case33_test_fused_prepack_impl(int M, int N, int K, int rank) {
         return 3;
     }
 
-    std::vector<int8_t> ref_a;
-    std::vector<int8_t> ref_b;
-    prepack_a_all(noisy_a.data(), M, K, blocks_k, true, &ref_a);
-    prepack_b_all(noisy_b.data(), N, K, blocks_k, tile_cols, &ref_b);
-
     Case33GemmXor gemm;
     gemm.set_int8_mode(Case32Int8Mode::FastU8S8);
     gemm.set_prepack_mode(Case33PrepackMode::Fused);
+    if (!gemm.resolve_runtime_isa()) {
+        return 4;
+    }
+
+    /* The reference must pack A the way the resolved ISA expects: x86 u8s8
+     * kernels take A+128, ARM (DotProd/NEON) and scalar take signed A. Passing
+     * `true` unconditionally made the test fail on every ARM device. */
+    std::vector<int8_t> ref_a;
+    std::vector<int8_t> ref_b;
+    prepack_a_all(noisy_a.data(), M, K, blocks_k, gemm.fast_u8s8_active(), &ref_a);
+    prepack_b_all(noisy_b.data(), N, K, blocks_k, tile_cols, &ref_b);
+
     std::vector<int8_t> fused_b;
     std::vector<int8_t> fused_a;
     if (!gemm.prepare_job_b(M, N, K, &fused_b, nullptr, seed_b, rank)) {
