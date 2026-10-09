@@ -203,6 +203,10 @@ int ensure_buffers(int rows, int cols)
         free_buffers();
         return -1;
     }
+    /* Word stores (memset may use cache-zeroing instructions, unsafe on uncached memory).
+     * The DSP has not used the block yet, so the host may write both halves this once. */
+    for(int w = 0; w < CP_PEARLX_CTL_WORDS; w++)
+        ctl_store(w, 0);
     g_buf.rows = rows;
     g_buf.cols = cols;
     g_buf.xr_words = xr_words;

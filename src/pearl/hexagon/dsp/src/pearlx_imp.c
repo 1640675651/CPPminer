@@ -40,6 +40,7 @@
 #define CTL_CHECKED   32
 #define CTL_STOP      33
 #define CTL_EPOCH     34
+#define CTL_TEST_IDLE_US 35             // self-test: idle this long after each launch
 #define CTL_WORDS     64
 enum { CTL_RUNNING = 1, CTL_DONE = 2, CTL_STOPPED = 3, CTL_FAILED = 4 };
 #define CTL_POLL_US   100               // while waiting for the host to check a launch
@@ -1228,12 +1229,11 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
             int aborted = 0;
             t0 = HAP_perf_get_time_us();
             err = run_panel(ctx, col0, cols, slot, NULL, NULL, 0, NULL, ctl, &aborted);
-            if (!err && !aborted) {
-                // The records out to memory before the host is told they are there.
-                const size_t words = (size_t)(cols / NT_COLS) * (prows / MR) * shape.lines * 32;
-                qurt_mem_cache_clean((qurt_addr_t)slot, words * 4, QURT_MEM_CACHE_FLUSH,
-                                     QURT_MEM_DCACHE);
-            }
+            // The records out to memory before the host is told they are there. Cleaning the
+            // whole data cache costs ~0.07 ms per launch; cleaning the 8 MiB slot by address
+            // costs ~0.44 ms, walking every line though only the cache's worth is dirty.
+            if (!err && !aborted)
+                qurt_mem_cache_clean(0, 0, QURT_MEM_CACHE_FLUSH_ALL, QURT_MEM_DCACHE);
             busy += HAP_perf_get_time_us() - t0;
             if (err || aborted) {
                 stopped = aborted;
@@ -1242,6 +1242,11 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
             ctl[CTL_LAUNCHED] = (uint32)(s + 1);
             ctl_push(ctl);
             (*launched)++;
+            // Self-test only: idle so the launch's lines would still be in the cache while the
+            // host reads them, had they not been cleaned (the miner leaves the word at 0).
+            ctl_pull(ctl);
+            if (ctl[CTL_TEST_IDLE_US])
+                qurt_timer_sleep(ctl[CTL_TEST_IDLE_US]);
         }
     }
     ctl[CTL_STATE] = err ? CTL_FAILED : stopped ? CTL_STOPPED : CTL_DONE;

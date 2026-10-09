@@ -231,7 +231,7 @@ static int hash_test(remote_handle64 h, size_t bytes) {
 
 /* scan_run's control block words (pearlx.idl). */
 enum { CTL_LAUNCHED = 0, CTL_EPOCH_ACK = 1, CTL_STATE = 2, CTL_CHECKED = 32, CTL_STOP = 33,
-       CTL_EPOCH = 34, CTL_WORDS = 64 };
+       CTL_EPOCH = 34, CTL_TEST_IDLE_US = 35, CTL_WORDS = 64 };
 
 typedef struct {
     remote_handle64 h;
@@ -269,9 +269,12 @@ static uint64_t fnv64(const uint32_t *w, size_t n) {
  * made one call at a time (set_a_gen per panel, gemm_xor per launch): every launch's
  * records, copied out while the DSP is already running the next ones, must match. Then the
  * stop word, set mid-run, must end the call early. -L 2: the host takes longer per launch
- * than the DSP, so the DSP has to wait for free record slots. */
+ * than the DSP, so the DSP has to wait for free record slots. -L 3: the DSP idles 100 ms
+ * after each launch, so records it left in its cache would be read stale: this is the case
+ * that catches missing cache cleaning (in -L 1 the next launch evicts them first). */
 static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int panels,
-                    int slow_host) {
+                    int mode) {
+    const int slow_host = mode == 2;
     const int lines = (k / MS_K * 2 + 31) / 32, nbuf = 2;
     const int per_panel = n / cols, S = panels * per_panel, m = panels * rows;
     const size_t slot_words = (size_t)(cols / 128) * (rows / 4) * lines * 32;
@@ -300,7 +303,8 @@ static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int pan
     seed_label_words(a_seed, PEARL_SEED_LABEL_A, a_sl);
     seed_label_words(b_seed, PEARL_SEED_LABEL_B, b_sl);
     printf("scan_run test: %d launches of %d x %d (%d panels), %d record slots%s\n", S, rows,
-           cols, panels, nbuf, slow_host ? ", slow host" : "");
+           cols, panels, nbuf,
+           slow_host ? ", slow host" : mode == 3 ? ", DSP idle after launches" : "");
 
     int err = 0;
     uint64 us = 0;
@@ -330,6 +334,7 @@ static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int pan
         /* Word stores: memset may use cache-zeroing instructions, unsafe on uncached memory. */
         for (int w = 0; w < CTL_WORDS; w++)
             __atomic_store_n(&ctl[w], 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctl[CTL_TEST_IDLE_US], mode == 3 ? 100000u : 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&ctl[CTL_EPOCH], (uint32_t)(pass + 7), __ATOMIC_RELEASE);
         run_call rc = { h, sig, k, m, rows, cols, nbuf, a_sl, pairs_a, ctl, xr,
                         nbuf * slot_words, 0, 0, 0, 0, 0 };
@@ -423,7 +428,7 @@ int main(int argc, char *argv[]) {
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
            " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1] [-b hit_bits] [-u 0|1]"
-           " [-G 0|1] [-H 0|1] [-L 0|1|2]\n");
+           " [-G 0|1] [-H 0|1] [-L 0|1|2|3]\n");
     /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
     uint32_t key_bound[16];
     for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
@@ -470,7 +475,7 @@ int main(int argc, char *argv[]) {
            "VTCM %d KB, vote %s\n", n, k, panels, rows, cols, hvx, mhz, vtcm, vote ? "FAILED" : "ok");
 
     if (run) {
-        err = run_test(h, n, k, rows, cols, panels, run == 2);
+        err = run_test(h, n, k, rows, cols, panels, run);
         pearlx_close(h);
         printf("%s\n", err ? "FAILED" : "Success");
         return err ? 1 : 0;

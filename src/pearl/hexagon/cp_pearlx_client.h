@@ -56,7 +56,8 @@ enum {
     CP_PEARLX_CTL_STATE = 2,       /* DSP: 1 running, 2 done, 3 stopped, 4 failed */
     CP_PEARLX_CTL_CHECKED = 32,    /* host: launches checked (their slots are free) */
     CP_PEARLX_CTL_STOP = 33,       /* host: nonzero stops the DSP at the next column tile */
-    CP_PEARLX_CTL_EPOCH = 34       /* host: changed per attempt, so stale counts are ignored */
+    CP_PEARLX_CTL_EPOCH = 34,      /* host: changed per attempt, so stale counts are ignored */
+    CP_PEARLX_CTL_TEST_IDLE_US = 35 /* host, self-test only: DSP idles this long per launch */
 };
 
 /* The attempt's launches over rows [row0, row0 + rows) of A without a call per launch:

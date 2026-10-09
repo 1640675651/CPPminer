@@ -70,8 +70,9 @@ interface pearlx : remote_handle64 {
    // DSP writes words 0..31 only: [0] launches finished (s + 1 after launch s, counted
    // from 0, not from s0), [1] the host's epoch as read at the start, [2] state (1 running,
    // 2 done, 3 stopped, 4 failed). The host writes words 32..63 only: [32] launches
-   // checked, [33] stop (nonzero: stop at the next column tile), [34] epoch. Launch s
-   // starts once launch s - nbuf is checked. launched: launches finished in this call.
+   // checked, [33] stop (nonzero: stop at the next column tile), [34] epoch, [35] self-test
+   // only: microseconds to idle after each launch (0 in the miner). Launch s starts once
+   // launch s - nbuf is checked. launched: launches finished in this call.
    long scan_run(in sequence<int8> a_sig, in long row0, in long rows, in long panel_rows,
                  in long launch_cols, in long s0, in long nbuf, in long nthreads,
                  in sequence<uint32> seed_label, in sequence<uint32> pairs,
