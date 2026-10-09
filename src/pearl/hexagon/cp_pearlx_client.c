@@ -88,8 +88,8 @@ CpPearlx* cp_pearlx_open(void)
     int err = px->open(PEARLX_URI, &px->h);
     if(err){
         fprintf(stderr,
-                "[hexagon] cannot open pearlx on the cDSP (0x%x): is libpearlx_skel.so (and "
-                "libworker_pool.so) in ADSP_LIBRARY_PATH?\n", err);
+                "[hexagon] cannot open pearlx on the cDSP (0x%x): are libpearlx_skel.so and "
+                "libworker_pool.so in the current directory or in ADSP_LIBRARY_PATH?\n", err);
         dlclose(px->lib);
         free(px);
         return NULL;

@@ -187,7 +187,8 @@ There are two parts:
 2. **The miner.** It needs no SDK.
    - On the phone in Termux: `./build.sh --backend cpu,hexagon`.
    - Cross-compiled with the Android NDK, for example the one in the Hexagon
-     SDK. Push `libomp.so` from the NDK alongside the miner.
+     SDK. It links the NDK's static OpenMP, so the miner needs no `libomp.so`
+     or `LD_LIBRARY_PATH` on the phone.
 
      ```powershell
      cmake -S . -B build/android-hexagon -G Ninja `
@@ -209,10 +210,13 @@ There are two parts:
 ## Run
 
 The DSP library loads in an unsigned protection domain, so root is not needed.
-FastRPC finds the skel through `ADSP_LIBRARY_PATH`:
+FastRPC looks for `libpearlx_skel.so` and `libworker_pool.so` in the current
+directory, then in the system DSP directories. Run the miner from the directory
+that holds them, or list that directory in `ADSP_LIBRARY_PATH`. No other
+environment is needed.
 
 ```sh
-export ADSP_LIBRARY_PATH=/path/to/dir/with/libpearlx_skel.so   # and libworker_pool.so
+cd /path/to/dir/with/libpearlx_skel.so                    # or: export ADSP_LIBRARY_PATH=<that dir>
 # the default 128x128 size needs ~1.07 GiB; --m 32 --n 32 needs ~310 MiB
 ./cppminer --backend hexagon --m 32 --n 32 --pool stratum+tcp://HOST:PORT --wallet prl1... --worker phone
 ./cppminer --backend hexagon --m 32 --n 32 --mock --mock-diff 40   # offline: first share + verify
@@ -226,7 +230,8 @@ export ADSP_LIBRARY_PATH=/path/to/dir/with/libpearlx_skel.so   # and libworker_p
 
 Testing was done from `adb shell` (`/data/local/tmp`). Running from Termux has
 not been tested yet. If `cp_pearlx_open` fails, check that the app may open
-`/dev/fastrpc-cdsp` and that `ADSP_LIBRARY_PATH` is set.
+`/dev/fastrpc-cdsp`, and that the two DSP libraries are in the current directory
+or in `ADSP_LIBRARY_PATH` (error `0x80000406` when they are not found).
 
 Only Hexagon v66 has been tested. `vrmpyz` (the Z buffer) is a v66 HVX
 instruction, so other DSP versions need checking before use.

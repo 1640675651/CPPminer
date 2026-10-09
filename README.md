@@ -90,69 +90,28 @@ Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_q
 This scipt pulls third-party dependencies and execute cmake.
 ## Run
 
-```powershell
-# Pearl CPU (default --algo pearl)
-.\cppminer.exe --algo pearl --backend cpu --wallet prl1... --worker worker_name
-
-# Quantus CPU (LuckyPool / compatible stratum; --pool required, no default host)
-.\cppminer.exe --algo quantus --backend cpu --threads 8 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
-
-# Quantus wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU build)
-.\cppminer.exe --backend wgpu --list-devices
-.\cppminer.exe --algo quantus --backend wgpu --devices 0 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
-# Omit --devices to use all mining adapters (discrete preferred).
-
-# Quantus OpenCL (requires -Backend OpenCl / CP_ENABLE_OPENCL)
-.\cppminer.exe --backend opencl --list-devices
-.\cppminer.exe --algo quantus --backend opencl --devices 0 `
-  --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker worker_name
+```
+cppminer [--algo pearl|quantus] --backend BACKEND [--devices IDS]
+         [--pool stratum+tcp://HOST:PORT] --wallet ADDRESS [--worker NAME] [backend options]
 ```
 
-```powershell
-# CUDA (CUTLASS fused GEMM+jackpot)
-.\cppminer.exe --backend cuda --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker worker_name --devices 0
+- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu` and `hexagon`; Quantus on `cpu`, `opencl` and `wgpu`. The backend must be enabled in the build.
+- Pearl defaults to the LuckyPool Pearl pool; Quantus needs `--pool`.
+- `--list-devices` prints the device indices that `--devices` takes.
+- `--mock` mines a fixed job offline until the first share, verifies it and exits; it needs no pool or wallet.
 
-# CUDA debug: cuBLAS period GEMM + separate XOR/jackpot (requires -EnableCublas build)
-.\cppminer.exe --backend cuda --cublas-period --pool stratum+tcp://pearl-cpu-eu1.luckypool.io:3370 `
-  --wallet prl1... --worker worker_name --devices 0
-
-# OpenCL (LuckyPool production layout)
-.\cppminer.exe --backend opencl --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
-
-# Pearl wgpu (requires -Backend Wgpu / CP_ENABLE_WGPU; LDS staging auto-on for discrete GPUs)
-.\cppminer.exe --backend wgpu --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name --devices 0
-
-# OneDNN (Intel GPU gemmstone + GPU jackpot)
-.\cppminer.exe --backend onednn --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
-
-# OneDNN fused path (single kernel: IGEMM + fold + BLAKE3 + in-kernel jackpot)
-.\cppminer.exe --backend onednn --fused-jackpot --pool stratum+tcp://pearl-eu1.luckypool.io:3360 `
-  --wallet prl1... --worker worker_name
-
-# Offline mock: first share + verify (no pool)
-.\cppminer.exe --backend onednn --mock
-.\cppminer.exe --backend cuda --mock
-.\cppminer.exe --backend opencl --mock
-.\cppminer.exe --backend wgpu --devices 0 --mock
-.\cppminer.exe --backend cpu --mock
-.\cppminer.exe --algo quantus --backend cpu --mock
-.\cppminer.exe --algo quantus --backend opencl --devices 0 --mock
-.\cppminer.exe --algo quantus --backend wgpu --devices 0 --mock
-```
+Examples (`.\cppminer.exe` on Windows, `./cppminer` elsewhere):
 
 ```sh
-# Pearl Hexagon (Android; libpearlx_skel.so + libworker_pool.so in ADSP_LIBRARY_PATH).
-# Needs about m*k + n*k bytes: ~1 GiB at the default size, ~300 MiB with --m 32 --n 32.
-export ADSP_LIBRARY_PATH=/data/local/tmp/cppminer
-./cppminer --backend hexagon --m 32 --n 32 --pool stratum+tcp://pearl-eu1.luckypool.io:3360 \
-  --wallet prl1... --worker worker_name
-./cppminer --backend hexagon --m 32 --n 32 --mock
+# Pearl on GPU 0 (CUDA build)
+cppminer --backend cuda --devices 0 --wallet prl1... --worker rig01
+
+# Quantus on the CPU
+cppminer --algo quantus --backend cpu --pool stratum+tcp://HOST:PORT --wallet qzpp... --worker rig01
+
+# Find a GPU, then test it offline
+cppminer --backend opencl --list-devices
+cppminer --backend opencl --devices 0 --mock
 ```
 
 ### Options
@@ -160,14 +119,15 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/cppminer
 | Flag | Description |
 |------|-------------|
 | `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon`. `--pool` required for Quantus unless `--mock` |
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`). `hexagon` needs about m·k + n·k bytes (1 GiB at the default size), so phones usually need a smaller `--m`/`--n`; see [Scan batching](#scan-batching---batch-size) for its launch size |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`).
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
 | `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
 | `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
 | `--list-devices` | List devices for the selected backend and exit |
-| `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) || `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
+| `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) |
+| `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
@@ -226,18 +186,6 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 
 **Batching:** `--row-period-batch` and `--batch-size` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
 
-```powershell
-# List Intel GPUs, then mine with fused jackpot
-.\cppminer.exe --backend onednn --list-devices
-.\cppminer.exe --backend onednn --fused-jackpot --devices 0 --mock --mock-diff 50
-
-# Default two-kernel path, smaller panels (less VRAM per launch)
-.\cppminer.exe --backend onednn --row-period-batch 16 --batch-size 512 --mock
-
-# Alternate device layouts (GPU prep fuses transpose + noise)
-.\cppminer.exe --backend onednn --onednn-layout TT --mock --mock-diff 50
-```
-
 ### Scan batching (`--batch-size`)
 
 Host syncs after each batch (cancel / progress / share check). Meaning differs by backend:
@@ -291,29 +239,35 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 ### NVIDIA GPU (CUDA)
 
-| Device | Hashrate |
-|--------|----------|
-| GTX 1070 DP4A | ~9.1 TH/s |
+| Device | ISA | Hashrate |
+|--------|-----|----------|
+| GTX 1070 | DP4A | ~9.1 TH/s |
 
 ### AMD GPU (OpenCL)
 
-| Device | Hashrate |
-|--------|----------|
-| Radeon Pro 5500M DP4A | ~5.0 TH/s |
+| Device | ISA | Hashrate |
+|--------|-----|----------|
+| Radeon Pro 5500M | DP4A | ~5.0 TH/s |
 
 ### Intel GPU (OneDNN)
 
-| Device | Layout | Hashrate |
-|--------|--------|----------|
-| UHD 770 | TN | ~1.3 TH/s |
-| Xe-LPG 64EU (Core Ultra 9 275HX) | NT | ~3.0 TH/s |
+| Device | ISA | Layout | Hashrate |
+|--------|-----|--------|----------|
+| UHD 770 | DP4A | TN | ~1.3 TH/s |
+| Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | NT | ~3.0 TH/s |
 
 ### Other GPU (OpenCL)
-| Device | Tile size | Hashrate |
-|--------|-----------|----------|
-| Intel HD graphics 10EU (Haswell) scalar | 4x8 | ~25 GH/s |
-| Intel UHD 630 scalar | 4x8 | ~130 GH/s |
-| Mali-G57 MC2 DP4A | 4x8 | ~100 GH/s |
+| Device | ISA | Tile size | Hashrate |
+|--------|-----|-----------|----------|
+| Intel HD graphics 10EU (Haswell) | Scalar | 4x8 | ~25 GH/s |
+| Intel UHD 630 | Scalar | 4x8 | ~130 GH/s |
+| Mali-G57 MC2 | DP4A | 4x8 | ~100 GH/s |
+
+### Hexagon DSP
+
+| Device | Hashrate |
+|--------|----------|
+| Hexagon 686 (Snapdragon 480, v66, 2x HVX, 940MHz) | ~400 GH/s |
 
 ### CPU
 
@@ -324,14 +278,6 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Core i5 12490F @ 4.0GHz | AVX-VNNI | ~1.1 TH/s | ~400 GH/s |
 | Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | ~920 GH/s |
 | Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | ~160 GH/s | N/A |
-| Snapdragon 480 2x A76 @ 2.0GHz + 6x A55 @ 1.8GHz (`--m 4 --n 4`) | NEON DotProd | ~130 GH/s | N/A |
-
-### Hexagon DSP
-
-| Device | Matrix | Hashrate |
-|--------|--------|----------|
-| Snapdragon 480 cDSP (Hexagon v66, 2x HVX) | `--m 32 --n 32` | ~398 GH/s scanning, ~397 GH/s with per-attempt prep |
-
 
 ## Vendored proof stack (`third_party/`)
 

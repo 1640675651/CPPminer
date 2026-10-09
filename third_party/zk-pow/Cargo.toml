@@ -43,5 +43,7 @@ rand_chacha = "0.9"
 inherits = "release"
 debug-assertions = true
 
-[target.'cfg(unix)'.dependencies]
+# Not on Android: jemalloc's configure script can't run in a cross-build from Windows,
+# and only the binaries below use it.
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }

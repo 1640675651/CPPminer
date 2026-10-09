@@ -506,23 +506,66 @@ else()
     set(_cp_cargo_args build --release)
     set(_cp_cargo_profile release)
 endif()
+set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile})
+set(_cp_cargo_env CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target)
+# Android cross-builds (NDK toolchain file): build the crate for the Android target, with
+# the NDK's clang and llvm-ar for any C code in its dependencies. Needs that target's Rust
+# standard library (rustup target add aarch64-linux-android, or conda-forge's
+# rust-std-aarch64-linux-android at the rustc version); without it, use the proof stub.
+# The archive then lands in target/<triple>/, apart from any host build's.
+set(_cp_rust_target "")
+set(_cp_rust_target_ok TRUE)
+if(ANDROID)
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(_cp_rust_target aarch64-linux-android)
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(_cp_rust_target x86_64-linux-android)
+    else()
+        message(FATAL_ERROR "cp-proof-ffi: no Rust target for ANDROID_ABI ${ANDROID_ABI}")
+    endif()
+    string(REPLACE "-" "_" _cp_rust_target_env ${_cp_rust_target})
+    list(APPEND _cp_cargo_args --target ${_cp_rust_target})
+    set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_rust_target}/${_cp_cargo_profile})
+    list(APPEND _cp_cargo_env
+        CC_${_cp_rust_target_env}=${CMAKE_C_COMPILER}
+        CFLAGS_${_cp_rust_target_env}=--target=${CMAKE_C_COMPILER_TARGET}
+        AR_${_cp_rust_target_env}=${CMAKE_AR})
+    if(CP_PROOF_FFI AND CARGO_EXECUTABLE)
+        get_filename_component(_cp_cargo_dir ${CARGO_EXECUTABLE} DIRECTORY)
+        find_program(RUSTC_EXECUTABLE rustc HINTS ${_cp_cargo_dir} NO_DEFAULT_PATH)
+        find_program(RUSTC_EXECUTABLE rustc)
+        set(_cp_rust_sysroot "")
+        if(RUSTC_EXECUTABLE)
+            execute_process(COMMAND ${RUSTC_EXECUTABLE} --print sysroot
+                OUTPUT_VARIABLE _cp_rust_sysroot OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+        if(NOT IS_DIRECTORY "${_cp_rust_sysroot}/lib/rustlib/${_cp_rust_target}")
+            set(_cp_rust_target_ok FALSE)
+            message(WARNING "cp_proof_ffi: Rust has no ${_cp_rust_target} standard library "
+                "(rustup target add ${_cp_rust_target}, or conda-forge "
+                "rust-std-${_cp_rust_target}), so cargo cannot build the proof FFI")
+        endif()
+    endif()
+endif()
 # The name depends on the toolchain, not the OS: an MSVC-targeting cargo emits
 # cp_proof_ffi.lib, while a MinGW-targeting one emits libcp_proof_ffi.a. Keying
 # this off WIN32 broke the MinGW/MSYS2 build, which is still Windows.
 if(MSVC)
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/cp_proof_ffi.lib)
+    set(_cp_proof_lib ${_cp_cargo_out}/cp_proof_ffi.lib)
 else()
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/libcp_proof_ffi.a)
+    set(_cp_proof_lib ${_cp_cargo_out}/libcp_proof_ffi.a)
 endif()
 
 set(_cp_link_proof_ffi FALSE)
-if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
+if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_rust_target_ok AND _cp_proof_deps_ok
+   AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
         ${CP_PROOF_FFI_DIR}/src/*.rs)
     add_custom_command(
         OUTPUT ${_cp_proof_lib}
         COMMAND ${CMAKE_COMMAND} -E env
-            CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target
+            ${_cp_cargo_env}
             ${CARGO_EXECUTABLE} ${_cp_cargo_args}
             --manifest-path ${CP_PROOF_FFI_MANIFEST}
         WORKING_DIRECTORY ${CP_PROOF_FFI_DIR}
@@ -541,16 +584,19 @@ if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF
     add_dependencies(cppminer cp_proof_ffi_build)
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
-elseif(CP_PROOF_FFI AND EXISTS ${_cp_proof_lib} AND NOT CMAKE_CROSSCOMPILING)
+elseif(CP_PROOF_FFI AND EXISTS ${_cp_proof_lib} AND (NOT CMAKE_CROSSCOMPILING OR _cp_rust_target))
     # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
-    # Not when cross-compiling: the archive in target/release/ was built for
-    # the host, and lld only reports "archive member is neither ET_REL nor
-    # LLVM bitcode" at link time.
+    # Not when cross-compiling to a target without its own directory: the
+    # archive in target/release/ was built for the host, and lld only reports
+    # "archive member is neither ET_REL nor LLVM bitcode" at link time.
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
 else()
     if(NOT CP_PROOF_FFI)
         message(STATUS "cp_proof_ffi: disabled (CP_PROOF_FFI=OFF); using proof stub")
+    elseif(NOT _cp_rust_target_ok)
+        message(WARNING "cp_proof_ffi: no ${_cp_rust_target} build; using proof stub "
+            "(no share submit proofs)")
     elseif(NOT CARGO_EXECUTABLE)
         message(WARNING "cargo not found; using proof stub (no share submit proofs)")
     elseif(NOT _cp_proof_deps_ok)
@@ -574,6 +620,9 @@ if(_cp_link_proof_ffi)
             "-framework Security"
             "-framework CoreFoundation"
             "-framework SystemConfiguration")
+    elseif(ANDROID)
+        # pthread is part of Android's libc; Rust's std also needs liblog and libunwind.
+        target_link_libraries(cppminer PRIVATE dl log unwind m)
     else()
         target_link_libraries(cppminer PRIVATE pthread dl m)
     endif()
@@ -834,6 +883,19 @@ else()
             set(OpenMP_gomp_LIBRARY "${_cp_gomp_static}" CACHE FILEPATH "" FORCE)
         endif()
         unset(_cp_gomp_static)
+    endif()
+    if(ANDROID AND CMAKE_CROSSCOMPILING)
+        # NDK cross-builds: FindOpenMP picks the NDK's libomp.so, which Android's linker only
+        # finds through LD_LIBRARY_PATH (it never looks next to the executable). Link the
+        # NDK's libomp.a instead so the miner runs on its own.
+        execute_process(
+            COMMAND ${CMAKE_CXX_COMPILER} --target=${CMAKE_CXX_COMPILER_TARGET}
+                    -print-file-name=libomp.a
+            OUTPUT_VARIABLE _cp_omp_static OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(IS_ABSOLUTE "${_cp_omp_static}" AND EXISTS "${_cp_omp_static}")
+            set(OpenMP_omp_LIBRARY "${_cp_omp_static}" CACHE FILEPATH "" FORCE)
+        endif()
+        unset(_cp_omp_static)
     endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
