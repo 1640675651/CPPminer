@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6 (tentative)
+### New features
+- Experimental hexagon backend for qualcomm devices
+
+### Pearl Hexagon
+- Self-guided loop on the DSP, negligible kernel launch overhead
+- Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
+
 ## v0.5
 ### New features
 - Experimental OneDNN (gemmstone+nGEN) backend for intel GPU

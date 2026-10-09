@@ -87,7 +87,11 @@ Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_q
 ./build.sh --backend cpu,opencl,onednn,cuda
 ./build.sh --backend cpu,wgpu
 ```
-This scipt pulls third-party dependencies and execute cmake.
+This script pulls third-party dependencies and runs CMake.
+
+### Hexagon
+
+`./build.sh --backend cpu,hexagon` builds only the miner (its Hexagon worker and FastRPC client), and `build.ps1` has no Hexagon option. Neither script builds the DSP libraries the miner loads on the cDSP, `libpearlx_skel.so` and `libworker_pool.so`: they need the Hexagon SDK on an x86 machine. See [Build in the Hexagon README](src/pearl/hexagon/README.md#build) for those, and for cross-compiling the miner for Android.
 ## Run
 
 ```

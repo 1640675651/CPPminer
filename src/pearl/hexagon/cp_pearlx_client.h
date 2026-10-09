@@ -47,6 +47,29 @@ int cp_pearlx_chunk_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const 
 int cp_pearlx_info(CpPearlx* px, int* hvx_contexts, int* clock_vote_err, int* clock_mhz,
                    int* vtcm_kb);
 
+/* scan_run's control block (pearlx.idl): 64 words, 128-byte aligned, uncached. The DSP
+ * writes the first half, the host the second; neither writes the other's half. */
+#define CP_PEARLX_CTL_WORDS 64
+enum {
+    CP_PEARLX_CTL_LAUNCHED = 0,    /* DSP: launches finished (launch s done: s + 1) */
+    CP_PEARLX_CTL_EPOCH_ACK = 1,   /* DSP: the epoch it read at the start of the call */
+    CP_PEARLX_CTL_STATE = 2,       /* DSP: 1 running, 2 done, 3 stopped, 4 failed */
+    CP_PEARLX_CTL_CHECKED = 32,    /* host: launches checked (their slots are free) */
+    CP_PEARLX_CTL_STOP = 33,       /* host: nonzero stops the DSP at the next column tile */
+    CP_PEARLX_CTL_EPOCH = 34       /* host: changed per attempt, so stale counts are ignored */
+};
+
+/* The attempt's launches over rows [row0, row0 + rows) of A without a call per launch:
+ * a_sig is those rows of signal A; panels of panel_rows, launches of launch_cols columns
+ * numbered from s0 into nbuf record slots of xr (xr_words in all). The call returns when
+ * the rows are done or the host sets the stop word; launched counts this call's launches.
+ * Follow it from another thread through ctl. */
+int cp_pearlx_scan_run(CpPearlx* px, const int8_t* a_sig, int row0, int rows, int k,
+                       int panel_rows, int launch_cols, int s0, int nbuf, int nthreads,
+                       const uint32_t seed_label[16], const uint32_t* pairs, uint32_t* ctl,
+                       uint32_t* xr, size_t xr_words, uint64_t* dsp_us, uint64_t* wait_us,
+                       int* launched);
+
 #ifdef __cplusplus
 }
 #endif

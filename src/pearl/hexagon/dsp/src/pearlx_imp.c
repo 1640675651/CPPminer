@@ -29,6 +29,35 @@
 // the next tile's A and starting values and prefetches the one after.
 #define PAD_TILES 2
 
+// scan_run's control block, shared with the host during the call (see pearlx.idl). Each
+// side writes only its own half, a separate cache line, so neither side's write-back can
+// overwrite the other's words: the DSP flushes its half after writing it and invalidates
+// the host's half before reading it.
+#define CTL_LAUNCHED  0
+#define CTL_EPOCH_ACK 1
+#define CTL_STATE     2
+#define CTL_HOST      32                // first word of the host's half
+#define CTL_CHECKED   32
+#define CTL_STOP      33
+#define CTL_EPOCH     34
+#define CTL_WORDS     64
+enum { CTL_RUNNING = 1, CTL_DONE = 2, CTL_STOPPED = 3, CTL_FAILED = 4 };
+#define CTL_POLL_US   100               // while waiting for the host to check a launch
+
+static inline void ctl_pull(volatile uint32 *ctl) {
+    qurt_mem_cache_clean((qurt_addr_t)(ctl + CTL_HOST), (CTL_WORDS - CTL_HOST) * 4,
+                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+}
+
+static inline void ctl_push(volatile uint32 *ctl) {
+    qurt_mem_cache_clean((qurt_addr_t)ctl, CTL_HOST * 4, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
+static inline int ctl_stop_requested(volatile uint32 *ctl) {
+    ctl_pull(ctl);
+    return ctl[CTL_STOP] != 0;
+}
+
 typedef struct {
     worker_pool_context_t pool;
     int clock_vote_err;
@@ -566,6 +595,8 @@ typedef struct {
     int stop_on_hit;
     volatile int *stop;     // shared: set by the first thread to hit when stop_on_hit
     jp_result res;
+    volatile uint32 *ctl;   // scan_run: the host's stop flag, checked per column tile
+    int aborted;            // set when ctl's stop ended the run early
 } gemmx_thread;
 
 static void gemmx_thread_run(void *arg) {
@@ -575,6 +606,10 @@ static void gemmx_thread_run(void *arg) {
     for (int nt = th->nfull > 0 ? th->t : 0; nt < p->Nt; ) {
         if (th->stop && *th->stop)
             break;
+        if (th->ctl && ctl_stop_requested(th->ctl)) {
+            th->aborted = 1;
+            break;
+        }
         const int full = nt < th->nfull;
         j->nt = nt;
         j->sl = th->t;
@@ -709,8 +744,10 @@ static int ensure_vtcm(pearlx_ctx *ctx, int nthreads) {
 
 // The packed row panel against columns [col0, col0 + ncols): records to xr (xr != NULL),
 // or the jackpot on the DSP (key and bound; the first hit and the hit count into *res).
+// ctl (scan_run, else NULL): stop early when the host asks, setting *aborted.
 static int run_panel(pearlx_ctx *ctx, int col0, int ncols, uint32 *xr, const uint32 *key,
-                     const uint32 *bound, int stop_on_hit, jp_result *res) {
+                     const uint32 *bound, int stop_on_hit, jp_result *res,
+                     volatile uint32 *ctl, int *aborted) {
     const int nthreads = ctx->a_threads;
     gx_problem p;
     panel_problem(ctx, &p);
@@ -742,6 +779,7 @@ static int run_panel(pearlx_ctx *ctx, int col0, int ncols, uint32 *xr, const uin
         jobs[t].t = t;
         jobs[t].n = nthreads;
         jobs[t].nfull = p.Nt / nthreads * nthreads;
+        jobs[t].ctl = ctl;
         if (!xr) {
             jobs[t].job.xr_local = (uint32 *)(ctx->jp_rec + rec_bytes * t);
             jobs[t].key = key;
@@ -751,6 +789,11 @@ static int run_panel(pearlx_ctx *ctx, int col0, int ncols, uint32 *xr, const uin
         }
     }
     err = run_hvx_jobs(ctx, nthreads, gemmx_thread_run, jobs, sizeof(jobs[0]));
+    if (aborted) {
+        *aborted = 0;
+        for (int t = 0; t < nthreads; t++)
+            *aborted |= jobs[t].aborted;
+    }
     if (!xr && !err) {
         // The first hit in (column tile, row tile, half) order, and the total.
         memset(res, 0, sizeof(*res));
@@ -783,7 +826,7 @@ int pearlx_gemm_xor(remote_handle64 h, int col0, int ncols, uint32 *xr, int xrLe
     panel_problem(ctx, &p);
     if ((int64)(ncols / NT_COLS) * p.Mt * p.lines * 32 > xrLen || ((uintptr_t)xr & (VBYTES - 1)))
         return AEE_EBADPARM;
-    int err = run_panel(ctx, col0, ncols, xr, NULL, NULL, 0, NULL);
+    int err = run_panel(ctx, col0, ncols, xr, NULL, NULL, 0, NULL, NULL, NULL);
     *dsp_us = HAP_perf_get_time_us() - t0;
     return err;
 }
@@ -798,7 +841,8 @@ int pearlx_scan(remote_handle64 h, int col0, int ncols, const uint32 *key_bound,
         return AEE_EBADPARM;
     uint64 t0 = HAP_perf_get_time_us();
     jp_result res;
-    int err = run_panel(ctx, col0, ncols, NULL, key_bound, key_bound + 8, stop_on_hit, &res);
+    int err = run_panel(ctx, col0, ncols, NULL, key_bound, key_bound + 8, stop_on_hit, &res,
+                        NULL, NULL);
     if (!err) {
         hit[0] = (uint32)res.hits;
         hit[1] = (uint32)(res.hits ? res.t * MR : 0);
@@ -1079,16 +1123,10 @@ int pearlx_set_b_gen(remote_handle64 h, int n, int k, const uint32 *seed_label, 
     return AEE_SUCCESS;
 }
 
-int pearlx_set_a_gen(remote_handle64 h, const int8 *A, int ALen, int row0, int rows,
-                     int nthreads, const uint32 *seed_label, int slLen, const uint32 *pairs,
-                     int pairsLen, uint64 *dsp_us) {
-    pearlx_ctx *ctx = (pearlx_ctx *)h;
-    if (!ctx->Bz)
-        return AEE_EBADSTATE;
-    if (row0 < 0 || rows <= 0 || rows % GEN_ROWS || (int64)rows * ctx->k > ALen ||
-        slLen < 16 || pairsLen < 2 * ctx->k)
-        return AEE_EBADPARM;
-    uint64 t0 = HAP_perf_get_time_us();
+// The packed row panel of noisy A from its signal rows A (rows of them, noise rows from
+// row0); rows a multiple of GEN_ROWS.
+static int gen_a_panel(pearlx_ctx *ctx, const int8 *A, int row0, int rows, int nthreads,
+                       const uint32 *seed_label, const uint32 *pairs) {
     gx_problem p;
     int err = prepare_panel(ctx, rows, nthreads, &p);
     if (!err)
@@ -1105,8 +1143,112 @@ int pearlx_set_a_gen(remote_handle64 h, const int8 *A, int ALen, int row0, int r
     if (err)
         return err;
     ctx->a_rows = rows;
-    *dsp_us = HAP_perf_get_time_us() - t0;
     return AEE_SUCCESS;
+}
+
+int pearlx_set_a_gen(remote_handle64 h, const int8 *A, int ALen, int row0, int rows,
+                     int nthreads, const uint32 *seed_label, int slLen, const uint32 *pairs,
+                     int pairsLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    if (!ctx->Bz)
+        return AEE_EBADSTATE;
+    if (row0 < 0 || rows <= 0 || rows % GEN_ROWS || (int64)rows * ctx->k > ALen ||
+        slLen < 16 || pairsLen < 2 * ctx->k)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    int err = gen_a_panel(ctx, A, row0, rows, nthreads, seed_label, pairs);
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return err;
+}
+
+// An attempt's launches without a call per launch (see pearlx.idl): the host follows
+// through ctl, checking each launch's records while the DSP runs the next ones.
+int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int rows,
+                    int panel_rows, int launch_cols, int s0, int nbuf, int nthreads,
+                    const uint32 *seed_label, int slLen, const uint32 *pairs, int pairsLen,
+                    uint32 *ctl_words, int ctlLen, uint32 *xr, int xrLen, uint64 *dsp_us,
+                    uint64 *wait_us, int *launched) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    *dsp_us = *wait_us = 0;
+    *launched = 0;
+    if (!ctx->Bz)
+        return AEE_EBADSTATE;
+    const int n = ctx->n, k = ctx->k;
+    if (row0 < 0 || rows <= 0 || rows % GEN_ROWS || panel_rows <= 0 || panel_rows % GEN_ROWS ||
+        launch_cols <= 0 || launch_cols % NT_COLS || s0 < 0 || nbuf < 1 ||
+        (int64)rows * k > ALen || slLen < 16 || pairsLen < 2 * k || ctlLen < CTL_WORDS ||
+        ((uintptr_t)ctl_words & (VBYTES - 1)) || ((uintptr_t)xr & (VBYTES - 1)))
+        return AEE_EBADPARM;
+    gx_problem shape;
+    memset(&shape, 0, sizeof(shape));
+    gx_shape(&shape, n, k);
+    // Equal slots, each 128-byte aligned, big enough for the largest launch.
+    const size_t slot_words = (size_t)xrLen / nbuf / 32 * 32;
+    const int max_rows = panel_rows < rows ? panel_rows : rows;
+    const int max_cols = launch_cols < n ? launch_cols : n;
+    if ((size_t)(max_cols / NT_COLS) * (max_rows / MR) * shape.lines * 32 > slot_words)
+        return AEE_EBADPARM;
+
+    volatile uint32 *ctl = ctl_words;
+    ctl_pull(ctl);
+    ctl[CTL_LAUNCHED] = (uint32)s0;
+    ctl[CTL_EPOCH_ACK] = ctl[CTL_EPOCH];
+    ctl[CTL_STATE] = CTL_RUNNING;
+    ctl_push(ctl);
+
+    int err = AEE_SUCCESS, stopped = 0, s = s0;
+    uint64 busy = 0, waited = 0;
+    for (int r = 0; r < rows && !err && !stopped; r += panel_rows) {
+        const int prows = rows - r < panel_rows ? rows - r : panel_rows;
+        if (ctl_stop_requested(ctl)) {
+            stopped = 1;
+            break;
+        }
+        uint64 t0 = HAP_perf_get_time_us();
+        err = gen_a_panel(ctx, A + (size_t)r * k, row0 + r, prows, nthreads, seed_label, pairs);
+        busy += HAP_perf_get_time_us() - t0;
+        for (int col0 = 0; col0 < n && !err && !stopped; col0 += launch_cols, s++) {
+            const int cols = n - col0 < launch_cols ? n - col0 : launch_cols;
+            // Slot s % nbuf is free once the host has checked launch s - nbuf.
+            t0 = HAP_perf_get_time_us();
+            for (;;) {
+                ctl_pull(ctl);
+                if (ctl[CTL_STOP]) {
+                    stopped = 1;
+                    break;
+                }
+                if ((int)ctl[CTL_CHECKED] >= s - nbuf + 1)
+                    break;
+                qurt_timer_sleep(CTL_POLL_US);   // qurt_sleep is not exported to user PDs
+            }
+            waited += HAP_perf_get_time_us() - t0;
+            if (stopped)
+                break;
+            uint32 *slot = xr + (size_t)(s % nbuf) * slot_words;
+            int aborted = 0;
+            t0 = HAP_perf_get_time_us();
+            err = run_panel(ctx, col0, cols, slot, NULL, NULL, 0, NULL, ctl, &aborted);
+            if (!err && !aborted) {
+                // The records out to memory before the host is told they are there.
+                const size_t words = (size_t)(cols / NT_COLS) * (prows / MR) * shape.lines * 32;
+                qurt_mem_cache_clean((qurt_addr_t)slot, words * 4, QURT_MEM_CACHE_FLUSH,
+                                     QURT_MEM_DCACHE);
+            }
+            busy += HAP_perf_get_time_us() - t0;
+            if (err || aborted) {
+                stopped = aborted;
+                break;
+            }
+            ctl[CTL_LAUNCHED] = (uint32)(s + 1);
+            ctl_push(ctl);
+            (*launched)++;
+        }
+    }
+    ctl[CTL_STATE] = err ? CTL_FAILED : stopped ? CTL_STOPPED : CTL_DONE;
+    ctl_push(ctl);
+    *dsp_us = busy;
+    *wait_us = waited;
+    return err;
 }
 
 // ---- Keyed BLAKE3 chunk chaining values (the leaves of cp_noise.c's matrix hashes) ----

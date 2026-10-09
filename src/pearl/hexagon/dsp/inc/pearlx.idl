@@ -60,4 +60,21 @@ interface pearlx : remote_handle64 {
    // key: 8 words. cvs: 8 words per chunk, in chunk order. data and cvs 128-byte aligned.
    long chunk_cvs(in sequence<int8> data, in long raw_len, in sequence<uint32> key,
                   rout sequence<uint32> cvs, rout uint64 dsp_us);
+
+   // An attempt's launches, run back to back by the DSP itself: for each row panel of
+   // rows [row0, row0 + rows) (panel_rows at a time), set_a_gen from a_sig (those rows of
+   // signal A), then gemm_xor against launch_cols columns at a time across all of B.
+   // Launches are numbered from s0; launch s writes its records to slot s % nbuf of xr
+   // (xr split into nbuf equal slots), in gemm_xor's layout.
+   // ctl (64 words, 128-byte aligned) is shared with the host while the call runs. The
+   // DSP writes words 0..31 only: [0] launches finished (s + 1 after launch s, counted
+   // from 0, not from s0), [1] the host's epoch as read at the start, [2] state (1 running,
+   // 2 done, 3 stopped, 4 failed). The host writes words 32..63 only: [32] launches
+   // checked, [33] stop (nonzero: stop at the next column tile), [34] epoch. Launch s
+   // starts once launch s - nbuf is checked. launched: launches finished in this call.
+   long scan_run(in sequence<int8> a_sig, in long row0, in long rows, in long panel_rows,
+                 in long launch_cols, in long s0, in long nbuf, in long nthreads,
+                 in sequence<uint32> seed_label, in sequence<uint32> pairs,
+                 rout sequence<uint32> ctl, rout sequence<uint32> xr,
+                 rout uint64 dsp_us, rout uint64 wait_us, rout long launched);
 };

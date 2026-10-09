@@ -8,10 +8,10 @@ contexts).
 
 | Device | Backend | Hashrate (m = n = 32768) |
 |---|---|---|
-| Snapdragon 480 cDSP | hexagon | ~398 GMAC/s while scanning, ~397 GMAC/s overall |
+| Snapdragon 480 cDSP | hexagon | ~402 GMAC/s while scanning, ~401 GMAC/s overall |
 | Snapdragon 480 CPU (2x A76 + 6x A55) | cpu (NEON DotProd) | ~130 GMAC/s |
 
-The overall rate includes about 0.03 s of host work per 11.07 s attempt, while
+The overall rate includes about 0.03 s of host work per 10.98 s attempt, while
 the DSP is idle: the random signal A, its hash for the noise seed, and the
 permutation pairs. Each new job also idles the DSP for ~0.38 s:
 - ~0.07 s for the zero B's hash, which gives the B noise seed;
@@ -39,20 +39,21 @@ Where the scan rate goes, against the kernel's ~413 GMAC/s peak:
 |---|---|
 | Copying a 128 KB slice of B into VTCM per 128-column tile and K block, amortized over the launch's 1024 row tiles. An `l2fetch` of the slice before the copy cut this from ~1.6%; v66 has no user DMA (`dmstart` is v68+) to overlap it with compute | ~1.1% |
 | Other fixed costs per column tile and K block (kernel entry, the first row tile's A) | ~0.3% |
-| Generating and packing each row panel's noisy A (`set_a_gen`, ~9.7 ms per 8 launches) | ~0.7% |
-| FastRPC call per launch (~1.1 ms of 170 ms) and the gap between launches | ~1.4% |
+| Generating and packing each row panel's noisy A (~9.7 ms per 8 launches) | ~0.7% |
+| Writing each launch's 8 MiB of records out of the DSP's cache before announcing it (from the rise in DSP busy time) | ~0.2% |
+| The DSP idle: starting the `scan_run` call, and the host checking the last launch after the DSP has finished | ~0.25% |
 
-The per-launch call overhead was ~3 ms until the tile-XOR records moved to an
-**uncached** shared buffer. FastRPC invalidates a cached output buffer's 8 MiB in
-the CPU cache after every call. The host jackpot copies each 256-byte record in
-with wide loads, which keeps uncached reads cheap: about 0.9 s of CPU per
-attempt, overlapped with the DSP.
+With one FastRPC call per launch, the call and the gap between launches cost
+~1.1% (DSP busy 98.9% of the scan); the DSP now runs the launches itself (see
+[How it works](#how-it-works)). The tile-XOR records live in an **uncached**
+shared buffer, which the host reads while the DSP is still running. The host
+jackpot copies each 256-byte record in with wide loads, which keeps uncached
+reads cheap: about 0.9 s of CPU per attempt, overlapped with the DSP.
 
 The DSP library also has a `scan` method that runs the jackpot on the DSP (HVX
 BLAKE3, 32 hash tiles per vector) and returns only the first hit. Its results
 match the host jackpot exactly (checked by `pearlx_test`), but it adds ~2.9 ms of
-DSP time per launch. That's more than the ~1 ms of FastRPC overhead it would
-save, so the miner keeps the jackpot on the host.
+DSP time per launch, so the miner keeps the jackpot on the host.
 
 ## Hash tile: 4 x 64
 
@@ -81,14 +82,33 @@ backends' macro panels: by default 32 x 32 macros, so 4096 rows x 4096 columns
 | B noise seed (hash of the zero B^T), B permutation pairs | host | once per job |
 | Noisy B (signal B = 0) generated in packed layout (`pearlx set_b_gen`) | cDSP | once per job |
 | Sparse random signal A, its incremental hash, `a_noise_seed`, A permutation pairs | host | every attempt |
-| Noisy A of a row panel generated from its signal rows, in packed layout (`pearlx set_a_gen`) | cDSP | per panel, at its first launch |
-| GEMM + milestone XOR of the panel against one block of columns (`pearlx gemm_xor`) | cDSP | per launch |
+| Noisy A of a row panel generated from its signal rows, in packed layout | cDSP | per panel, before its first launch |
+| GEMM + milestone XOR of the panel against one block of columns | cDSP | per launch |
 | BLAKE3 jackpot over the launch's tile XORs | host, OpenMP | per launch |
 
-A dedicated thread issues the launches back to back. The mining thread follows,
-checking each finished launch. The DSP only waits when the record buffer it is
-about to reuse hasn't been checked yet. In practice it is busy about 98.8% of
-the scan.
+The DSP runs the launches itself (`pearlx scan_run`): one call covers whole row
+panels, with at most 128 MiB of signal A (the call maps those rows into the
+DSP), so an attempt at `--m 32` is one call and at the default size four. A
+dedicated host thread makes the calls back to back. Host and DSP follow each
+other through a 256-byte uncached control block:
+
+- **DSP → host:** after a launch's records are written out to memory, the DSP
+  publishes the number of launches finished.
+- **Host → DSP:** the mining thread polls that count, runs the jackpot over the
+  new launch, and publishes the number of launches checked. Launch s writes to
+  record slot s % 2 and starts once launch s - 2 is checked, so the host has a
+  whole launch of slack; the DSP sleeps 100 µs at a time if it gets ahead.
+- **Stop:** on a hit or a new job the host sets a stop word. The DSP checks it
+  between launches and at every 128-column tile inside one, so it returns within
+  ~12 ms (`pearlx_test -L 1` measures this).
+- **Epoch:** the host changes an epoch word every attempt and ignores counts the
+  DSP has not tagged with it, so nothing carries over from the previous attempt.
+
+Each side writes only its own 128-byte half of the block, so neither side's
+cache write-back can overwrite the other's words: the DSP flushes its half after
+writing it and invalidates the host's half before reading it. The host's start
+of the next launch no longer depends on its thread scheduling, and the DSP is
+busy ~99.75% of the scan, against 98.9% with one call per launch.
 
 Every hit is recomputed on the host before it becomes a share. The host builds
 the tile's A rows from signal A and its B columns from the job seed, using its
@@ -161,10 +181,10 @@ not counted.
 |---|---|
 | `cp_pearl_hexagon_worker.cpp` | Worker: job and attempt prep (seeds, signal A, its incremental hash), the launch pipeline, jackpot, hit recompute |
 | `cp_pearlx_client.c` | FastRPC client: loads `libcdsprpc.so` at run time and marshals the `pearlx` calls by hand. No Hexagon SDK headers are needed |
-| `dsp/inc/pearlx.idl` | DSP interface: `set_b_gen` and `set_a_gen` (noise generated on the DSP), `gemm_xor`, `chunk_cvs` (matrix hash leaves), `info`; `set_b`, `set_a` (pack host-built matrices) and `scan` (jackpot on the DSP) are used only by the self-test |
+| `dsp/inc/pearlx.idl` | DSP interface: `scan_run` (an attempt's launches, run by the DSP, with the control block), `set_b_gen` (noisy B generated on the DSP), `chunk_cvs` (matrix hash leaves), `info`; `set_a_gen` and `gemm_xor` (one panel / one launch per call), `set_b`, `set_a` (pack host-built matrices) and `scan` (jackpot on the DSP) are used only by the self-test |
 | `dsp/src/pearlx_imp.c` | DSP side: noise generation, packing, VTCM, threads over both HVX contexts, the DSP jackpot |
 | `dsp/src/pearlx.S`, `dsp/src/pearlx_xor.inc` | HVX kernel (Case 1.1 fold and reduction) |
-| `dsp/src/pearlx_test.c` | Android self-test against CPU references, plus timing: GEMM + XOR, the DSP jackpot (`-b` hit rate), the noise generators (`-G 1`) and the chunk hashes (`-H 1`), with the miner's `cp_noise.c` linked in as the reference |
+| `dsp/src/pearlx_test.c` | Android self-test against CPU references, plus timing: GEMM + XOR, the DSP jackpot (`-b` hit rate), the noise generators (`-G 1`), the chunk hashes (`-H 1`), and `scan_run` against one call per launch with records read during the run and a mid-run stop (`-L 1`; `-L 2` with a host slower than the DSP), with the miner's `cp_noise.c` linked in as the reference |
 | `dsp/CMakeLists.txt`, `dsp/build.ps1` | Hexagon SDK build of the DSP library and the self-test |
 
 ## Build

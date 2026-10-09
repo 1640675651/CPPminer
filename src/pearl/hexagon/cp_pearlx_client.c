@@ -42,7 +42,7 @@ struct remote_rpc_control_unsigned_module {
 /* Method ids follow the declaration order in pearlx.idl after open (0) and close (1). */
 #define PEARLX_URI "file:///libpearlx_skel.so?pearlx_skel_handle_invoke&_modver=1.0&_dom=cdsp"
 enum { PX_SET_B = 2, PX_SET_A = 3, PX_GEMM_XOR = 4, PX_INFO = 5, PX_SCAN = 6,
-       PX_SET_B_GEN = 7, PX_SET_A_GEN = 8, PX_CHUNK_CVS = 9 };
+       PX_SET_B_GEN = 7, PX_SET_A_GEN = 8, PX_CHUNK_CVS = 9, PX_SCAN_RUN = 10 };
 
 struct CpPearlx {
     void* lib;
@@ -247,6 +247,41 @@ int cp_pearlx_chunk_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const 
     ra[4].buf.nLen = cvs_words * 4;
     int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_CHUNK_CVS, 3, 2, 0, 0), ra);
     if(dsp_us) *dsp_us = out[0];
+    return err;
+}
+
+int cp_pearlx_scan_run(CpPearlx* px, const int8_t* a_sig, int row0, int rows, int k,
+                       int panel_rows, int launch_cols, int s0, int nbuf, int nthreads,
+                       const uint32_t seed_label[16], const uint32_t* pairs, uint32_t* ctl,
+                       uint32_t* xr, size_t xr_words, uint64_t* dsp_us, uint64_t* wait_us,
+                       int* launched)
+{
+    const size_t len = (size_t)rows * (size_t)k;
+    if(len > 0x7fffffffu || xr_words > 0x7fffffffu / 4) return -1;
+    uint32_t in[12] = {(uint32_t)len, (uint32_t)row0, (uint32_t)rows, (uint32_t)panel_rows,
+                       (uint32_t)launch_cols, (uint32_t)s0, (uint32_t)nbuf, (uint32_t)nthreads,
+                       16, (uint32_t)(2 * k), CP_PEARLX_CTL_WORDS, (uint32_t)xr_words};
+    uint64_t out[3] = {0, 0, 0};   /* dsp_us, wait_us, launched */
+    remote_arg ra[7];
+    memset(ra, 0, sizeof(ra));
+    ra[0].buf.pv = in;
+    ra[0].buf.nLen = sizeof(in);
+    ra[1].buf.pv = (void*)a_sig;
+    ra[1].buf.nLen = len;
+    ra[2].buf.pv = (void*)seed_label;
+    ra[2].buf.nLen = 16 * 4;
+    ra[3].buf.pv = (void*)pairs;
+    ra[3].buf.nLen = (size_t)2 * k * 4;
+    ra[4].buf.pv = out;
+    ra[4].buf.nLen = sizeof(out);
+    ra[5].buf.pv = ctl;
+    ra[5].buf.nLen = CP_PEARLX_CTL_WORDS * 4;
+    ra[6].buf.pv = xr;
+    ra[6].buf.nLen = xr_words * 4;
+    int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_SCAN_RUN, 4, 3, 0, 0), ra);
+    if(dsp_us) *dsp_us = out[0];
+    if(wait_us) *wait_us = out[1];
+    if(launched) memcpy(launched, &out[2], sizeof(int));
     return err;
 }
 

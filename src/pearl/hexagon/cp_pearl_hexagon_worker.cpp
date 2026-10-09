@@ -12,8 +12,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -33,11 +35,11 @@
  *   job:     noisy B (signal B = 0) generated packed in DSP memory (pearlx set_b_gen).
  *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs;
  *            then the matrix is scanned in launches of row_macros x col_macros 128x128
- *            macro blocks. Each row panel of noisy A is generated and packed on the DSP
- *            from the panel's signal rows (set_a_gen); each launch runs it against one
- *            block of columns (gemm_xor). A DSP thread issues the launches back to back;
- *            the mining thread follows, running the BLAKE3 jackpot over each finished
- *            launch.
+ *            macro blocks. The DSP runs the launches itself (scan_run): it generates and
+ *            packs each row panel of noisy A from the panel's signal rows, then runs it
+ *            against one block of columns per launch. The mining thread follows through a
+ *            shared control block, running the BLAKE3 jackpot over each finished launch,
+ *            and stops the DSP on a hit or a new job.
  * Hash tile: 4 rows x 64 columns (half a 4x128 HVX register tile), proof layout 4x64.
  */
 
@@ -56,9 +58,9 @@ CpPearlx* g_px = nullptr;
 int g_row_macros = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
 int g_col_macros = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
 
-/* One long-lived thread makes the DSP launches. FastRPC pairs every calling thread with
- * a thread on the DSP, so a new caller per launch pays that setup each time (~8 ms per
- * launch measured), and the host keeps the mining thread for the jackpot and noisy A. */
+/* One long-lived thread makes the DSP calls (scan_run blocks for a whole segment). FastRPC
+ * pairs every calling thread with a thread on the DSP, so a new caller per call pays that
+ * setup each time (~8 ms measured), and the mining thread stays free for the jackpot. */
 class DspThread {
 public:
     DspThread() : th_([this] { loop(); }) {}
@@ -141,22 +143,41 @@ struct JobCache {
     std::vector<uint32_t> pairs_b;   /* B-side permutation, for re-deriving hit columns */
 } g_job;
 
-/* Double-buffered launch records (rpcmem, shared with the DSP). */
+/* Launch s writes its records to slot s % kRecSlots; it starts once the host has checked
+ * launch s - kRecSlots, so the host has one launch of slack. */
+constexpr int kRecSlots = 2;
+/* Signal A per scan_run call: the call maps its rows of A into the DSP. */
+constexpr size_t kSegmentBytes = (size_t)128 << 20;
+
+/* Launch records and scan_run's control block (rpcmem, uncached, shared with the DSP). */
 struct Buffers {
     int rows = 0;
     int cols = 0;
-    size_t xr_words = 0;
-    uint32_t* xr[2] = {nullptr, nullptr};
+    size_t xr_words = 0;         /* per slot */
+    uint32_t* xr = nullptr;      /* kRecSlots slots */
+    uint32_t* ctl = nullptr;     /* CP_PEARLX_CTL_WORDS */
+    uint32_t epoch = 0;
 } g_buf;
 
 void free_buffers()
 {
-    for(int i = 0; i < 2; i++){
-        cp_pearlx_free(g_px, g_buf.xr[i]);
-        g_buf.xr[i] = nullptr;
-    }
+    cp_pearlx_free(g_px, g_buf.xr);
+    cp_pearlx_free(g_px, g_buf.ctl);
+    g_buf.xr = nullptr;
+    g_buf.ctl = nullptr;
     g_buf.rows = g_buf.cols = 0;
     g_buf.xr_words = 0;
+}
+
+/* The control block's words (cp_pearlx_client.h): the host stores only its own half. */
+uint32_t ctl_load(int w)
+{
+    return __atomic_load_n(&g_buf.ctl[w], __ATOMIC_ACQUIRE);
+}
+
+void ctl_store(int w, uint32_t v)
+{
+    __atomic_store_n(&g_buf.ctl[w], v, __ATOMIC_RELEASE);
 }
 
 /* Launch size for an m x n matrix (m, n multiples of 1024): rows x cols, at most. */
@@ -172,16 +193,15 @@ int ensure_buffers(int rows, int cols)
         return 0;
     free_buffers();
     const size_t xr_words = (size_t)(cols / kRegCols) * (rows / kTileRows) * kRecWords;
-    for(int i = 0; i < 2; i++){
-        /* Uncached: the DSP writes 8 MiB of records per launch, and invalidating them in
-         * the CPU cache on every call cost ~2 ms of the call (~1%). The jackpot reads them
-         * slower, but it runs while the DSP is busy. */
-        g_buf.xr[i] = (uint32_t*)cp_pearlx_alloc_uncached(g_px, xr_words * sizeof(uint32_t));
-        if(!g_buf.xr[i]){
-            fprintf(stderr, "[hexagon] rpcmem allocation failed (launch %d x %d)\n", rows, cols);
-            free_buffers();
-            return -1;
-        }
+    /* Uncached: the host reads the records while the DSP is still running, and the DSP
+     * writes them out to memory itself. The jackpot reads them slower, but it runs while
+     * the DSP is busy. */
+    g_buf.xr = (uint32_t*)cp_pearlx_alloc_uncached(g_px, kRecSlots * xr_words * sizeof(uint32_t));
+    g_buf.ctl = (uint32_t*)cp_pearlx_alloc_uncached(g_px, CP_PEARLX_CTL_WORDS * sizeof(uint32_t));
+    if(!g_buf.xr || !g_buf.ctl){
+        fprintf(stderr, "[hexagon] rpcmem allocation failed (launch %d x %d)\n", rows, cols);
+        free_buffers();
+        return -1;
     }
     g_buf.rows = rows;
     g_buf.cols = cols;
@@ -594,7 +614,8 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     auto check = [&](int s) {
         const double t = cp_now_sec();
         const Launch& l = launches[s];
-        Hit h = check_launch(l, g_buf.xr[s & 1], a_key8, bound);
+        Hit h = check_launch(l, g_buf.xr + (size_t)(s % kRecSlots) * g_buf.xr_words, a_key8,
+                             bound);
         if(h.found && verify_hit(h, h_A_sig, a_seed, pairs_a.data(), a_key8, bound) != 0)
             h.found = 0;
         tiles_done += launch_tiles(l);
@@ -602,64 +623,83 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         return h;
     };
 
-    /* The DSP thread runs the launches back to back, generating each row panel's noisy A
-     * at the panel's first launch; it only waits for the host when the record buffer it
-     * is about to reuse is not checked yet. The host follows, checking each launch. */
-    struct Pipe {
-        std::mutex mu;
-        std::condition_variable cv;
-        int launched = 0;   /* launches the DSP has finished */
-        int checked = 0;    /* launches the host has checked: their record buffer is free */
-        bool stop = false;
+    /* The DSP runs the launches itself (pearlx scan_run), generating each row panel's noisy
+     * A at its start and waiting only when the record slot it is about to reuse is not
+     * checked yet. The host follows through the control block, checking each launch, and
+     * sets its stop word on a hit or a new job. One call covers whole row panels with at
+     * most kSegmentBytes of signal A; the DSP thread makes the calls back to back. */
+    struct Segment {
+        int row0, rows, s0, launches;
+    };
+    std::vector<Segment> segments;
+    const int per_panel = launches[0].launches_in_panel;
+    const int seg_panels = std::max(1, (int)(kSegmentBytes / ((size_t)g_buf.rows * K_DIM)));
+    for(int p = 0; p < panels; p += seg_panels){
+        const int np = std::min(seg_panels, panels - p);
+        const int row0 = p * g_buf.rows;
+        int rows = 0;
+        for(int q = p; q < p + np; q++) rows += panel_rows[q];
+        segments.push_back({row0, rows, p * per_panel, np * per_panel});
+    }
+
+    struct Run {
+        std::atomic<bool> stop{false};
+        std::atomic<bool> done{false};
         int err = 0;
-        uint64_t dsp_us = 0;
-    } pipe;
+        uint64_t dsp_us = 0, wait_us = 0;
+    } run;
+    const uint32_t epoch = ++g_buf.epoch;
+    ctl_store(CP_PEARLX_CTL_CHECKED, 0);
+    ctl_store(CP_PEARLX_CTL_STOP, 0);
+    ctl_store(CP_PEARLX_CTL_EPOCH, epoch);
 
     g_dsp->start([&]() {
-        for(int s = 0; s < S; s++){
-            const Launch& l = launches[s];
-            {
-                std::unique_lock<std::mutex> lock(pipe.mu);
-                pipe.cv.wait(lock, [&] { return pipe.stop || pipe.checked >= s - 1; });
-                if(pipe.stop) return;
-            }
-            uint64_t us_a = 0, us = 0;
-            int err = 0;
-            if(l.first_in_panel)
-                err = cp_pearlx_set_a_gen(g_px, h_A_sig + (size_t)l.row0 * K_DIM, l.row0, l.rows,
-                                          K_DIM, 0, a_seed_label, pairs_a.data(), &us_a);
-            if(!err)
-                err = cp_pearlx_gemm_xor(g_px, l.col0, l.cols, g_buf.xr[s & 1], g_buf.xr_words,
-                                         &us);
-            {
-                std::lock_guard<std::mutex> lock(pipe.mu);
-                pipe.dsp_us += us_a + us;
-                pipe.err = err;
-                if(!err) pipe.launched = s + 1;
-            }
-            pipe.cv.notify_all();
-            if(err) return;
-        }
-    });
-
-    for(int s = 0; s < S; s++){
-        {
-            const double t = cp_now_sec();
-            std::unique_lock<std::mutex> lock(pipe.mu);
-            pipe.cv.wait(lock, [&] { return pipe.err || pipe.launched > s; });
-            wait_sec += cp_now_sec() - t;
-            if(pipe.err){
-                fprintf(stderr, "[hexagon] pearlx launch failed (0x%x)\n", pipe.err);
-                rc = -2;
+        for(const Segment& g : segments){
+            if(run.stop.load()) break;
+            uint64_t dsp_us = 0, wait_us = 0;
+            int done = 0;
+            const int err = cp_pearlx_scan_run(
+                g_px, h_A_sig + (size_t)g.row0 * K_DIM, g.row0, g.rows, K_DIM, g_buf.rows,
+                g_buf.cols, g.s0, kRecSlots, 0, a_seed_label, pairs_a.data(), g_buf.ctl,
+                g_buf.xr, kRecSlots * g_buf.xr_words, &dsp_us, &wait_us, &done);
+            run.dsp_us += dsp_us;
+            run.wait_us += wait_us;
+            if(err){
+                run.err = err;
                 break;
             }
+            if(done < g.launches) break;   /* stopped */
+        }
+        run.done.store(true);
+    });
+    /* Launches the DSP has finished in this attempt (0 until it has seen this epoch). */
+    auto finished = [&]() {
+        return ctl_load(CP_PEARLX_CTL_EPOCH_ACK) == epoch ? (int)ctl_load(CP_PEARLX_CTL_LAUNCHED)
+                                                          : 0;
+    };
+
+    for(int s = 0; s < S; s++){
+        const double t = cp_now_sec();
+        bool cancelled = false;
+        while(finished() <= s && !run.done.load()){
+            if(cp_job_should_cancel()){
+                cancelled = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+        wait_sec += cp_now_sec() - t;
+        if(cancelled)
+            break;
+        if(finished() <= s){
+            if(run.err){
+                fprintf(stderr, "[hexagon] pearlx scan_run failed (0x%x)\n", run.err);
+                rc = -2;
+            }
+            break;
         }
         hit = check(s);
-        {
-            std::lock_guard<std::mutex> lock(pipe.mu);
-            pipe.checked = s + 1;
-        }
-        pipe.cv.notify_all();
+        ctl_store(CP_PEARLX_CTL_CHECKED, (uint32_t)(s + 1));
         if(hit.found || cp_job_should_cancel())
             break;
 
@@ -674,19 +714,17 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
             last_report = now;
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(pipe.mu);
-        pipe.stop = true;
-    }
-    pipe.cv.notify_all();
+    /* Stops the DSP mid-launch after a hit or a cancel; after the last launch a no-op. */
+    run.stop.store(true);
+    ctl_store(CP_PEARLX_CTL_STOP, 1);
     g_dsp->wait();
-    const uint64_t dsp_us_total = pipe.dsp_us;
 
     const double scan_sec = cp_now_sec() - scan_t0;
     if(out_tiles_scanned) *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("hexagon", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[hexagon] scan %.3fs: DSP busy %.3fs; host jackpot %.3fs, waiting for the DSP "
-           "%.3fs\n", scan_sec, dsp_us_total / 1e6, check_sec, wait_sec);
+    printf("[hexagon] scan %.3fs: DSP busy %.3fs, waited for the host %.3fs; host jackpot "
+           "%.3fs, waiting for the DSP %.3fs\n", scan_sec, run.dsp_us / 1e6, run.wait_us / 1e6,
+           check_sec, wait_sec);
     fflush(stdout);
     if(rc != 0)
         return rc;

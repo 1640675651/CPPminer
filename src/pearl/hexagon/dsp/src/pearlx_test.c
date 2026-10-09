@@ -2,11 +2,13 @@
 // each panel of random A rows packs it (set_a) and runs every column block
 // (gemm_xor); checks hash-tile XORs against a CPU reference and reports rates.
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "AEEStdErr.h"
 #include "remote.h"
 #include "rpcmem.h"
@@ -227,9 +229,180 @@ static int hash_test(remote_handle64 h, size_t bytes) {
     return bad ? 1 : 0;
 }
 
+/* scan_run's control block words (pearlx.idl). */
+enum { CTL_LAUNCHED = 0, CTL_EPOCH_ACK = 1, CTL_STATE = 2, CTL_CHECKED = 32, CTL_STOP = 33,
+       CTL_EPOCH = 34, CTL_WORDS = 64 };
+
+typedef struct {
+    remote_handle64 h;
+    const int8_t *sig;
+    int k, rows, panel_rows, cols, nbuf;
+    const uint32_t *seed_label, *pairs;
+    uint32_t *ctl, *xr;
+    size_t xr_words;
+    uint64 dsp_us, wait_us;
+    int launched, err;
+    volatile int done;
+    uint64_t t_start, t_return;
+} run_call;
+
+static void *run_thread(void *arg) {
+    run_call *c = arg;
+    c->t_start = now_us();
+    c->err = pearlx_scan_run(c->h, c->sig, c->rows * c->k, 0, c->rows, c->panel_rows, c->cols,
+                             0, c->nbuf, 0, c->seed_label, 16, c->pairs, 2 * c->k, c->ctl,
+                             CTL_WORDS, c->xr, (int)c->xr_words, &c->dsp_us, &c->wait_us,
+                             &c->launched);
+    c->t_return = now_us();
+    __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static uint64_t fnv64(const uint32_t *w, size_t n) {
+    uint64_t x = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++)
+        x = (x ^ w[i]) * 1099511628211ull;
+    return x;
+}
+
+/* -L 1: scan_run, followed from this thread as the miner does, against the same launches
+ * made one call at a time (set_a_gen per panel, gemm_xor per launch): every launch's
+ * records, copied out while the DSP is already running the next ones, must match. Then the
+ * stop word, set mid-run, must end the call early. -L 2: the host takes longer per launch
+ * than the DSP, so the DSP has to wait for free record slots. */
+static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int panels,
+                    int slow_host) {
+    const int lines = (k / MS_K * 2 + 31) / 32, nbuf = 2;
+    const int per_panel = n / cols, S = panels * per_panel, m = panels * rows;
+    const size_t slot_words = (size_t)(cols / 128) * (rows / 4) * lines * 32;
+    int8_t *sig = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)m * k);
+    uint32_t *xr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED,
+                                nbuf * slot_words * 4);
+    uint32_t *ctl = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, CTL_WORDS * 4);
+    uint32_t *copy = malloc(slot_words * 4), *pairs_a = malloc((size_t)k * 8);
+    uint32_t *pairs_b = malloc((size_t)k * 8);
+    uint64_t *ref = malloc(S * sizeof(uint64_t));
+    if (!sig || !xr || !ctl || !copy || !pairs_a || !pairs_b || !ref) {
+        printf("ERROR: allocation failed\n");
+        return 1;
+    }
+    uint8_t a_seed[32], b_seed[32];
+    uint32_t sd = 4242;
+    for (int i = 0; i < 32; i++) {
+        a_seed[i] = (uint8_t)(lcg(&sd) >> 24);
+        b_seed[i] = (uint8_t)(lcg(&sd) >> 24);
+    }
+    for (size_t i = 0; i < (size_t)m * k; i++)
+        sig[i] = (int8_t)((int)(lcg(&sd) >> 25) - 64);
+    pearl_build_perm_pairs_a(a_seed, k, 128, pairs_a);
+    pearl_build_perm_pairs_b(b_seed, k, 128, pairs_b);
+    uint32_t a_sl[16], b_sl[16];
+    seed_label_words(a_seed, PEARL_SEED_LABEL_A, a_sl);
+    seed_label_words(b_seed, PEARL_SEED_LABEL_B, b_sl);
+    printf("scan_run test: %d launches of %d x %d (%d panels), %d record slots%s\n", S, rows,
+           cols, panels, nbuf, slow_host ? ", slow host" : "");
+
+    int err = 0;
+    uint64 us = 0;
+    if ((err = pearlx_set_b_gen(h, n, k, b_sl, 16, pairs_b, 2 * k, &us))) goto fail;
+    /* Reference: one call per panel and per launch. Its cost outside the DSP is each call's
+     * time minus the DSP's time in it (the hashing between calls is not counted). */
+    uint64_t t0, call_old = 0, dsp_old = 0;
+    for (int p = 0, s = 0; p < panels; p++) {
+        t0 = now_us();
+        if ((err = pearlx_set_a_gen(h, sig + (size_t)p * rows * k, rows * k, p * rows, rows, 0,
+                                    a_sl, 16, pairs_a, 2 * k, &us)))
+            goto fail;
+        call_old += now_us() - t0;
+        dsp_old += us;
+        for (int c = 0; c < per_panel; c++, s++) {
+            t0 = now_us();
+            if ((err = pearlx_gemm_xor(h, c * cols, cols, xr, (int)slot_words, &us))) goto fail;
+            call_old += now_us() - t0;
+            dsp_old += us;
+            ref[s] = fnv64(xr, slot_words);
+        }
+    }
+
+    /* scan_run, followed from here. */
+    for (int pass = 0; pass < 2; pass++) {
+        const int stop_after = pass ? (S > 3 ? 3 : 1) : S;   /* pass 1: stop mid-run */
+        /* Word stores: memset may use cache-zeroing instructions, unsafe on uncached memory. */
+        for (int w = 0; w < CTL_WORDS; w++)
+            __atomic_store_n(&ctl[w], 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctl[CTL_EPOCH], (uint32_t)(pass + 7), __ATOMIC_RELEASE);
+        run_call rc = { h, sig, k, m, rows, cols, nbuf, a_sl, pairs_a, ctl, xr,
+                        nbuf * slot_words, 0, 0, 0, 0, 0 };
+        pthread_t th;
+        t0 = now_us();
+        if (pthread_create(&th, NULL, run_thread, &rc)) {
+            printf("ERROR: pthread_create\n");
+            return 1;
+        }
+        int bad = 0, seen = 0;
+        uint64_t stop_t = 0;
+        for (int s = 0; s < stop_after; s++) {
+            for (;;) {
+                const uint32_t ack = __atomic_load_n(&ctl[CTL_EPOCH_ACK], __ATOMIC_ACQUIRE);
+                const uint32_t done = __atomic_load_n(&ctl[CTL_LAUNCHED], __ATOMIC_ACQUIRE);
+                if (ack == (uint32_t)(pass + 7) && (int)done > s)
+                    break;
+                if (__atomic_load_n(&rc.done, __ATOMIC_ACQUIRE))
+                    break;
+                usleep(200);
+            }
+            if ((int)__atomic_load_n(&ctl[CTL_LAUNCHED], __ATOMIC_ACQUIRE) <= s)
+                break;
+            memcpy(copy, xr + (size_t)(s % nbuf) * slot_words, slot_words * 4);
+            bad += fnv64(copy, slot_words) != ref[s];
+            seen++;
+            if (slow_host)
+                usleep(400000);
+            __atomic_store_n(&ctl[CTL_CHECKED], (uint32_t)(s + 1), __ATOMIC_RELEASE);
+        }
+        if (pass) {
+            stop_t = now_us();
+            __atomic_store_n(&ctl[CTL_STOP], 1u, __ATOMIC_RELEASE);
+        }
+        pthread_join(th, NULL);
+        if (rc.err) {
+            err = rc.err;
+            goto fail;
+        }
+        if (!pass) {
+            /* scan_run's cost outside the DSP: the call's time minus the DSP's work and its
+             * waits for this thread. */
+            const uint64_t call_new = rc.t_return - rc.t_start;
+            printf("  one call per launch: %.1f ms in calls, %.1f ms DSP: %.2f ms per launch "
+                   "outside the DSP\n", call_old / 1e3, dsp_old / 1e3,
+                   ((double)call_old - dsp_old) / 1e3 / S);
+            printf("  scan_run:            %.1f ms in the call, %.1f ms DSP, %.1f ms waiting "
+                   "for this thread: %.2f ms per launch outside the DSP\n", call_new / 1e3,
+                   rc.dsp_us / 1e3, rc.wait_us / 1e3,
+                   ((double)call_new - rc.dsp_us - rc.wait_us) / 1e3 / S);
+            printf("run check: %s (%d of %d launches' records differ, read during the run)\n",
+                   bad || seen != S ? "FAIL" : "PASS", bad, S);
+            if (bad || seen != S || rc.launched != S) err = -1;
+        } else {
+            const uint32_t state = __atomic_load_n(&ctl[CTL_STATE], __ATOMIC_ACQUIRE);
+            const int ok = !bad && rc.launched < S && state == 3;
+            printf("stop check: %s (stop after %d launches: the DSP finished %d, state %u, "
+                   "returned %.1f ms after the stop)\n", ok ? "PASS" : "FAIL", stop_after,
+                   rc.launched, state, (now_us() - stop_t) / 1e3);
+            if (!ok) err = -1;
+        }
+        if (err) break;
+    }
+    return err ? 1 : 0;
+fail:
+    printf("ERROR 0x%x in scan_run test\n", err);
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     int n = 4096, k = 4096, rows = 1024, cols = 4096, panels = 4, threads = 0, check = 1;
     int samples = 4096, jackpot = 1, hit_bits = 14, xr_uncached = 0, gen = 0, hash = 0;
+    int run = 0;
     for (int a = 1; a + 1 < argc; a += 2) {
         int v = atoi(argv[a + 1]);
         if (!strcmp(argv[a], "-n")) n = v;
@@ -245,11 +418,12 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[a], "-u")) xr_uncached = v;
         else if (!strcmp(argv[a], "-G")) gen = v;
         else if (!strcmp(argv[a], "-H")) hash = v;
+        else if (!strcmp(argv[a], "-L")) run = v;
         else { printf("unknown option %s\n", argv[a]); return 1; }
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
            " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1] [-b hit_bits] [-u 0|1]"
-           " [-G 0|1] [-H 0|1]\n");
+           " [-G 0|1] [-H 0|1] [-L 0|1|2]\n");
     /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
     uint32_t key_bound[16];
     for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
@@ -295,6 +469,12 @@ int main(int argc, char *argv[]) {
     printf("pearlx: n=%d k=%d, %d panels of %d rows, %d columns per call; DSP %d HVX, %d MHz, "
            "VTCM %d KB, vote %s\n", n, k, panels, rows, cols, hvx, mhz, vtcm, vote ? "FAILED" : "ok");
 
+    if (run) {
+        err = run_test(h, n, k, rows, cols, panels, run == 2);
+        pearlx_close(h);
+        printf("%s\n", err ? "FAILED" : "Success");
+        return err ? 1 : 0;
+    }
     if (hash) {
         err = hash_test(h, (size_t)n * k);
         pearlx_close(h);
