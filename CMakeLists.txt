@@ -453,6 +453,10 @@ elseif(CP_ENABLE_ONEDNN)
 endif()
 
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
+# CP_PROOF_FFI=OFF forces the stub, e.g. for a cross build where cargo cannot
+# target the device (-DCARGO_EXECUTABLE=...-NOTFOUND does not stick: find_program
+# re-searches a NOTFOUND cache entry on every reconfigure).
+option(CP_PROOF_FFI "Build and link the Rust proof FFI (needs cargo for the target)" ON)
 set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi)
 set(CP_PROOF_FFI_MANIFEST ${CP_PROOF_FFI_DIR}/Cargo.toml)
 find_program(CARGO_EXECUTABLE cargo
@@ -493,7 +497,7 @@ else()
 endif()
 
 set(_cp_link_proof_ffi FALSE)
-if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
+if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
         ${CP_PROOF_FFI_DIR}/src/*.rs)
     add_custom_command(
@@ -518,12 +522,17 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     add_dependencies(cppminer cp_proof_ffi_build)
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
-elseif(EXISTS ${_cp_proof_lib})
+elseif(CP_PROOF_FFI AND EXISTS ${_cp_proof_lib} AND NOT CMAKE_CROSSCOMPILING)
     # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
+    # Not when cross-compiling: the archive in target/release/ was built for
+    # the host, and lld only reports "archive member is neither ET_REL nor
+    # LLVM bitcode" at link time.
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
 else()
-    if(NOT CARGO_EXECUTABLE)
+    if(NOT CP_PROOF_FFI)
+        message(STATUS "cp_proof_ffi: disabled (CP_PROOF_FFI=OFF); using proof stub")
+    elseif(NOT CARGO_EXECUTABLE)
         message(WARNING "cargo not found; using proof stub (no share submit proofs)")
     elseif(NOT _cp_proof_deps_ok)
         message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
