@@ -92,6 +92,23 @@
 #ifndef CASE32_USE_LDS
 #define CASE32_USE_LDS 0
 #endif
+/* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
+   KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
+   -DCASE32_PIPELINE=0 restores the plain load-then-dot loop. */
+#ifndef CASE32_PIPELINE
+#define CASE32_PIPELINE 1
+#endif
+#if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
+#undef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+/* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
+#ifndef SWZ_IM
+#define SWZ_IM 8
+#endif
+#ifndef SWZ_JM
+#define SWZ_JM 4
+#endif
 #ifndef CASE32_CPM_INT
 #define CASE32_CPM_INT 0
 #endif
@@ -334,6 +351,56 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
 #endif
 }
 
+/* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
+   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
+   KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
+   load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
+   dwordx4 even for compilers that do not infer alignment through vload4(char*). */
+#if (MR % 4) == 0 && (NR % 4) == 0 && RANK == 4
+#define CASE32_VEC_LOADS 1
+#else
+#define CASE32_VEC_LOADS 0
+#endif
+
+inline void case32_load_a_pack(__private int *a_pack, __global const char *a_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *a_v = (__global const uint4 *)a_kg;
+    #pragma unroll
+    for (int i = 0; i < MR / 4; ++i) {
+        const uint4 v = a_v[i];
+        a_pack[4 * i + 0] = as_int(v.s0);
+        a_pack[4 * i + 1] = as_int(v.s1);
+        a_pack[4 * i + 2] = as_int(v.s2);
+        a_pack[4 * i + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+    }
+#endif
+}
+
+inline void case32_load_b_pack(__private int *b_pack, __global const char *b_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *b_v = (__global const uint4 *)b_kg;
+    #pragma unroll
+    for (int j = 0; j < NR / 4; ++j) {
+        const uint4 v = b_v[j];
+        b_pack[4 * j + 0] = as_int(v.s0);
+        b_pack[4 * j + 1] = as_int(v.s1);
+        b_pack[4 * j + 2] = as_int(v.s2);
+        b_pack[4 * j + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+    }
+#endif
+}
+
 #if CASE32_USE_LDS
 /* Case 3.4: all WIs cooperatively copy A/B kg-strips into SLM (coalesced 16B). */
 inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int nbytes,
@@ -350,6 +417,11 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
+#if !defined(CASE32_WMMA)
+#ifdef CASE32_REQD_WG
+/* Host passes the exact launch local size when one macro block fits a work-group. */
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -367,8 +439,28 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
     const int mb = mb_begin + (int)get_group_id(0);
-    const int jm = mb / macro_rows;
-    const int im = mb % macro_rows;
+    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+       walk every im for one jm: each resident work-group streams its own A strip
+       from DRAM and A is never reused from L2 (the whole of A is re-read once per
+       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+       all addressing derive from (im, jm). Falls back to the linear map when the
+       macro grid is not divisible (uniform branch). */
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
 
     const int tr0 = im * MICRO_M;
     const int tc0 = jm * MICRO_N;
@@ -414,6 +506,27 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         }
 #if !CASE32_PACKED_DOT
         cpm_vec cpm[CPM_NVEC];
+#endif
+#if CASE32_PIPELINE
+        /* Software pipeline (register double buffer). In the coalesced layout a WI's
+           operands for k-group (kb, kg) sit at a_run + (kb*KGROUPS + kg)*MACRO_KG_STRIP_A
+           (same for B), i.e. the whole K walk is one flat stride, so the prefetch runs
+           across kb boundaries and never drains. Buffer 0 holds the k-group being
+           consumed; the loop is unrolled x2 so buffers alternate without copies. */
+        __global const char *a_run =
+                a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)tr * (size_t)KG_BYTES_A;
+        __global const char *b_run =
+                b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)tc * (size_t)KG_SLICE_B;
+        const int kg_last = blocks_k * KGROUPS - 1;
+        int kg_flat = 0;
+        int a_p0[MR];
+        int b_p0[NR];
+        int a_p1[MR];
+        int b_p1[NR];
+        case32_load_a_pack(a_p0, a_run);
+        case32_load_b_pack(b_p0, b_run);
 #endif
         int ms = 0;
         for (int kb = 0; kb < blocks_k; ++kb) {
@@ -470,6 +583,30 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             }
             barrier(CLK_LOCAL_MEM_FENCE);
         }
+#elif CASE32_PIPELINE
+        (void)a_kb_base;
+        (void)b_kb_base;
+        for (int kg = 0; kg < KGROUPS; kg += 2) {
+            /* kg+1 always exists (KGROUPS even); kg+2 may be the next kb's first
+               k-group, clamp at the very end (re-reads the last k-group, harmless). */
+            const int kg_n1 = kg_flat + 1;
+            const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
+            case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
+#else
+            case32_accum_kgroup(acc, cpm, a_p0, b_p0);
+#endif
+            case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
+#if CASE32_PACKED_DOT
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
+#else
+            case32_accum_kgroup(acc, cpm, a_p1, b_p1);
+#endif
+            kg_flat += 2;
+        }
 #else
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg =
@@ -481,15 +618,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
             int a_pack[MR];
             int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
@@ -507,19 +637,12 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg = a_tile + (size_t)kg * (size_t)KG_BYTES_A;
-            int a_pack[MR];
-            int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
             __global const char *b_kg =
                     b_tile + (size_t)kg * (size_t)KG_SLICE_B;
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
 #if CASE32_PACKED_DOT
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
@@ -612,3 +735,425 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         *out_t_cols = t_cols;
     }
 }
+#else /* CASE32_WMMA */
+
+/* =====================================================================================
+ * AMD WMMA (matrix core) path: --ocl-dot wmma, -DCASE32_WMMA=11 (gfx11, RDNA3) or
+ * -DCASE32_WMMA=12 (gfx12, RDNA4). Needs wave32, the 8x16 hash tile and RANK=4 prepack.
+ *
+ * Work split. One wave32 owns a 64x64 C sub-tile of the macro block: 4x4 WMMA blocks of
+ * 16x16 = 8x4 hash tiles of 8x16 = 32 hash tiles, i.e. one hash tile per lane for the
+ * msg[16] fold and BLAKE3. A 128x128 macro block is 4 waves = 128 WIs, the same local
+ * size (MACRO_M/8 * MACRO_N/16) the dot4 kernel launches with; 64x64 is one wave.
+ *
+ *      macro block (128x128)            one wave's 64x64 (16x16 WMMA blocks bi x bj)
+ *   +-------------+-------------+         bj=0    bj=1    bj=2    bj=3
+ *   | wave 0      | wave 2      |  bi=0 | t0   | t8   | t16  | t24  |  rows 0..7  (top)
+ *   | wm=0 wn=0   | wm=0 wn=1   |       | t1   | t9   | t17  | t25  |  rows 8..15 (bottom)
+ *   +-------------+-------------+  bi=1 | t2   | t10  | ...
+ *   | wave 1      | wave 3      |       | t3   | t11  | ...
+ *   | wm=1 wn=0   | wm=1 wn=1   |  ...       t = bj*8 + bi*2 + half
+ *   +-------------+-------------+  after the milestone reduce-scatter lane t holds tile t
+ *
+ * Operands come from the default coalesced prepack, unchanged: inside one macro block,
+ * flat k-group g (4 k) of row r (A) / column c (B) is the dword at byte g*STRIP + r*4,
+ * STRIP = MACRO_M*4 (MACRO_KG_STRIP_A/B). A 16-k WMMA step is 4 consecutive k-groups, so
+ * every lane gathers its operand with dword loads at a STRIP stride; the 16 lanes of a
+ * half-wave read 64 consecutive bytes per k-group (fully coalesced).
+ *
+ * gfx11 wave32 V_WMMA_I32_16X16X16_IU8 (A, B: 4 VGPRs; C, D: 8 VGPRs):
+ *   A: lane l holds row m = l%16, VGPR q = k 4q..4q+3 (byte j of the dword = k 4q+j);
+ *      lanes 16..31 must carry a copy of lanes 0..15 (they load the same addresses).
+ *   B: lane l holds column n = l%16, same k packing.
+ *   D: VGPR e of lane l = D[2e + l/16][l%16]:
+ *                 lanes 0..15     lanes 16..31
+ *        VGPR 0   row  0          row  1        \
+ *        VGPR 1   row  2          row  3         | top hash tile    (rows 0..7)
+ *        VGPR 2   row  4          row  5         |
+ *        VGPR 3   row  6          row  7        /
+ *        VGPR 4   row  8          row  9        \
+ *        ...                                     | bottom hash tile (rows 8..15)
+ *        VGPR 7   row 14          row 15        /
+ *
+ * gfx12 wave32 V_WMMA_I32_16X16X16_IU8 (A, B: 2 VGPRs; C, D: 8 VGPRs), h = l/16:
+ *   A: lane l holds row m = l%16, no duplication across the halves.
+ *      CASE32_WMMA_G12_KSPLIT=0 (default, RDNA4 ISA guide):
+ *          VGPR0 = k 4h..4h+3, VGPR1 = k 8+4h..8+4h+3
+ *          (lanes 0..15: k 0-3, 8-11; lanes 16..31: k 4-7, 12-15)
+ *      CASE32_WMMA_G12_KSPLIT=1 (alternative, for the self-test):
+ *          VGPR0 = k 8h..8h+3, VGPR1 = k 8h+4..8h+7
+ *   B: same with column n = l%16.
+ *   D: VGPR e of lane l = D[e + 8*(l/16)][l%16]:
+ *                 lanes 0..15     lanes 16..31
+ *        VGPR e   row e           row 8+e
+ *      -> lanes 0..15 hold the top hash tile, lanes 16..31 the bottom one.
+ *   These gfx12 assumptions are unverified until CP_OCL_WMMA_SELFTEST=1 runs on gfx12.
+ *
+ * Milestones. Every KR = 128 k the 32 hash-tile words of a wave are formed in two steps:
+ * each lane XORs the D elements it owns per hash tile (2 partials per WMMA block, 32 per
+ * lane), then a 5-stage XOR reduce-scatter over ds_swizzle (xor 16, 8, 4, 2, 1; 31
+ * swizzles) leaves the complete word of hash tile t in lane t. XOR and int32 wrap-around
+ * accumulation are both order-independent, so the words equal the dot4 kernel's exactly.
+ * ===================================================================================== */
+#if CASE32_WMMA != 11 && CASE32_WMMA != 12
+#error CASE32_WMMA must be 11 (gfx11) or 12 (gfx12)
+#endif
+#if MR != 8 || NR != 16 || HASH_NR != 16 || RANK != 4 || KR != 128
+#error WMMA path needs the 8x16 hash tile, RANK=4 prepack and KR=128
+#endif
+#if (MACRO_M % 64) != 0 || (MACRO_N % 64) != 0 || MACRO_M != MACRO_N
+#error WMMA path needs a 64x64 or 128x128 macro block
+#endif
+#if CASE32_USE_LDS
+#error WMMA path reads the coalesced prepack directly (no LDS staging)
+#endif
+#ifndef CASE32_WMMA_G12_KSPLIT
+#define CASE32_WMMA_G12_KSPLIT 0
+#endif
+/* 1: register double-buffer the 16-k step operands (host default; CP_OCL_WMMA_PIPELINE=0
+   builds the plain load-then-WMMA loop). */
+#ifndef CASE32_WMMA_PIPELINE
+#define CASE32_WMMA_PIPELINE 1
+#endif
+#if CASE32_WMMA_PIPELINE && (KGROUPS % 8) != 0
+#error CASE32_WMMA_PIPELINE needs an even number of 16-k steps per KR panel
+#endif
+
+#define WMMA_WAVE_ROWS 64
+#define WMMA_WAVE_COLS 64
+#define WMMA_BM (WMMA_WAVE_ROWS / 16)
+#define WMMA_BN (WMMA_WAVE_COLS / 16)
+#define WMMA_WAVES_M (MACRO_M / WMMA_WAVE_ROWS)
+#define WMMA_KG_DW_A (MACRO_KG_STRIP_A / 4) /* dwords between consecutive k-groups */
+#define WMMA_KG_DW_B (MACRO_KG_STRIP_B / 4)
+#define WMMA_KSTEPS (KGROUPS / 4)          /* 16-k WMMA steps per KR panel */
+
+#if CASE32_WMMA == 11
+typedef int4 wmma_ab;
+#else
+typedef int2 wmma_ab;
+#endif
+typedef int8 wmma_acc;
+
+/* k-group offset of the first operand dword of `lane` (0 on gfx11: full k per lane). */
+inline int wmma_lane_kg0(uint lane, int ksplit) {
+#if CASE32_WMMA == 11
+    (void)lane;
+    (void)ksplit;
+    return 0;
+#else
+    const int h = (int)(lane >> 4);
+    return ksplit ? 2 * h : h;
+#endif
+}
+
+/* One lane's A or B operand for a 16-k step. p: the lane's dword for its row/column at
+   k-group wmma_lane_kg0(); kg: dword stride between consecutive k-groups. */
+inline wmma_ab wmma_load_ab(__global const int *p, int kg, int ksplit) {
+#if CASE32_WMMA == 11
+    (void)ksplit;
+    return (int4)(p[0], p[kg], p[2 * kg], p[3 * kg]);
+#else
+    return (int2)(p[0], p[(ksplit ? 1 : 2) * kg]);
+#endif
+}
+
+/* D/C row of accumulator VGPR e in `lane` (column is lane % 16 on both). */
+inline int wmma_c_row(int e, uint lane) {
+#if CASE32_WMMA == 11
+    return 2 * e + (int)(lane >> 4);
+#else
+    return e + 8 * (int)(lane >> 4);
+#endif
+}
+
+inline wmma_acc wmma_mac(wmma_ab a, wmma_ab b, wmma_acc c) {
+#if CASE32_WMMA == 11
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#else
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#endif
+}
+
+/* This lane's XOR partials of the two 8x16 hash tiles of one 16x16 block. */
+inline void wmma_tile_partials(wmma_acc c, uint lane, uint *top, uint *bot) {
+#if CASE32_WMMA == 11
+    (void)lane;
+    *top = as_uint(c.s0 ^ c.s1 ^ c.s2 ^ c.s3); /* rows 0,2,4,6 / 1,3,5,7 */
+    *bot = as_uint(c.s4 ^ c.s5 ^ c.s6 ^ c.s7); /* rows 8..14 / 9..15 */
+#else
+    const uint x = as_uint(c.s0 ^ c.s1 ^ c.s2 ^ c.s3 ^ c.s4 ^ c.s5 ^ c.s6 ^ c.s7);
+    const int lower = lane < 16u;
+    *top = lower ? x : 0u;
+    *bot = lower ? 0u : x;
+#endif
+}
+
+/* ds_swizzle bit-mask mode (offset[15] = 0): and_mask = 0x1f, or_mask = 0, xor_mask = m.
+   Works within groups of 32 lanes, i.e. the whole wave32. */
+#define WMMA_SWZ_XOR(v, m) as_uint(__builtin_amdgcn_ds_swizzle(as_int(v), ((m) << 10) | 0x1f))
+/* Reduce-scatter stage over lane bit m: keep the half of p[0..n) whose index bit
+   matches the lane bit, send the other half to lane ^ m, XOR in what comes back. */
+#define WMMA_RS_STAGE(p, lane, n, m)                                                  \
+    do {                                                                              \
+        const int hi_ = ((lane) & (m)) != 0u;                                         \
+        _Pragma("unroll") for (int j_ = 0; j_ < (n) / 2; ++j_) {                      \
+            const uint keep_ = hi_ ? (p)[j_ + (n) / 2] : (p)[j_];                     \
+            const uint send_ = hi_ ? (p)[j_] : (p)[j_ + (n) / 2];                     \
+            (p)[j_] = keep_ ^ WMMA_SWZ_XOR(send_, m);                                 \
+        }                                                                             \
+    } while (0)
+
+/* p[t] (t = 0..31): this lane's partial of word t. Returns XOR over all 32 lanes of
+   p[lane], i.e. lane t receives the complete word t. Whole wave must be active. */
+inline uint wmma_reduce_scatter32(uint *p, uint lane) {
+    WMMA_RS_STAGE(p, lane, 32, 16);
+    WMMA_RS_STAGE(p, lane, 16, 8);
+    WMMA_RS_STAGE(p, lane, 8, 4);
+    WMMA_RS_STAGE(p, lane, 4, 2);
+    WMMA_RS_STAGE(p, lane, 2, 1);
+    return p[0];
+}
+
+/* Operands of one 16-k step (k-groups g..g+3) for the wave's 4 row and 4 column blocks. */
+inline void wmma_load_step(__private wmma_ab *a, __private wmma_ab *b, __global const int *a_lane,
+                           __global const int *b_lane, int g) {
+    #pragma unroll
+    for (int bi = 0; bi < WMMA_BM; ++bi) {
+        a[bi] = wmma_load_ab(a_lane + g * WMMA_KG_DW_A + bi * 16, WMMA_KG_DW_A,
+                             CASE32_WMMA_G12_KSPLIT);
+    }
+    #pragma unroll
+    for (int bj = 0; bj < WMMA_BN; ++bj) {
+        b[bj] = wmma_load_ab(b_lane + g * WMMA_KG_DW_B + bj * 16, WMMA_KG_DW_B,
+                             CASE32_WMMA_G12_KSPLIT);
+    }
+}
+
+inline void wmma_mac_step(__private wmma_acc *acc, __private const wmma_ab *a,
+                          __private const wmma_ab *b) {
+    #pragma unroll
+    for (int bi = 0; bi < WMMA_BM; ++bi) {
+        #pragma unroll
+        for (int bj = 0; bj < WMMA_BN; ++bj) {
+            acc[bi * WMMA_BN + bj] = wmma_mac(a[bi], b[bj], acc[bi * WMMA_BN + bj]);
+        }
+    }
+}
+
+#ifdef CASE32_REQD_WG
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
+__kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
+                                    __global uint *tile_xor, int N, int blocks_k,
+                                    int blocks_per_milestone, int num_milestones, int tile_count,
+                                    int macro_rows, int macro_cols, int xor_after_milestone,
+                                    int mb_begin, int compact_xor, __global const uint *a_key8,
+                                    __global const uint *bound, __global int *found_flag,
+                                    __global int *out_t_rows, __global int *out_t_cols,
+                                    int fuse_jackpot, int micro_m_begin, int micro_m_count) {
+    /* The host launches exactly one full macro block per work-group here. */
+    (void)blocks_per_milestone;
+    (void)micro_m_begin;
+    (void)micro_m_count;
+    if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
+        return;
+    }
+
+    const int mb = mb_begin + (int)get_group_id(0);
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
+
+    const uint lid = (uint)get_local_id(0);
+    const uint lane = lid & 31u;
+    const int wave = (int)(lid >> 5);
+    const int wm = wave % WMMA_WAVES_M;
+    const int wn = wave / WMMA_WAVES_M;
+
+    /* Per-lane operand streams: row (col) wm*64 + lane%16 of the macro block, first
+       k-group per the arch layout; block bi (bj) adds 16 rows (cols) = 16 dwords. */
+    const int kg0 = wmma_lane_kg0(lane, CASE32_WMMA_G12_KSPLIT);
+    __global const int *a_lane =
+            (__global const int *)(a_pre + (size_t)im * (size_t)blocks_k *
+                                                   (size_t)MACRO_KB_BLOCK_A) +
+            (wm * WMMA_WAVE_ROWS + (int)(lane & 15u)) + kg0 * WMMA_KG_DW_A;
+    __global const int *b_lane =
+            (__global const int *)(b_pre + (size_t)jm * (size_t)blocks_k *
+                                                   (size_t)MACRO_KB_BLOCK_B) +
+            (wn * WMMA_WAVE_COLS + (int)(lane & 15u)) + kg0 * WMMA_KG_DW_B;
+
+    /* Hash tile owned by this lane after the reduce-scatter: t = bj*8 + bi*2 + half. */
+    const int own_bj = (int)(lane >> 3);
+    const int own_bi = (int)((lane >> 1) & 3u);
+    const int own_half = (int)(lane & 1u);
+    const int hash_row = wm * (WMMA_WAVE_ROWS / MR) + own_bi * 2 + own_half; /* in macro */
+    const int hash_col = wn * (WMMA_WAVE_COLS / HASH_NR) + own_bj;            /* in macro */
+    const int tr_global = im * MICRO_M + hash_row;
+    const int hash_tc_global = jm * HASH_MICRO_N + hash_col;
+    const int hash_spatial_id = tr_global * (N / HASH_NR) + hash_tc_global;
+
+    uint msg[PP_JACKPOT_WORDS];
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg[i] = 0u;
+    }
+    wmma_acc acc[WMMA_BM * WMMA_BN];
+    #pragma unroll
+    for (int i = 0; i < WMMA_BM * WMMA_BN; ++i) {
+        acc[i] = (wmma_acc)(0);
+    }
+
+    int kg_flat = 0;
+#if CASE32_WMMA_PIPELINE
+    /* Register double buffer: the next 16-k step's operands are in flight while the
+       current step's 16 WMMAs issue. The k walk is one flat k-group stride across KR
+       panels, so the prefetch crosses milestones; the very last one is clamped (re-reads
+       the final step, harmless). */
+    const int kg_last_step = blocks_k * KGROUPS - 4;
+    wmma_ab a0[WMMA_BM];
+    wmma_ab b0[WMMA_BN];
+    wmma_ab a1[WMMA_BM];
+    wmma_ab b1[WMMA_BN];
+    wmma_load_step(a0, b0, a_lane, b_lane, 0);
+#endif
+    for (int ms = 0; ms < blocks_k; ++ms) {
+#if CASE32_WMMA_PIPELINE
+        for (int ks = 0; ks < WMMA_KSTEPS; ks += 2) {
+            wmma_load_step(a1, b1, a_lane, b_lane, kg_flat + 4);
+            wmma_mac_step(acc, a0, b0);
+            const int kg_n2 = (kg_flat + 8 <= kg_last_step) ? (kg_flat + 8) : kg_last_step;
+            wmma_load_step(a0, b0, a_lane, b_lane, kg_n2);
+            wmma_mac_step(acc, a1, b1);
+            kg_flat += 8;
+        }
+#else
+        for (int ks = 0; ks < WMMA_KSTEPS; ++ks) {
+            wmma_ab a[WMMA_BM];
+            wmma_ab b[WMMA_BN];
+            wmma_load_step(a, b, a_lane, b_lane, kg_flat);
+            wmma_mac_step(acc, a, b);
+            kg_flat += 4;
+        }
+#endif
+
+        /* Milestone (one per KR panel, cumulative C): word of hash tile `lane`. */
+        uint p[32];
+        #pragma unroll
+        for (int bi = 0; bi < WMMA_BM; ++bi) {
+            #pragma unroll
+            for (int bj = 0; bj < WMMA_BN; ++bj) {
+                wmma_tile_partials(acc[bi * WMMA_BN + bj], lane, &p[bj * 8 + bi * 2],
+                                   &p[bj * 8 + bi * 2 + 1]);
+            }
+        }
+        const uint x = wmma_reduce_scatter32(p, lane);
+
+        if (xor_after_milestone) {
+            if (fuse_jackpot) {
+                if (ms < PP_MAX_MILESTONES) {
+                    const int tid = ms % PP_JACKPOT_WORDS;
+                    const uint contribution =
+                            (ms + PP_JACKPOT_WORDS < num_milestones) ? pp_rotl32(x, PP_LROT) : x;
+                    msg[tid] ^= contribution;
+                }
+            } else {
+                ulong out_idx;
+                if (compact_xor) {
+                    const int hash_local_id = hash_row * HASH_MICRO_N + hash_col;
+                    const ulong batch_stride =
+                            (ulong)(MICRO_M * HASH_MICRO_N) * (ulong)num_milestones;
+                    out_idx = (ulong)get_group_id(0) * batch_stride +
+                              (ulong)hash_local_id * (ulong)num_milestones + (ulong)ms;
+                } else {
+                    out_idx = (ulong)ms * (ulong)tile_count + (ulong)hash_spatial_id;
+                }
+                tile_xor[out_idx] = x;
+            }
+        }
+    }
+
+    if (!fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
+        return;
+    }
+
+    uint digest[8];
+    b3_compress64(a_key8, msg, digest);
+    if (!digest_beats_target(digest, bound)) {
+        return;
+    }
+    if (found_flag == 0) {
+        return;
+    }
+    if (atomic_cmpxchg(found_flag, 0, 1) != 0) {
+        return;
+    }
+    if (out_t_rows != 0) {
+        *out_t_rows = im * MACRO_M + hash_row * MR;
+    }
+    if (out_t_cols != 0) {
+        *out_t_cols = jm * MACRO_N + hash_col * HASH_NR;
+    }
+}
+
+/* Layout self-test (host: CP_OCL_WMMA_SELFTEST=1), one wave32, using the same helpers as
+   the GEMM kernel. a: 16x16 int8 row-major [m][k]; b: [n][k]; c_in, d_out: int32 [m][n].
+   words[0..31]: reduce-scatter of a synthetic pattern; words[32], words[33]: the top and
+   bottom 8x16 hash-tile XOR of D via wmma_tile_partials. ksplit: gfx12 A/B k mapping. */
+__kernel void case33_wmma_selftest(__global const int *a, __global const int *b,
+                                   __global const int *c_in, __global int *d_out,
+                                   __global uint *words, int ksplit) {
+    const uint lane = (uint)get_local_id(0) & 31u;
+    const int col = (int)(lane & 15u);
+    const int kg0 = wmma_lane_kg0(lane, ksplit);
+    /* row/col stride 4 dwords, k-group stride 1 dword */
+    const wmma_ab av = wmma_load_ab(a + col * 4 + kg0, 1, ksplit);
+    const wmma_ab bv = wmma_load_ab(b + col * 4 + kg0, 1, ksplit);
+    wmma_acc c;
+    c.s0 = c_in[wmma_c_row(0, lane) * 16 + col];
+    c.s1 = c_in[wmma_c_row(1, lane) * 16 + col];
+    c.s2 = c_in[wmma_c_row(2, lane) * 16 + col];
+    c.s3 = c_in[wmma_c_row(3, lane) * 16 + col];
+    c.s4 = c_in[wmma_c_row(4, lane) * 16 + col];
+    c.s5 = c_in[wmma_c_row(5, lane) * 16 + col];
+    c.s6 = c_in[wmma_c_row(6, lane) * 16 + col];
+    c.s7 = c_in[wmma_c_row(7, lane) * 16 + col];
+    const wmma_acc d = wmma_mac(av, bv, c);
+    d_out[wmma_c_row(0, lane) * 16 + col] = d.s0;
+    d_out[wmma_c_row(1, lane) * 16 + col] = d.s1;
+    d_out[wmma_c_row(2, lane) * 16 + col] = d.s2;
+    d_out[wmma_c_row(3, lane) * 16 + col] = d.s3;
+    d_out[wmma_c_row(4, lane) * 16 + col] = d.s4;
+    d_out[wmma_c_row(5, lane) * 16 + col] = d.s5;
+    d_out[wmma_c_row(6, lane) * 16 + col] = d.s6;
+    d_out[wmma_c_row(7, lane) * 16 + col] = d.s7;
+
+    uint p[32];
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) {
+        p[t] = (lane * 2654435761u + (uint)t * 2246822519u) ^ ((lane + 1u) * (uint)(t + 3));
+    }
+    words[lane] = wmma_reduce_scatter32(p, lane);
+
+    uint q[32];
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) {
+        q[t] = 0u;
+    }
+    wmma_tile_partials(d, lane, &q[0], &q[1]);
+    const uint w = wmma_reduce_scatter32(q, lane);
+    if (lane < 2u) {
+        words[32 + lane] = w;
+    }
+}
+#endif /* CASE32_WMMA */

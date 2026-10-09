@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -301,11 +302,17 @@ bool OpenClContext::init(const OclDeviceInfo &pick) {
         return false;
     }
 
+    /* Nothing reads CL_PROFILING_COMMAND_* events, so keep the queue plain: with
+       profiling enabled the runtime timestamps every command. CP_OCL_QUEUE_PROFILING=1
+       turns it back on for ad-hoc event timing. */
+    const char *prof_env = std::getenv("CP_OCL_QUEUE_PROFILING");
+    const bool profiling = prof_env && prof_env[0] && prof_env[0] != '0';
+    const cl_command_queue_properties qprops = profiling ? CL_QUEUE_PROFILING_ENABLE : 0;
 #ifdef CL_VERSION_2_0
-    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, qprops, 0};
     queue = clCreateCommandQueueWithProperties(context, device, props, &err);
 #else
-    queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
+    queue = clCreateCommandQueue(context, device, qprops, &err);
 #endif
     if (!queue || err != CL_SUCCESS) {
         log_cl_error("clCreateCommandQueue", err);
@@ -367,7 +374,41 @@ bool OpenClContext::build_program_from_source(const char *source, const char *bu
         program = nullptr;
         return false;
     }
+    dump_program_binary_(program);
     return true;
+}
+
+/* CP_OCL_DUMP_BIN=<path>: write CL_PROGRAM_BINARIES of every successfully built
+   program (first to <path>, later ones to <path>.1, <path>.2, ...). On AMD the
+   blob is an ELF code object: inspect with
+   llvm-objdump -d --mcpu=gfx1103 <path>. Debug aid only. */
+void OpenClContext::dump_program_binary_(cl_program prog) {
+    const char *dump_path = std::getenv("CP_OCL_DUMP_BIN");
+    if (!dump_path || !dump_path[0] || !prog) {
+        return;
+    }
+    static int dump_index = 0;
+    size_t bin_size = 0;
+    if (clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof(bin_size), &bin_size, nullptr) !=
+                CL_SUCCESS ||
+        bin_size == 0) {
+        return;
+    }
+    std::vector<unsigned char> bin(bin_size);
+    unsigned char *bins[] = {bin.data()};
+    if (clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof(bins), bins, nullptr) != CL_SUCCESS) {
+        return;
+    }
+    std::string path = dump_path;
+    if (dump_index > 0) {
+        path += "." + std::to_string(dump_index);
+    }
+    ++dump_index;
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(bin.data()),
+              static_cast<std::streamsize>(bin.size()));
+    std::fprintf(stderr, "[ocl] dumped program binary (%zu B) to %s\n", bin.size(),
+                 path.c_str());
 }
 
 bool OpenClContext::build_program_from_file(const char *cl_path, const char *build_options,
