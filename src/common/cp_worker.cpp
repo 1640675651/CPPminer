@@ -5,6 +5,7 @@
 #include "cp_util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
@@ -624,6 +625,26 @@ extern "C" int cp_worker_writes_host_signal_a(void)
         return !cp_onednn_worker_gpu_prep_ready();
 #endif
     return 0;
+}
+
+extern "C" int8_t* cp_worker_alloc_host_signal_a(size_t bytes)
+{
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
+        return cp_pearl_hexagon_worker_alloc_signal_a(bytes);
+#endif
+    return (int8_t*)calloc(1, bytes);
+}
+
+extern "C" void cp_worker_free_host_signal_a(int8_t* p)
+{
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+        cp_pearl_hexagon_worker_free_signal_a(p);
+        return;
+    }
+#endif
+    free(p);
 }
 
 extern "C" int cp_worker_worker_handles_matrix_prep(void)

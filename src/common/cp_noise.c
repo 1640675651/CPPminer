@@ -994,7 +994,7 @@ static void pearl_mh_parent_cv(const PearlMatrixHash* h, const uint8_t* children
     pearl_output_chaining_value(&o, out);
 }
 
-static int pearl_mh_build(PearlMatrixHash* h, const uint8_t* data)
+static int pearl_mh_alloc_levels(PearlMatrixHash* h)
 {
     const size_t n = h->num_chunks;
     int top = 0;
@@ -1004,13 +1004,15 @@ static int pearl_mh_build(PearlMatrixHash* h, const uint8_t* data)
         h->level[j] = (uint8_t*)malloc((n >> j) * BLAKE3_OUT_LEN);
         if(!h->level[j]) return -1;
     }
+    return 0;
+}
+
+/* Every complete parent above level 0. */
+static void pearl_mh_build_parents(PearlMatrixHash* h)
+{
+    const size_t n = h->num_chunks;
     long i;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for(i = 0; i < (long)n; i++)
-        pearl_mh_chunk_cv(h, data, (size_t)i, h->level[0] + (size_t)i * BLAKE3_OUT_LEN);
-    for(int j = 1; j <= top; j++){
+    for(int j = 1; j < h->num_levels; j++){
         const long len = (long)(n >> j);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
@@ -1019,6 +1021,19 @@ static int pearl_mh_build(PearlMatrixHash* h, const uint8_t* data)
             pearl_mh_parent_cv(h, h->level[j - 1] + (size_t)i * 2 * BLAKE3_OUT_LEN,
                                h->level[j] + (size_t)i * BLAKE3_OUT_LEN);
     }
+}
+
+static int pearl_mh_build(PearlMatrixHash* h, const uint8_t* data)
+{
+    if(pearl_mh_alloc_levels(h) != 0) return -1;
+    const size_t n = h->num_chunks;
+    long i;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(i = 0; i < (long)n; i++)
+        pearl_mh_chunk_cv(h, data, (size_t)i, h->level[0] + (size_t)i * BLAKE3_OUT_LEN);
+    pearl_mh_build_parents(h);
     return 0;
 }
 
@@ -1140,6 +1155,28 @@ int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_l
         h->valid = 0;
         return -1;
     }
+    pearl_mh_root(h, out);
+    return 0;
+}
+
+int pearl_matrix_hash_from_cvs(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                               const uint8_t key[32], const uint8_t* chunk_cvs, uint8_t out[32])
+{
+    const size_t n = padded_chunk_len(raw_len) / B3_CHUNK;
+    if(!h || n <= 1 || !chunk_cvs) return -1;
+    pearl_mh_release(h);
+    memcpy(h->key, key, 32);
+    load_key_words(key, h->key_words);
+    h->data = mat;
+    h->raw_len = raw_len;
+    h->num_chunks = n;
+    if(pearl_mh_alloc_levels(h) != 0){
+        pearl_mh_release(h);
+        return -1;
+    }
+    memcpy(h->level[0], chunk_cvs, n * BLAKE3_OUT_LEN);
+    pearl_mh_build_parents(h);
+    h->valid = 1;
     pearl_mh_root(h, out);
     return 0;
 }

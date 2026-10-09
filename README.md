@@ -147,11 +147,12 @@ This scipt pulls third-party dependencies and execute cmake.
 ```
 
 ```sh
-# Pearl Hexagon (Android; libpearlx_skel.so + libworker_pool.so in ADSP_LIBRARY_PATH)
+# Pearl Hexagon (Android; libpearlx_skel.so + libworker_pool.so in ADSP_LIBRARY_PATH).
+# Needs about m*k + n*k bytes: ~1 GiB at the default size, ~300 MiB with --m 32 --n 32.
 export ADSP_LIBRARY_PATH=/data/local/tmp/cppminer
-./cppminer --backend hexagon --pool stratum+tcp://pearl-eu1.luckypool.io:3360 \
+./cppminer --backend hexagon --m 32 --n 32 --pool stratum+tcp://pearl-eu1.luckypool.io:3360 \
   --wallet prl1... --worker worker_name
-./cppminer --backend hexagon --mock
+./cppminer --backend hexagon --m 32 --n 32 --mock
 ```
 
 ### Options
@@ -159,7 +160,7 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/cppminer
 | Flag | Description |
 |------|-------------|
 | `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon`. `--pool` required for Quantus unless `--mock` |
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`). `hexagon` defaults to `--m 32 --n 32` (phone memory); see [Scan batching](#scan-batching---batch-size) for its launch size |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`). `hexagon` needs about m·k + n·k bytes (1 GiB at the default size), so phones usually need a smaller `--m`/`--n`; see [Scan batching](#scan-batching---batch-size) for its launch size |
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`) |
@@ -329,7 +330,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Matrix | Hashrate |
 |--------|--------|----------|
-| Snapdragon 480 cDSP (Hexagon v66, 2x HVX) | `--m 32 --n 32` | ~402 GH/s scanning, ~400 GH/s with per-attempt prep |
+| Snapdragon 480 cDSP (Hexagon v66, 2x HVX) | `--m 32 --n 32` | ~398 GH/s scanning, ~397 GH/s with per-attempt prep |
 
 
 ## Vendored proof stack (`third_party/`)

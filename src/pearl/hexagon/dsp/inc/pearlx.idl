@@ -41,4 +41,23 @@ interface pearlx : remote_handle64 {
    // being processed when a hit is found, so hit[0] then counts only what was checked.
    long scan(in long col0, in long ncols, in sequence<uint32> key_bound, in long stop_on_hit,
              rout sequence<uint32> hit, rout uint64 dsp_us);
+
+   // Noise generated on the DSP, bit for bit as cp_noise.c (rank 128). seed_label: the
+   // noise seed (8 little-endian words) then the 32-byte label ("B_tensor" / "A_tensor")
+   // as 8 words. pairs: the k permutation pairs (first, second), 2k words.
+   // set_b_gen: like set_b with noisy B (signal B = 0) generated and packed on the DSP;
+   // noise row j is column j.
+   long set_b_gen(in long n, in long k, in sequence<uint32> seed_label,
+                  in sequence<uint32> pairs, rout uint64 dsp_us);
+   // set_a_gen: like set_a, from the signal rows: the panel is signal + noise, noise row
+   // row0 + r for panel row r. rows must be a multiple of 128.
+   long set_a_gen(in sequence<int8> a_sig, in long row0, in long rows, in long nthreads,
+                  in sequence<uint32> seed_label, in sequence<uint32> pairs,
+                  rout uint64 dsp_us);
+
+   // Keyed BLAKE3 chaining values of the 1 KB chunks of raw_len bytes (a multiple of
+   // 32 KB): the leaves of cp_noise.c's matrix hashes. data empty: raw_len zero bytes.
+   // key: 8 words. cvs: 8 words per chunk, in chunk order. data and cvs 128-byte aligned.
+   long chunk_cvs(in sequence<int8> data, in long raw_len, in sequence<uint32> key,
+                  rout sequence<uint32> cvs, rout uint64 dsp_us);
 };

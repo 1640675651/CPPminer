@@ -1,19 +1,29 @@
 # Pearl Hexagon backend (`--backend hexagon`)
 
-Pearl mining on the compute DSP (cDSP) of Snapdragon phones. The GEMM and the
-milestone XOR run on the DSP's HVX vector units. The host CPU prepares the
-matrices and runs the BLAKE3 jackpot. Tested on a Snapdragon 480 (SM4350,
-Hexagon v66, 2 HVX contexts).
+Pearl mining on the compute DSP (cDSP) of Snapdragon phones. The DSP's HVX
+vector units generate the noise, pack the matrices, and run the GEMM and the
+milestone XOR. The host CPU keeps signal A and its hash, derives the seeds, and
+runs the BLAKE3 jackpot. Tested on a Snapdragon 480 (SM4350, Hexagon v66, 2 HVX
+contexts).
 
 | Device | Backend | Hashrate (m = n = 32768) |
 |---|---|---|
-| Snapdragon 480 cDSP | hexagon | ~402 GMAC/s while scanning, ~400 GMAC/s overall |
+| Snapdragon 480 cDSP | hexagon | ~398 GMAC/s while scanning, ~397 GMAC/s overall |
 | Snapdragon 480 CPU (2x A76 + 6x A55) | cpu (NEON DotProd) | ~130 GMAC/s |
 
-The overall rate includes about 0.06 s of host work per 11.0 s attempt, while
-the DSP is idle. This covers the random signal A, its hash for the noise seed,
-and the first panel's noisy rows. Measured from `adb shell`, which limits the
-process to the six A55 cores.
+The overall rate includes about 0.03 s of host work per 11.07 s attempt, while
+the DSP is idle: the random signal A, its hash for the noise seed, and the
+permutation pairs. Each new job also idles the DSP for ~0.38 s:
+- ~0.07 s for the zero B's hash, which gives the B noise seed;
+- ~0.10 s for the DSP to generate B;
+- ~0.19 s to rebuild signal A's hash tree under the new job key, so the job's
+  first attempt is incremental too.
+
+Both hashes compute their 1 KB chunk hashes on the DSP (`pearlx chunk_cvs`, HVX
+BLAKE3, 32 chunks per vector) and build the tree above them on the host
+(`pearl_matrix_hash_from_cvs`). The host alone takes ~0.36 s per 128 MiB.
+
+Measured from `adb shell`, which limits the process to the six A55 cores.
 
 The hash of signal A is incremental (`pearl_matrix_hash_digest` in
 `cp_noise.c`). An attempt changes one value per column, so only about 4,000 of
@@ -28,7 +38,7 @@ Where the scan rate goes, against the kernel's ~413 GMAC/s peak:
 | Cost | Share |
 |---|---|
 | Copying a 128 KB slice of B into VTCM per 128-column tile and K block, amortized over the launch's 1024 row tiles | ~1.9% |
-| Packing each row panel (`set_a`, ~6.8 ms per 8 launches) | ~0.5% |
+| Generating and packing each row panel's noisy A (`set_a_gen`, ~9.7 ms per 8 launches) | ~0.7% |
 | FastRPC call per launch (~1.1 ms of 170 ms) and the gap between launches | ~1.4% |
 
 The per-launch call overhead was ~3 ms until the tile-XOR records moved to an
@@ -67,25 +77,48 @@ backends' macro panels: by default 32 x 32 macros, so 4096 rows x 4096 columns
 
 | Step | Where | When |
 |---|---|---|
-| Noisy B^T (signal B^T = 0) | host, OpenMP | once per job |
-| Pack B into DSP memory (`pearlx set_b`) | cDSP | once per job |
-| Sparse random signal A, `a_noise_seed` | host | every attempt |
-| Noisy A for a row panel | host, OpenMP | per panel, one slice per launch of the panel before |
-| Pack the row panel (`pearlx set_a`) | cDSP | per panel |
+| B noise seed (hash of the zero B^T), B permutation pairs | host | once per job |
+| Noisy B (signal B = 0) generated in packed layout (`pearlx set_b_gen`) | cDSP | once per job |
+| Sparse random signal A, its incremental hash, `a_noise_seed`, A permutation pairs | host | every attempt |
+| Noisy A of a row panel generated from its signal rows, in packed layout (`pearlx set_a_gen`) | cDSP | per panel, at its first launch |
 | GEMM + milestone XOR of the panel against one block of columns (`pearlx gemm_xor`) | cDSP | per launch |
 | BLAKE3 jackpot over the launch's tile XORs | host, OpenMP | per launch |
 
 A dedicated thread issues the launches back to back. The mining thread follows,
-checking each finished launch and building the next panel's noisy rows one
-launch ahead. The DSP only waits when the record buffer it is about to reuse
-hasn't been checked yet, or a new panel's rows aren't built. In practice it is
-busy about 97.5% of the scan. Every hit is recomputed on the host from the
-noisy rows, with the B columns derived again from the job seed, before it
-becomes a share. A wrong result from the DSP can therefore never be submitted.
+checking each finished launch. The DSP only waits when the record buffer it is
+about to reuse hasn't been checked yet. In practice it is busy about 98.8% of
+the scan.
+
+Every hit is recomputed on the host before it becomes a share. The host builds
+the tile's A rows from signal A and its B columns from the job seed, using its
+own noise code (`cp_noise.c`). A wrong result from the DSP, in the kernel or in
+the noise it generated, can therefore never be submitted.
 
 Proofs use the host signal A with an all-zero B^T, like the CPU backend.
+Signal A lives in memory shared with the DSP (`cp_worker_alloc_host_signal_a`),
+which reads each panel's signal rows in place.
 
-On the DSP, `set_a` packs the panel's rows once into the kernel's chunk layout.
+**Noise generation on the DSP** reproduces `cp_noise.c` bit for bit; `pearlx_test
+-G 1` checks every XOR word against host-generated matrices. For a noise row (a
+row of A, or a column of B):
+1. **Table:** 4 keyed-BLAKE3 digests (key: the noise seed; message: the block
+   index and the label) give a 128-entry table of `(byte & 63) - 16`.
+2. **Noise:** `noise[l] = table[first[l]] - table[second[l]]` over the k
+   permutation pairs.
+
+The DSP handles 128 rows at a time:
+- An HVX BLAKE3 computes the tables, 32 digests per vector.
+- A byte transpose makes them index-major, so one noise column for 128 rows is
+  one vector subtract.
+- For A, a second transpose turns 128 columns back into rows, which get the
+  signal added and are packed into the kernel's 4-row chunks. The gather, both
+  transpose passes, the add and the packing run fused in registers.
+- For B, four noise columns interleave directly into packed B's 4-byte words.
+
+B takes ~0.1 s per job instead of ~0.75 s of host noise plus packing, and there
+is no 128 MiB staging copy. A takes ~9.7 ms per 4096-row panel versus 6.8 ms
+for packing host-built rows.
+
 In each launch, for each 128-column tile of B and each K block of 1024, the DSP
 copies a 128 KB slice of B into VTCM and streams the panel's row tiles through
 the kernel. The kernel is the HVX `vrmpyz`
@@ -98,12 +131,12 @@ about 4.5% over the plain GEMM.
 
 | Path | Contents |
 |---|---|
-| `cp_pearl_hexagon_worker.cpp` | Worker: job and attempt prep, the launch pipeline, jackpot, hit recompute |
+| `cp_pearl_hexagon_worker.cpp` | Worker: job and attempt prep (seeds, signal A, its incremental hash), the launch pipeline, jackpot, hit recompute |
 | `cp_pearlx_client.c` | FastRPC client: loads `libcdsprpc.so` at run time and marshals the `pearlx` calls by hand. No Hexagon SDK headers are needed |
-| `dsp/inc/pearlx.idl` | DSP interface: `set_b`, `set_a`, `gemm_xor`, `info`, and `scan` (jackpot on the DSP; not used by the miner) |
-| `dsp/src/pearlx_imp.c` | DSP side: packing, VTCM, threads over both HVX contexts |
+| `dsp/inc/pearlx.idl` | DSP interface: `set_b_gen` and `set_a_gen` (noise generated on the DSP), `gemm_xor`, `chunk_cvs` (matrix hash leaves), `info`; `set_b`, `set_a` (pack host-built matrices) and `scan` (jackpot on the DSP) are used only by the self-test |
+| `dsp/src/pearlx_imp.c` | DSP side: noise generation, packing, VTCM, threads over both HVX contexts, the DSP jackpot |
 | `dsp/src/pearlx.S`, `dsp/src/pearlx_xor.inc` | HVX kernel (Case 1.1 fold and reduction) |
-| `dsp/src/pearlx_test.c` | Android self-test: `pearlx` against a CPU reference, plus timing |
+| `dsp/src/pearlx_test.c` | Android self-test against CPU references, plus timing: GEMM + XOR, the DSP jackpot (`-b` hit rate), the noise generators (`-G 1`) and the chunk hashes (`-H 1`), with the miner's `cp_noise.c` linked in as the reference |
 | `dsp/CMakeLists.txt`, `dsp/build.ps1` | Hexagon SDK build of the DSP library and the self-test |
 
 ## Build
@@ -117,6 +150,7 @@ There are two parts:
    cd src\pearl\hexagon\dsp
    .\build.ps1                                   # hexagon_Release_toolv87_v66\ship\libpearlx_skel.so
    .\build.ps1 -NoBuild -Test "-n 32768 -r 4096 -w 4096 -g 2"   # push + self-test on the phone
+   .\build.ps1 -NoBuild -Test "-n 32768 -r 4096 -G 1"           # DSP noise vs cp_noise.c
    ```
 
    Ship `libpearlx_skel.so` and the SDK's `libworker_pool.so` from
@@ -145,13 +179,14 @@ FastRPC finds the skel through `ADSP_LIBRARY_PATH`:
 
 ```sh
 export ADSP_LIBRARY_PATH=/path/to/dir/with/libpearlx_skel.so   # and libworker_pool.so
-./cppminer --backend hexagon --pool stratum+tcp://HOST:PORT --wallet prl1... --worker phone
-./cppminer --backend hexagon --mock --mock-diff 40              # offline: first share + verify
+# the default 128x128 size needs ~1 GiB; --m 32 --n 32 needs ~300 MiB
+./cppminer --backend hexagon --m 32 --n 32 --pool stratum+tcp://HOST:PORT --wallet prl1... --worker phone
+./cppminer --backend hexagon --m 32 --n 32 --mock --mock-diff 40   # offline: first share + verify
 ```
 
 | Option | Hexagon meaning |
 |---|---|
-| `--m N --n N` | Matrix size in units of 1024. The default is 32 (32768) instead of 128: each matrix is 128 MiB on the host, and B is kept again in DSP memory. 131072 needs 512 MiB per matrix |
+| `--m N --n N` | Matrix size in units of 1024 (default 128, as for every backend). Memory is about m·k + n·k bytes: signal A (shared with the DSP) plus packed B in DSP memory, plus ~50 MiB of buffers. The default 131072 needs ~1 GiB; the measurements here use `--m 32 --n 32` (~300 MiB) |
 | `--row-period-batch N` | 128-row macros per DSP launch (default 32 = 4096 rows). Rows set how far each VTCM slice of B is amortized. Per row panel: 2048 rows ~770 GOPS, 4096 ~792 |
 | `--batch-size N` / `--col-period-batch N` | 128-column macros per DSP launch (default 32 = 4096 columns). Columns barely matter: a full-width launch is only 0.3% faster than 4096 columns |
 

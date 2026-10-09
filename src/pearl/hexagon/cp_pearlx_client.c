@@ -41,7 +41,8 @@ struct remote_rpc_control_unsigned_module {
 
 /* Method ids follow the declaration order in pearlx.idl after open (0) and close (1). */
 #define PEARLX_URI "file:///libpearlx_skel.so?pearlx_skel_handle_invoke&_modver=1.0&_dom=cdsp"
-enum { PX_SET_B = 2, PX_SET_A = 3, PX_GEMM_XOR = 4, PX_INFO = 5 };
+enum { PX_SET_B = 2, PX_SET_A = 3, PX_GEMM_XOR = 4, PX_INFO = 5, PX_SCAN = 6,
+       PX_SET_B_GEN = 7, PX_SET_A_GEN = 8, PX_CHUNK_CVS = 9 };
 
 struct CpPearlx {
     void* lib;
@@ -175,6 +176,76 @@ int cp_pearlx_gemm_xor(CpPearlx* px, int col0, int ncols, uint32_t* xr, size_t x
     ra[2].buf.pv = xr;
     ra[2].buf.nLen = xr_words * 4;
     int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_GEMM_XOR, 1, 2, 0, 0), ra);
+    if(dsp_us) *dsp_us = out[0];
+    return err;
+}
+
+int cp_pearlx_set_b_gen(CpPearlx* px, int n, int k, const uint32_t seed_label[16],
+                        const uint32_t* pairs, uint64_t* dsp_us)
+{
+    uint32_t in[4] = {(uint32_t)n, (uint32_t)k, 16, (uint32_t)(2 * k)};
+    uint64_t out[1] = {0};
+    remote_arg ra[4];
+    memset(ra, 0, sizeof(ra));
+    ra[0].buf.pv = in;
+    ra[0].buf.nLen = sizeof(in);
+    ra[1].buf.pv = (void*)seed_label;
+    ra[1].buf.nLen = 16 * 4;
+    ra[2].buf.pv = (void*)pairs;
+    ra[2].buf.nLen = (size_t)2 * k * 4;
+    ra[3].buf.pv = out;
+    ra[3].buf.nLen = sizeof(out);
+    int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_SET_B_GEN, 3, 1, 0, 0), ra);
+    if(dsp_us) *dsp_us = out[0];
+    return err;
+}
+
+int cp_pearlx_set_a_gen(CpPearlx* px, const int8_t* a_sig, int row0, int rows, int k,
+                        int nthreads, const uint32_t seed_label[16], const uint32_t* pairs,
+                        uint64_t* dsp_us)
+{
+    const size_t len = (size_t)rows * (size_t)k;
+    if(len > 0x7fffffffu) return -1;
+    uint32_t in[6] = {(uint32_t)len, (uint32_t)row0, (uint32_t)rows, (uint32_t)nthreads, 16,
+                      (uint32_t)(2 * k)};
+    uint64_t out[1] = {0};
+    remote_arg ra[5];
+    memset(ra, 0, sizeof(ra));
+    ra[0].buf.pv = in;
+    ra[0].buf.nLen = sizeof(in);
+    ra[1].buf.pv = (void*)a_sig;
+    ra[1].buf.nLen = len;
+    ra[2].buf.pv = (void*)seed_label;
+    ra[2].buf.nLen = 16 * 4;
+    ra[3].buf.pv = (void*)pairs;
+    ra[3].buf.nLen = (size_t)2 * k * 4;
+    ra[4].buf.pv = out;
+    ra[4].buf.nLen = sizeof(out);
+    int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_SET_A_GEN, 4, 1, 0, 0), ra);
+    if(dsp_us) *dsp_us = out[0];
+    return err;
+}
+
+int cp_pearlx_chunk_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const uint32_t key[8],
+                        uint32_t* cvs, uint64_t* dsp_us)
+{
+    if(raw_len > 0x7fffffffu) return -1;
+    const size_t cvs_words = raw_len / 1024 * 8;
+    uint32_t in[4] = {data ? (uint32_t)raw_len : 0u, (uint32_t)raw_len, 8, (uint32_t)cvs_words};
+    uint64_t out[1] = {0};
+    remote_arg ra[5];
+    memset(ra, 0, sizeof(ra));
+    ra[0].buf.pv = in;
+    ra[0].buf.nLen = sizeof(in);
+    ra[1].buf.pv = (void*)data;
+    ra[1].buf.nLen = data ? raw_len : 0;
+    ra[2].buf.pv = (void*)key;
+    ra[2].buf.nLen = 8 * 4;
+    ra[3].buf.pv = out;
+    ra[3].buf.nLen = sizeof(out);
+    ra[4].buf.pv = cvs;
+    ra[4].buf.nLen = cvs_words * 4;
+    int err = px->invoke(px->h, REMOTE_SCALARS_MAKEX(0, PX_CHUNK_CVS, 3, 2, 0, 0), ra);
     if(dsp_us) *dsp_us = out[0];
     return err;
 }

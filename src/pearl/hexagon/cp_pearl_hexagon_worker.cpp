@@ -5,6 +5,7 @@
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
 #include "cp_pearlx_client.h"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <sys/resource.h>
@@ -27,15 +28,16 @@
 #endif
 
 /*
- * Hexagon cDSP worker (zero-B, like the CPU worker):
- *   job:     noisy B^T built on the host once, packed into DSP memory (pearlx set_b).
- *   attempt: sparse random signal A on the host -> a_noise_seed; then the matrix is
- *            scanned in launches of row_macros x col_macros 128x128 macro blocks. Each
- *            row panel of noisy A is packed on the DSP once (set_a); each launch runs
- *            it against one block of columns (gemm_xor). A DSP thread issues the
- *            launches back to back; the mining thread follows, running the BLAKE3
- *            jackpot over each finished launch and building the next panel's noisy
- *            rows a slice at a time, one launch ahead.
+ * Hexagon cDSP worker (zero-B, like the CPU worker). The DSP generates and packs all the
+ * noise; the host keeps signal A (shared with the DSP), its hash, the seeds and the jackpot.
+ *   job:     noisy B (signal B = 0) generated packed in DSP memory (pearlx set_b_gen).
+ *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs;
+ *            then the matrix is scanned in launches of row_macros x col_macros 128x128
+ *            macro blocks. Each row panel of noisy A is generated and packed on the DSP
+ *            from the panel's signal rows (set_a_gen); each launch runs it against one
+ *            block of columns (gemm_xor). A DSP thread issues the launches back to back;
+ *            the mining thread follows, running the BLAKE3 jackpot over each finished
+ *            launch.
  * Hash tile: 4 rows x 64 columns (half a 4x128 HVX register tile), proof layout 4x64.
  */
 
@@ -139,21 +141,18 @@ struct JobCache {
     std::vector<uint32_t> pairs_b;   /* B-side permutation, for re-deriving hit columns */
 } g_job;
 
-/* Double-buffered row panel of noisy A and launch records (rpcmem, shared with the DSP). */
+/* Double-buffered launch records (rpcmem, shared with the DSP). */
 struct Buffers {
     int rows = 0;
     int cols = 0;
     size_t xr_words = 0;
-    int8_t* a[2] = {nullptr, nullptr};
     uint32_t* xr[2] = {nullptr, nullptr};
 } g_buf;
 
 void free_buffers()
 {
     for(int i = 0; i < 2; i++){
-        cp_pearlx_free(g_px, g_buf.a[i]);
         cp_pearlx_free(g_px, g_buf.xr[i]);
-        g_buf.a[i] = nullptr;
         g_buf.xr[i] = nullptr;
     }
     g_buf.rows = g_buf.cols = 0;
@@ -174,12 +173,11 @@ int ensure_buffers(int rows, int cols)
     free_buffers();
     const size_t xr_words = (size_t)(cols / kRegCols) * (rows / kTileRows) * kRecWords;
     for(int i = 0; i < 2; i++){
-        g_buf.a[i] = (int8_t*)cp_pearlx_alloc(g_px, (size_t)rows * K_DIM);
         /* Uncached: the DSP writes 8 MiB of records per launch, and invalidating them in
          * the CPU cache on every call cost ~2 ms of the call (~1%). The jackpot reads them
          * slower, but it runs while the DSP is busy. */
         g_buf.xr[i] = (uint32_t*)cp_pearlx_alloc_uncached(g_px, xr_words * sizeof(uint32_t));
-        if(!g_buf.a[i] || !g_buf.xr[i]){
+        if(!g_buf.xr[i]){
             fprintf(stderr, "[hexagon] rpcmem allocation failed (launch %d x %d)\n", rows, cols);
             free_buffers();
             return -1;
@@ -196,7 +194,33 @@ int job_matches(const uint8_t job_key[32], int m, int n)
     return g_job.ready && g_job.m == m && g_job.n == n && memcmp(g_job.job_key, job_key, 32) == 0;
 }
 
-/* Noisy B^T for the job (signal B^T = 0), packed into DSP memory. */
+/* Noise seed + label as the 16 words pearlx set_*_gen take. */
+void seed_label_words(const uint8_t seed[32], const uint8_t label[32], uint32_t out[16])
+{
+    memcpy(out, seed, 32);
+    memcpy(out + 8, label, 32);
+}
+
+/* Keyed matrix hash with the chunk hashes on the DSP and the tree above them on the host:
+ * the root of data (NULL: all zeros) into root, and the tree into cache when given. */
+int dsp_matrix_hash(const int8_t* data, size_t bytes, const uint8_t key[32], uint8_t* cvs,
+                    PearlMatrixHash* cache, uint8_t root[32])
+{
+    uint32_t key8[8];
+    memcpy(key8, key, 32);
+    uint64_t us = 0;
+    if(cp_pearlx_chunk_cvs(g_px, data, bytes, key8, (uint32_t*)cvs, &us) != 0)
+        return -1;
+    PearlMatrixHash* h = cache ? cache : pearl_matrix_hash_create();
+    const int rc = h ? pearl_matrix_hash_from_cvs(h, data, bytes, key, cvs, root) : -1;
+    if(!cache) pearl_matrix_hash_free(h);
+    return rc;
+}
+
+/* The job's B (signal B = 0): its noise seed from the hash of the zero B^T, then noisy B
+ * generated and packed in DSP memory. Then signal A's hash tree under the new job key, so
+ * that the job's first attempt rehashes only what it changes. The chunk hashes of both
+ * matrices run on the DSP. */
 int prepare_job(const uint8_t job_key[32], int m, int n)
 {
     if(!g_px) return -2;
@@ -209,58 +233,72 @@ int prepare_job(const uint8_t job_key[32], int m, int n)
     memcpy(g_job.job_key, job_key, 32);
     g_job.m = m;
     g_job.n = n;
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_job.salted, g_job.b_noise_seed);
+    const size_t b_bytes = (size_t)n * K_DIM, a_bytes = (size_t)m * K_DIM;
+    uint8_t* cvs = (uint8_t*)cp_pearlx_alloc(g_px, (b_bytes > a_bytes ? b_bytes : a_bytes) / 1024 * 32);
+
+    uint8_t root_b[32];
+    if(cvs && dsp_matrix_hash(NULL, b_bytes, job_key, cvs, nullptr, root_b) == 0){
+        pearl_b_noise_seed_from_root(job_key, root_b, n, g_job.salted, g_job.b_noise_seed);
+    } else {
+        fprintf(stderr, "[hexagon] DSP hash of the zero B failed; hashing it on the host\n");
+        pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_job.salted, g_job.b_noise_seed);
+    }
+    if(g_hash_check){
+        uint8_t ref[32];
+        pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_job.salted, ref);
+        const bool same = memcmp(ref, g_job.b_noise_seed, 32) == 0;
+        printf("[hexagon] hash check: B noise seed from the DSP %s the host's\n",
+               same ? "matches" : "DIFFERS FROM");
+        if(!same) memcpy(g_job.b_noise_seed, ref, 32);
+    }
+    const double t_seed = cp_now_sec() - t0;
     g_job.pairs_b.assign((size_t)K_DIM * 2, 0);
     pearl_build_perm_pairs_b(g_job.b_noise_seed, K_DIM, R_RANK, g_job.pairs_b.data());
 
-    int8_t* bt = (int8_t*)cp_pearlx_alloc(g_px, (size_t)n * K_DIM);
-    if(!bt){
-        fprintf(stderr, "[hexagon] rpcmem allocation failed for noisy B^T (%d x %d)\n", n, K_DIM);
-        return -2;
-    }
-    if(pearl_build_noisy_b(n, K_DIM, R_RANK, g_job.b_noise_seed, NULL, bt) != 0){
-        cp_pearlx_free(g_px, bt);
-        return cp_job_should_cancel() ? -1 : -2;
-    }
-    const double t_gen = cp_now_sec() - t0;
+    uint32_t seed_label[16];
+    seed_label_words(g_job.b_noise_seed, PEARL_SEED_LABEL_B, seed_label);
     uint64_t dsp_us = 0;
-    const int err = cp_pearlx_set_b(g_px, bt, n, K_DIM, &dsp_us);
-    cp_pearlx_free(g_px, bt);
+    const int err = cp_pearlx_set_b_gen(g_px, n, K_DIM, seed_label, g_job.pairs_b.data(), &dsp_us);
     if(err){
-        fprintf(stderr, "[hexagon] pearlx set_b failed (0x%x): n=%d may not fit in DSP memory\n",
-                err, n);
+        cp_pearlx_free(g_px, cvs);
+        fprintf(stderr, "[hexagon] pearlx set_b_gen failed (0x%x): n=%d may not fit in DSP "
+                        "memory\n", err, n);
         return -2;
     }
+
+    /* Signal A (unless a proof still holds it): its tree for this key, so attempt 0 is
+     * incremental like the rest. */
+    double t_a = 0.0;
+    if(h_Ap_global && cvs){
+        const double ta0 = cp_now_sec();
+        if(!g_ahash) g_ahash = pearl_matrix_hash_create();
+        uint8_t root_a[32];
+        if(g_ahash &&
+           dsp_matrix_hash(h_Ap_global, a_bytes, job_key, cvs, g_ahash, root_a) == 0){
+            if(g_hash_check){
+                uint8_t ref[32];
+                pearl_keyed_digest_int8(h_Ap_global, a_bytes, job_key, ref);
+                printf("[hexagon] hash check: signal A tree from the DSP %s the host's hash\n",
+                       memcmp(ref, root_a, 32) == 0 ? "matches" : "DIFFERS FROM");
+                if(memcmp(ref, root_a, 32) != 0) pearl_matrix_hash_invalidate(g_ahash);
+            }
+        } else if(g_ahash) {
+            pearl_matrix_hash_invalidate(g_ahash);
+        }
+        t_a = cp_now_sec() - ta0;
+    }
+    cp_pearlx_free(g_px, cvs);
+
     int rows, cols;
     launch_shape(m, n, &rows, &cols);
     if(ensure_buffers(rows, cols) != 0)
         return -2;
-    printf("[hexagon] zero-B: noisy B built in %.2fs, packed on the DSP in %.2fs (salted=%d)\n",
-           t_gen, dsp_us / 1e6, g_job.salted);
+    printf("[hexagon] job setup %.3fs: B seed %.3fs, noisy B generated on the DSP %.3fs, "
+           "signal A hash tree %.3fs (salted=%d)\n", cp_now_sec() - t0, t_seed, dsp_us / 1e6,
+           t_a, g_job.salted);
     fflush(stdout);
     g_job.ready = 1;
     return 0;
-}
-
-/* Noisy A rows [row0 + r0, row0 + r1) into dst, which holds the panel from row0. */
-void build_noisy_a_rows(int row0, int r0, int r1, const uint8_t a_key[32],
-                        const uint32_t* pairs, const int8_t* a_sig, int8_t* dst)
-{
-#ifdef _OPENMP
-    #pragma omp parallel
-#endif
-    {
-        std::vector<int8_t> el((size_t)R_RANK), nr((size_t)K_DIM);
-#ifdef _OPENMP
-        #pragma omp for schedule(static)
-#endif
-        for(int r = r0; r < r1; r++){
-            const int row = row0 + r;
-            pearl_fuse_noise_row_a_buf(row, K_DIM, R_RANK, a_key, pairs,
-                                       a_sig + (size_t)row * K_DIM, dst + (size_t)r * K_DIM,
-                                       el.data(), nr.data());
-        }
-    }
 }
 
 /* One DSP launch: rows [row0, row0 + rows) x columns [col0, col0 + cols). */
@@ -322,19 +360,25 @@ Hit check_launch(const Launch& l, const uint32_t* xr, const uint32_t a_key8[8],
     return hit;
 }
 
-/* Recompute a hit tile on the host from the panel's noisy A rows and freshly derived
- * noisy B columns, so a DSP fault can never turn into an invalid share. */
-int verify_hit(const Hit& hit, int row0, const int8_t* a_panel, const uint32_t a_key8[8],
-               const uint32_t bound[8])
+/* Recompute a hit tile on the host: its A rows from signal A and B columns from the job
+ * seed, with the host's noise code. A DSP fault (kernel or noise generation) can therefore
+ * never turn into an invalid share. */
+int verify_hit(const Hit& hit, const int8_t* a_sig, const uint8_t a_seed[32],
+               const uint32_t* pairs_a, const uint32_t a_key8[8], const uint32_t bound[8])
 {
     std::vector<int8_t> bcol((size_t)kTileCols * K_DIM), el((size_t)R_RANK), nr((size_t)K_DIM);
+    std::vector<int8_t> arow((size_t)kTileRows * K_DIM);
+    for(int i = 0; i < kTileRows; i++)
+        pearl_fuse_noise_row_a_buf(hit.t_rows + i, K_DIM, R_RANK, a_seed, pairs_a,
+                                   a_sig + (size_t)(hit.t_rows + i) * K_DIM,
+                                   arow.data() + (size_t)i * K_DIM, el.data(), nr.data());
     for(int j = 0; j < kTileCols; j++)
         pearl_fuse_noise_row_b_buf(hit.t_cols + j, K_DIM, R_RANK, g_job.b_noise_seed,
                                    g_job.pairs_b.data(), NULL, bcol.data() + (size_t)j * K_DIM,
                                    el.data(), nr.data());
     uint32_t ref[kMilestones] = {};
     for(int i = 0; i < kTileRows; i++){
-        const int8_t* a = a_panel + (size_t)(hit.t_rows - row0 + i) * K_DIM;
+        const int8_t* a = arow.data() + (size_t)i * K_DIM;
         for(int j = 0; j < kTileCols; j++){
             const int8_t* b = bcol.data() + (size_t)j * K_DIM;
             int32_t acc = 0;
@@ -354,6 +398,20 @@ int verify_hit(const Hit& hit, int row0, const int8_t* a_panel, const uint32_t a
 }
 
 } /* namespace */
+
+extern "C" int8_t* cp_pearl_hexagon_worker_alloc_signal_a(size_t bytes)
+{
+    /* Shared with the DSP: set_a_gen reads each panel's signal rows in place. */
+    if(!g_px) return nullptr;
+    int8_t* p = (int8_t*)cp_pearlx_alloc(g_px, bytes);
+    if(p) memset(p, 0, bytes);
+    return p;
+}
+
+extern "C" void cp_pearl_hexagon_worker_free_signal_a(int8_t* p)
+{
+    if(p && g_px) cp_pearlx_free(g_px, p);
+}
 
 extern "C" void cp_pearl_hexagon_worker_set_launch(int row_macros, int col_macros)
 {
@@ -511,22 +569,10 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     const int S = (int)launches.size();
     const int panels = (int)panel_rows.size();
 
-    double check_sec = 0.0, build_sec = 0.0, wait_sec = 0.0;
-    /* The slice of the panel after launch s's that is built alongside launch s. */
-    auto build_slice = [&](int s) {
-        const Launch& l = launches[s];
-        if(l.panel + 1 >= panels) return;
-        const int next_rows = panel_rows[l.panel + 1];
-        const int r0 = (int)((int64_t)next_rows * l.index_in_panel / l.launches_in_panel);
-        const int r1 = (int)((int64_t)next_rows * (l.index_in_panel + 1) / l.launches_in_panel);
-        const double t = cp_now_sec();
-        build_noisy_a_rows(l.row0 + l.rows, r0, r1, a_seed, pairs_a.data(), h_A_sig,
-                           g_buf.a[(l.panel + 1) & 1]);
-        build_sec += cp_now_sec() - t;
-    };
+    double check_sec = 0.0, wait_sec = 0.0;
+    uint32_t a_seed_label[16];
+    seed_label_words(a_seed, PEARL_SEED_LABEL_A, a_seed_label);
 
-    build_noisy_a_rows(0, 0, panel_rows[0], a_seed, pairs_a.data(), h_A_sig, g_buf.a[0]);
-    build_slice(0);
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
     double last_report = scan_t0;
@@ -549,24 +595,21 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         const double t = cp_now_sec();
         const Launch& l = launches[s];
         Hit h = check_launch(l, g_buf.xr[s & 1], a_key8, bound);
-        if(h.found && verify_hit(h, l.row0, g_buf.a[l.panel & 1], a_key8, bound) != 0)
+        if(h.found && verify_hit(h, h_A_sig, a_seed, pairs_a.data(), a_key8, bound) != 0)
             h.found = 0;
         tiles_done += launch_tiles(l);
         check_sec += cp_now_sec() - t;
         return h;
     };
 
-    /* The DSP thread runs the launches back to back; it only waits for the host when the
-     * record buffer it is about to reuse is not checked yet, or a new panel's noisy rows
-     * are not built yet. The host follows: after launch s it checks s (s's panel buffer
-     * is still intact for a hit recompute) and then builds launch s + 1's slice, one
-     * launch ahead of the panel that needs it. */
+    /* The DSP thread runs the launches back to back, generating each row panel's noisy A
+     * at the panel's first launch; it only waits for the host when the record buffer it
+     * is about to reuse is not checked yet. The host follows, checking each launch. */
     struct Pipe {
         std::mutex mu;
         std::condition_variable cv;
         int launched = 0;   /* launches the DSP has finished */
         int checked = 0;    /* launches the host has checked: their record buffer is free */
-        int built = 1;      /* build_slice(s) is done for every s < built */
         bool stop = false;
         int err = 0;
         uint64_t dsp_us = 0;
@@ -577,16 +620,14 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
             const Launch& l = launches[s];
             {
                 std::unique_lock<std::mutex> lock(pipe.mu);
-                pipe.cv.wait(lock, [&] {
-                    return pipe.stop || (pipe.checked >= s - 1 &&
-                                         (!l.first_in_panel || l.panel == 0 || pipe.built >= s));
-                });
+                pipe.cv.wait(lock, [&] { return pipe.stop || pipe.checked >= s - 1; });
                 if(pipe.stop) return;
             }
             uint64_t us_a = 0, us = 0;
             int err = 0;
             if(l.first_in_panel)
-                err = cp_pearlx_set_a(g_px, g_buf.a[l.panel & 1], l.rows, K_DIM, 0, &us_a);
+                err = cp_pearlx_set_a_gen(g_px, h_A_sig + (size_t)l.row0 * K_DIM, l.row0, l.rows,
+                                          K_DIM, 0, a_seed_label, pairs_a.data(), &us_a);
             if(!err)
                 err = cp_pearlx_gemm_xor(g_px, l.col0, l.cols, g_buf.xr[s & 1], g_buf.xr_words,
                                          &us);
@@ -621,14 +662,6 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         pipe.cv.notify_all();
         if(hit.found || cp_job_should_cancel())
             break;
-        if(s + 1 < S){
-            build_slice(s + 1);
-            {
-                std::lock_guard<std::mutex> lock(pipe.mu);
-                pipe.built = s + 2;
-            }
-            pipe.cv.notify_all();
-        }
 
         const double now = cp_now_sec();
         if(now - last_report >= 5.0){
@@ -652,9 +685,8 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     const double scan_sec = cp_now_sec() - scan_t0;
     if(out_tiles_scanned) *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("hexagon", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[hexagon] scan %.3fs: DSP busy %.3fs; host jackpot %.3fs, noisy A %.3fs, "
-           "waiting for the DSP %.3fs\n",
-           scan_sec, dsp_us_total / 1e6, check_sec, build_sec, wait_sec);
+    printf("[hexagon] scan %.3fs: DSP busy %.3fs; host jackpot %.3fs, waiting for the DSP "
+           "%.3fs\n", scan_sec, dsp_us_total / 1e6, check_sec, wait_sec);
     fflush(stdout);
     if(rc != 0)
         return rc;

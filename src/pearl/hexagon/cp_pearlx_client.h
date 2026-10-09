@@ -33,6 +33,17 @@ int cp_pearlx_set_a(CpPearlx* px, const int8_t* a, int rows, int k, int nthreads
                     uint64_t* dsp_us);
 int cp_pearlx_gemm_xor(CpPearlx* px, int col0, int ncols, uint32_t* xr, size_t xr_words,
                        uint64_t* dsp_us);
+/* Noise generated and packed on the DSP (seed_label: noise seed then label, 8 words each;
+ * pairs: the k permutation pairs). set_a_gen's a_sig is the panel's signal rows. */
+int cp_pearlx_set_b_gen(CpPearlx* px, int n, int k, const uint32_t seed_label[16],
+                        const uint32_t* pairs, uint64_t* dsp_us);
+int cp_pearlx_set_a_gen(CpPearlx* px, const int8_t* a_sig, int row0, int rows, int k,
+                        int nthreads, const uint32_t seed_label[16], const uint32_t* pairs,
+                        uint64_t* dsp_us);
+/* Keyed BLAKE3 chaining values of the 1 KB chunks of raw_len bytes (a multiple of 32 KB;
+ * data NULL: all zeros) into cvs (8 words per chunk). data and cvs 128-byte aligned. */
+int cp_pearlx_chunk_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const uint32_t key[8],
+                        uint32_t* cvs, uint64_t* dsp_us);
 int cp_pearlx_info(CpPearlx* px, int* hvx_contexts, int* clock_vote_err, int* clock_mhz,
                    int* vtcm_kb);
 

@@ -113,6 +113,12 @@ int cp_worker_prefers_host_matrices(void);
  * fallback), so the host slot must be reclaimed before each attempt rather than on a share. */
 int cp_worker_writes_host_signal_a(void);
 
+/* Host signal A (h_Ap_global, zero-filled). A backend whose device reads it in place
+ * (Hexagon: shared rpcmem) allocates it; every other backend gets calloc/free. Anything
+ * that frees an A buffer (mine loop, share queue) must use cp_worker_free_host_signal_a. */
+int8_t* cp_worker_alloc_host_signal_a(size_t bytes);
+void cp_worker_free_host_signal_a(int8_t* p);
+
 /* Worker generates noisy matrices internally (CPU zero-B). */
 int cp_worker_worker_handles_matrix_prep(void);
 void cp_worker_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version);

@@ -39,8 +39,6 @@
 #define CP_MATRIX_UNIT        1024
 #define CP_MATRIX_UNITS_MAX   256
 #define CP_MATRIX_AREA_MAX    (128 * 128) /* max m_units * n_units */
-/* Hexagon (phone) default --m / --n: 32 units = 128 MiB per matrix. */
-#define CP_HEXAGON_MATRIX_UNITS_DEFAULT 32
 /* Hexagon: 128x128 macro blocks per DSP launch, rows and columns (32 x 32 = 4096 x 4096). */
 #define CP_HEXAGON_LAUNCH_MACROS_DEFAULT 32
 

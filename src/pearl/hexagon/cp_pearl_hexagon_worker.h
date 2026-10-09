@@ -1,6 +1,7 @@
 #ifndef CP_PEARL_HEXAGON_WORKER_H
 #define CP_PEARL_HEXAGON_WORKER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -8,11 +9,15 @@ extern "C" {
 #endif
 
 /* Pearl on the Hexagon cDSP (HVX): fused GEMM + milestone XOR in pearlx (dsp/), 4x64
- * hash tiles, host zero-B matrix prep and host BLAKE3 jackpot. */
+ * hash tiles, noise generated on the DSP (zero-B), host BLAKE3 jackpot. */
 void cp_pearl_hexagon_worker_init(void);
 void cp_pearl_hexagon_worker_shutdown(void);
 int cp_pearl_hexagon_worker_is_ready(void);
 int cp_pearl_hexagon_worker_list_devices(void);
+/* Host signal A in memory shared with the DSP (zero-filled), which reads each panel's
+ * signal rows in place to generate noisy A. Needs the worker initialized. */
+int8_t *cp_pearl_hexagon_worker_alloc_signal_a(size_t bytes);
+void cp_pearl_hexagon_worker_free_signal_a(int8_t *p);
 /* DSP launch size in 128x128 macro blocks: row_macros x col_macros (<= 0 restores the
  * default, CP_HEXAGON_LAUNCH_MACROS_DEFAULT each). */
 void cp_pearl_hexagon_worker_set_launch(int row_macros, int col_macros);

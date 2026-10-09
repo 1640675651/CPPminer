@@ -11,6 +11,10 @@
 #include "remote.h"
 #include "rpcmem.h"
 #include "pearlx.h"
+#include "cp_noise.h"
+
+/* cp_noise.c polls this between rows; the self-test never cancels. */
+int cp_job_should_cancel(void) { return 0; }
 
 // Weak so the binary still loads on devices whose libcdsprpc lacks it.
 #pragma weak remote_session_control
@@ -84,9 +88,148 @@ static void ref_tile(const int8_t *A, const int8_t *Bt, int k, int r0, int c0, u
         }
 }
 
+static uint64_t now_us(void);
+
+/* Noise seed + label as the 16 words set_*_gen take. */
+static void seed_label_words(const uint8_t seed[32], const uint8_t label[32], uint32_t out[16]) {
+    memcpy(out, seed, 32);
+    memcpy(out + 8, label, 32);
+}
+
+/* Records of the packed panel against all of B (one gemm_xor over the full width). */
+static int panel_records(remote_handle64 h, int n, uint32_t *xr, size_t xr_words) {
+    uint64 us = 0;
+    return pearlx_gemm_xor(h, 0, n, xr, (int)xr_words, &us);
+}
+
+/* -G 1: DSP-generated noisy B and A panel (set_b_gen, set_a_gen) against the host's
+ * cp_noise.c (pearl_build_noisy_b, pearl_fuse_noise_row_a_buf, then set_b / set_a), by
+ * comparing every XOR record of the panel against all of B. */
+static int gen_test(remote_handle64 h, int n, int k, int rows, int row0) {
+    const int nms = k / MS_K, lines = (nms * 2 + 31) / 32;
+    const size_t xr_words = (size_t)(n / 128) * (rows / 4) * lines * 32;
+    int8_t *bt = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)n * k);
+    int8_t *sig = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)rows * k);
+    int8_t *noisy = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)rows * k);
+    uint32_t *ref = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, xr_words * 4);
+    uint32_t *got = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, xr_words * 4);
+    uint32_t *pairs_a = malloc((size_t)k * 8), *pairs_b = malloc((size_t)k * 8);
+    if (!bt || !sig || !noisy || !ref || !got || !pairs_a || !pairs_b) {
+        printf("ERROR: allocation failed\n");
+        return 1;
+    }
+    uint8_t a_seed[32], b_seed[32];
+    uint32_t sd = 12345;
+    for (int i = 0; i < 32; i++) {
+        a_seed[i] = (uint8_t)(lcg(&sd) >> 24);
+        b_seed[i] = (uint8_t)(lcg(&sd) >> 24);
+    }
+    /* Signal A in the miner's range [-64, 63]. */
+    for (size_t i = 0; i < (size_t)rows * k; i++)
+        sig[i] = (int8_t)((int)(lcg(&sd) >> 25) - 64);
+    pearl_build_perm_pairs_a(a_seed, k, 128, pairs_a);
+    pearl_build_perm_pairs_b(b_seed, k, 128, pairs_b);
+    uint32_t a_sl[16], b_sl[16];
+    seed_label_words(a_seed, PEARL_SEED_LABEL_A, a_sl);
+    seed_label_words(b_seed, PEARL_SEED_LABEL_B, b_sl);
+    printf("gen test: n=%d k=%d, panel rows %d..%d\n", n, k, row0, row0 + rows - 1);
+
+    int err = 0;
+    uint64 us = 0, b_ref_dsp = 0, b_gen_dsp = 0, a_ref_dsp = 0, a_gen_dsp = 0;
+    /* Reference: host noise, DSP packing. */
+    uint64_t t0 = now_us();
+    pearl_build_noisy_b(n, k, 128, b_seed, NULL, bt);
+    const uint64_t b_host = now_us() - t0;
+    if ((err = pearlx_set_b(h, bt, n * k, n, k, &b_ref_dsp))) goto fail;
+    t0 = now_us();
+    {
+        int8_t el[128], nr[4096];
+        for (int r = 0; r < rows; r++)
+            pearl_fuse_noise_row_a_buf(row0 + r, k, 128, a_seed, pairs_a, sig + (size_t)r * k,
+                                       noisy + (size_t)r * k, el, nr);
+    }
+    const uint64_t a_host = now_us() - t0;
+    if ((err = pearlx_set_a(h, noisy, rows * k, rows, 0, &a_ref_dsp))) goto fail;
+    if ((err = panel_records(h, n, ref, xr_words))) goto fail;
+
+    /* Both generated on the DSP. */
+    if ((err = pearlx_set_b_gen(h, n, k, b_sl, 16, pairs_b, 2 * k, &b_gen_dsp))) goto fail;
+    if ((err = pearlx_set_a_gen(h, sig, rows * k, row0, rows, 0, a_sl, 16, pairs_a, 2 * k,
+                                &a_gen_dsp)))
+        goto fail;
+    if ((err = panel_records(h, n, got, xr_words))) goto fail;
+    size_t bad = 0;
+    for (size_t i = 0; i < xr_words; i++)
+        bad += got[i] != ref[i];
+    printf("  host noise: B %.1f ms, A panel %.1f ms (CPU)\n", b_host / 1e3, a_host / 1e3);
+    printf("  set_b (pack) %.1f ms vs set_b_gen %.1f ms; set_a (pack) %.2f ms vs set_a_gen %.2f ms"
+           " (DSP)\n", b_ref_dsp / 1e3, b_gen_dsp / 1e3, a_ref_dsp / 1e3, a_gen_dsp / 1e3);
+    printf("gen check: %s (%zu of %zu XOR words differ)\n", bad ? "FAIL" : "PASS", bad, xr_words);
+    if (bad) {
+        /* Which half is wrong: generated A with the reference B, and the other way round. */
+        size_t bad_a = 0, bad_b = 0;
+        if ((err = pearlx_set_b(h, bt, n * k, n, k, &us))) goto fail;
+        if ((err = pearlx_set_a_gen(h, sig, rows * k, row0, rows, 0, a_sl, 16, pairs_a, 2 * k, &us)))
+            goto fail;
+        if ((err = panel_records(h, n, got, xr_words))) goto fail;
+        for (size_t i = 0; i < xr_words; i++) bad_a += got[i] != ref[i];
+        if ((err = pearlx_set_b_gen(h, n, k, b_sl, 16, pairs_b, 2 * k, &us))) goto fail;
+        if ((err = pearlx_set_a(h, noisy, rows * k, rows, 0, &us))) goto fail;
+        if ((err = panel_records(h, n, got, xr_words))) goto fail;
+        for (size_t i = 0; i < xr_words; i++) bad_b += got[i] != ref[i];
+        printf("  set_a_gen alone: %zu words differ; set_b_gen alone: %zu words differ\n",
+               bad_a, bad_b);
+    }
+    return bad ? 1 : 0;
+fail:
+    printf("ERROR 0x%x in gen test\n", err);
+    return 1;
+}
+
+/* -H 1: chunk_cvs on the DSP (random data, and all zeros) against the host's keyed matrix
+ * hash: the root built from the DSP's chunk hashes must equal pearl_keyed_digest_int8. */
+static int hash_test(remote_handle64 h, size_t bytes) {
+    int8_t *data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes);
+    uint32_t *cvs = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes / 1024 * 32);
+    PearlMatrixHash *tree = pearl_matrix_hash_create();
+    if (!data || !cvs || !tree) {
+        printf("ERROR: allocation failed\n");
+        return 1;
+    }
+    uint8_t key[32];
+    uint32_t sd = 777, key8[8];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(lcg(&sd) >> 24);
+    memcpy(key8, key, 32);
+    int bad = 0;
+    for (int zero = 0; zero < 2; zero++) {
+        if (zero) memset(data, 0, bytes);
+        else fill(data, bytes, 31);
+        uint64 dsp_us = 0;
+        int err = pearlx_chunk_cvs(h, zero ? NULL : data, zero ? 0 : (int)bytes, (int)bytes, key8, 8,
+                                   cvs, (int)(bytes / 1024 * 8), &dsp_us);
+        if (err) {
+            printf("ERROR 0x%x: chunk_cvs\n", err);
+            return 1;
+        }
+        uint8_t root[32], ref[32];
+        const uint64_t t0 = now_us();
+        pearl_matrix_hash_from_cvs(tree, data, bytes, key, (const uint8_t *)cvs, root);
+        const uint64_t tree_us = now_us() - t0;
+        const uint64_t t1 = now_us();
+        pearl_keyed_digest_int8(data, bytes, key, ref);
+        const uint64_t host_us = now_us() - t1;
+        const int ok = memcmp(root, ref, 32) == 0;
+        printf("hash check (%s, %zu MiB): %s; DSP chunk hashes %.1f ms + host tree %.1f ms, "
+               "host full hash %.1f ms\n", zero ? "zeros" : "random", bytes >> 20,
+               ok ? "PASS" : "FAIL", dsp_us / 1e3, tree_us / 1e3, host_us / 1e3);
+        bad += !ok;
+    }
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char *argv[]) {
     int n = 4096, k = 4096, rows = 1024, cols = 4096, panels = 4, threads = 0, check = 1;
-    int samples = 4096, jackpot = 1, hit_bits = 14, xr_uncached = 0;
+    int samples = 4096, jackpot = 1, hit_bits = 14, xr_uncached = 0, gen = 0, hash = 0;
     for (int a = 1; a + 1 < argc; a += 2) {
         int v = atoi(argv[a + 1]);
         if (!strcmp(argv[a], "-n")) n = v;
@@ -100,10 +243,13 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[a], "-j")) jackpot = v;
         else if (!strcmp(argv[a], "-b")) hit_bits = v;
         else if (!strcmp(argv[a], "-u")) xr_uncached = v;
+        else if (!strcmp(argv[a], "-G")) gen = v;
+        else if (!strcmp(argv[a], "-H")) hash = v;
         else { printf("unknown option %s\n", argv[a]); return 1; }
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
-           " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1]\n");
+           " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1] [-b hit_bits] [-u 0|1]"
+           " [-G 0|1] [-H 0|1]\n");
     /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
     uint32_t key_bound[16];
     for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
@@ -148,6 +294,19 @@ int main(int argc, char *argv[]) {
     pearlx_info(h, &hvx, &vote, &mhz, &vtcm);
     printf("pearlx: n=%d k=%d, %d panels of %d rows, %d columns per call; DSP %d HVX, %d MHz, "
            "VTCM %d KB, vote %s\n", n, k, panels, rows, cols, hvx, mhz, vtcm, vote ? "FAILED" : "ok");
+
+    if (hash) {
+        err = hash_test(h, (size_t)n * k);
+        pearlx_close(h);
+        printf("%s\n", err ? "FAILED" : "Success");
+        return err ? 1 : 0;
+    }
+    if (gen) {
+        err = gen_test(h, n, k, rows, 3 * rows);
+        pearlx_close(h);
+        printf("%s\n", err ? "FAILED" : "Success");
+        return err ? 1 : 0;
+    }
 
     fill(Bt, (size_t)n * k, 2);
     uint64 dsp_us = 0;

@@ -21,9 +21,19 @@ set(NO_QURT_INC 1)
 
 if(${OS_TYPE} MATCHES "HLOS")
 
-    # Android: FastRPC stub library + self-test executable
+    # Android: FastRPC stub library + self-test executable. The self-test links the miner's
+    # host noise code (cp_noise.c, portable BLAKE3) as the reference for the DSP generators.
+    set(CPPMINER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
     add_library(pearlx SHARED ${CMAKE_CURRENT_BINARY_DIR}/pearlx_stub)
-    add_executable(pearlx_test ${CMAKE_CURRENT_SOURCE_DIR}/src/pearlx_test)
+    add_executable(pearlx_test ${CMAKE_CURRENT_SOURCE_DIR}/src/pearlx_test.c
+        ${CPPMINER_ROOT}/src/common/cp_noise.c
+        ${CPPMINER_ROOT}/third_party/blake3/blake3.c
+        ${CPPMINER_ROOT}/third_party/blake3/blake3_dispatch.c
+        ${CPPMINER_ROOT}/third_party/blake3/blake3_portable.c)
+    target_include_directories(pearlx_test PRIVATE ${CPPMINER_ROOT}/include
+        ${CPPMINER_ROOT}/third_party/blake3)
+    target_compile_definitions(pearlx_test PRIVATE BLAKE3_USE_NEON=0 BLAKE3_NO_SSE2
+        BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512)
 
     link_options(pearlx_test)
     include_directories(${common_incs})

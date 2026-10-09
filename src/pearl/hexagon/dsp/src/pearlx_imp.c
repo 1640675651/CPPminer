@@ -46,6 +46,9 @@ typedef struct {
     // scan: each thread's records of one column tile, checked on the DSP.
     uint8 *jp_rec;
     size_t jp_cap;
+    // set_b_gen / set_a_gen: per-thread noise tables and noise columns.
+    HVX_Vector *gen_scratch;
+    int gen_threads;
 } pearlx_ctx;
 
 // Pin core and bus clocks at their highest corner and keep the DSP out of
@@ -95,6 +98,7 @@ int pearlx_close(remote_handle64 handle) {
         free(ctx->Bz);
         free(ctx->Az);
         free(ctx->jp_rec);
+        free(ctx->gen_scratch);
         if (ctx->vtcm)
             HAP_release_VTCM(ctx->vtcm);
         HAP_power_request_t req;
@@ -369,6 +373,61 @@ static inline void b3_g(HVX_Vector *v, int a, int b, int c, int d, HVX_Vector x,
     v[b] = VROTR(VXOR(v[b], v[c]), r7);
 }
 
+#define B3_CHUNK_START 1
+#define B3_CHUNK_END 2
+#define B3_ROOT 8
+#define B3_KEYED_HASH 16
+
+// One BLAKE3 compression of a 64-byte block per lane: cv[0..7] is the input chaining value
+// and gets the output one (the first 8 state words XOR the last 8); counter_lo is each
+// lane's block counter (low word; the high word is 0). Rounds fully unrolled with
+// constant message indices, so the message stays in registers.
+static inline void b3_compress(const HVX_Vector m[16], HVX_Vector cv[8], HVX_Vector counter_lo,
+                               uint32 flags) {
+    const HVX_Vector r16 = Q6_V_vsplat_R(16), r12 = Q6_V_vsplat_R(12);
+    const HVX_Vector r8 = Q6_V_vsplat_R(8), r7 = Q6_V_vsplat_R(7);
+    HVX_Vector v[16];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 8; i++)
+        v[i] = cv[i];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++)
+        v[8 + i] = Q6_V_vsplat_R(b3_iv[i]);
+    v[12] = counter_lo;
+    v[13] = Q6_V_vzero();
+    v[14] = Q6_V_vsplat_R(64);
+    v[15] = Q6_V_vsplat_R(flags);
+#define B3_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    b3_g(v, 0, 4, 8, 12, m[s0], m[s1], r16, r12, r8, r7);                             \
+    b3_g(v, 1, 5, 9, 13, m[s2], m[s3], r16, r12, r8, r7);                             \
+    b3_g(v, 2, 6, 10, 14, m[s4], m[s5], r16, r12, r8, r7);                            \
+    b3_g(v, 3, 7, 11, 15, m[s6], m[s7], r16, r12, r8, r7);                            \
+    b3_g(v, 0, 5, 10, 15, m[s8], m[s9], r16, r12, r8, r7);                            \
+    b3_g(v, 1, 6, 11, 12, m[s10], m[s11], r16, r12, r8, r7);                          \
+    b3_g(v, 2, 7, 8, 13, m[s12], m[s13], r16, r12, r8, r7);                           \
+    b3_g(v, 3, 4, 9, 14, m[s14], m[s15], r16, r12, r8, r7);
+    B3_ROUND(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    B3_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    B3_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    B3_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    B3_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    B3_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    B3_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+#undef B3_ROUND
+#pragma clang loop unroll(full)
+    for (int w = 0; w < 8; w++)
+        cv[w] = VXOR(v[w], v[w + 8]);
+}
+
+// Keyed BLAKE3 of one 64-byte message per lane (a single chunk and block: flags
+// CHUNK_START | CHUNK_END | ROOT | KEYED_HASH, counter 0): digest words into out[0..7].
+static inline void b3_lanes(const HVX_Vector m[16], const uint32 key[8], HVX_Vector out[8]) {
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 8; i++)
+        out[i] = Q6_V_vsplat_R(key[i]);
+    b3_compress(m, out, Q6_V_vzero(), B3_CHUNK_START | B3_CHUNK_END | B3_ROOT | B3_KEYED_HASH);
+}
+
 // Hash tiles of n_rec records (n_rec <= 16) at rec, consecutive JP_REC_WORDS-word records:
 // returns a predicate of the lanes at or below the bound.
 static HVX_VectorPred jp_group(const uint32 *rec, int n_rec, const uint32 key[8],
@@ -392,40 +451,19 @@ static HVX_VectorPred jp_group(const uint32 *rec, int n_rec, const uint32 key[8]
                     r[i + d] = Q6_V_hi_W(w);
                 }
     }
-    const HVX_Vector r19 = Q6_V_vsplat_R(19), r16 = Q6_V_vsplat_R(16), r12 = Q6_V_vsplat_R(12);
-    const HVX_Vector r8 = Q6_V_vsplat_R(8), r7 = Q6_V_vsplat_R(7);
+    const HVX_Vector r19 = Q6_V_vsplat_R(19);
     // Fold: msg[i] = rotl(x[i], 13) ^ x[i + 16].
     HVX_Vector m[16];
 #pragma clang loop unroll(full)
     for (int i = 0; i < 16; i++)
         m[i] = VXOR(VROTR(x[i], r19), x[i + 16]);
-    HVX_Vector v[16];
-#pragma clang loop unroll(full)
-    for (int i = 0; i < 8; i++)
-        v[i] = Q6_V_vsplat_R(key[i]);
-#pragma clang loop unroll(full)
-    for (int i = 0; i < 4; i++)
-        v[8 + i] = Q6_V_vsplat_R(b3_iv[i]);
-    v[12] = Q6_V_vzero();
-    v[13] = Q6_V_vzero();
-    v[14] = Q6_V_vsplat_R(64);
-    v[15] = Q6_V_vsplat_R(0x1B);
-    // Rounds fully unrolled with constant message indices, so the message stays in
-    // registers instead of being picked from the stack by a run-time schedule.
-#define B3_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)     b3_g(v, 0, 4, 8, 12, m[s0], m[s1], r16, r12, r8, r7);                                 b3_g(v, 1, 5, 9, 13, m[s2], m[s3], r16, r12, r8, r7);                                 b3_g(v, 2, 6, 10, 14, m[s4], m[s5], r16, r12, r8, r7);                                b3_g(v, 3, 7, 11, 15, m[s6], m[s7], r16, r12, r8, r7);                                b3_g(v, 0, 5, 10, 15, m[s8], m[s9], r16, r12, r8, r7);                                b3_g(v, 1, 6, 11, 12, m[s10], m[s11], r16, r12, r8, r7);                              b3_g(v, 2, 7, 8, 13, m[s12], m[s13], r16, r12, r8, r7);                               b3_g(v, 3, 4, 9, 14, m[s14], m[s15], r16, r12, r8, r7);
-    B3_ROUND(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
-    B3_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
-    B3_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
-    B3_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
-    B3_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
-    B3_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
-    B3_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
-#undef B3_ROUND
-    // digest[w] = v[w] ^ v[w + 8]; compare from the most significant word down.
+    HVX_Vector dgst[8];
+    b3_lanes(m, key, dgst);
+    // Compare the digest with the bound from the most significant word down.
     HVX_VectorPred lt = Q6_Q_vsetq_R(0), gt = Q6_Q_vsetq_R(0);
 #pragma clang loop unroll(full)
     for (int w = 7; w >= 0; w--) {
-        const HVX_Vector dg = VXOR(v[w], v[w + 8]), bd = Q6_V_vsplat_R(bound[w]);
+        const HVX_Vector dg = dgst[w], bd = Q6_V_vsplat_R(bound[w]);
         const HVX_VectorPred open = Q6_Q_not_Q(Q6_Q_or_QQ(lt, gt));
         lt = Q6_Q_or_QQ(lt, Q6_Q_and_QQ(open, Q6_Q_vcmp_gt_VuwVuw(bd, dg)));
         gt = Q6_Q_or_QQ(gt, Q6_Q_and_QQ(open, Q6_Q_vcmp_gt_VuwVuw(dg, bd)));
@@ -598,6 +636,31 @@ static void panel_problem(const pearlx_ctx *ctx, gx_problem *p) {
     p->Az = ctx->Az;
 }
 
+// A panel buffer for `rows` rows (sized, padding zeroed); the panel is valid once the
+// caller has filled it and set ctx->a_rows = rows.
+static int prepare_panel(pearlx_ctx *ctx, int rows, int nthreads, gx_problem *p) {
+    ctx->a_rows = 0;
+    ctx->a_threads = hvx_threads(nthreads);
+    ctx->a_rows = rows;                     // for panel_problem
+    panel_problem(ctx, p);
+    ctx->a_rows = 0;
+    const size_t az_bytes = gx_az_bytes(p);
+    if (az_bytes > ctx->az_cap) {
+        free(ctx->Az);
+        ctx->az_cap = 0;
+        ctx->Az = memalign(VBYTES, az_bytes);
+        if (!ctx->Az)
+            return AEE_ENOMEMORY;
+        ctx->az_cap = az_bytes;
+    }
+    p->Az = ctx->Az;
+    // Each region's padding tiles: the kernel loads one chunk past the last
+    // one it uses and runs past its last tile (see PAD_TILES).
+    for (int kb = 0; kb < p->nkb; kb++)
+        memset(gx_a(p, kb, p->Mt), 0, (size_t)PAD_TILES * gx_rstride(p, kb));
+    return AEE_SUCCESS;
+}
+
 int pearlx_set_a(remote_handle64 h, const int8 *A, int ALen, int rows, int nthreads,
                  uint64 *dsp_us) {
     pearlx_ctx *ctx = (pearlx_ctx *)h;
@@ -606,39 +669,19 @@ int pearlx_set_a(remote_handle64 h, const int8 *A, int ALen, int rows, int nthre
     if (rows <= 0 || rows % MR || (int64)rows * ctx->k > ALen)
         return AEE_EBADPARM;
     uint64 t0 = HAP_perf_get_time_us();
-    ctx->a_rows = 0;
-
     gx_problem p;
-    ctx->a_threads = hvx_threads(nthreads);
-    ctx->a_rows = rows;
-    panel_problem(ctx, &p);
-    const size_t az_bytes = gx_az_bytes(&p);
-    if (az_bytes > ctx->az_cap) {
-        free(ctx->Az);
-        ctx->az_cap = 0;
-        ctx->Az = memalign(VBYTES, az_bytes);
-        if (!ctx->Az) {
-            ctx->a_rows = 0;
-            return AEE_ENOMEMORY;
-        }
-        ctx->az_cap = az_bytes;
-    }
-    p.Az = ctx->Az;
-
-    // Each region's padding tiles: the kernel loads one chunk past the last
-    // one it uses and runs past its last tile (see PAD_TILES).
-    for (int kb = 0; kb < p.nkb; kb++)
-        memset(gx_a(&p, kb, p.Mt), 0, (size_t)PAD_TILES * gx_rstride(&p, kb));
+    int err = prepare_panel(ctx, rows, nthreads, &p);
+    if (err)
+        return err;
 
     packx_a_job pa[MAX_NUM_WORKERS];
     const int na = ctx->a_threads < p.Mt ? ctx->a_threads : p.Mt;
     for (int t = 0; t < na; t++)
         pa[t] = (packx_a_job){ A, &p, p.Mt * t / na, p.Mt * (t + 1) / na };
-    int err = run_hvx_jobs(ctx, na, packx_a_run, pa, sizeof(pa[0]));
-    if (err) {
-        ctx->a_rows = 0;
+    err = run_hvx_jobs(ctx, na, packx_a_run, pa, sizeof(pa[0]));
+    if (err)
         return err;
-    }
+    ctx->a_rows = rows;
     *dsp_us = HAP_perf_get_time_us() - t0;
     return AEE_SUCCESS;
 }
@@ -759,6 +802,392 @@ int pearlx_scan(remote_handle64 h, int col0, int ncols, const uint32 *key_bound,
         for (int ms = 0; ms < JP_MS; ms++)
             hit[3 + ms] = res.hits ? res.words[ms] : 0;
     }
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return err;
+}
+
+// ---- Noise generation on the DSP, bit for bit as cp_noise.c ----
+// A noise row (a row of A, or a column of B) is a 128-entry table e[j] = (byte_j & 63) - 16
+// from 4 keyed BLAKE3 digests (key: the noise seed; message word 0 = 1 + 4 * row + q,
+// words 8..15 = the label "A_tensor" / "B_tensor"), then noise[l] = e[first[l]] -
+// e[second[l]] over the k permutation pairs. 128 rows at a time: the tables are
+// transposed to index-major vectors (byte r of el_t[j] = e_{row0 + r}[j]), so the noise
+// of column l for all 128 rows is one byte subtract.
+
+#define GEN_RANK 128                // table entries per noise row
+#define GEN_ROWS 128                // noise rows per block
+#define GEN_SCRATCH (2 * 128)       // vectors per thread: tables + noise columns
+
+static const uint32 lane_iota[32] __attribute__((aligned(VBYTES))) = {
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+
+// In-place transpose of 128 vectors of 128 bytes: afterwards byte i of r[j] is what was
+// byte j of r[i]. Seven rounds of vshuff on vector pairs 64, 32, .., 1 apart, done in two
+// register-resident passes (each vector loaded and stored twice, not seven times): rounds
+// 64, 32, 16 pair only vectors that differ in index bits 4..6, so they run on the 16
+// groups of 8 vectors 16 apart; rounds 8, 4, 2, 1 on the 8 groups of 16 neighbours.
+static void transpose_bytes_128(HVX_Vector *r) {
+    for (int base = 0; base < 16; base++) {
+        HVX_Vector v[8];
+#pragma clang loop unroll(full)
+        for (int j = 0; j < 8; j++)
+            v[j] = r[base + 16 * j];
+#pragma clang loop unroll(full)
+        for (int d = 4; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+            for (int j = 0; j < 8; j++)
+                if (!(j & d)) {
+                    HVX_VectorPair w = Q6_W_vshuff_VVR(v[j + d], v[j], -1);
+                    v[j] = Q6_V_lo_W(w);
+                    v[j + d] = Q6_V_hi_W(w);
+                }
+#pragma clang loop unroll(full)
+        for (int j = 0; j < 8; j++)
+            r[base + 16 * j] = v[j];
+    }
+    for (int g = 0; g < 8; g++) {
+        HVX_Vector v[16];
+#pragma clang loop unroll(full)
+        for (int j = 0; j < 16; j++)
+            v[j] = r[16 * g + j];
+#pragma clang loop unroll(full)
+        for (int d = 8; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+            for (int j = 0; j < 16; j++)
+                if (!(j & d)) {
+                    HVX_VectorPair w = Q6_W_vshuff_VVR(v[j + d], v[j], -1);
+                    v[j] = Q6_V_lo_W(w);
+                    v[j + d] = Q6_V_hi_W(w);
+                }
+#pragma clang loop unroll(full)
+        for (int j = 0; j < 16; j++)
+            r[16 * g + j] = v[j];
+    }
+}
+
+// Tables of noise rows [row0, row0 + 128), index-major into el_t[0..127].
+// seed_label: the noise seed (8 words), then the label (8 words).
+static void gen_tables(int row0, const uint32 *seed_label, HVX_Vector *el_t) {
+    HVX_Vector m[16];
+    for (int i = 1; i < 8; i++)
+        m[i] = Q6_V_vzero();
+    for (int i = 0; i < 8; i++)
+        m[8 + i] = Q6_V_vsplat_R(seed_label[8 + i]);
+    const HVX_Vector iota = *(const HVX_Vector *)lane_iota;
+    const HVX_Vector mask = Q6_V_vsplat_R(0x3F3F3F3F), zero_pt = Q6_V_vsplat_R(0x10101010);
+    for (int g = 0; g < GEN_ROWS / 8; g++) {
+        // One digest per lane: lane i = block 4 (row0 + 8g) + i, so 8 rows x 4 digests.
+        m[0] = VADD(Q6_V_vsplat_R(1 + 4 * (row0 + 8 * g)), iota);
+        HVX_Vector w[8];
+        b3_lanes(m, seed_label, w);
+        // 8 x 32 word transpose: vector v = row row0 + 8g + v, word 8q + w = word w of its
+        // digest q, i.e. table bytes in order.
+#pragma clang loop unroll(full)
+        for (int d = 4; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+            for (int i = 0; i < 8; i++)
+                if (!(i & d)) {
+                    HVX_VectorPair x = Q6_W_vshuff_VVR(w[i + d], w[i], -4);
+                    w[i] = Q6_V_lo_W(x);
+                    w[i + d] = Q6_V_hi_W(x);
+                }
+        for (int v = 0; v < 8; v++)
+            el_t[8 * g + v] = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(w[v], mask), zero_pt);
+    }
+    transpose_bytes_128(el_t);
+}
+
+static int ensure_gen_scratch(pearlx_ctx *ctx, int nthreads) {
+    if (ctx->gen_scratch && ctx->gen_threads >= nthreads)
+        return AEE_SUCCESS;
+    free(ctx->gen_scratch);
+    ctx->gen_threads = 0;
+    ctx->gen_scratch = memalign(VBYTES, (size_t)nthreads * GEN_SCRATCH * VBYTES);
+    if (!ctx->gen_scratch)
+        return AEE_ENOMEMORY;
+    ctx->gen_threads = nthreads;
+    return AEE_SUCCESS;
+}
+
+typedef struct {
+    const gx_problem *p;
+    HVX_Vector *Bz;
+    const uint32 *seed_label, *pairs;
+    int nt0, nt1;                   // column tiles
+    HVX_Vector *scratch;
+} gen_b_job;
+
+// Noisy B (signal B = 0) straight into the packed layout: vector (g, q) of column tile nt
+// holds the 4 values of k from 4g of columns 128 nt + 32 q + lane, one word per column.
+static void gen_b_run(void *arg) {
+    const gen_b_job *j = arg;
+    const gx_problem *p = j->p;
+    HVX_Vector *el_t = j->scratch;
+    for (int nt = j->nt0; nt < j->nt1; nt++) {
+        gen_tables(nt * NT_COLS, j->seed_label, el_t);
+        HVX_Vector *out = j->Bz + (size_t)nt * p->Kg * NV;
+        for (int g = 0; g < p->Kg; g++) {
+            HVX_Vector nz[4];
+            for (int q = 0; q < 4; q++) {
+                const uint32 *pr = j->pairs + 2 * (4 * g + q);
+                nz[q] = Q6_Vb_vsub_VbVb(el_t[pr[0] & (GEN_RANK - 1)], el_t[pr[1] & (GEN_RANK - 1)]);
+            }
+            // Bytes of k = 4g .. 4g + 3 into one word per column.
+            HVX_VectorPair a = Q6_W_vshuff_VVR(nz[1], nz[0], -1);
+            HVX_VectorPair b = Q6_W_vshuff_VVR(nz[3], nz[2], -1);
+            HVX_VectorPair c0 = Q6_W_vshuff_VVR(Q6_V_lo_W(b), Q6_V_lo_W(a), -2);
+            HVX_VectorPair c1 = Q6_W_vshuff_VVR(Q6_V_hi_W(b), Q6_V_hi_W(a), -2);
+            out[(size_t)g * NV + 0] = Q6_V_lo_W(c0);
+            out[(size_t)g * NV + 1] = Q6_V_hi_W(c0);
+            out[(size_t)g * NV + 2] = Q6_V_lo_W(c1);
+            out[(size_t)g * NV + 3] = Q6_V_hi_W(c1);
+        }
+    }
+}
+
+typedef struct {
+    const gx_problem *p;
+    const int8 *sig;                // the panel's signal rows, row-major
+    const uint32 *seed_label, *pairs;
+    int row0;                       // global row of the panel's first row
+    int b0, b1;                     // 128-row blocks of the panel
+    HVX_Vector *scratch;
+} gen_a_job;
+
+// Noisy A = signal + noise for 128 rows at a time, straight into the packed panel: per
+// 128 values of k, the noise columns are transposed back to rows, the signal added, and
+// each 4 rows packed into chunks as packx_a_run does.
+static void gen_a_run(void *arg) {
+    const gen_a_job *j = arg;
+    const gx_problem *p = j->p;
+    const int K = p->K;
+    HVX_Vector *el_t = j->scratch, *nz = j->scratch + GEN_RANK;
+    for (int b = j->b0; b < j->b1; b++) {
+        const int r0 = b * GEN_ROWS;
+        gen_tables(j->row0 + r0, j->seed_label, el_t);
+        for (int c4 = 0; c4 < K / 128; c4++) {
+            const uint32 *pairs = j->pairs + 2 * 128 * c4;
+            // The two passes of transpose_bytes_128, fused with what comes before and after:
+            // pass 1 gathers the noise columns l = 128 c4 + i straight into registers ...
+            for (int base = 0; base < 16; base++) {
+                HVX_Vector v[8];
+#pragma clang loop unroll(full)
+                for (int q = 0; q < 8; q++) {
+                    const uint32 *pr = pairs + 2 * (base + 16 * q);
+                    v[q] = Q6_Vb_vsub_VbVb(el_t[pr[0] & (GEN_RANK - 1)],
+                                           el_t[pr[1] & (GEN_RANK - 1)]);
+                }
+#pragma clang loop unroll(full)
+                for (int d = 4; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+                    for (int q = 0; q < 8; q++)
+                        if (!(q & d)) {
+                            HVX_VectorPair w = Q6_W_vshuff_VVR(v[q + d], v[q], -1);
+                            v[q] = Q6_V_lo_W(w);
+                            v[q + d] = Q6_V_hi_W(w);
+                        }
+#pragma clang loop unroll(full)
+                for (int q = 0; q < 8; q++)
+                    nz[base + 16 * q] = v[q];
+            }
+            // ... and pass 2 leaves finished rows 16 g .. 16 g + 15 in registers: add their
+            // signal and pack them, 4 rows to a chunk group as packx_a_run does.
+            const int kb = 4 * c4 / p->kblk;
+            for (int g = 0; g < GEN_ROWS / 16; g++) {
+                HVX_Vector v[16];
+#pragma clang loop unroll(full)
+                for (int q = 0; q < 16; q++)
+                    v[q] = nz[16 * g + q];
+#pragma clang loop unroll(full)
+                for (int d = 8; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+                    for (int q = 0; q < 16; q++)
+                        if (!(q & d)) {
+                            HVX_VectorPair w = Q6_W_vshuff_VVR(v[q + d], v[q], -1);
+                            v[q] = Q6_V_lo_W(w);
+                            v[q + d] = Q6_V_hi_W(w);
+                        }
+#pragma clang loop unroll(full)
+                for (int tt = 0; tt < 4; tt++) {
+                    HVX_Vector r[MR];
+#pragma clang loop unroll(full)
+                    for (int q = 0; q < MR; q++) {
+                        const int row = r0 + 16 * g + MR * tt + q;
+                        const int8 *sig = j->sig + (size_t)row * K + 128 * c4;
+                        r[q] = Q6_Vb_vadd_VbVb(v[MR * tt + q], *(const HVX_UVector *)sig);
+                    }
+                    HVX_VectorPair p01 = Q6_W_vshuff_VVR(r[1], r[0], -32);
+                    HVX_VectorPair p23 = Q6_W_vshuff_VVR(r[3], r[2], -32);
+                    HVX_VectorPair q0 = Q6_W_vshuff_VVR(Q6_V_lo_W(p23), Q6_V_lo_W(p01), -64);
+                    HVX_VectorPair q1 = Q6_W_vshuff_VVR(Q6_V_hi_W(p23), Q6_V_hi_W(p01), -64);
+                    HVX_Vector *out =
+                        (HVX_Vector *)(gx_a(p, kb, (r0 + 16 * g) / MR + tt) +
+                                       (size_t)(4 * c4 - kb * p->kblk) * VBYTES);
+                    out[0] = Q6_V_lo_W(q0);
+                    out[1] = Q6_V_hi_W(q0);
+                    out[2] = Q6_V_lo_W(q1);
+                    out[3] = Q6_V_hi_W(q1);
+                }
+            }
+        }
+    }
+}
+
+int pearlx_set_b_gen(remote_handle64 h, int n, int k, const uint32 *seed_label, int slLen,
+                     const uint32 *pairs, int pairsLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    if (n <= 0 || k <= 0 || n % NT_COLS || k % 128 || slLen < 16 || pairsLen < 2 * k)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    free(ctx->Bz);
+    ctx->Bz = NULL;
+    ctx->n = ctx->k = 0;
+    ctx->a_rows = 0;
+    gx_problem p;
+    memset(&p, 0, sizeof(p));
+    gx_shape(&p, n, k);
+    HVX_Vector *Bz = memalign(VBYTES, (size_t)n * k);
+    if (!Bz) {
+        FARF(ERROR, "pearlx: no memory for packed B (%d x %d)", n, k);
+        return AEE_ENOMEMORY;
+    }
+    const int nthreads = hvx_threads(0);
+    int err = ensure_gen_scratch(ctx, nthreads);
+    if (err) {
+        free(Bz);
+        return err;
+    }
+    const int nb = nthreads < p.Nt ? nthreads : p.Nt;
+    gen_b_job jb[MAX_NUM_WORKERS];
+    for (int t = 0; t < nb; t++)
+        jb[t] = (gen_b_job){ &p, Bz, seed_label, pairs, p.Nt * t / nb, p.Nt * (t + 1) / nb,
+                             ctx->gen_scratch + (size_t)t * GEN_SCRATCH };
+    err = run_hvx_jobs(ctx, nb, gen_b_run, jb, sizeof(jb[0]));
+    if (err) {
+        free(Bz);
+        return err;
+    }
+    ctx->Bz = Bz;
+    ctx->n = n;
+    ctx->k = k;
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return AEE_SUCCESS;
+}
+
+int pearlx_set_a_gen(remote_handle64 h, const int8 *A, int ALen, int row0, int rows,
+                     int nthreads, const uint32 *seed_label, int slLen, const uint32 *pairs,
+                     int pairsLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    if (!ctx->Bz)
+        return AEE_EBADSTATE;
+    if (row0 < 0 || rows <= 0 || rows % GEN_ROWS || (int64)rows * ctx->k > ALen ||
+        slLen < 16 || pairsLen < 2 * ctx->k)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    gx_problem p;
+    int err = prepare_panel(ctx, rows, nthreads, &p);
+    if (!err)
+        err = ensure_gen_scratch(ctx, ctx->a_threads);
+    if (err)
+        return err;
+    const int blocks = rows / GEN_ROWS;
+    const int na = ctx->a_threads < blocks ? ctx->a_threads : blocks;
+    gen_a_job ja[MAX_NUM_WORKERS];
+    for (int t = 0; t < na; t++)
+        ja[t] = (gen_a_job){ &p, A, seed_label, pairs, row0, blocks * t / na,
+                             blocks * (t + 1) / na, ctx->gen_scratch + (size_t)t * GEN_SCRATCH };
+    err = run_hvx_jobs(ctx, na, gen_a_run, ja, sizeof(ja[0]));
+    if (err)
+        return err;
+    ctx->a_rows = rows;
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return AEE_SUCCESS;
+}
+
+// ---- Keyed BLAKE3 chunk chaining values (the leaves of cp_noise.c's matrix hashes) ----
+// 32 chunks of 1 KB per vector, one per lane: 16 compressions per chunk with the chunk
+// index as counter, flags KEYED_HASH plus CHUNK_START on the first block and CHUNK_END on
+// the last. The host builds the tree above the leaves.
+
+#define CV_GROUP 32                 // chunks per vector
+
+typedef struct {
+    const uint8 *data;              // NULL: all-zero data
+    const uint32 *key;
+    uint32 *cvs;                    // 8 words per chunk
+    int g0, g1;                     // groups of CV_GROUP chunks
+} cv_job;
+
+static void cv_run(void *arg) {
+    const cv_job *j = arg;
+    const HVX_Vector iota = *(const HVX_Vector *)lane_iota;
+    for (int g = j->g0; g < j->g1; g++) {
+        const int chunk0 = g * CV_GROUP;
+        HVX_Vector cv[8];
+        for (int w = 0; w < 8; w++)
+            cv[w] = Q6_V_vsplat_R(j->key[w]);
+        const HVX_Vector counter = VADD(Q6_V_vsplat_R(chunk0), iota);
+        for (int pair = 0; pair < 8; pair++) {
+            const uint32 f0 = B3_KEYED_HASH | (pair == 0 ? B3_CHUNK_START : 0);
+            const uint32 f1 = B3_KEYED_HASH | (pair == 7 ? B3_CHUNK_END : 0);
+            if (!j->data) {
+                HVX_Vector m[16];
+                for (int w = 0; w < 16; w++)
+                    m[w] = Q6_V_vzero();
+                b3_compress(m, cv, counter, f0);
+                b3_compress(m, cv, counter, f1);
+                continue;
+            }
+            // Blocks 2 pair and 2 pair + 1 of the 32 chunks, one 128-byte vector per
+            // chunk, transposed so that r[w] holds word w of each chunk (16..31: the
+            // second block).
+            HVX_Vector r[32];
+            for (int c = 0; c < 32; c++)
+                r[c] = *(const HVX_Vector *)(j->data + (size_t)(chunk0 + c) * 1024 + pair * 128);
+            for (int d = 16; d >= 1; d /= 2)
+                for (int i = 0; i < 32; i++)
+                    if (!(i & d)) {
+                        HVX_VectorPair w = Q6_W_vshuff_VVR(r[i + d], r[i], -4);
+                        r[i] = Q6_V_lo_W(w);
+                        r[i + d] = Q6_V_hi_W(w);
+                    }
+            b3_compress(r, cv, counter, f0);
+            b3_compress(r + 16, cv, counter, f1);
+        }
+        // 8 x 32 word transpose: vector v = chunks 4v .. 4v + 3, 8 words each, in order.
+#pragma clang loop unroll(full)
+        for (int d = 4; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+            for (int i = 0; i < 8; i++)
+                if (!(i & d)) {
+                    HVX_VectorPair w = Q6_W_vshuff_VVR(cv[i + d], cv[i], -4);
+                    cv[i] = Q6_V_lo_W(w);
+                    cv[i + d] = Q6_V_hi_W(w);
+                }
+        HVX_Vector *out = (HVX_Vector *)(j->cvs + (size_t)chunk0 * 8);
+        for (int v = 0; v < 8; v++)
+            out[v] = cv[v];
+    }
+}
+
+int pearlx_chunk_cvs(remote_handle64 h, const int8 *data, int dataLen, int raw_len,
+                     const uint32 *key, int keyLen, uint32 *cvs, int cvsLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    const int chunks = raw_len / 1024;
+    if (raw_len <= 0 || raw_len % (1024 * CV_GROUP) || keyLen < 8 || cvsLen < chunks * 8 ||
+        (dataLen != 0 && dataLen < raw_len) || ((uintptr_t)data & (VBYTES - 1)) ||
+        ((uintptr_t)cvs & (VBYTES - 1)))
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    const int groups = chunks / CV_GROUP;
+    const int nthreads = hvx_threads(0);
+    const int nc = nthreads < groups ? nthreads : groups;
+    cv_job jc[MAX_NUM_WORKERS];
+    for (int t = 0; t < nc; t++)
+        jc[t] = (cv_job){ dataLen ? (const uint8 *)data : NULL, key, cvs, groups * t / nc,
+                          groups * (t + 1) / nc };
+    int err = run_hvx_jobs(ctx, nc, cv_run, jc, sizeof(jc[0]));
     *dsp_us = HAP_perf_get_time_us() - t0;
     return err;
 }

@@ -116,7 +116,8 @@ static void print_usage(void)
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
-    printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; default --m 32 --n 32;\n");
+    printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
+    printf("                     bytes (1 GiB at the default size; smaller --m/--n on phones);\n");
     printf("                     DSP launch = --row-period-batch x --batch-size 128x128 macro\n");
     printf("                     blocks (default %d x %d)\n", CP_HEXAGON_LAUNCH_MACROS_DEFAULT,
            CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
@@ -988,12 +989,6 @@ int main(int argc, char** argv)
     }
 
     {
-        if(backend_sel == CP_BACKEND_HEXAGON){
-            /* Phone memory: noisy B^T is built on the host and kept packed in DSP memory,
-             * next to the host signal A (m*k each). 32 units = 128 MiB per matrix. */
-            if(!m_units) m_units = CP_HEXAGON_MATRIX_UNITS_DEFAULT;
-            if(!n_units) n_units = CP_HEXAGON_MATRIX_UNITS_DEFAULT;
-        }
         if(!m_units) m_units = M_DIM / CP_MATRIX_UNIT;
         if(!n_units) n_units = N_DIM / CP_MATRIX_UNIT;
         if(m_units * n_units > CP_MATRIX_AREA_MAX){

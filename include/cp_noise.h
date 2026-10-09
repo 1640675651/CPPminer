@@ -59,6 +59,11 @@ void pearl_matrix_hash_invalidate(PearlMatrixHash* h);
 int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
                              const uint8_t key[32], const uint64_t* dirty_offsets,
                              size_t n_dirty, uint8_t out[32], size_t* rehashed_chunks);
+/* Rebuild h from chunk chaining values computed elsewhere (e.g. on a DSP: 32 bytes per
+ * 1 KB chunk, in order) for the matrix at mat (may be NULL for a matrix that will not be
+ * updated, e.g. an all-zero one), and return the root, as pearl_keyed_digest_int8 would. */
+int pearl_matrix_hash_from_cvs(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                               const uint8_t key[32], const uint8_t* chunk_cvs, uint8_t out[32]);
 
 int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
                          uint8_t* out, int out_cap);
