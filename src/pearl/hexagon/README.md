@@ -48,7 +48,16 @@ With one FastRPC call per launch, the call and the gap between launches cost
 [How it works](#how-it-works)). The tile-XOR records live in an **uncached**
 shared buffer, which the host reads while the DSP is still running. The host
 jackpot copies each 256-byte record in with wide loads, which keeps uncached
-reads cheap: about 0.9 s of CPU per attempt, overlapped with the DSP.
+reads cheap.
+
+The jackpot runs on all cores with OpenMP but takes only ~43 ms of each ~170 ms
+launch, so the worker turns off OpenMP's idle spinning for it
+(`kmp_set_blocktime(0)`): by default LLVM OpenMP keeps a team spinning for 200
+ms after each parallel region, which kept five otherwise idle cores at 100% (the
+miner at ~510% CPU instead of ~100%). The price is ~0.35% of the rate: the
+attempt's last check, which nothing overlaps, runs on clocked-down cores (~43 ms
+instead of ~15 ms). One thread would also keep up (~82 ms per launch, ~44% CPU);
+OpenMP stays for faster DSPs, whose launches would leave less time per check.
 
 The DSP library also has a `scan` method that runs the jackpot on the DSP (HVX
 BLAKE3, 32 hash tiles per vector) and returns only the first hit. Its results

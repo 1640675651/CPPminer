@@ -528,6 +528,14 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         return -2;
     }
     const double attempt_t0 = cp_now_sec();
+#if defined(_OPENMP) && defined(KMP_VERSION_MAJOR)
+    /* LLVM OpenMP keeps a team's threads spinning for 200 ms after each parallel region.
+     * The jackpot runs ~15-80 ms per ~170 ms DSP launch, so they would never sleep: five
+     * idle cores at 100%. Sleep at once instead (this thread's regions only; the CPU
+     * backend keeps spinning). Costs ~0.35%: the attempt's last check, which nothing
+     * overlaps, runs on cores the governor has clocked down. */
+    kmp_set_blocktime(0);
+#endif
     if(!job_matches(job_key, m, n)){
         const int rc = prepare_job(job_key, m, n);
         if(rc != 0) return rc;
