@@ -321,6 +321,11 @@ void cp_gpu_set_cutlass_fused(int on)
         g_gpus[i].use_cutlass_fused = g_cutlass_fused;
 }
 
+void cp_gpu_set_cuda_mma(int mode)
+{
+    cp_cutlass_set_mma_mode(mode);
+}
+
 void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
 {
     g_salted = (cert_version >= 3) ? 1 : 0;
@@ -352,7 +357,8 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaSetDevice(g->dev));
         if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
             fprintf(stderr,
-                    "[gpu] GPU%d: --cutlass-fused needs Pascal SIMT (compute capability <= 7.5)\n",
+                    "[gpu] GPU%d: --cutlass-fused needs sm_61+ (dp4a) or sm_75+ for "
+                    "--cuda-mma tensorop\n",
                     g->dev);
             exit(1);
         }
@@ -371,6 +377,14 @@ void cp_gpu_init(int* devs, int ndev)
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
                : (g->use_cublas_period ? "cuBLAS int8 period GEMM"
                                        : "CUDA period GEMM"));
+        if(g->use_cutlass_fused){
+            cudaDeviceProp prop;
+            CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
+            printf("[gpu] GPU%d: sm_%d%d -> CUTLASS mma %s%s\n", g->dev,
+                   prop.major, prop.minor,
+                   cp_cutlass_mma_kind_name(cp_cutlass_mma_kind(g->dev)),
+                   cp_cutlass_mma_mode() == CP_CUTLASS_MMA_AUTO ? " (auto)" : "");
+        }
         fflush(stdout);
     }
     sync_tile_config();
@@ -1240,6 +1254,125 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     }
     printf("[align-test-prod] noisy A sample rows OK\n");
     fflush(stdout);
+
+    /* CUTLASS simt vs tensorop: the per-hash-tile milestone XOR words
+     * ([step][cta][virtual SIMT tile]) feed the proof, so both kernels must
+     * produce bit-identical dumps on the same noisy Ap/BpT panels. */
+    if(g_cutlass_fused && !g_step_major_ap){
+        cudaDeviceProp prop;
+        CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
+        const int has_imma = prop.major > 7 || (prop.major == 7 && prop.minor >= 5);
+        const int rb = (m / CP_CUTLASS_CTA_M) < 2 ? (m / CP_CUTLASS_CTA_M) : 2;
+        const int cb = (n / CP_CUTLASS_CTA_N) < 3 ? (n / CP_CUTLASS_CTA_N) : 3;
+        if(has_imma && rb > 0 && cb > 0){
+            const size_t tiles = cp_cutlass_tiles_per_batch(rb, cb);
+            const size_t bytes = cp_cutlass_tile_xor_bytes(rb, cb);
+            const size_t words = bytes / sizeof(uint32_t);
+            const int num_steps = K_DIM / R_RANK;
+            const int kinds[2] = {CP_CUTLASS_MMA_SIMT, CP_CUTLASS_MMA_TENSOROP};
+            const int saved_mode = cp_cutlass_mma_mode();
+            uint32_t* d_x = NULL;
+            uint32_t* h_x[2] = {NULL, NULL};
+            int xrc = 0;
+            CU_CHECK(cudaMalloc(&d_x, bytes));
+            for(int k = 0; k < 2 && xrc == 0; k++){
+                h_x[k] = (uint32_t*)malloc(bytes);
+                if(!h_x[k]){ xrc = -1; break; }
+                cp_cutlass_set_mma_mode(kinds[k]);
+                CU_CHECK(cudaMemset(d_x, 0, bytes));
+                t0 = cp_now_sec();
+                if(cp_cutlass_period_batch(g->dev, g->d_Ap, g->d_BpT, m, n,
+                                           /*row_period0=*/1, /*col_period0=*/1,
+                                           rb, cb, 0, d_x, tiles, NULL) != 0){
+                    xrc = -1; break;
+                }
+                CU_CHECK(cudaDeviceSynchronize());
+                printf("[align-test-prod] CUTLASS %s tile-xor dump %dx%d CTAs %.3fs\n",
+                       cp_cutlass_mma_kind_name(kinds[k]), rb, cb, cp_now_sec() - t0);
+                CU_CHECK(cudaMemcpy(h_x[k], d_x, bytes, cudaMemcpyDeviceToHost));
+            }
+            cp_cutlass_set_mma_mode(saved_mode);
+            if(xrc == 0){
+                /* Independent CPU reference for hash tile 0 of CTA (0,0) of the
+                 * batch (SIMT thread 0: rows {0..3,16..19}, cols {0..3,32..35}).
+                 * Accumulators persist across milestones, so step s is the XOR of
+                 * the prefix GEMM over k < R_RANK*(s+1). */
+                int8_t* h_ar = (int8_t*)malloc((size_t)16 * K_DIM);
+                if(h_ar){
+                    static const int offs[8] = {0, 1, 2, 3, 16, 17, 18, 19};
+                    static const int coffs[8] = {0, 1, 2, 3, 32, 33, 34, 35};
+                    int32_t acc[64];
+                    int ref_bad[2] = {0, 0};
+                    for(int i = 0; i < 8; i++){
+                        CU_CHECK(cudaMemcpy(h_ar + (size_t)i * K_DIM,
+                                            g->d_Ap + ((size_t)1 * CP_CUTLASS_CTA_M + offs[i]) * K_DIM,
+                                            (size_t)K_DIM, cudaMemcpyDeviceToHost));
+                        CU_CHECK(cudaMemcpy(h_ar + (size_t)(8 + i) * K_DIM,
+                                            g->d_BpT + ((size_t)1 * CP_CUTLASS_CTA_N + coffs[i]) * K_DIM,
+                                            (size_t)K_DIM, cudaMemcpyDeviceToHost));
+                    }
+                    memset(acc, 0, sizeof(acc));
+                    for(int s = 0; s < num_steps; s++){
+                        uint32_t xv = 0;
+                        for(int r = 0; r < 8; r++)
+                            for(int c = 0; c < 8; c++){
+                                const int8_t* a = h_ar + (size_t)r * K_DIM + (size_t)s * R_RANK;
+                                const int8_t* b = h_ar + (size_t)(8 + c) * K_DIM + (size_t)s * R_RANK;
+                                for(int k = 0; k < R_RANK; k++)
+                                    acc[r * 8 + c] += (int32_t)a[k] * (int32_t)b[k];
+                                xv ^= (uint32_t)acc[r * 8 + c];
+                            }
+                        for(int k = 0; k < 2; k++)
+                            if(h_x[k][(size_t)s * tiles] != xv) ref_bad[k]++;
+                    }
+                    free(h_ar);
+                    printf("[align-test-prod] CUTLASS hash tile 0 vs CPU prefix GEMM: simt %d/%d steps differ, "
+                           "tensorop %d/%d\n", ref_bad[0], num_steps, ref_bad[1], num_steps);
+                    fflush(stdout);
+                    if(ref_bad[0] || ref_bad[1]) xrc = -1;
+                }
+                size_t bad = 0, first = (size_t)-1, nz = 0;
+                for(size_t i = 0; i < words; i++){
+                    if(h_x[0][i]) nz++;
+                    if(h_x[0][i] != h_x[1][i]){ if(!bad) first = i; bad++; }
+                }
+                if(nz == 0){
+                    fprintf(stderr, "[align-test-prod] CUTLASS tile-xor dump is all zero\n");
+                    xrc = -1;
+                } else if(bad){
+                    const size_t step = first / tiles;
+                    const size_t rem = first % tiles;
+                    fprintf(stderr,
+                            "[align-test-prod] CUTLASS simt vs tensorop tile-xor mismatch: "
+                            "%zu/%zu words differ, first at step %zu cta %zu tile %zu "
+                            "(simt %08x tensorop %08x)\n",
+                            bad, words, step, rem / 256, rem % 256,
+                            h_x[0][first], h_x[1][first]);
+                    /* XOR of a CTA's 256 words is mapping-independent (all 16384
+                     * cells): equal => hash-tile mapping bug, else data/K schedule. */
+                    uint32_t cw[2] = {0, 0};
+                    for(int k = 0; k < 2; k++)
+                        for(int t = 0; t < 256; t++)
+                            cw[k] ^= h_x[k][step * tiles + (rem / 256) * 256 + t];
+                    fprintf(stderr, "[align-test-prod]   CTA-wide XOR there: simt %08x tensorop %08x (%s)\n",
+                            cw[0], cw[1], cw[0] == cw[1] ? "equal: mapping bug" : "differ: data/K-schedule bug");
+                    xrc = -1;
+                } else {
+                    printf("[align-test-prod] CUTLASS simt vs tensorop tile-xor OK "
+                           "(%zu words, %d steps, %zu hash tiles)\n",
+                           words, num_steps, tiles);
+                    fflush(stdout);
+                }
+            }
+            cudaFree(d_x);
+            free(h_x[0]);
+            free(h_x[1]);
+            if(xrc != 0) goto done;
+        } else if(!has_imma){
+            printf("[align-test-prod] sm_%d%d: no int8 tensor cores, simt vs tensorop check skipped\n",
+                   prop.major, prop.minor);
+        }
+    }
 
     rc = 0;
 done:
