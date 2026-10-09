@@ -66,6 +66,11 @@ void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
                                 const int8_t* Bt, int n, int k, int salted,
                                 uint8_t b_noise_seed[32]);
 
+/* Second half of pearl_b_noise_seed_from_bt, from an already computed keyed digest of B^T
+   (e.g. on the GPU). */
+void pearl_b_noise_seed_from_root(const uint8_t job_key[32], const uint8_t hash_b[32], int n,
+                                  int salted, uint8_t b_noise_seed[32]);
+
 /* Zero-B fast path: hash A only, derive a_noise_seed from cached b_noise_seed. */
 void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
                                const uint8_t b_noise_seed[32],

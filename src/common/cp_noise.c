@@ -917,7 +917,12 @@ void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
         fprintf(stderr, "pearl_b_noise_seed_from_bt: digest failed\n");
         exit(1);
     }
+    pearl_b_noise_seed_from_root(job_key, hash_b, n, salted, b_noise_seed);
+}
 
+void pearl_b_noise_seed_from_root(const uint8_t job_key[32], const uint8_t hash_b[32], int n,
+                                  int salted, uint8_t b_noise_seed[32])
+{
     uint8_t bound_b[32];
     const uint8_t* root_b = hash_b;
     if(salted){

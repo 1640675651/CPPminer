@@ -2,6 +2,7 @@
 
 #include "case32_layout.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

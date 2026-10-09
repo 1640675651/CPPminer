@@ -22,6 +22,9 @@ struct Case33OclPrep {
                            int K, int blocks_k, int macro_rows, int salted,
                            uint8_t a_key_out[32]);
 
+    /* Keyed digest of an all-zero n x K matrix (zero-B mining) on the GPU. */
+    bool zero_matrix_keyed_hash(int n, int K, const uint8_t job_key[32], uint8_t out[32]);
+
     /* GPU random A + keyed hash + row-major noisy A (signal from d_A_sig_). */
     bool prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t *ab_seed, int ab_seed_len,
                                     const uint8_t job_key[32], const uint8_t b_noise_seed[32],
@@ -83,8 +86,14 @@ private:
                         uint8_t out[32]);
     bool merkle_finish_root_(int num_subroots);
     bool build_perm_pairs_(int is_b, int K);
+    bool gen_random_a_(uint64_t rng_seed, int total); /* signal A into d_A_sig_ */
     bool noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, int K, int out_lda, int is_b,
                                 int has_signal);
+    /* Work-group row-major path; false when unavailable so the caller falls back. */
+    bool noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
+                                   int is_b, int has_signal);
+    bool noisy_matrix_rowmajor_check_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
+                                      int is_b, int has_signal);
     bool noisy_matrix_a_colmajor_(cl_mem out, cl_mem signal, int rows, int K, int lda);
     bool noisy_matrix_colmajor_(cl_mem out, int cols, int K, int ldb, int is_b);
     bool noisy_matrix_b_rowmajor_(cl_mem out, int K, int N, int ldb);
@@ -101,13 +110,18 @@ private:
     size_t merkle_cap_ = 0;
 
     cl_kernel k_gen_random_ = nullptr;
+    cl_kernel k_gen_random16_ = nullptr; // optional: 16 elements per work item
     cl_kernel k_build_pairs_ = nullptr;
     cl_kernel k_keyed_chunk_roots_ = nullptr;
     cl_kernel k_compute_blake_mt_ = nullptr;
     cl_kernel k_reduce_roots_ = nullptr;
     cl_kernel k_fused_prepack_a_ = nullptr;
+    cl_kernel k_fused_prepack_a_wg_ = nullptr; // optional: 256-wide blocks, needs el rows
+    int fpa_split_ = 1; // work groups per block in k_fused_prepack_a_wg_ (local memory)
     cl_kernel k_fused_prepack_b_ = nullptr;
     cl_kernel k_noisy_rowmajor_ = nullptr;
+    cl_kernel k_uniform_rows_ = nullptr;      // optional: work-group row-major noise path
+    cl_kernel k_noisy_rowmajor_wg_ = nullptr; // optional, with k_uniform_rows_
     cl_kernel k_noisy_a_colmajor_ = nullptr;
     cl_kernel k_noisy_colmajor_ = nullptr;
     cl_kernel k_noisy_b_rowmajor_ = nullptr;
@@ -126,6 +140,12 @@ private:
     bool a_witness_valid_ = false;
     cl_mem d_noisy_scratch_ = nullptr;
     size_t noisy_scratch_cap_ = 0;
+    cl_mem d_el_rows_ = nullptr; // rows x R_RANK uniform noise for the work-group path
+    size_t el_rows_cap_ = 0;
+    bool ensure_el_rows_(size_t bytes);
+    bool uniform_rows_(int rows, int is_b);
+    bool fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, int K, int blocks_k,
+                                 int macro_rows);
 };
 
 std::string cp_ocl_kernel_dir();
