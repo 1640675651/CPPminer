@@ -36,13 +36,17 @@
 #define CTL_LAUNCHED  0
 #define CTL_EPOCH_ACK 1
 #define CTL_STATE     2
-#define CTL_HOST      32                // first word of the host's half
-#define CTL_CHECKED   32
-#define CTL_STOP      33
-#define CTL_EPOCH     34
-#define CTL_TEST_IDLE_US 35             // self-test: idle this long after each launch
-#define CTL_WORDS     64
-enum { CTL_RUNNING = 1, CTL_DONE = 2, CTL_STOPPED = 3, CTL_FAILED = 4 };
+#define CTL_HITS      3                 // jackpot mode: the hit launch's hits
+#define CTL_HIT_ROW   4
+#define CTL_HIT_COL   5
+#define CTL_HIT_XOR   8                 // 32 words: the hit's milestone XORs
+#define CTL_HOST      64                // first word of the host's half
+#define CTL_CHECKED   64
+#define CTL_STOP      65
+#define CTL_EPOCH     66
+#define CTL_TEST_IDLE_US 67             // self-test: idle this long after each launch
+#define CTL_WORDS     128
+enum { CTL_RUNNING = 1, CTL_DONE = 2, CTL_STOPPED = 3, CTL_FAILED = 4, CTL_HIT = 5 };
 #define CTL_POLL_US   100               // while waiting for the host to check a launch
 
 static inline void ctl_pull(volatile uint32 *ctl) {
@@ -1162,32 +1166,35 @@ int pearlx_set_a_gen(remote_handle64 h, const int8 *A, int ALen, int row0, int r
     return err;
 }
 
-// An attempt's launches without a call per launch (see pearlx.idl): the host follows
-// through ctl, checking each launch's records while the DSP runs the next ones.
+// An attempt's launches without a call per launch (see pearlx.idl). Records mode: the host
+// follows through ctl, checking each launch's records while the DSP runs the next ones.
+// Jackpot mode: the DSP checks each launch itself and reports only a hit.
 int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int rows,
                     int panel_rows, int launch_cols, int s0, int nbuf, int nthreads,
                     const uint32 *seed_label, int slLen, const uint32 *pairs, int pairsLen,
-                    uint32 *ctl_words, int ctlLen, uint32 *xr, int xrLen, uint64 *dsp_us,
-                    uint64 *wait_us, int *launched) {
+                    const uint32 *key_bound, int kbLen, uint32 *ctl_words, int ctlLen,
+                    uint32 *xr, int xrLen, uint64 *dsp_us, uint64 *wait_us, int *launched) {
     pearlx_ctx *ctx = (pearlx_ctx *)h;
     *dsp_us = *wait_us = 0;
     *launched = 0;
     if (!ctx->Bz)
         return AEE_EBADSTATE;
     const int n = ctx->n, k = ctx->k;
+    const int jackpot = kbLen > 0;
     if (row0 < 0 || rows <= 0 || rows % GEN_ROWS || panel_rows <= 0 || panel_rows % GEN_ROWS ||
         launch_cols <= 0 || launch_cols % NT_COLS || s0 < 0 || nbuf < 1 ||
         (int64)rows * k > ALen || slLen < 16 || pairsLen < 2 * k || ctlLen < CTL_WORDS ||
-        ((uintptr_t)ctl_words & (VBYTES - 1)) || ((uintptr_t)xr & (VBYTES - 1)))
+        ((uintptr_t)ctl_words & (VBYTES - 1)) || ((uintptr_t)xr & (VBYTES - 1)) ||
+        (jackpot && (kbLen < 16 || k != JP_MS * 128)))
         return AEE_EBADPARM;
     gx_problem shape;
     memset(&shape, 0, sizeof(shape));
     gx_shape(&shape, n, k);
-    // Equal slots, each 128-byte aligned, big enough for the largest launch.
+    // Records mode: equal slots, each 128-byte aligned, big enough for the largest launch.
     const size_t slot_words = (size_t)xrLen / nbuf / 32 * 32;
     const int max_rows = panel_rows < rows ? panel_rows : rows;
     const int max_cols = launch_cols < n ? launch_cols : n;
-    if ((size_t)(max_cols / NT_COLS) * (max_rows / MR) * shape.lines * 32 > slot_words)
+    if (!jackpot && (size_t)(max_cols / NT_COLS) * (max_rows / MR) * shape.lines * 32 > slot_words)
         return AEE_EBADPARM;
 
     volatile uint32 *ctl = ctl_words;
@@ -1195,11 +1202,12 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
     ctl[CTL_LAUNCHED] = (uint32)s0;
     ctl[CTL_EPOCH_ACK] = ctl[CTL_EPOCH];
     ctl[CTL_STATE] = CTL_RUNNING;
+    ctl[CTL_HITS] = 0;
     ctl_push(ctl);
 
-    int err = AEE_SUCCESS, stopped = 0, s = s0;
+    int err = AEE_SUCCESS, stopped = 0, hit = 0, s = s0;
     uint64 busy = 0, waited = 0;
-    for (int r = 0; r < rows && !err && !stopped; r += panel_rows) {
+    for (int r = 0; r < rows && !err && !stopped && !hit; r += panel_rows) {
         const int prows = rows - r < panel_rows ? rows - r : panel_rows;
         if (ctl_stop_requested(ctl)) {
             stopped = 1;
@@ -1210,7 +1218,7 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
         busy += HAP_perf_get_time_us() - t0;
         for (int col0 = 0; col0 < n && !err && !stopped; col0 += launch_cols, s++) {
             const int cols = n - col0 < launch_cols ? n - col0 : launch_cols;
-            // Slot s % nbuf is free once the host has checked launch s - nbuf.
+            // Records mode: slot s % nbuf is free once the host has checked launch s - nbuf.
             t0 = HAP_perf_get_time_us();
             for (;;) {
                 ctl_pull(ctl);
@@ -1218,30 +1226,48 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
                     stopped = 1;
                     break;
                 }
-                if ((int)ctl[CTL_CHECKED] >= s - nbuf + 1)
+                if (jackpot || (int)ctl[CTL_CHECKED] >= s - nbuf + 1)
                     break;
                 qurt_timer_sleep(CTL_POLL_US);   // qurt_sleep is not exported to user PDs
             }
             waited += HAP_perf_get_time_us() - t0;
             if (stopped)
                 break;
-            uint32 *slot = xr + (size_t)(s % nbuf) * slot_words;
             int aborted = 0;
+            jp_result res;
             t0 = HAP_perf_get_time_us();
-            err = run_panel(ctx, col0, cols, slot, NULL, NULL, 0, NULL, ctl, &aborted);
-            // The records out to memory before the host is told they are there. Cleaning the
-            // whole data cache costs ~0.07 ms per launch; cleaning the 8 MiB slot by address
-            // costs ~0.44 ms, walking every line though only the cache's worth is dirty.
-            if (!err && !aborted)
-                qurt_mem_cache_clean(0, 0, QURT_MEM_CACHE_FLUSH_ALL, QURT_MEM_DCACHE);
+            if (jackpot) {
+                // Stops at the column tiles in progress once a thread finds a hit.
+                err = run_panel(ctx, col0, cols, NULL, key_bound, key_bound + 8, 1, &res, ctl,
+                                &aborted);
+            } else {
+                uint32 *slot = xr + (size_t)(s % nbuf) * slot_words;
+                err = run_panel(ctx, col0, cols, slot, NULL, NULL, 0, NULL, ctl, &aborted);
+                // The records out to memory before the host is told they are there. Cleaning
+                // the whole data cache costs ~0.07 ms per launch; cleaning the 8 MiB slot by
+                // address costs ~0.44 ms, walking every line though only the cache's worth is
+                // dirty.
+                if (!err && !aborted)
+                    qurt_mem_cache_clean(0, 0, QURT_MEM_CACHE_FLUSH_ALL, QURT_MEM_DCACHE);
+            }
             busy += HAP_perf_get_time_us() - t0;
             if (err || aborted) {
                 stopped = aborted;
                 break;
             }
+            if (jackpot && res.hits) {
+                hit = 1;
+                ctl[CTL_HITS] = (uint32)res.hits;
+                ctl[CTL_HIT_ROW] = (uint32)(row0 + r + res.t * MR);
+                ctl[CTL_HIT_COL] = (uint32)(col0 + res.nt * NT_COLS + res.h * (NT_COLS / SPLIT));
+                for (int ms = 0; ms < JP_MS; ms++)
+                    ctl[CTL_HIT_XOR + ms] = res.words[ms];
+            }
             ctl[CTL_LAUNCHED] = (uint32)(s + 1);
             ctl_push(ctl);
             (*launched)++;
+            if (hit)
+                break;
             // Self-test only: idle so the launch's lines would still be in the cache while the
             // host reads them, had they not been cleaned (the miner leaves the word at 0).
             ctl_pull(ctl);
@@ -1249,7 +1275,7 @@ int pearlx_scan_run(remote_handle64 h, const int8 *A, int ALen, int row0, int ro
                 qurt_timer_sleep(ctl[CTL_TEST_IDLE_US]);
         }
     }
-    ctl[CTL_STATE] = err ? CTL_FAILED : stopped ? CTL_STOPPED : CTL_DONE;
+    ctl[CTL_STATE] = err ? CTL_FAILED : hit ? CTL_HIT : stopped ? CTL_STOPPED : CTL_DONE;
     ctl_push(ctl);
     *dsp_us = busy;
     *wait_us = waited;

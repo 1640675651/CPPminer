@@ -119,8 +119,9 @@ static void print_usage(void)
     printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
     printf("                     bytes (1 GiB at the default size; smaller --m/--n on phones);\n");
     printf("                     DSP launch = --row-period-batch x --batch-size 128x128 macro\n");
-    printf("                     blocks (default %d x %d)\n", CP_HEXAGON_LAUNCH_MACROS_DEFAULT,
-           CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
+    printf("                     blocks (default %d x %d); --fused-jackpot runs the jackpot on\n",
+           CP_HEXAGON_LAUNCH_MACROS_DEFAULT, CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
+    printf("                     the DSP (~1%% slower, almost no CPU)\n");
 #endif
     printf("  --m N, --n N         matrix rows/cols in units of %d (default %d; each <= %d,\n",
            CP_MATRIX_UNIT, M_DIM / CP_MATRIX_UNIT, CP_MATRIX_UNITS_MAX);
@@ -456,7 +457,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
-    int onednn_fused_jackpot = 0;
+    int fused_jackpot = 0;
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
@@ -807,9 +808,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--fused-jackpot")){
-            onednn_fused_jackpot = 1;
+            fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
-            onednn_fused_jackpot = 0;
+            fused_jackpot = 0;
         } else if(!strcmp(argv[i], "--onednn-layout")){
             if(i + 1 >= argc){
                 fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
@@ -1364,12 +1365,13 @@ int main(int argc, char** argv)
         if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT)
             row_period_batch = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
         cp_worker_set_hexagon_launch(row_period_batch, batch_size);
+        cp_worker_set_hexagon_fused_jackpot(fused_jackpot);
     }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
      * Period batch must be set before init (backend banner + scan loop read batch at init). */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-        cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
+        cp_onednn_worker_set_fused_jackpot(fused_jackpot);
         if(onednn_layout){
             cp_onednn_worker_set_gemm_layout(onednn_layout);
         }
@@ -1476,7 +1478,7 @@ int main(int argc, char** argv)
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
             const double panel_tiles =
                     (double)row_period_batch * (double)batch_size;
-            if(onednn_fused_jackpot){
+            if(fused_jackpot){
                 printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
                 printf("[mode] period batch: row=%d col=%d\n", row_period_batch, batch_size);
             } else {
@@ -1499,7 +1501,8 @@ int main(int argc, char** argv)
             const int lrows = row_period_batch * 128 < g_m_active ? row_period_batch * 128
                                                                    : g_m_active;
             const int lcols = batch_size * 128 < g_n_active ? batch_size * 128 : g_n_active;
-            printf("[mode] scan: cDSP HVX fused GEMM + XOR (4x64 hash tiles) + host jackpot\n");
+            printf("[mode] scan: cDSP HVX fused GEMM + XOR (4x64 hash tiles) + %s\n",
+                   fused_jackpot ? "DSP jackpot (--fused-jackpot)" : "host jackpot");
             printf("[mode] DSP launch: %dx%d macro blocks of 128x128 = %dx%d "
                    "(--row-period-batch x --batch-size), %d hash tiles\n",
                    lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));

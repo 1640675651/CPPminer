@@ -68,6 +68,8 @@ void cp_worker_set_wgpu_tile(int mr, int nr);
 void cp_worker_set_wgpu_macro(int macro_m, int macro_n);
 /* hexagon-only: DSP launch in 128x128 macro blocks, rows x columns (<= 0 = default 32). */
 void cp_worker_set_hexagon_launch(int row_macros, int col_macros);
+/* hexagon-only: --fused-jackpot, the jackpot on the DSP instead of the host. */
+void cp_worker_set_hexagon_fused_jackpot(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
 void cp_worker_configure_ocl_tile(int device_index);
 

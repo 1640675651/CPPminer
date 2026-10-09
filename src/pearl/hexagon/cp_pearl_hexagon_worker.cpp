@@ -56,6 +56,8 @@ constexpr int kRecWords = (kMilestones * kSplit + 31) / 32 * 32;
 
 CpPearlx* g_px = nullptr;
 int g_row_macros = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+/* --fused-jackpot: the DSP checks each launch itself and reports only a hit. */
+bool g_fused_jackpot = false;
 int g_col_macros = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
 
 /* One long-lived thread makes the DSP calls (scan_run blocks for a whole segment). FastRPC
@@ -443,6 +445,11 @@ extern "C" void cp_pearl_hexagon_worker_set_launch(int row_macros, int col_macro
     g_col_macros = col_macros > 0 ? col_macros : CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
 }
 
+extern "C" void cp_pearl_hexagon_worker_set_fused_jackpot(int on)
+{
+    g_fused_jackpot = on != 0;
+}
+
 extern "C" void cp_pearl_hexagon_worker_launch(int m, int n, int* rows, int* cols)
 {
     launch_shape(m, n, rows, cols);
@@ -460,7 +467,9 @@ extern "C" void cp_pearl_hexagon_worker_init(void)
     cp_pearlx_info(g_px, &hvx, &vote_err, &mhz, &vtcm_kb);
     printf("[hexagon] cDSP: %d HVX contexts, %d MHz, VTCM %d KB, max-clock vote %s\n", hvx, mhz,
            vtcm_kb, vote_err ? "FAILED" : "ok");
-    printf("[hexagon] fused HVX GEMM + XOR (4x64 hash tiles, zero-B), host BLAKE3 jackpot\n");
+    printf("[hexagon] fused HVX GEMM + XOR (4x64 hash tiles, zero-B), %s\n",
+           g_fused_jackpot ? "BLAKE3 jackpot on the DSP (--fused-jackpot)"
+                           : "host BLAKE3 jackpot");
     if(g_dsp->prio_ok_)
         printf("[hexagon] DSP launch thread: nice -10\n");
     else
@@ -636,10 +645,12 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     };
 
     /* The DSP runs the launches itself (pearlx scan_run), generating each row panel's noisy
-     * A at its start and waiting only when the record slot it is about to reuse is not
-     * checked yet. The host follows through the control block, checking each launch, and
-     * sets its stop word on a hit or a new job. One call covers whole row panels with at
-     * most kSegmentBytes of signal A; the DSP thread makes the calls back to back. */
+     * A at its start. Default: it waits only when the record slot it is about to reuse is
+     * not checked yet; the host follows through the control block, checking each launch,
+     * and sets its stop word on a hit or a new job. --fused-jackpot: the DSP checks each
+     * launch itself and stops at the first hit; the host only verifies that hit. One call
+     * covers whole row panels with at most kSegmentBytes of signal A; the DSP thread makes
+     * the calls back to back. */
     struct Segment {
         int row0, rows, s0, launches;
     };
@@ -660,6 +671,9 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         int err = 0;
         uint64_t dsp_us = 0, wait_us = 0;
     } run;
+    uint32_t key_bound[16];   /* jackpot mode: the attempt's key, then the bound */
+    memcpy(key_bound, a_key8, 32);
+    memcpy(key_bound + 8, bound, 32);
     const uint32_t epoch = ++g_buf.epoch;
     ctl_store(CP_PEARLX_CTL_CHECKED, 0);
     ctl_store(CP_PEARLX_CTL_STOP, 0);
@@ -672,8 +686,9 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
             int done = 0;
             const int err = cp_pearlx_scan_run(
                 g_px, h_A_sig + (size_t)g.row0 * K_DIM, g.row0, g.rows, K_DIM, g_buf.rows,
-                g_buf.cols, g.s0, kRecSlots, 0, a_seed_label, pairs_a.data(), g_buf.ctl,
-                g_buf.xr, kRecSlots * g_buf.xr_words, &dsp_us, &wait_us, &done);
+                g_buf.cols, g.s0, kRecSlots, 0, a_seed_label, pairs_a.data(),
+                g_fused_jackpot ? key_bound : nullptr, g_buf.ctl, g_buf.xr,
+                kRecSlots * g_buf.xr_words, &dsp_us, &wait_us, &done);
             run.dsp_us += dsp_us;
             run.wait_us += wait_us;
             if(err){
@@ -681,6 +696,7 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
                 break;
             }
             if(done < g.launches) break;   /* stopped */
+            if(ctl_load(CP_PEARLX_CTL_STATE) == CP_PEARLX_STATE_HIT) break;
         }
         run.done.store(true);
     });
@@ -690,6 +706,31 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
                                                           : 0;
     };
 
+    auto report_progress = [&](int done_launches) {
+        const double now = cp_now_sec();
+        if(now - last_report < 5.0) return;
+        char mac_buf[32];
+        cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_done, now - scan_t0), mac_buf,
+                           sizeof(mac_buf));
+        printf("[hexagon] plain_proof progress: launch %d/%d (%.1f%%) %s\n", done_launches,
+               S, 100.0 * done_launches / S, mac_buf);
+        fflush(stdout);
+        last_report = now;
+    };
+    auto count_tiles = [&](int done_launches) {
+        tiles_done = 0;
+        for(int s = 0; s < done_launches && s < S; s++)
+            tiles_done += launch_tiles(launches[s]);
+    };
+
+    if(g_fused_jackpot){
+        while(!run.done.load() && !cp_job_should_cancel()){
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            count_tiles(finished());
+            report_progress(finished());
+        }
+        wait_sec = cp_now_sec() - scan_t0;
+    } else
     for(int s = 0; s < S; s++){
         const double t = cp_now_sec();
         bool cancelled = false;
@@ -714,29 +755,39 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         ctl_store(CP_PEARLX_CTL_CHECKED, (uint32_t)(s + 1));
         if(hit.found || cp_job_should_cancel())
             break;
-
-        const double now = cp_now_sec();
-        if(now - last_report >= 5.0){
-            char mac_buf[32];
-            cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_done, now - scan_t0), mac_buf,
-                               sizeof(mac_buf));
-            printf("[hexagon] plain_proof progress: launch %d/%d (%.1f%%) %s\n", s + 1, S,
-                   100.0 * (s + 1) / S, mac_buf);
-            fflush(stdout);
-            last_report = now;
-        }
+        report_progress(s + 1);
     }
     /* Stops the DSP mid-launch after a hit or a cancel; after the last launch a no-op. */
     run.stop.store(true);
     ctl_store(CP_PEARLX_CTL_STOP, 1);
     g_dsp->wait();
+    if(g_fused_jackpot){
+        const int done_launches = finished();
+        count_tiles(done_launches);
+        if(run.err){
+            fprintf(stderr, "[hexagon] pearlx scan_run failed (0x%x)\n", run.err);
+            rc = -2;
+        } else if(ctl_load(CP_PEARLX_CTL_EPOCH_ACK) == epoch &&
+                  ctl_load(CP_PEARLX_CTL_STATE) == CP_PEARLX_STATE_HIT){
+            /* The DSP's hit, recomputed on the host before it can become a share. */
+            const double t = cp_now_sec();
+            hit.found = 1;
+            hit.t_rows = (int)ctl_load(CP_PEARLX_CTL_HIT_ROW);
+            hit.t_cols = (int)ctl_load(CP_PEARLX_CTL_HIT_COL);
+            for(int ms = 0; ms < kMilestones; ms++)
+                hit.xor_words[ms] = ctl_load(CP_PEARLX_CTL_HIT_XOR + ms);
+            if(verify_hit(hit, h_A_sig, a_seed, pairs_a.data(), a_key8, bound) != 0)
+                hit.found = 0;
+            check_sec += cp_now_sec() - t;
+        }
+    }
 
     const double scan_sec = cp_now_sec() - scan_t0;
     if(out_tiles_scanned) *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("hexagon", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[hexagon] scan %.3fs: DSP busy %.3fs, waited for the host %.3fs; host jackpot "
+    printf("[hexagon] scan %.3fs: DSP busy %.3fs, waited for the host %.3fs; host %s "
            "%.3fs, waiting for the DSP %.3fs\n", scan_sec, run.dsp_us / 1e6, run.wait_us / 1e6,
-           check_sec, wait_sec);
+           g_fused_jackpot ? "hit check" : "jackpot", check_sec, wait_sec);
     fflush(stdout);
     if(rc != 0)
         return rc;

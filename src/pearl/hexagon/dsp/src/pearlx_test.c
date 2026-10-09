@@ -230,14 +230,16 @@ static int hash_test(remote_handle64 h, size_t bytes) {
 }
 
 /* scan_run's control block words (pearlx.idl). */
-enum { CTL_LAUNCHED = 0, CTL_EPOCH_ACK = 1, CTL_STATE = 2, CTL_CHECKED = 32, CTL_STOP = 33,
-       CTL_EPOCH = 34, CTL_TEST_IDLE_US = 35, CTL_WORDS = 64 };
+enum { CTL_LAUNCHED = 0, CTL_EPOCH_ACK = 1, CTL_STATE = 2, CTL_HITS = 3, CTL_HIT_ROW = 4,
+       CTL_HIT_COL = 5, CTL_HIT_XOR = 8, CTL_CHECKED = 64, CTL_STOP = 65, CTL_EPOCH = 66,
+       CTL_TEST_IDLE_US = 67, CTL_WORDS = 128 };
+enum { STATE_DONE = 2, STATE_STOPPED = 3, STATE_HIT = 5 };
 
 typedef struct {
     remote_handle64 h;
     const int8_t *sig;
     int k, rows, panel_rows, cols, nbuf;
-    const uint32_t *seed_label, *pairs;
+    const uint32_t *seed_label, *pairs, *key_bound;
     uint32_t *ctl, *xr;
     size_t xr_words;
     uint64 dsp_us, wait_us;
@@ -250,7 +252,8 @@ static void *run_thread(void *arg) {
     run_call *c = arg;
     c->t_start = now_us();
     c->err = pearlx_scan_run(c->h, c->sig, c->rows * c->k, 0, c->rows, c->panel_rows, c->cols,
-                             0, c->nbuf, 0, c->seed_label, 16, c->pairs, 2 * c->k, c->ctl,
+                             0, c->nbuf, 0, c->seed_label, 16, c->pairs, 2 * c->k, c->key_bound,
+                             c->key_bound ? 16 : 0, c->ctl,
                              CTL_WORDS, c->xr, (int)c->xr_words, &c->dsp_us, &c->wait_us,
                              &c->launched);
     c->t_return = now_us();
@@ -265,15 +268,73 @@ static uint64_t fnv64(const uint32_t *w, size_t n) {
     return x;
 }
 
+/* A host jackpot hit in the reference records: its tile and milestone XORs. */
+typedef struct {
+    int row, col;
+    uint32_t x[32];
+} ref_hit;
+#define MAX_REF_HITS 64
+
+/* -L 4: scan_run in jackpot mode against the host jackpot over the reference records:
+ * the DSP must stop at the first launch with any hit, and report one of that launch's
+ * hits with its milestone XORs; with no hits it must run every launch. */
+static int jackpot_run(remote_handle64 h, const int8_t *sig, int k, int m, int rows,
+                       int cols, int S, const uint32_t *a_sl, const uint32_t *pairs_a,
+                       const uint32_t key_bound[16], uint32_t *ctl, const ref_hit *hits,
+                       const int *nhits, uint64_t dsp_old) {
+    for (int w = 0; w < CTL_WORDS; w++)
+        __atomic_store_n(&ctl[w], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctl[CTL_EPOCH], 11u, __ATOMIC_RELEASE);
+    run_call rc = { h, sig, k, m, rows, cols, 1, a_sl, pairs_a, key_bound, ctl, NULL, 0,
+                    0, 0, 0, 0, 0 };
+    run_thread(&rc);
+    if (rc.err) {
+        printf("ERROR 0x%x in jackpot-mode scan_run\n", rc.err);
+        return 1;
+    }
+    int first = -1, total = 0;
+    for (int s = 0; s < S; s++) {
+        total += nhits[s];
+        if (first < 0 && nhits[s]) first = s;
+    }
+    const uint32_t state = __atomic_load_n(&ctl[CTL_STATE], __ATOMIC_ACQUIRE);
+    const int done = (int)__atomic_load_n(&ctl[CTL_LAUNCHED], __ATOMIC_ACQUIRE);
+    int ok;
+    if (first < 0) {
+        ok = state == STATE_DONE && done == S && rc.launched == S;
+        printf("jackpot check: %s (no hits in %d launches on the host; DSP state %u, %d "
+               "launches)\n", ok ? "PASS" : "FAIL", S, state, done);
+    } else {
+        const int row = (int)ctl[CTL_HIT_ROW], col = (int)ctl[CTL_HIT_COL];
+        int match = 0;
+        for (int i = 0; i < nhits[first] && i < MAX_REF_HITS; i++) {
+            const ref_hit *rh = &hits[(size_t)first * MAX_REF_HITS + i];
+            if (rh->row == row && rh->col == col &&
+                !memcmp(rh->x, (const uint32_t *)ctl + CTL_HIT_XOR, sizeof(rh->x)))
+                match = 1;
+        }
+        ok = state == STATE_HIT && done == first + 1 && match;
+        printf("jackpot check: %s (host: first hit in launch %d, %d hits there, %d in all; "
+               "DSP: stopped after %d launches, hit at row %d col %d, %s the host's, %u "
+               "hits seen)\n", ok ? "PASS" : "FAIL", first, nhits[first], total, done, row,
+               col, match ? "one of" : "NOT one of", ctl[CTL_HITS]);
+    }
+    printf("  DSP time per launch: jackpot mode %.2f ms (%d launches), records mode %.2f ms\n",
+           rc.dsp_us / 1e3 / (rc.launched ? rc.launched : 1), rc.launched,
+           dsp_old / 1e3 / S);
+    return ok ? 0 : 1;
+}
+
 /* -L 1: scan_run, followed from this thread as the miner does, against the same launches
  * made one call at a time (set_a_gen per panel, gemm_xor per launch): every launch's
  * records, copied out while the DSP is already running the next ones, must match. Then the
  * stop word, set mid-run, must end the call early. -L 2: the host takes longer per launch
  * than the DSP, so the DSP has to wait for free record slots. -L 3: the DSP idles 100 ms
  * after each launch, so records it left in its cache would be read stale: this is the case
- * that catches missing cache cleaning (in -L 1 the next launch evicts them first). */
+ * that catches missing cache cleaning (in -L 1 the next launch evicts them first). -L 4:
+ * jackpot mode (see jackpot_run; -b sets the hit rate). */
 static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int panels,
-                    int mode) {
+                    int mode, const uint32_t key_bound[16]) {
     const int slow_host = mode == 2;
     const int lines = (k / MS_K * 2 + 31) / 32, nbuf = 2;
     const int per_panel = n / cols, S = panels * per_panel, m = panels * rows;
@@ -285,7 +346,9 @@ static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int pan
     uint32_t *copy = malloc(slot_words * 4), *pairs_a = malloc((size_t)k * 8);
     uint32_t *pairs_b = malloc((size_t)k * 8);
     uint64_t *ref = malloc(S * sizeof(uint64_t));
-    if (!sig || !xr || !ctl || !copy || !pairs_a || !pairs_b || !ref) {
+    ref_hit *hits = malloc((size_t)S * MAX_REF_HITS * sizeof(ref_hit));
+    int *nhits = calloc(S, sizeof(int));
+    if (!sig || !xr || !ctl || !copy || !pairs_a || !pairs_b || !ref || !hits || !nhits) {
         printf("ERROR: allocation failed\n");
         return 1;
     }
@@ -324,9 +387,31 @@ static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int pan
             if ((err = pearlx_gemm_xor(h, c * cols, cols, xr, (int)slot_words, &us))) goto fail;
             call_old += now_us() - t0;
             dsp_old += us;
-            ref[s] = fnv64(xr, slot_words);
+            memcpy(copy, xr, slot_words * 4);
+            ref[s] = fnv64(copy, slot_words);
+            if (mode == 4) {
+                /* The host jackpot over this launch: every hash tile that hits. */
+                const int recs = (cols / 128) * (rows / 4);
+                for (int rec = 0; rec < recs; rec++)
+                    for (int hh = 0; hh < 2; hh++) {
+                        uint32_t x[32];
+                        for (int ms = 0; ms < 32; ms++)
+                            x[ms] = copy[(size_t)rec * lines * 32 + ms * 2 + hh];
+                        if (!ref_jackpot(x, key_bound, key_bound + 8)) continue;
+                        if (nhits[s] < MAX_REF_HITS) {
+                            ref_hit *rh = &hits[(size_t)s * MAX_REF_HITS + nhits[s]];
+                            rh->row = p * rows + rec % (rows / 4) * 4;
+                            rh->col = c * cols + rec / (rows / 4) * 128 + hh * 64;
+                            memcpy(rh->x, x, sizeof(x));
+                        }
+                        nhits[s]++;
+                    }
+            }
         }
     }
+    if (mode == 4)
+        return jackpot_run(h, sig, k, m, rows, cols, S, a_sl, pairs_a, key_bound, ctl, hits,
+                           nhits, dsp_old);
 
     /* scan_run, followed from here. */
     for (int pass = 0; pass < 2; pass++) {
@@ -336,7 +421,7 @@ static int run_test(remote_handle64 h, int n, int k, int rows, int cols, int pan
             __atomic_store_n(&ctl[w], 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&ctl[CTL_TEST_IDLE_US], mode == 3 ? 100000u : 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&ctl[CTL_EPOCH], (uint32_t)(pass + 7), __ATOMIC_RELEASE);
-        run_call rc = { h, sig, k, m, rows, cols, nbuf, a_sl, pairs_a, ctl, xr,
+        run_call rc = { h, sig, k, m, rows, cols, nbuf, a_sl, pairs_a, NULL, ctl, xr,
                         nbuf * slot_words, 0, 0, 0, 0, 0 };
         pthread_t th;
         t0 = now_us();
@@ -428,7 +513,7 @@ int main(int argc, char *argv[]) {
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
            " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1] [-b hit_bits] [-u 0|1]"
-           " [-G 0|1] [-H 0|1] [-L 0|1|2|3]\n");
+           " [-G 0|1] [-H 0|1] [-L 0|1|2|3|4]\n");
     /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
     uint32_t key_bound[16];
     for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
@@ -475,7 +560,7 @@ int main(int argc, char *argv[]) {
            "VTCM %d KB, vote %s\n", n, k, panels, rows, cols, hvx, mhz, vtcm, vote ? "FAILED" : "ok");
 
     if (run) {
-        err = run_test(h, n, k, rows, cols, panels, run);
+        err = run_test(h, n, k, rows, cols, panels, run, key_bound);
         pearlx_close(h);
         printf("%s\n", err ? "FAILED" : "Success");
         return err ? 1 : 0;

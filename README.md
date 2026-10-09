@@ -219,6 +219,8 @@ CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C windo
 
 Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logical unroll grid, e.g. 16×16 → 8192×8192 tiles at `m=n=131072`). Each panel = one gemmstone GEMM launch (+ separate jackpot kernel unless `--fused-jackpot`).
 
+`--fused-jackpot` also applies to `--backend hexagon`: the jackpot runs on the DSP instead of the host CPU, ~1% slower with almost no CPU use (see [the Hexagon README](src/pearl/hexagon/README.md)).
+
 | Flag | Role | Default |
 |------|------|---------|
 | `--row-period-batch` | Hash-tile rows per panel | 256 |

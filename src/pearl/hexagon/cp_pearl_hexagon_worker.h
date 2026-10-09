@@ -21,6 +21,8 @@ void cp_pearl_hexagon_worker_free_signal_a(int8_t *p);
 /* DSP launch size in 128x128 macro blocks: row_macros x col_macros (<= 0 restores the
  * default, CP_HEXAGON_LAUNCH_MACROS_DEFAULT each). */
 void cp_pearl_hexagon_worker_set_launch(int row_macros, int col_macros);
+/* --fused-jackpot: the BLAKE3 jackpot on the DSP instead of the host. */
+void cp_pearl_hexagon_worker_set_fused_jackpot(int on);
 /* Launch rows x cols for an m x n matrix (clipped to the matrix). */
 void cp_pearl_hexagon_worker_launch(int m, int n, int *rows, int *cols);
 void cp_pearl_hexagon_worker_begin_job(const uint8_t job_key[32], int m, int n,

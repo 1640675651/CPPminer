@@ -59,10 +59,13 @@ attempt's last check, which nothing overlaps, runs on clocked-down cores (~43 ms
 instead of ~15 ms). One thread would also keep up (~82 ms per launch, ~44% CPU);
 OpenMP stays for faster DSPs, whose launches would leave less time per check.
 
-The DSP library also has a `scan` method that runs the jackpot on the DSP (HVX
-BLAKE3, 32 hash tiles per vector) and returns only the first hit. Its results
-match the host jackpot exactly (checked by `pearlx_test`), but it adds ~2.9 ms of
-DSP time per launch, so the miner keeps the jackpot on the host.
+With `--fused-jackpot` the DSP runs the jackpot itself (HVX BLAKE3, 32 hash tiles
+per vector) and reports only a hit: no records are written for the host, the
+host thread just waits, and a hit is still recomputed on the host before it
+becomes a share. It adds ~3 ms of DSP time per launch; at `--m 32 --n 32` the
+scan runs at ~396 GMAC/s instead of ~401, with the miner at ~0% CPU instead of
+~100% (`pearlx_test -L 4` checks its hits against the host jackpot). The default
+keeps the jackpot on the host.
 
 ## Hash tile: 4 x 64
 
@@ -256,6 +259,7 @@ cd /path/to/dir/with/libpearlx_skel.so                    # or: export ADSP_LIBR
 | `--m N --n N` | Matrix size in units of 1024 (default 128, as for every backend). Memory is about m·k + n·k bytes plus 50–80 MiB (see [Memory](#memory)): ~1.07 GiB at the default 131072; the measurements here use `--m 32 --n 32` (~310 MiB) |
 | `--row-period-batch N` | 128-row macros per DSP launch (default 32 = 4096 rows). Rows set how far each VTCM slice of B and each FastRPC call are amortized. `pearlx_test` per call: 4096 rows 802 GOPS, 8192 rows 813, 16384 rows 818; each doubling also doubles the panel buffer and the record buffers (see [Memory](#memory)) |
 | `--batch-size N` / `--col-period-batch N` | 128-column macros per DSP launch (default 32 = 4096 columns). Columns barely matter: a full-width launch is only 0.3% faster than 4096 columns |
+| `--fused-jackpot` | Run the BLAKE3 jackpot on the DSP instead of the host: ~1% slower, almost no CPU (see above). Default off |
 
 Testing was done from `adb shell` (`/data/local/tmp`). Running from Termux has
 not been tested yet. If `cp_pearlx_open` fails, check that the app may open

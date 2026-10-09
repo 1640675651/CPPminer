@@ -367,6 +367,15 @@ extern "C" void cp_worker_set_hexagon_launch(int row_macros, int col_macros)
 #endif
 }
 
+extern "C" void cp_worker_set_hexagon_fused_jackpot(int on)
+{
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    cp_pearl_hexagon_worker_set_fused_jackpot(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_configure_ocl_tile(int device_index)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
