@@ -20,8 +20,11 @@ typedef struct CpPearlx CpPearlx;
 CpPearlx* cp_pearlx_open(void);
 void cp_pearlx_close(CpPearlx* px);
 
-/* Buffers shared with the DSP without copies (rpcmem). */
+/* Buffers shared with the DSP without copies (rpcmem). An uncached buffer needs no CPU
+ * cache maintenance per call (FastRPC otherwise cleans or invalidates the whole buffer on
+ * every call that passes it), at the price of slower CPU access. */
 void* cp_pearlx_alloc(CpPearlx* px, size_t bytes);
+void* cp_pearlx_alloc_uncached(CpPearlx* px, size_t bytes);
 void cp_pearlx_free(CpPearlx* px, void* p);
 
 /* See pearlx.idl. Return 0 on success, else the FastRPC / AEE error. */

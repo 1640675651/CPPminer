@@ -31,4 +31,14 @@ interface pearlx : remote_handle64 {
    // vtcm_kb: total VTCM on this DSP (-1 if the query fails).
    long info(rout long hvx_contexts, rout long clock_vote_err, rout long clock_mhz,
              rout long vtcm_kb);
+
+   // Like gemm_xor, with the jackpot on the DSP instead of returning the XORs (k = 4096).
+   // key_bound: the attempt's BLAKE3 key (8 words), then the bound (8 words, little-endian,
+   // word 7 most significant). A hash tile hits when the keyed BLAKE3 of its folded
+   // milestone XORs is at or below the bound. hit: [0] hits found, [1] the first hit's row
+   // (from the panel's first row), [2] its column, [3..34] its 32 milestone XORs. "First"
+   // is in (column tile, row tile, half) order. stop_on_hit = 1 stops at the column tiles
+   // being processed when a hit is found, so hit[0] then counts only what was checked.
+   long scan(in long col0, in long ncols, in sequence<uint32> key_bound, in long stop_on_hit,
+             rout sequence<uint32> hit, rout uint64 dsp_us);
 };

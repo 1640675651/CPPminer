@@ -7,24 +7,41 @@ Hexagon v66, 2 HVX contexts).
 
 | Device | Backend | Hashrate (m = n = 32768) |
 |---|---|---|
-| Snapdragon 480 cDSP | hexagon | ~395 GMAC/s while scanning, ~380 GMAC/s overall |
+| Snapdragon 480 cDSP | hexagon | ~402 GMAC/s while scanning, ~400 GMAC/s overall |
 | Snapdragon 480 CPU (2x A76 + 6x A55) | cpu (NEON DotProd) | ~130 GMAC/s |
 
-The overall rate includes about 0.44 s of host work per 11.6 s attempt, mostly
-hashing the signal A for its noise seed. Measured from `adb shell`, which limits
-the process to the six A55 cores.
+The overall rate includes about 0.06 s of host work per 11.0 s attempt, while
+the DSP is idle. This covers the random signal A, its hash for the noise seed,
+and the first panel's noisy rows. Measured from `adb shell`, which limits the
+process to the six A55 cores.
+
+The hash of signal A is incremental (`pearl_matrix_hash_digest` in
+`cp_noise.c`). An attempt changes one value per column, so only about 4,000 of
+signal A's 131,072 1 KB chunks change. The worker keeps every chunk's chaining
+value and every complete parent of the BLAKE3 tree, and hashes again only the
+changed chunks and their ancestors. That takes 0.03 s instead of 0.35 s; the
+first attempt of each job hashes everything. Set `CP_HEXAGON_HASH_CHECK=1` to
+compare it with a full hash on every attempt.
 
 Where the scan rate goes, against the kernel's ~413 GMAC/s peak:
 
 | Cost | Share |
 |---|---|
 | Copying a 128 KB slice of B into VTCM per 128-column tile and K block, amortized over the launch's 1024 row tiles | ~1.9% |
-| FastRPC call per launch (~2.7 ms of 170 ms) and packing each row panel (`set_a`, ~6.8 ms per 8 launches) | ~2% |
-| The rest of the gap between DSP calls, host-side | ~1% |
+| Packing each row panel (`set_a`, ~6.8 ms per 8 launches) | ~0.5% |
+| FastRPC call per launch (~1.1 ms of 170 ms) and the gap between launches | ~1.4% |
 
-With `OMP_NUM_THREADS=7` (one more OpenMP thread than the six visible cores)
-the scan reaches ~399 GMAC/s on this phone. The cause isn't understood, so it is
-not the default.
+The per-launch call overhead was ~3 ms until the tile-XOR records moved to an
+**uncached** shared buffer. FastRPC invalidates a cached output buffer's 8 MiB in
+the CPU cache after every call. The host jackpot copies each 256-byte record in
+with wide loads, which keeps uncached reads cheap: about 0.9 s of CPU per
+attempt, overlapped with the DSP.
+
+The DSP library also has a `scan` method that runs the jackpot on the DSP (HVX
+BLAKE3, 32 hash tiles per vector) and returns only the first hit. Its results
+match the host jackpot exactly (checked by `pearlx_test`), but it adds ~2.9 ms of
+DSP time per launch. That's more than the ~1 ms of FastRPC overhead it would
+save, so the miner keeps the jackpot on the host.
 
 ## Hash tile: 4 x 64
 
@@ -83,7 +100,7 @@ about 4.5% over the plain GEMM.
 |---|---|
 | `cp_pearl_hexagon_worker.cpp` | Worker: job and attempt prep, the launch pipeline, jackpot, hit recompute |
 | `cp_pearlx_client.c` | FastRPC client: loads `libcdsprpc.so` at run time and marshals the `pearlx` calls by hand. No Hexagon SDK headers are needed |
-| `dsp/inc/pearlx.idl` | DSP interface: `set_b`, `set_a`, `gemm_xor`, `info` |
+| `dsp/inc/pearlx.idl` | DSP interface: `set_b`, `set_a`, `gemm_xor`, `info`, and `scan` (jackpot on the DSP; not used by the miner) |
 | `dsp/src/pearlx_imp.c` | DSP side: packing, VTCM, threads over both HVX contexts |
 | `dsp/src/pearlx.S`, `dsp/src/pearlx_xor.inc` | HVX kernel (Case 1.1 fold and reduction) |
 | `dsp/src/pearlx_test.c` | Android self-test: `pearlx` against a CPU reference, plus timing |

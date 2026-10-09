@@ -329,7 +329,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Matrix | Hashrate |
 |--------|--------|----------|
-| Snapdragon 480 cDSP (Hexagon v66, 2x HVX) | `--m 32 --n 32` | ~395 GH/s scanning, ~380 GH/s with per-attempt prep |
+| Snapdragon 480 cDSP (Hexagon v66, 2x HVX) | `--m 32 --n 32` | ~402 GH/s scanning, ~400 GH/s with per-attempt prep |
 
 
 ## Vendored proof stack (`third_party/`)

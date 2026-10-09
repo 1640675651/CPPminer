@@ -41,6 +41,24 @@ int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
  * Leaves other entries untouched — caller must ensure A starts in [-64, 63] (e.g. zeros). */
 int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
                                        int8_t* A_inout);
+/* Same, also writing the k byte offsets it wrote (offsets_out[j] for column j; may be NULL). */
+int pearl_perturb_random_a_one_per_col_ex(const uint8_t* seed, int seed_len, int m, int k,
+                                          int8_t* A_inout, uint64_t* offsets_out);
+
+/* Incremental keyed Merkle digest of a matrix: the same value as pearl_keyed_digest_int8,
+ * but it keeps every chunk chaining value and every complete parent of the BLAKE3 tree, so
+ * after a few bytes change only the touched chunks and their ancestors are hashed again.
+ * The first call, or a call with another key, length or buffer, hashes everything. */
+typedef struct PearlMatrixHash PearlMatrixHash;
+PearlMatrixHash* pearl_matrix_hash_create(void);
+void pearl_matrix_hash_free(PearlMatrixHash* h);
+void pearl_matrix_hash_invalidate(PearlMatrixHash* h);
+/* dirty_offsets: byte offsets changed since the previous call on the same buffer (ignored
+ * on a full rebuild). Returns 0 on success; *rehashed_chunks (may be NULL) gets the number
+ * of chunks hashed. */
+int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                             const uint8_t key[32], const uint64_t* dirty_offsets,
+                             size_t n_dirty, uint8_t out[32], size_t* rehashed_chunks);
 
 int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
                          uint8_t* out, int out_cap);

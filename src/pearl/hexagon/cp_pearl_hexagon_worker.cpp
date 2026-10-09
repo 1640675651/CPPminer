@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -120,6 +121,14 @@ private:
 
 DspThread* g_dsp = nullptr;
 
+/* Cached hash tree of signal A (incremental hash_a), and CP_HEXAGON_HASH_CHECK=1 to compare
+ * it with a full hash every attempt. */
+PearlMatrixHash* g_ahash = nullptr;
+const bool g_hash_check = [] {
+    const char* v = getenv("CP_HEXAGON_HASH_CHECK");
+    return v && *v && strcmp(v, "0") != 0;
+}();
+
 struct JobCache {
     uint8_t job_key[32]{};
     int m = 0;
@@ -166,7 +175,10 @@ int ensure_buffers(int rows, int cols)
     const size_t xr_words = (size_t)(cols / kRegCols) * (rows / kTileRows) * kRecWords;
     for(int i = 0; i < 2; i++){
         g_buf.a[i] = (int8_t*)cp_pearlx_alloc(g_px, (size_t)rows * K_DIM);
-        g_buf.xr[i] = (uint32_t*)cp_pearlx_alloc(g_px, xr_words * sizeof(uint32_t));
+        /* Uncached: the DSP writes 8 MiB of records per launch, and invalidating them in
+         * the CPU cache on every call cost ~2 ms of the call (~1%). The jackpot reads them
+         * slower, but it runs while the DSP is busy. */
+        g_buf.xr[i] = (uint32_t*)cp_pearlx_alloc_uncached(g_px, xr_words * sizeof(uint32_t));
         if(!g_buf.a[i] || !g_buf.xr[i]){
             fprintf(stderr, "[hexagon] rpcmem allocation failed (launch %d x %d)\n", rows, cols);
             free_buffers();
@@ -279,7 +291,10 @@ Hit check_launch(const Launch& l, const uint32_t* xr, const uint32_t a_key8[8],
     #pragma omp parallel for schedule(static)
 #endif
     for(int rec = 0; rec < records; rec++){
-        const uint32_t* w = xr + (size_t)rec * kRecWords;
+        /* The records are uncached: copy each one in with wide loads instead of reading its
+         * words one by one (one memory transaction per load either way). */
+        uint32_t w[kRecWords];
+        memcpy(w, xr + (size_t)rec * kRecWords, sizeof(w));
         for(int h = 0; h < kSplit; h++){
             uint32_t ms_xor[kMilestones];
             for(int ms = 0; ms < kMilestones; ms++)
@@ -376,6 +391,8 @@ extern "C" void cp_pearl_hexagon_worker_shutdown(void)
 {
     delete g_dsp;
     g_dsp = nullptr;
+    pearl_matrix_hash_free(g_ahash);
+    g_ahash = nullptr;
     free_buffers();
     g_job.ready = 0;
     g_job.pairs_b.clear();
@@ -440,11 +457,36 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         fprintf(stderr, "[hexagon] CSPRNG failed for random A\n");
         return -2;
     }
-    if(pearl_perturb_random_a_one_per_col(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig) != 0)
+    std::vector<uint64_t> changed((size_t)K_DIM);
+    if(pearl_perturb_random_a_one_per_col_ex(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig,
+                                             changed.data()) != 0)
         return -1;
+    /* hash_a over all of signal A, but only the chunks this attempt wrote (and their tree
+     * ancestors) are hashed again; the first attempt of a job hashes everything. */
+    const double t_hash = cp_now_sec();
+    uint8_t hash_a[32];
+    size_t rehashed = 0;
+    if(!g_ahash) g_ahash = pearl_matrix_hash_create();
+    if(pearl_matrix_hash_digest(g_ahash, h_A_sig, (size_t)m * K_DIM, job_key, changed.data(),
+                                changed.size(), hash_a, &rehashed) != 0){
+        fprintf(stderr, "[hexagon] incremental hash of signal A failed; hashing it all\n");
+        pearl_matrix_hash_invalidate(g_ahash);
+        pearl_keyed_digest_int8(h_A_sig, (size_t)m * K_DIM, job_key, hash_a);
+        rehashed = (size_t)m * K_DIM / 1024;
+    }
+    const double hash_sec = cp_now_sec() - t_hash;
+    if(g_hash_check){
+        uint8_t full[32];
+        pearl_keyed_digest_int8(h_A_sig, (size_t)m * K_DIM, job_key, full);
+        printf("[hexagon] hash check: incremental hash_a %s the full hash\n",
+               memcmp(full, hash_a, 32) == 0 ? "matches" : "DIFFERS FROM");
+        if(memcmp(full, hash_a, 32) != 0){
+            pearl_matrix_hash_invalidate(g_ahash);
+            memcpy(hash_a, full, 32);
+        }
+    }
     uint8_t a_seed[32];
-    pearl_a_noise_seed_from_a(job_key, g_job.b_noise_seed, h_A_sig, m, K_DIM, g_job.salted,
-                              a_seed);
+    pearl_a_noise_seed_from_hash(g_job.b_noise_seed, hash_a, (uint32_t)m, g_job.salted, a_seed);
     std::vector<uint32_t> pairs_a((size_t)K_DIM * 2);
     pearl_build_perm_pairs_a(a_seed, K_DIM, R_RANK, pairs_a.data());
 
@@ -493,10 +535,11 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     int rc = 0;
 
     printf("[hexagon] plain_proof scan %d launches of %dx%d (%d panels), %llu hash tiles, "
-           "difficulty scaled by %llu\n",
+           "difficulty scaled by %llu; hash_a %.3fs (%zu of %zu chunks)\n",
            S, g_buf.rows, g_buf.cols, panels,
            (unsigned long long)((uint64_t)(m / kTileRows) * (uint64_t)(n / kTileCols)),
-           (unsigned long long)cp_jackpot_scale_factor());
+           (unsigned long long)cp_jackpot_scale_factor(), hash_sec, rehashed,
+           (size_t)m * K_DIM / 1024);
     fflush(stdout);
 
     auto launch_tiles = [](const Launch& l) {

@@ -352,6 +352,12 @@ int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
 int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
                                        int8_t* A_inout)
 {
+    return pearl_perturb_random_a_one_per_col_ex(seed, seed_len, m, k, A_inout, NULL);
+}
+
+int pearl_perturb_random_a_one_per_col_ex(const uint8_t* seed, int seed_len, int m, int k,
+                                          int8_t* A_inout, uint64_t* offsets_out)
+{
     if(!A_inout || m <= 0 || k <= 0)
         return -1;
 
@@ -365,6 +371,8 @@ int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m,
         s = pearl_splitmix64(s);
         const int8_t val = (int8_t)((int)((uint32_t)(s >> 32) % 128u) - 64);
         A_inout[(size_t)row * (size_t)k + (size_t)j] = val;
+        if(offsets_out)
+            offsets_out[j] = (uint64_t)row * (uint64_t)k + (uint64_t)j;
     }
     return 0;
 }
@@ -910,6 +918,229 @@ int pearl_root_from_chunk_cvs(const uint8_t* chunk_cvs, int num_chunks,
         output = pearl_parent_output(parent_block, key_words, flags);
     }
     pearl_output_root_bytes(&output, out);
+    return 0;
+}
+
+/* ---- Incremental keyed matrix digest (cp_noise.h) ----
+ * Level 0 holds every chunk chaining value; level j holds the (num_chunks >> j) complete
+ * parents covering chunks [i * 2^j, (i + 1) * 2^j). The BLAKE3 tree over num_chunks chunks
+ * is the perfect subtrees of num_chunks' binary decomposition, merged right to left, so
+ * the root needs only those subtree tops (one per set bit) plus the final merge. */
+
+#define PEARL_MH_MAX_LEVELS 64
+
+struct PearlMatrixHash {
+    int valid;
+    uint8_t key[32];
+    uint32_t key_words[8];
+    const void* data;
+    size_t raw_len;
+    size_t num_chunks;
+    int num_levels;
+    uint8_t* level[PEARL_MH_MAX_LEVELS];
+    uint32_t* idx;                  /* scratch: dirty node indices of one level */
+    size_t idx_cap;
+};
+
+PearlMatrixHash* pearl_matrix_hash_create(void)
+{
+    return (PearlMatrixHash*)calloc(1, sizeof(PearlMatrixHash));
+}
+
+static void pearl_mh_release(PearlMatrixHash* h)
+{
+    for(int j = 0; j < PEARL_MH_MAX_LEVELS; j++){
+        free(h->level[j]);
+        h->level[j] = NULL;
+    }
+    free(h->idx);
+    h->idx = NULL;
+    h->idx_cap = 0;
+    h->num_levels = 0;
+    h->valid = 0;
+}
+
+void pearl_matrix_hash_free(PearlMatrixHash* h)
+{
+    if(!h) return;
+    pearl_mh_release(h);
+    free(h);
+}
+
+void pearl_matrix_hash_invalidate(PearlMatrixHash* h)
+{
+    if(h) h->valid = 0;
+}
+
+static void pearl_mh_chunk_cv(const PearlMatrixHash* h, const uint8_t* data, size_t i,
+                              uint8_t out[32])
+{
+    const size_t off = i * B3_CHUNK;
+    if(off + B3_CHUNK <= h->raw_len){
+        pearl_keyed_chunk_cv_cpu(h->key, (uint64_t)i, data + off, B3_CHUNK, out);
+    } else {
+        uint8_t chunk[B3_CHUNK];
+        memset(chunk, 0, B3_CHUNK);
+        if(off < h->raw_len) memcpy(chunk, data + off, h->raw_len - off);
+        pearl_keyed_chunk_cv_cpu(h->key, (uint64_t)i, chunk, B3_CHUNK, out);
+    }
+}
+
+/* Parent of the two adjacent chaining values at children[0..63]. */
+static void pearl_mh_parent_cv(const PearlMatrixHash* h, const uint8_t* children,
+                               uint8_t out[32])
+{
+    pearl_output_t o = pearl_parent_output(children, h->key_words, KEYED_HASH);
+    pearl_output_chaining_value(&o, out);
+}
+
+static int pearl_mh_build(PearlMatrixHash* h, const uint8_t* data)
+{
+    const size_t n = h->num_chunks;
+    int top = 0;
+    while(((size_t)2 << top) <= n) top++;
+    h->num_levels = top + 1;
+    for(int j = 0; j <= top; j++){
+        h->level[j] = (uint8_t*)malloc((n >> j) * BLAKE3_OUT_LEN);
+        if(!h->level[j]) return -1;
+    }
+    long i;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(i = 0; i < (long)n; i++)
+        pearl_mh_chunk_cv(h, data, (size_t)i, h->level[0] + (size_t)i * BLAKE3_OUT_LEN);
+    for(int j = 1; j <= top; j++){
+        const long len = (long)(n >> j);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(i = 0; i < len; i++)
+            pearl_mh_parent_cv(h, h->level[j - 1] + (size_t)i * 2 * BLAKE3_OUT_LEN,
+                               h->level[j] + (size_t)i * BLAKE3_OUT_LEN);
+    }
+    return 0;
+}
+
+static int pearl_mh_cmp_u32(const void* a, const void* b)
+{
+    const uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+static int pearl_mh_update(PearlMatrixHash* h, const uint8_t* data, const uint64_t* offsets,
+                           size_t n_dirty, size_t* rehashed)
+{
+    if(h->idx_cap < n_dirty){
+        free(h->idx);
+        h->idx = (uint32_t*)malloc(n_dirty * sizeof(uint32_t));
+        if(!h->idx){
+            h->idx_cap = 0;
+            return -1;
+        }
+        h->idx_cap = n_dirty;
+    }
+    size_t cnt = 0;
+    for(size_t t = 0; t < n_dirty; t++){
+        const uint64_t c = offsets[t] / B3_CHUNK;
+        if(c < h->num_chunks) h->idx[cnt++] = (uint32_t)c;
+    }
+    qsort(h->idx, cnt, sizeof(uint32_t), pearl_mh_cmp_u32);
+    size_t w = 0;
+    for(size_t t = 0; t < cnt; t++)
+        if(w == 0 || h->idx[w - 1] != h->idx[t]) h->idx[w++] = h->idx[t];
+    cnt = w;
+    if(rehashed) *rehashed = cnt;
+
+    long t;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for(t = 0; t < (long)cnt; t++)
+        pearl_mh_chunk_cv(h, data, h->idx[t], h->level[0] + (size_t)h->idx[t] * BLAKE3_OUT_LEN);
+
+    /* Parents of dirty nodes, level by level; the lists stay sorted, so duplicates are
+     * adjacent. A node with no complete parent is a subtree top used directly by the root. */
+    for(int j = 1; j < h->num_levels && cnt > 0; j++){
+        const size_t len = h->num_chunks >> j;
+        w = 0;
+        for(size_t s = 0; s < cnt; s++){
+            const uint32_t v = h->idx[s] >> 1;
+            if(v < len && (w == 0 || h->idx[w - 1] != v)) h->idx[w++] = v;
+        }
+        cnt = w;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(t = 0; t < (long)cnt; t++)
+            pearl_mh_parent_cv(h, h->level[j - 1] + (size_t)h->idx[t] * 2 * BLAKE3_OUT_LEN,
+                               h->level[j] + (size_t)h->idx[t] * BLAKE3_OUT_LEN);
+    }
+    return 0;
+}
+
+static void pearl_mh_root(const PearlMatrixHash* h, uint8_t out[32])
+{
+    const uint8_t* stack[PEARL_MH_MAX_LEVELS + 1];
+    int s = 0;
+    size_t start = 0;
+    for(int j = h->num_levels - 1; j >= 0; j--){
+        if(h->num_chunks & ((size_t)1 << j)){
+            stack[s++] = h->level[j] + (start >> j) * BLAKE3_OUT_LEN;
+            start += (size_t)1 << j;
+        }
+    }
+    if(s == 1){
+        /* A power of two: the root is the top node itself, merged from its children. */
+        const uint8_t* children = h->level[h->num_levels - 2];
+        stack[0] = children;
+        stack[1] = children + BLAKE3_OUT_LEN;
+        s = 2;
+    }
+    uint8_t block[BLAKE3_BLOCK_LEN];
+    memcpy(block, stack[s - 2], BLAKE3_OUT_LEN);
+    memcpy(block + BLAKE3_OUT_LEN, stack[s - 1], BLAKE3_OUT_LEN);
+    pearl_output_t output = pearl_parent_output(block, h->key_words, KEYED_HASH);
+    for(int r = s - 3; r >= 0; r--){
+        uint8_t parent_block[BLAKE3_BLOCK_LEN];
+        memcpy(parent_block, stack[r], BLAKE3_OUT_LEN);
+        pearl_output_chaining_value(&output, parent_block + BLAKE3_OUT_LEN);
+        output = pearl_parent_output(parent_block, h->key_words, KEYED_HASH);
+    }
+    pearl_output_root_bytes(&output, out);
+}
+
+int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                             const uint8_t key[32], const uint64_t* dirty_offsets,
+                             size_t n_dirty, uint8_t out[32], size_t* rehashed_chunks)
+{
+    const uint8_t* data = (const uint8_t*)mat;
+    const size_t pad_len = padded_chunk_len(raw_len);
+    const size_t n = pad_len / B3_CHUNK;
+    if(!h || n <= 1){
+        if(rehashed_chunks) *rehashed_chunks = n;
+        return pearl_keyed_matrix_digest_chunks(data, raw_len, pad_len, key, out);
+    }
+    const int full = !h->valid || h->data != (const void*)mat || h->raw_len != raw_len ||
+                     memcmp(h->key, key, 32) != 0 || (n_dirty > 0 && !dirty_offsets);
+    if(full){
+        pearl_mh_release(h);
+        memcpy(h->key, key, 32);
+        load_key_words(key, h->key_words);
+        h->data = mat;
+        h->raw_len = raw_len;
+        h->num_chunks = n;
+        if(pearl_mh_build(h, data) != 0){
+            pearl_mh_release(h);
+            return -1;
+        }
+        h->valid = 1;
+        if(rehashed_chunks) *rehashed_chunks = n;
+    } else if(pearl_mh_update(h, data, dirty_offsets, n_dirty, rehashed_chunks) != 0){
+        h->valid = 0;
+        return -1;
+    }
+    pearl_mh_root(h, out);
     return 0;
 }
 

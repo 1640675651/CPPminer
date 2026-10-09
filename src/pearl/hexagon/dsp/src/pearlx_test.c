@@ -37,6 +37,38 @@ static void fill(int8_t *p, size_t n, uint32_t seed) {
 }
 
 // XOR of hash tile (rows r0.., columns c0..c0+63) after each milestone.
+static uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void b3_g(uint32_t *v, int a, int b, int c, int d, uint32_t x, uint32_t y) {
+    v[a] += v[b] + x; v[d] = rotr32(v[d] ^ v[a], 16); v[c] += v[d]; v[b] = rotr32(v[b] ^ v[c], 12);
+    v[a] += v[b] + y; v[d] = rotr32(v[d] ^ v[a], 8);  v[c] += v[d]; v[b] = rotr32(v[b] ^ v[c], 7);
+}
+
+/* Fold 32 milestone XORs, keyed BLAKE3 compress, digest <= bound (cp_jackpot.hpp). */
+static int ref_jackpot(const uint32_t *x, const uint32_t key[8], const uint32_t bound[8]) {
+    static const uint32_t iv[4] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au};
+    static const uint8_t perm[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+    uint32_t m[16], v[16], t[16];
+    for (int i = 0; i < 16; i++) m[i] = rotr32(x[i], 19) ^ x[i + 16];
+    for (int i = 0; i < 8; i++) v[i] = key[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = iv[i];
+    v[12] = 0; v[13] = 0; v[14] = 64; v[15] = 0x1B;
+    for (int r = 0; r < 7; r++) {
+        b3_g(v, 0, 4, 8, 12, m[0], m[1]);   b3_g(v, 1, 5, 9, 13, m[2], m[3]);
+        b3_g(v, 2, 6, 10, 14, m[4], m[5]);  b3_g(v, 3, 7, 11, 15, m[6], m[7]);
+        b3_g(v, 0, 5, 10, 15, m[8], m[9]);  b3_g(v, 1, 6, 11, 12, m[10], m[11]);
+        b3_g(v, 2, 7, 8, 13, m[12], m[13]); b3_g(v, 3, 4, 9, 14, m[14], m[15]);
+        for (int i = 0; i < 16; i++) t[i] = m[perm[i]];
+        memcpy(m, t, sizeof(m));
+    }
+    for (int w = 7; w >= 0; w--) {
+        const uint32_t d = v[w] ^ v[w + 8];
+        if (d < bound[w]) return 1;
+        if (d > bound[w]) return 0;
+    }
+    return 1;
+}
+
 static void ref_tile(const int8_t *A, const int8_t *Bt, int k, int r0, int c0, uint32_t *out) {
     const int nms = k / MS_K;
     memset(out, 0, nms * sizeof(uint32_t));
@@ -54,7 +86,7 @@ static void ref_tile(const int8_t *A, const int8_t *Bt, int k, int r0, int c0, u
 
 int main(int argc, char *argv[]) {
     int n = 4096, k = 4096, rows = 1024, cols = 4096, panels = 4, threads = 0, check = 1;
-    int samples = 4096;
+    int samples = 4096, jackpot = 1, hit_bits = 14, xr_uncached = 0;
     for (int a = 1; a + 1 < argc; a += 2) {
         int v = atoi(argv[a + 1]);
         if (!strcmp(argv[a], "-n")) n = v;
@@ -65,10 +97,21 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[a], "-t")) threads = v;
         else if (!strcmp(argv[a], "-c")) check = v;
         else if (!strcmp(argv[a], "-s")) samples = v;
+        else if (!strcmp(argv[a], "-j")) jackpot = v;
+        else if (!strcmp(argv[a], "-b")) hit_bits = v;
+        else if (!strcmp(argv[a], "-u")) xr_uncached = v;
         else { printf("unknown option %s\n", argv[a]); return 1; }
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
-           " [-t threads] [-c 0|1] [-s samples/call]\n");
+           " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1]\n");
+    /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
+    uint32_t key_bound[16];
+    for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
+    for (int i = 0; i < 7; i++) key_bound[8 + i] = 0xFFFFFFFFu;
+    key_bound[15] = 0xFFFFFFFFu >> (hit_bits & 31);
+    uint32_t scan_hit[3 + 32];
+    uint64_t best_scan = UINT64_MAX, best_scan_dsp = UINT64_MAX;
+    size_t scan_calls = 0, scan_bad = 0, scan_hits = 0;
     if (cols > n) cols = n;
     if (n <= 0 || n % 128 || k <= 0 || k % 128 || rows <= 0 || rows % 4 || cols <= 0 ||
         cols % 128 || n % cols || panels <= 0) {
@@ -89,7 +132,10 @@ int main(int argc, char *argv[]) {
     }
     int8_t *Bt = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)n * k);
     int8_t *A = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (size_t)rows * k);
-    uint32_t *xr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, xr_words * 4);
+    /* -u 1: XOR records in an uncached buffer (no per-call CPU cache maintenance). */
+    uint32_t *xr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                xr_uncached ? RPCMEM_FLAG_UNCACHED : RPCMEM_DEFAULT_FLAGS,
+                                xr_words * 4);
     if (!Bt || !A || !xr) {
         printf("ERROR: rpcmem_alloc failed\n");
         return 1;
@@ -158,12 +204,67 @@ int main(int argc, char *argv[]) {
                 checked++;
             }
             check_us += now_us() - tc;
+            if (jackpot && k == 4096) {
+                /* Host jackpot over this call's XORs: every hit, and the first in
+                 * (column tile, row tile, half) order. */
+                const uint64_t tc = now_us();
+                size_t host_hits = 0;
+                int first_row = -1, first_col = -1;
+                const uint32_t *first_words = NULL;
+                uint32_t x[32];
+                for (int nt = 0; nt < Ntc; nt++)
+                    for (int t = 0; t < Mt; t++)
+                        for (int half = 0; half < 2; half++) {
+                            const uint32_t *rec = xr + ((size_t)nt * Mt + t) * lines * 32;
+                            for (int ms = 0; ms < 32; ms++) x[ms] = rec[ms * 2 + half];
+                            if (!ref_jackpot(x, key_bound, key_bound + 8)) continue;
+                            if (host_hits++ == 0) {
+                                first_row = 4 * t;
+                                first_col = c * cols + 128 * nt + 64 * half;
+                                first_words = rec;
+                            }
+                        }
+                check_us += now_us() - tc;
+                const uint64_t ts = now_us();
+                uint64 sdsp = 0;
+                if ((err = pearlx_scan(h, c * cols, cols, key_bound, 16, 0, scan_hit, 3 + 32, &sdsp))) {
+                    printf("ERROR 0x%x: scan\n", err);
+                    goto bail;
+                }
+                const uint64_t scall = now_us() - ts;
+                check_us += scall;
+                if (scall < best_scan) best_scan = scall;
+                if (sdsp < best_scan_dsp) best_scan_dsp = sdsp;
+                scan_calls++;
+                scan_hits += host_hits;
+                int ok = scan_hit[0] == host_hits;
+                if (ok && host_hits) {
+                    ok = (int)scan_hit[1] == first_row && (int)scan_hit[2] == first_col;
+                    for (int ms = 0; ok && ms < 32; ms++)
+                        ok = scan_hit[3 + ms] == first_words[ms * 2 + (first_col / 64) % 2];
+                }
+                if (!ok) {
+                    if (scan_bad < 5)
+                        printf("  SCAN MISMATCH panel %d call %d: dsp %u hits (first %u,%u), host %zu"
+                               " (first %d,%d)\n", g, c, scan_hit[0], scan_hit[1], scan_hit[2],
+                               host_hits, first_row, first_col);
+                    scan_bad++;
+                }
+            }
         }
         const uint64_t panel = now_us() - tp - check_us;
         if (panel < best_panel) best_panel = panel;
     }
     const double call_ops = 2.0 * rows * cols * k, panel_ops = 2.0 * rows * n * k;
     printf("set_a: best %.2f ms\n", best_seta / 1e3);
+    if (scan_calls) {
+        printf("scan (DSP jackpot): best %.2f ms call (%.1f GOPS), %.2f ms DSP (%.1f GOPS)\n",
+               best_scan / 1e3, 2.0 * rows * cols * k / (best_scan * 1e3), best_scan_dsp / 1e3,
+               2.0 * rows * cols * k / (best_scan_dsp * 1e3));
+        printf("scan check: %s (%zu calls, %zu hits on the host, %zu calls differ)\n",
+               scan_bad ? "FAIL" : "PASS", scan_calls, scan_hits, scan_bad);
+        if (scan_bad) err = AEE_EFAILED;
+    }
     printf("gemm_xor: best %.2f ms call (%.1f GOPS), %.2f ms DSP (%.1f GOPS)\n", best_call / 1e3,
            call_ops / (best_call * 1e3), best_dsp / 1e3, call_ops / (best_dsp * 1e3));
     printf("row panel (set_a + %d calls): best %.2f ms (%.1f GOPS)\n", calls, best_panel / 1e3,

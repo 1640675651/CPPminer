@@ -43,6 +43,9 @@ typedef struct {
     // VTCM for the B slices, one 128 KB slot per thread, held between calls.
     uint8 *vtcm;
     int vtcm_threads;
+    // scan: each thread's records of one column tile, checked on the DSP.
+    uint8 *jp_rec;
+    size_t jp_cap;
 } pearlx_ctx;
 
 // Pin core and bus clocks at their highest corner and keep the DSP out of
@@ -91,6 +94,7 @@ int pearlx_close(remote_handle64 handle) {
             worker_pool_deinit(&ctx->pool);
         free(ctx->Bz);
         free(ctx->Az);
+        free(ctx->jp_rec);
         if (ctx->vtcm)
             HAP_release_VTCM(ctx->vtcm);
         HAP_power_request_t req;
@@ -330,6 +334,132 @@ static void packx_b_run(void *arg) {
     }
 }
 
+// ---- Jackpot on the DSP: keyed BLAKE3 of each hash tile's folded milestone XORs ----
+// 32 hash tiles per vector, one per 32-bit lane: lane 2r + h is hash tile h of record r
+// in a group of 16 records. Matches cp_jackpot.hpp (fold with rotl 13 into 16 words, one
+// keyed compression with flags CHUNK_START | CHUNK_END | ROOT | KEYED_HASH, digest <= bound
+// as a little-endian 256-bit number).
+
+#define JP_MS 32                    // milestones (k = 4096, one per 128)
+#define JP_REC_WORDS 64             // words per register-tile record: ms * 2 + h
+
+typedef struct {
+    int hits;                       // hash tiles at or below the bound
+    int t, nt, h;                   // the first hit: row tile, column tile, half
+    uint32 words[JP_MS];            // its milestone XORs
+} jp_result;
+
+static const uint32 b3_iv[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
+
+#define VADD(a, b) Q6_Vw_vadd_VwVw(a, b)
+#define VXOR(a, b) Q6_V_vxor_VV(a, b)
+#define VROTR(a, r) Q6_Vuw_vrotr_VuwVuw(a, r)
+
+static inline void b3_g(HVX_Vector *v, int a, int b, int c, int d, HVX_Vector x, HVX_Vector y,
+                        HVX_Vector r16, HVX_Vector r12, HVX_Vector r8, HVX_Vector r7) {
+    v[a] = VADD(VADD(v[a], v[b]), x);
+    v[d] = VROTR(VXOR(v[d], v[a]), r16);
+    v[c] = VADD(v[c], v[d]);
+    v[b] = VROTR(VXOR(v[b], v[c]), r12);
+    v[a] = VADD(VADD(v[a], v[b]), y);
+    v[d] = VROTR(VXOR(v[d], v[a]), r8);
+    v[c] = VADD(v[c], v[d]);
+    v[b] = VROTR(VXOR(v[b], v[c]), r7);
+}
+
+// Hash tiles of n_rec records (n_rec <= 16) at rec, consecutive JP_REC_WORDS-word records:
+// returns a predicate of the lanes at or below the bound.
+static HVX_VectorPred jp_group(const uint32 *rec, int n_rec, const uint32 key[8],
+                               const uint32 bound[8]) {
+    // Each record is two vectors: milestones 0..15 and 16..31, as (h = 0, h = 1) word pairs.
+    // A 16 x 16 transpose of those pairs gives x[ms] with lane 2r + h = record r's half h.
+    HVX_Vector x[JP_MS];
+    for (int half = 0; half < 2; half++) {
+        HVX_Vector *r = x + 16 * half;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 16; i++)
+            r[i] = i < n_rec ? ((const HVX_Vector *)(rec + (size_t)i * JP_REC_WORDS))[half]
+                             : Q6_V_vzero();
+#pragma clang loop unroll(full)
+        for (int d = 8; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+            for (int i = 0; i < 16; i++)
+                if (!(i & d)) {
+                    HVX_VectorPair w = Q6_W_vshuff_VVR(r[i + d], r[i], -8);
+                    r[i] = Q6_V_lo_W(w);
+                    r[i + d] = Q6_V_hi_W(w);
+                }
+    }
+    const HVX_Vector r19 = Q6_V_vsplat_R(19), r16 = Q6_V_vsplat_R(16), r12 = Q6_V_vsplat_R(12);
+    const HVX_Vector r8 = Q6_V_vsplat_R(8), r7 = Q6_V_vsplat_R(7);
+    // Fold: msg[i] = rotl(x[i], 13) ^ x[i + 16].
+    HVX_Vector m[16];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 16; i++)
+        m[i] = VXOR(VROTR(x[i], r19), x[i + 16]);
+    HVX_Vector v[16];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 8; i++)
+        v[i] = Q6_V_vsplat_R(key[i]);
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++)
+        v[8 + i] = Q6_V_vsplat_R(b3_iv[i]);
+    v[12] = Q6_V_vzero();
+    v[13] = Q6_V_vzero();
+    v[14] = Q6_V_vsplat_R(64);
+    v[15] = Q6_V_vsplat_R(0x1B);
+    // Rounds fully unrolled with constant message indices, so the message stays in
+    // registers instead of being picked from the stack by a run-time schedule.
+#define B3_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)     b3_g(v, 0, 4, 8, 12, m[s0], m[s1], r16, r12, r8, r7);                                 b3_g(v, 1, 5, 9, 13, m[s2], m[s3], r16, r12, r8, r7);                                 b3_g(v, 2, 6, 10, 14, m[s4], m[s5], r16, r12, r8, r7);                                b3_g(v, 3, 7, 11, 15, m[s6], m[s7], r16, r12, r8, r7);                                b3_g(v, 0, 5, 10, 15, m[s8], m[s9], r16, r12, r8, r7);                                b3_g(v, 1, 6, 11, 12, m[s10], m[s11], r16, r12, r8, r7);                              b3_g(v, 2, 7, 8, 13, m[s12], m[s13], r16, r12, r8, r7);                               b3_g(v, 3, 4, 9, 14, m[s14], m[s15], r16, r12, r8, r7);
+    B3_ROUND(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    B3_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    B3_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    B3_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    B3_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    B3_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    B3_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+#undef B3_ROUND
+    // digest[w] = v[w] ^ v[w + 8]; compare from the most significant word down.
+    HVX_VectorPred lt = Q6_Q_vsetq_R(0), gt = Q6_Q_vsetq_R(0);
+#pragma clang loop unroll(full)
+    for (int w = 7; w >= 0; w--) {
+        const HVX_Vector dg = VXOR(v[w], v[w + 8]), bd = Q6_V_vsplat_R(bound[w]);
+        const HVX_VectorPred open = Q6_Q_not_Q(Q6_Q_or_QQ(lt, gt));
+        lt = Q6_Q_or_QQ(lt, Q6_Q_and_QQ(open, Q6_Q_vcmp_gt_VuwVuw(bd, dg)));
+        gt = Q6_Q_or_QQ(gt, Q6_Q_and_QQ(open, Q6_Q_vcmp_gt_VuwVuw(dg, bd)));
+    }
+    // Lanes past the last record were zero-filled: never hits.
+    return Q6_Q_and_QQn(Q6_Q_vsetq2_R(8 * n_rec), gt);   /* vsetq2: 128 means all */
+}
+
+// Jackpot over records [0, n) of one column tile (record i = row tile t0 + i).
+static void jp_records(const uint32 *rec, int n, int t0, int nt, const uint32 key[8],
+                       const uint32 bound[8], jp_result *res) {
+    HVX_Vector lanes __attribute__((aligned(VBYTES)));
+    for (int r0 = 0; r0 < n; r0 += 16) {
+        const int cnt = n - r0 < 16 ? n - r0 : 16;
+        const HVX_VectorPred hit = jp_group(rec + (size_t)r0 * JP_REC_WORDS, cnt, key, bound);
+        lanes = Q6_V_vand_QR(hit, 0x01010101);
+        const uint32 *lw = (const uint32 *)&lanes;
+        for (int l = 0; l < 32; l++) {
+            if (!lw[l])
+                continue;
+            const int r = r0 + l / 2, h = l % 2;
+            if (res->hits++ == 0 || nt < res->nt || (nt == res->nt && (t0 + r < res->t ||
+                                                     (t0 + r == res->t && h < res->h)))) {
+                res->t = t0 + r;
+                res->nt = nt;
+                res->h = h;
+                const uint32 *w = rec + (size_t)r * JP_REC_WORDS;
+                for (int ms = 0; ms < JP_MS; ms++)
+                    res->words[ms] = w[ms * 2 + h];
+            }
+        }
+    }
+}
+
 // Starting accumulators of the first K block.
 static const HVX_Vector zero_acc[MR * NV];
 
@@ -340,6 +470,7 @@ typedef struct {
     int nt, sl;                     // column tile, and its slot in the partial sums
     int t0, t1;                     // row tiles
     int kb;                         // K block
+    uint32 *xr_local;               // jackpot mode: this thread's records, tile t0 first
 } gemmx_job;
 
 static void gemmx_job_run(gemmx_job *j) {
@@ -367,7 +498,8 @@ static void gemmx_job_run(gemmx_job *j) {
         .in = kb == 0 ? zero_acc : gx_s(p, kb, j->sl, j->t0), .in_step = kb == 0 ? 0 : rs,
         .out = last ? j->tmp : gx_s(p, kb + 1, j->sl, j->t0),
         .out_step = last ? 0 : gx_rstride(p, kb + 1),
-        .xo = p->xr + ((size_t)(j->nt * p->Mt + j->t0) * p->lines + kb / bpl) * 32,
+        .xo = j->xr_local ? j->xr_local + (size_t)(kb / bpl) * 32
+                          : p->xr + ((size_t)(j->nt * p->Mt + j->t0) * p->lines + kb / bpl) * 32,
         .xo_step = p->lines * VBYTES,
         .ntiles = j->t1 - j->t0,
         .rot = (VBYTES - 4 * s) % VBYTES,
@@ -387,6 +519,11 @@ static void gemmx_job_run(gemmx_job *j) {
 typedef struct {
     gemmx_job job;          // first, so its tmp vectors stay 128-byte aligned
     int t, n, nfull;        // this thread, thread count, tiles done in full rounds
+    // Jackpot mode (job.xr_local set): check each column tile's records as it finishes.
+    const uint32 *key, *bound;
+    int stop_on_hit;
+    volatile int *stop;     // shared: set by the first thread to hit when stop_on_hit
+    jp_result res;
 } gemmx_thread;
 
 static void gemmx_thread_run(void *arg) {
@@ -394,6 +531,8 @@ static void gemmx_thread_run(void *arg) {
     gemmx_job *j = &th->job;
     const gx_problem *p = j->p;
     for (int nt = th->nfull > 0 ? th->t : 0; nt < p->Nt; ) {
+        if (th->stop && *th->stop)
+            break;
         const int full = nt < th->nfull;
         j->nt = nt;
         j->sl = th->t;
@@ -401,6 +540,11 @@ static void gemmx_thread_run(void *arg) {
         j->t1 = full ? p->Mt : p->Mt * (th->t + 1) / th->n;
         for (j->kb = 0; j->kb < p->nkb; j->kb++)
             gemmx_job_run(j);
+        if (j->xr_local) {
+            jp_records(j->xr_local, j->t1 - j->t0, j->t0, nt, th->key, th->bound, &th->res);
+            if (th->stop_on_hit && th->res.hits)
+                *th->stop = 1;
+        }
         // After the full rounds, every thread takes each leftover tile.
         nt = full && nt + th->n < th->nfull ? nt + th->n : (full ? th->nfull : nt + 1);
     }
@@ -499,25 +643,8 @@ int pearlx_set_a(remote_handle64 h, const int8 *A, int ALen, int rows, int nthre
     return AEE_SUCCESS;
 }
 
-int pearlx_gemm_xor(remote_handle64 h, int col0, int ncols, uint32 *xr, int xrLen,
-                    uint64 *dsp_us) {
-    pearlx_ctx *ctx = (pearlx_ctx *)h;
-    if (!ctx->Bz || !ctx->a_rows)
-        return AEE_EBADSTATE;
-    if (col0 < 0 || ncols <= 0 || col0 % NT_COLS || ncols % NT_COLS || col0 + ncols > ctx->n)
-        return AEE_EBADPARM;
-    uint64 t0 = HAP_perf_get_time_us();
-    const int nthreads = ctx->a_threads;
-
-    gx_problem p;
-    panel_problem(ctx, &p);
-    p.nt0 = col0 / NT_COLS;
-    p.Nt = ncols / NT_COLS;
-    if ((int64)p.Nt * p.Mt * p.lines * 32 > xrLen || ((uintptr_t)xr & (VBYTES - 1)))
-        return AEE_EBADPARM;
-    p.xr = xr;
-
-    // VTCM is kept from call to call; ask again only when the thread count grows.
+// VTCM is kept from call to call; ask again only when the thread count grows.
+static int ensure_vtcm(pearlx_ctx *ctx, int nthreads) {
     if (ctx->vtcm && ctx->vtcm_threads < nthreads) {
         HAP_release_VTCM(ctx->vtcm);
         ctx->vtcm = NULL;
@@ -530,10 +657,37 @@ int pearlx_gemm_xor(remote_handle64 h, int col0, int ncols, uint32 *xr, int xrLe
         }
         ctx->vtcm_threads = nthreads;
     }
+    return AEE_SUCCESS;
+}
+
+// The packed row panel against columns [col0, col0 + ncols): records to xr (xr != NULL),
+// or the jackpot on the DSP (key and bound; the first hit and the hit count into *res).
+static int run_panel(pearlx_ctx *ctx, int col0, int ncols, uint32 *xr, const uint32 *key,
+                     const uint32 *bound, int stop_on_hit, jp_result *res) {
+    const int nthreads = ctx->a_threads;
+    gx_problem p;
+    panel_problem(ctx, &p);
+    p.nt0 = col0 / NT_COLS;
+    p.Nt = ncols / NT_COLS;
+    p.xr = xr;
+    int err = ensure_vtcm(ctx, nthreads);
+    if (err)
+        return err;
+    // Jackpot mode: one column tile's records per thread at a time.
+    const size_t rec_bytes = (size_t)p.Mt * p.lines * VBYTES;
+    if (!xr && ctx->jp_cap < rec_bytes * nthreads) {
+        free(ctx->jp_rec);
+        ctx->jp_cap = 0;
+        ctx->jp_rec = memalign(VBYTES, rec_bytes * nthreads);
+        if (!ctx->jp_rec)
+            return AEE_ENOMEMORY;
+        ctx->jp_cap = rec_bytes * nthreads;
+    }
 
     gemmx_thread *jobs = memalign(VBYTES, MAX_NUM_WORKERS * sizeof(gemmx_thread));
     if (!jobs)
         return AEE_ENOMEMORY;
+    volatile int stop = 0;
     for (int t = 0; t < nthreads; t++) {
         memset(&jobs[t], 0, sizeof(jobs[t]));
         jobs[t].job.p = &p;
@@ -541,9 +695,70 @@ int pearlx_gemm_xor(remote_handle64 h, int col0, int ncols, uint32 *xr, int xrLe
         jobs[t].t = t;
         jobs[t].n = nthreads;
         jobs[t].nfull = p.Nt / nthreads * nthreads;
+        if (!xr) {
+            jobs[t].job.xr_local = (uint32 *)(ctx->jp_rec + rec_bytes * t);
+            jobs[t].key = key;
+            jobs[t].bound = bound;
+            jobs[t].stop_on_hit = stop_on_hit;
+            jobs[t].stop = &stop;
+        }
     }
-    int err = run_hvx_jobs(ctx, nthreads, gemmx_thread_run, jobs, sizeof(jobs[0]));
+    err = run_hvx_jobs(ctx, nthreads, gemmx_thread_run, jobs, sizeof(jobs[0]));
+    if (!xr && !err) {
+        // The first hit in (column tile, row tile, half) order, and the total.
+        memset(res, 0, sizeof(*res));
+        for (int t = 0; t < nthreads; t++) {
+            const jp_result *r = &jobs[t].res;
+            if (!r->hits)
+                continue;
+            if (!res->hits || r->nt < res->nt || (r->nt == res->nt && (r->t < res->t ||
+                                                  (r->t == res->t && r->h < res->h)))) {
+                const int total = res->hits;
+                *res = *r;
+                res->hits = total;
+            }
+            res->hits += r->hits;
+        }
+    }
     free(jobs);
+    return err;
+}
+
+int pearlx_gemm_xor(remote_handle64 h, int col0, int ncols, uint32 *xr, int xrLen,
+                    uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    if (!ctx->Bz || !ctx->a_rows)
+        return AEE_EBADSTATE;
+    if (col0 < 0 || ncols <= 0 || col0 % NT_COLS || ncols % NT_COLS || col0 + ncols > ctx->n)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    gx_problem p;
+    panel_problem(ctx, &p);
+    if ((int64)(ncols / NT_COLS) * p.Mt * p.lines * 32 > xrLen || ((uintptr_t)xr & (VBYTES - 1)))
+        return AEE_EBADPARM;
+    int err = run_panel(ctx, col0, ncols, xr, NULL, NULL, 0, NULL);
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return err;
+}
+
+int pearlx_scan(remote_handle64 h, int col0, int ncols, const uint32 *key_bound, int kbLen,
+                int stop_on_hit, uint32 *hit, int hitLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    if (!ctx->Bz || !ctx->a_rows)
+        return AEE_EBADSTATE;
+    if (col0 < 0 || ncols <= 0 || col0 % NT_COLS || ncols % NT_COLS || col0 + ncols > ctx->n ||
+        kbLen < 16 || hitLen < 3 + JP_MS || ctx->k != JP_MS * 128)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    jp_result res;
+    int err = run_panel(ctx, col0, ncols, NULL, key_bound, key_bound + 8, stop_on_hit, &res);
+    if (!err) {
+        hit[0] = (uint32)res.hits;
+        hit[1] = (uint32)(res.hits ? res.t * MR : 0);
+        hit[2] = (uint32)(res.hits ? col0 + res.nt * NT_COLS + res.h * (NT_COLS / SPLIT) : 0);
+        for (int ms = 0; ms < JP_MS; ms++)
+            hit[3 + ms] = res.hits ? res.words[ms] : 0;
+    }
     *dsp_us = HAP_perf_get_time_us() - t0;
     return err;
 }

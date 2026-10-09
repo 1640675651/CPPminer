@@ -32,6 +32,7 @@ typedef union {
 #define DSPRPC_CONTROL_UNSIGNED_MODULE 2
 #define RPCMEM_HEAP_ID_SYSTEM 25
 #define RPCMEM_DEFAULT_FLAGS 1 /* cached */
+#define RPCMEM_FLAG_UNCACHED 0
 
 struct remote_rpc_control_unsigned_module {
     int domain;
@@ -103,10 +104,20 @@ void cp_pearlx_close(CpPearlx* px)
     free(px);
 }
 
-void* cp_pearlx_alloc(CpPearlx* px, size_t bytes)
+static void* alloc_flags(CpPearlx* px, size_t bytes, uint32_t flags)
 {
     if(!px || bytes == 0 || bytes > 0x7fffffffu) return NULL;
-    return px->rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, (int)bytes);
+    return px->rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, flags, (int)bytes);
+}
+
+void* cp_pearlx_alloc(CpPearlx* px, size_t bytes)
+{
+    return alloc_flags(px, bytes, RPCMEM_DEFAULT_FLAGS);
+}
+
+void* cp_pearlx_alloc_uncached(CpPearlx* px, size_t bytes)
+{
+    return alloc_flags(px, bytes, RPCMEM_FLAG_UNCACHED);
 }
 
 void cp_pearlx_free(CpPearlx* px, void* p)
