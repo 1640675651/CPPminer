@@ -6,10 +6,9 @@
 //
 // Private memory (fuse_jackpot mining path; source arrays + compiler stack):
 //   acc[NR×MR]  4×4: 64 B   8×8: 256 B   8×16: 512 B
-//   msg[16]          64 B         64 B         64 B
 //   a_pack[MR]       16 B         32 B         32 B
-//   digest[8]        32 B         32 B         32 B
-//   b3_compress64     ~192 B       ~192 B  (inlined v/m/t; Beignet may reserve for whole kernel)
+//   msg (uint16), digest (uint8) and the b3_compress64 state are register values with
+//   static component indices, never run-time-indexed arrays.
 // Measured CL_KERNEL_PRIVATE_MEM_SIZE on Beignet (Haswell GT1, scalar):
 //   8×8: 128 B/WI with CLBlast cpm issue (was 384 with per-element dot4; 1152 with ms_xor)
 //   8×16: 1152 B/WI (acc spill dominates)
@@ -138,63 +137,86 @@ typedef float4 cpm_vec;
 
 inline uint pp_rotl32(uint x, int s) { return (x << s) | (x >> (32 - s)); }
 
-inline uint b3_rotr32(uint x, int n) { return (x >> n) | (x << (32 - n)); }
+/* BLAKE3 G with the right rotations 16/12/8/7 written as left rotations. */
+#define B3_G(a, b, c, d, x, y)                \
+    do {                                      \
+        a += b + (x); d = rotate(d ^ a, 16u); \
+        c += d;       b = rotate(b ^ c, 20u); \
+        a += b + (y); d = rotate(d ^ a, 24u); \
+        c += d;       b = rotate(b ^ c, 25u); \
+    } while (0)
 
-inline void b3_g(uint *v, int a, int b, int c, int d, uint x, uint y) {
-    v[a] += v[b] + x;
-    v[d] = b3_rotr32(v[d] ^ v[a], 16);
-    v[c] += v[d];
-    v[b] = b3_rotr32(v[b] ^ v[c], 12);
-    v[a] += v[b] + y;
-    v[d] = b3_rotr32(v[d] ^ v[a], 8);
-    v[c] += v[d];
-    v[b] = b3_rotr32(v[b] ^ v[c], 7);
-}
-
-inline void b3_compress64(__global const uint *key8, const uint *msg16, uint *out8) {
-    const uint kIV[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-                         0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
-    uint v[16] = {key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7],
-                  kIV[0],  kIV[1],  kIV[2],  kIV[3],  0u,      0u,      64u,     0x1Bu};
-    uint m[16];
-    for (int i = 0; i < 16; ++i) {
-        m[i] = msg16[i];
-    }
-    const uchar kPerm[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+/* Keyed single-block BLAKE3 (CHUNK_START | CHUNK_END | ROOT | KEYED_HASH, 64 bytes).
+ * State and message stay in named registers / vector components: indexing a private array
+ * at run time (the old table-driven permutation) makes Adreno place it in local memory,
+ * which filled the 32 KB of an Adreno 6xx shader core and left one work group per core. */
+inline uint8 b3_compress64(__global const uint *key8, uint16 m) {
+    uint s0 = key8[0], s1 = key8[1], s2 = key8[2], s3 = key8[3];
+    uint s4 = key8[4], s5 = key8[5], s6 = key8[6], s7 = key8[7];
+    uint s8 = 0x6A09E667u, s9 = 0xBB67AE85u, s10 = 0x3C6EF372u, s11 = 0xA54FF53Au;
+    uint s12 = 0u, s13 = 0u, s14 = 64u, s15 = 0x1Bu;
+    #pragma unroll
     for (int round = 0; round < 7; ++round) {
-        b3_g(v, 0, 4, 8, 12, m[0], m[1]);
-        b3_g(v, 1, 5, 9, 13, m[2], m[3]);
-        b3_g(v, 2, 6, 10, 14, m[4], m[5]);
-        b3_g(v, 3, 7, 11, 15, m[6], m[7]);
-        b3_g(v, 0, 5, 10, 15, m[8], m[9]);
-        b3_g(v, 1, 6, 11, 12, m[10], m[11]);
-        b3_g(v, 2, 7, 8, 13, m[12], m[13]);
-        b3_g(v, 3, 4, 9, 14, m[14], m[15]);
-        if (round < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; ++i) {
-                t[i] = m[kPerm[i]];
-            }
-            for (int i = 0; i < 16; ++i) {
-                m[i] = t[i];
-            }
+        B3_G(s0, s4, s8, s12, m.s0, m.s1);
+        B3_G(s1, s5, s9, s13, m.s2, m.s3);
+        B3_G(s2, s6, s10, s14, m.s4, m.s5);
+        B3_G(s3, s7, s11, s15, m.s6, m.s7);
+        B3_G(s0, s5, s10, s15, m.s8, m.s9);
+        B3_G(s1, s6, s11, s12, m.sa, m.sb);
+        B3_G(s2, s7, s8, s13, m.sc, m.sd);
+        B3_G(s3, s4, s9, s14, m.se, m.sf);
+        if (round < 6) { /* message permutation {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8} */
+            m = (uint16)(m.s2, m.s6, m.s3, m.sa, m.s7, m.s0, m.s4, m.sd,
+                         m.s1, m.sb, m.sc, m.s5, m.s9, m.se, m.sf, m.s8);
         }
     }
-    for (int i = 0; i < 8; ++i) {
-        out8[i] = v[i] ^ v[i + 8];
-    }
+    return (uint8)(s0 ^ s8, s1 ^ s9, s2 ^ s10, s3 ^ s11, s4 ^ s12, s5 ^ s13, s6 ^ s14,
+                   s7 ^ s15);
 }
 
-inline bool digest_beats_target(const uint digest[8], __global const uint *bound) {
-    for (int w = 7; w >= 0; --w) {
-        if (digest[w] < bound[w]) {
-            return true;
-        }
-        if (digest[w] > bound[w]) {
-            return false;
-        }
+/* digest <= bound as 256-bit little-endian words, most significant word (7) first. */
+inline bool digest_beats_target(uint8 d, __global const uint *bound) {
+#define B3_CMP_WORD(i)               \
+    if (d.s##i != bound[i]) {        \
+        return d.s##i < bound[i];    \
     }
+    B3_CMP_WORD(7)
+    B3_CMP_WORD(6)
+    B3_CMP_WORD(5)
+    B3_CMP_WORD(4)
+    B3_CMP_WORD(3)
+    B3_CMP_WORD(2)
+    B3_CMP_WORD(1)
+    B3_CMP_WORD(0)
+#undef B3_CMP_WORD
     return true;
+}
+
+#if PP_JACKPOT_WORDS != 16
+#error "msg is a uint16; PP_JACKPOT_WORDS must be 16"
+#endif
+/* msg.s[tid] ^= x with tid uniform across the work group: a switch keeps every component a
+ * register (msg[tid] on an array would be a run-time index, see b3_compress64). */
+inline uint16 pp_msg_xor(uint16 msg, int tid, uint x) {
+    switch (tid) {
+    case 0: msg.s0 ^= x; break;
+    case 1: msg.s1 ^= x; break;
+    case 2: msg.s2 ^= x; break;
+    case 3: msg.s3 ^= x; break;
+    case 4: msg.s4 ^= x; break;
+    case 5: msg.s5 ^= x; break;
+    case 6: msg.s6 ^= x; break;
+    case 7: msg.s7 ^= x; break;
+    case 8: msg.s8 ^= x; break;
+    case 9: msg.s9 ^= x; break;
+    case 10: msg.sa ^= x; break;
+    case 11: msg.sb ^= x; break;
+    case 12: msg.sc ^= x; break;
+    case 13: msg.sd ^= x; break;
+    case 14: msg.se ^= x; break;
+    default: msg.sf ^= x; break;
+    }
+    return msg;
 }
 
 #if defined(CASE32_USE_ASM_DOT) || defined(CASE32_USE_BUILTIN_SDOT4) || \
@@ -395,10 +417,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     const int hash_tile_cols = N / HASH_NR;
     const int hash_spatial_id = tr_global * hash_tile_cols + hash_tc_global;
 
-    uint msg[PP_JACKPOT_WORDS];
-    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
-        msg[i] = 0u;
-    }
+    uint16 msg = (uint16)(0u);
 #if CASE32_USE_LDS && defined(CASE32_COALESCE)
     /* Case 3.4: stage full macro kg-strips; every WI participates in the copy. */
     __local uchar lds_a[KG_LDS_CHUNK * MACRO_KG_STRIP_A];
@@ -546,7 +565,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                                 (ms + PP_JACKPOT_WORDS < num_milestones)
                                         ? pp_rotl32(x, PP_LROT)
                                         : x;
-                        msg[tid] ^= contribution;
+                        msg = pp_msg_xor(msg, tid, contribution);
                     }
                 } else {
                     ulong out_idx;
@@ -590,8 +609,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         return;
     }
 
-    uint digest[8];
-    b3_compress64(a_key8, msg, digest);
+    const uint8 digest = b3_compress64(a_key8, msg);
     if (!digest_beats_target(digest, bound)) {
         return;
     }
