@@ -241,6 +241,14 @@ Case33GemmOcl::~Case33GemmOcl() {
         clReleaseKernel(kernel_);
         kernel_ = nullptr;
     }
+    if (scan_kernel_) {
+        clReleaseKernel(scan_kernel_);
+        scan_kernel_ = nullptr;
+    }
+    if (msg_buf_) {
+        clReleaseMemObject(msg_buf_);
+        msg_buf_ = nullptr;
+    }
     if (a_buf_) {
         clReleaseMemObject(a_buf_);
         a_buf_ = nullptr;
@@ -319,6 +327,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         if (reqd_wg_size_ > 0) {
             build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
         }
+        if (split_jackpot_) {
+            build_opts += " -DCASE33_SPLIT_JACKPOT=1";
+        }
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (gcn) {
             build_opts += " -DCASE32_NO_DPI=1 -DCASE32_GCN_MAD24=1";
@@ -373,6 +384,18 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                               label);
                 return false;
             }
+            if (scan_kernel_) {
+                clReleaseKernel(scan_kernel_);
+                scan_kernel_ = nullptr;
+            }
+            if (split_jackpot_) {
+                scan_kernel_ = ocl_.create_kernel("case33_jackpot_scan");
+                if (!scan_kernel_) {
+                    std::snprintf(dpi_status_, sizeof(dpi_status_),
+                                  "%s: jackpot scan kernel create FAILED", label);
+                    return false;
+                }
+            }
             adopted_backend_ = backend;
             using_integer_dot_ = use_dot;
             using_asm_dot_ = use_asm;
@@ -408,6 +431,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 }
                 if (reqd_wg_size_ > 0) {
                     build_opts2 += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+                }
+                if (split_jackpot_) {
+                    build_opts2 += " -DCASE33_SPLIT_JACKPOT=1";
                 }
                 if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
                     return adopt_kernel(label);
@@ -503,6 +529,17 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                                        sizeof(priv_b), &priv_b, nullptr);
         std::printf("[ocl] kernel mem: local=%llu B/WG private=%llu B/WI\n",
                     (unsigned long long)local_b, (unsigned long long)priv_b);
+        if (scan_kernel_) {
+            local_b = 0;
+            priv_b = 0;
+            (void)clGetKernelWorkGroupInfo(scan_kernel_, ocl_.device, CL_KERNEL_LOCAL_MEM_SIZE,
+                                           sizeof(local_b), &local_b, nullptr);
+            (void)clGetKernelWorkGroupInfo(scan_kernel_, ocl_.device,
+                                           CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(priv_b), &priv_b,
+                                           nullptr);
+            std::printf("[ocl] jackpot scan kernel mem: local=%llu B/WG private=%llu B/WI\n",
+                        (unsigned long long)local_b, (unsigned long long)priv_b);
+        }
         std::fflush(stdout);
     }
     return built;
@@ -608,8 +645,9 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
                        : dot_kind_short(adopted_backend_, issue_mode_,
                                         resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
-                  case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
+                  "OpenCL %dx%d macro batch=%d %s, hash tile %dx%d KR=%d %s s8s8",
+                  case32::kMacroM, case32::kMacroN, macro_batch_, jackpot_label_(), case32::kMR,
+                  case32::kNR,
                   case32::kKR, dot_kind);
     available_ = true;
     return true;
@@ -659,8 +697,9 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
                        : dot_kind_short(adopted_backend_, issue_mode_,
                                         resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
-                  case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
+                  "OpenCL %dx%d macro batch=%d %s, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
+                  case32::kMacroM, case32::kMacroN, macro_batch_, jackpot_label_(), case32::kMR,
+                  case32::kNR,
                   case32::hash_tile_mr(), case32::hash_tile_nr(), case32::kKR, dot_kind);
     available_ = true;
     return true;
@@ -721,6 +760,29 @@ bool Case33GemmOcl::ensure_jackpot_bufs_() {
     return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
 }
 
+bool Case33GemmOcl::ensure_msg_buf_() {
+    if (!split_jackpot_) {
+        return true;
+    }
+    const size_t bytes = static_cast<size_t>(16) * sizeof(uint32_t) *
+                         static_cast<size_t>(macro_batch_) *
+                         static_cast<size_t>(case32::hash_tiles_per_macro());
+    if (msg_buf_ && msg_buf_bytes_ >= bytes) {
+        return true;
+    }
+    if (msg_buf_) {
+        clReleaseMemObject(msg_buf_);
+        msg_buf_ = nullptr;
+        msg_buf_bytes_ = 0;
+    }
+    msg_buf_ = ocl_.alloc_buffer(bytes, CL_MEM_READ_WRITE);
+    if (!msg_buf_) {
+        return false;
+    }
+    msg_buf_bytes_ = bytes;
+    return true;
+}
+
 bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     if (batch_count < 1) {
         return false;
@@ -759,12 +821,12 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
         }
     }
 
-    cl_mem tile_xor_dummy = dummy_buf_;
+    cl_mem tile_xor_buf = split_jackpot_ ? msg_buf_ : dummy_buf_;
 
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(kernel_, 0, sizeof(cl_mem), &a_buf_);
     err |= clSetKernelArg(kernel_, 1, sizeof(cl_mem), &b_buf_);
-    err |= clSetKernelArg(kernel_, 2, sizeof(cl_mem), &tile_xor_dummy);
+    err |= clSetKernelArg(kernel_, 2, sizeof(cl_mem), &tile_xor_buf);
     err |= clSetKernelArg(kernel_, 3, sizeof(int), &N_);
     err |= clSetKernelArg(kernel_, 4, sizeof(int), &blocks_k_);
     err |= clSetKernelArg(kernel_, 5, sizeof(int), &blocks_per_milestone_);
@@ -809,6 +871,33 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
             return false;
         }
     }
+
+    if (split_jackpot_) {
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(scan_kernel_, 0, sizeof(cl_mem), &msg_buf_);
+        err |= clSetKernelArg(scan_kernel_, 1, sizeof(int), &mb_begin);
+        err |= clSetKernelArg(scan_kernel_, 2, sizeof(int), &macro_rows_);
+        err |= clSetKernelArg(scan_kernel_, 3, sizeof(int), &macro_cols_);
+        err |= clSetKernelArg(scan_kernel_, 4, sizeof(cl_mem), &a_key_buf_);
+        err |= clSetKernelArg(scan_kernel_, 5, sizeof(cl_mem), &bound_buf_);
+        err |= clSetKernelArg(scan_kernel_, 6, sizeof(cl_mem), &found_buf_);
+        err |= clSetKernelArg(scan_kernel_, 7, sizeof(cl_mem), &out_rows_buf_);
+        err |= clSetKernelArg(scan_kernel_, 8, sizeof(cl_mem), &out_cols_buf_);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clSetKernelArg (jackpot scan) failed\n");
+            return false;
+        }
+        /* Global size is the word stride the GEMM kernel used; leave local size to the driver. */
+        const size_t global = static_cast<size_t>(batch_count) *
+                              static_cast<size_t>(case32::hash_tiles_per_macro());
+        err = clEnqueueNDRangeKernel(ocl_.queue, scan_kernel_, 1, nullptr, &global, nullptr, 0,
+                                     nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clEnqueueNDRangeKernel (jackpot scan) failed: %s\n",
+                         OpenClContext::error_string(err).c_str());
+            return false;
+        }
+    }
     return true;
 }
 
@@ -820,7 +909,7 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
     if (!available_ || !a_key8 || !bound) {
         return false;
     }
-    if (!ensure_jackpot_bufs_()) {
+    if (!ensure_jackpot_bufs_() || !ensure_msg_buf_()) {
         return false;
     }
 

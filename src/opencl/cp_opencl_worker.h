@@ -31,6 +31,7 @@ void cp_opencl_worker_set_issue_broadcast(int on);
 void cp_opencl_worker_set_dot_policy(int policy);
 /* Scalar MAC nest (Case32OclCpmType): 0 = auto (default), 1 = float, 2 = int, 3 = mad24. */
 void cp_opencl_worker_set_cpm_type(int type);
+void cp_opencl_worker_set_split_jackpot(int on);
 /* Stage A/B in __local (default off). */
 void cp_opencl_worker_set_use_lds(int on);
 /* Register double-buffered GEMM k-group loop (default off). */

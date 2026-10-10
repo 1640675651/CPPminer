@@ -2,6 +2,9 @@
 //
 // fuse_jackpot=1 (mining): milestone XORs fold online into private msg[16]; BLAKE3 + target
 // compare on-device. Host readback is only found_flag (+ t_rows/t_cols on hit).
+// CASE33_SPLIT_JACKPOT=1 (--no-fused-jackpot): same online fold, but the GEMM kernel writes
+// the 16 msg words per hash tile to tile_xor (word-major across the macro batch) and
+// case33_jackpot_scan does BLAKE3 + target compare in a second launch.
 // fuse_jackpot=0: legacy tile_xor writeback for correctness benchmarks.
 //
 // Private memory (fuse_jackpot mining path; source arrays + compiler stack):
@@ -75,6 +78,10 @@
 #define MICRO_N (MACRO_N / NR)
 #endif
 #define HASH_MICRO_N (MACRO_N / HASH_NR)
+#define HASH_PER_MACRO (MICRO_M * HASH_MICRO_N)
+#ifndef CASE33_SPLIT_JACKPOT
+#define CASE33_SPLIT_JACKPOT 0
+#endif
 #ifndef KG_SLICE_B
 #define KG_SLICE_B (NR * RANK)
 #endif
@@ -574,6 +581,30 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
+/* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+   walk every im for one jm: each resident work-group streams its own A strip
+   from DRAM and A is never reused from L2 (the whole of A is re-read once per
+   jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+   ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+   strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+   all addressing derive from (im, jm). Falls back to the linear map when the
+   macro grid is not divisible (uniform branch). case33_jackpot_scan must decode
+   hit coordinates with this same map. */
+inline void case33_macro_tile(int mb, int macro_rows, int macro_cols, int *im, int *jm) {
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        *im = super_row * SWZ_IM + (within % SWZ_IM);
+        *jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        *jm = mb / macro_rows;
+        *im = mb - *jm * macro_rows;
+    }
+}
+
 #ifdef CASE32_REQD_WG
 /* Host passes the exact launch local size when one macro block fits a work-group. */
 __attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
@@ -595,28 +626,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
     const int mb = mb_begin + (int)get_group_id(0);
-    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
-       walk every im for one jm: each resident work-group streams its own A strip
-       from DRAM and A is never reused from L2 (the whole of A is re-read once per
-       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
-       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
-       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
-       all addressing derive from (im, jm). Falls back to the linear map when the
-       macro grid is not divisible (uniform branch). */
     int jm;
     int im;
-    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
-        const int super_rows = macro_rows / SWZ_IM;
-        const int super_id = mb / (SWZ_IM * SWZ_JM);
-        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
-        const int super_col = super_id / super_rows;
-        const int super_row = super_id - super_col * super_rows;
-        im = super_row * SWZ_IM + (within % SWZ_IM);
-        jm = super_col * SWZ_JM + (within / SWZ_IM);
-    } else {
-        jm = mb / macro_rows;
-        im = mb - jm * macro_rows;
-    }
+    case33_macro_tile(mb, macro_rows, macro_cols, &im, &jm);
 
     const int tr0 = im * MICRO_M;
     const int tc0 = jm * MICRO_N;
@@ -864,6 +876,37 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         return;
     }
 #endif
+#if CASE33_SPLIT_JACKPOT
+    (void)a_key8;
+    (void)bound;
+    (void)out_t_rows;
+    (void)out_t_cols;
+    if (!fuse_jackpot || !xor_after_milestone) {
+        return;
+    }
+    {
+        const size_t stride = (size_t)get_num_groups(0) * (size_t)HASH_PER_MACRO;
+        __global uint *dst = tile_xor + (size_t)get_group_id(0) * (size_t)HASH_PER_MACRO +
+                             (size_t)(tr * HASH_MICRO_N + hash_tc);
+        dst[0 * stride] = msg.s0;
+        dst[1 * stride] = msg.s1;
+        dst[2 * stride] = msg.s2;
+        dst[3 * stride] = msg.s3;
+        dst[4 * stride] = msg.s4;
+        dst[5 * stride] = msg.s5;
+        dst[6 * stride] = msg.s6;
+        dst[7 * stride] = msg.s7;
+        dst[8 * stride] = msg.s8;
+        dst[9 * stride] = msg.s9;
+        dst[10 * stride] = msg.sa;
+        dst[11 * stride] = msg.sb;
+        dst[12 * stride] = msg.sc;
+        dst[13 * stride] = msg.sd;
+        dst[14 * stride] = msg.se;
+        dst[15 * stride] = msg.sf;
+    }
+}
+#else
     if (!fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
         return;
     }
@@ -888,4 +931,44 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     if (out_t_cols != 0) {
         *out_t_cols = t_cols;
     }
+}
+#endif
+
+/* CASE33_SPLIT_JACKPOT second pass: one WI per hash tile of the macro batch the GEMM kernel
+ * just wrote. Launched with global size == batch hash tiles (no local size), so the word
+ * stride equals the GEMM kernel's get_num_groups(0) * HASH_PER_MACRO. */
+__kernel void case33_jackpot_scan(__global const uint *msg_words, int mb_begin, int macro_rows,
+                                  int macro_cols, __global const uint *a_key8, __global const uint *bound,
+                                  __global int *found_flag, __global int *out_t_rows,
+                                  __global int *out_t_cols) {
+    if (*found_flag != 0) {
+        return;
+    }
+    const size_t stride = get_global_size(0);
+    const size_t t = get_global_id(0);
+#define CASE33_MSG_WORD(i) msg_words[(size_t)(i) * stride + t]
+    const uint16 msg = (uint16)(CASE33_MSG_WORD(0), CASE33_MSG_WORD(1), CASE33_MSG_WORD(2),
+                                CASE33_MSG_WORD(3), CASE33_MSG_WORD(4), CASE33_MSG_WORD(5),
+                                CASE33_MSG_WORD(6), CASE33_MSG_WORD(7), CASE33_MSG_WORD(8),
+                                CASE33_MSG_WORD(9), CASE33_MSG_WORD(10), CASE33_MSG_WORD(11),
+                                CASE33_MSG_WORD(12), CASE33_MSG_WORD(13), CASE33_MSG_WORD(14),
+                                CASE33_MSG_WORD(15));
+#undef CASE33_MSG_WORD
+    const uint8 digest = b3_compress64(a_key8, msg);
+    if (!digest_beats_target(digest, bound)) {
+        return;
+    }
+    if (atomic_cmpxchg(found_flag, 0, 1) != 0) {
+        return;
+    }
+
+    const int g = (int)(t / HASH_PER_MACRO);
+    const int r = (int)(t - (size_t)g * HASH_PER_MACRO);
+    const int tr = r / HASH_MICRO_N;
+    const int hash_tc = r - tr * HASH_MICRO_N;
+    int im;
+    int jm;
+    case33_macro_tile(mb_begin + g, macro_rows, macro_cols, &im, &jm);
+    *out_t_rows = im * MACRO_M + tr * MR;
+    *out_t_cols = jm * MACRO_N + hash_tc * HASH_NR;
 }

@@ -58,6 +58,7 @@ static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
 static int g_cpm_type = 0; /* Case32OclCpmType */
 static int g_use_lds = 0;
 static int g_double_buffer = 0;
+static int g_split_jackpot = 0;
 
 namespace {
 
@@ -318,6 +319,10 @@ extern "C" void cp_opencl_worker_set_double_buffer(int on) {
     g_double_buffer = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_split_jackpot(int on) {
+    g_split_jackpot = on ? 1 : 0;
+}
+
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
     int tile_mr = 4;
     int tile_nr = 8;
@@ -445,6 +450,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_cpm_type(static_cast<Case32OclCpmType>(g_cpm_type));
     g_gemm.set_use_lds(g_use_lds);
     g_gemm.set_double_buffer(g_double_buffer);
+    g_gemm.set_split_jackpot(g_split_jackpot);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -484,6 +490,10 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     printf("[ocl] register double buffer: %s (--ocl-double-buff %s)%s\n",
            g_double_buffer ? "on" : "off", g_double_buffer ? "on" : "off",
            g_double_buffer && g_use_lds ? "; not used with --ocl-lds on" : "");
+    printf("[ocl] jackpot: %s\n",
+           g_split_jackpot ? "separate kernel, 16 msg words/tile via global memory "
+                             "(--no-fused-jackpot)"
+                           : "fused into the GEMM kernel (default)");
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {

@@ -325,6 +325,15 @@ extern "C" void cp_worker_set_ocl_cpm_type(int type)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_split_jackpot(int on)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_split_jackpot(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_set_ocl_lds(int on)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
