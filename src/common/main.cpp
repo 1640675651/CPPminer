@@ -107,6 +107,8 @@ static void print_usage(void)
     printf("                     force-khr, asm, or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
+    printf("  --no-fused-jackpot OpenCL: GEMM writes 16 folded words per hash tile, a separate\n");
+    printf("                     kernel runs BLAKE3 + target (default: fused in the GEMM kernel)\n");
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("  --wgpu-lds on|off  wgpu (pearl) stage A/B in workgroup memory\n");
@@ -505,6 +507,7 @@ int main(int argc, char** argv)
     int ocl_dot_policy = 0; /* Case32OclDotPolicy */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
+    int ocl_split_jackpot = 0; /* only an explicit --no-fused-jackpot; OpenCL defaults fused */
     int wgpu_lds = -1;
     int wgpu_tile_mr = 0;
     int wgpu_tile_nr = 0;
@@ -816,8 +819,10 @@ int main(int argc, char** argv)
             cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--fused-jackpot")){
             fused_jackpot = 1;
+            ocl_split_jackpot = 0;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
             fused_jackpot = 0;
+            ocl_split_jackpot = 1;
         } else if(!strcmp(argv[i], "--onednn-layout")){
             if(i + 1 >= argc){
                 fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
@@ -1123,6 +1128,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_cpm_int(1);
     if(ocl_lds)
         cp_worker_set_ocl_lds(1);
+    if(ocl_split_jackpot)
+        cp_worker_set_ocl_split_jackpot(1);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(wgpu_lds >= 0)
@@ -1475,7 +1482,9 @@ int main(int argc, char** argv)
                 (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? (128 / 4) * (128 / 8)
                 : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? (128 / 8) * (128 / 8)
                 : (128 / 8) * (128 / 16);
-            printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
+            printf(ocl_split_jackpot
+                           ? "[mode] scan: OpenCL GEMM + XOR fold, separate device jackpot kernel\n"
+                           : "[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
             printf("[mode] macro batch: %d (%d hash tiles/launch, --batch-size)\n",
                    batch_size, batch_size * tiles_per_macro);
             printf("[mode] noisy B cached on GPU per job\n");

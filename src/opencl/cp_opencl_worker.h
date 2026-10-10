@@ -29,6 +29,7 @@ void cp_opencl_worker_set_issue_broadcast(int on);
 void cp_opencl_worker_set_dot_policy(int policy);
 /* Broadcast cpm type: 0 = float (default), 1 = int32. Requires broadcast issue. */
 void cp_opencl_worker_set_cpm_int(int on);
+void cp_opencl_worker_set_split_jackpot(int on);
 /* Stage A/B in __local (default off). */
 void cp_opencl_worker_set_use_lds(int on);
 /* Apply tile override or auto-detect for device before kernel build. */

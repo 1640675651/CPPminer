@@ -45,6 +45,10 @@ struct Case33GemmOcl {
     /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
     void set_use_lds(int on);
     bool use_lds() const { return use_lds_; }
+    /* --no-fused-jackpot: GEMM writes 16 folded msg words per hash tile, a second kernel
+     * (case33_jackpot_scan) hashes them. Must be set before init_context. */
+    void set_split_jackpot(int on) { split_jackpot_ = on != 0; }
+    bool split_jackpot() const { return split_jackpot_; }
 
 
 
@@ -111,6 +115,13 @@ private:
 
     bool ensure_jackpot_bufs_();
 
+    bool ensure_msg_buf_();
+
+    const char *jackpot_label_() const {
+        return split_jackpot_ ? "GEMM+XOR (16 msg words/tile) + jackpot kernel"
+                              : "fused GEMM+XOR+jackpot";
+    }
+
     bool run_macro_batch_(int mb_begin, int batch_count);
 
 
@@ -157,6 +168,8 @@ private:
 
     bool use_lds_ = false;
 
+    bool split_jackpot_ = false;
+
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
     bool using_integer_dot_ = false;
@@ -170,6 +183,12 @@ private:
 
 
     cl_kernel kernel_ = nullptr;
+
+    cl_kernel scan_kernel_ = nullptr;
+
+    cl_mem msg_buf_ = nullptr;
+
+    size_t msg_buf_bytes_ = 0;
 
     cl_mem a_buf_ = nullptr;
 

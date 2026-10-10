@@ -59,6 +59,7 @@ void cp_worker_set_ocl_issue_broadcast(int on);
 void cp_worker_set_ocl_dot_policy(int policy);
 /* OpenCL-only: broadcast cpm type. 0 = float (default), 1 = int32. */
 void cp_worker_set_ocl_cpm_int(int on);
+void cp_worker_set_ocl_split_jackpot(int on);
 /* OpenCL-only: stage A/B panels in local memory (0 = off default, 1 = on). */
 void cp_worker_set_ocl_lds(int on);
 /* wgpu-only (pearl): stage A/B panels in workgroup memory (-1 = auto default, 0 = off, 1 = on). */

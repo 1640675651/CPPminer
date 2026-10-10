@@ -48,6 +48,7 @@ static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
 static int g_cpm_int = 0;
 static int g_use_lds = 0;
+static int g_split_jackpot = 0;
 
 namespace {
 
@@ -302,6 +303,10 @@ extern "C" void cp_opencl_worker_set_use_lds(int on) {
     g_use_lds = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_split_jackpot(int on) {
+    g_split_jackpot = on ? 1 : 0;
+}
+
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
     int tile_mr = 4;
     int tile_nr = 8;
@@ -382,6 +387,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(g_dot_policy));
     g_gemm.set_cpm_int(g_cpm_int);
     g_gemm.set_use_lds(g_use_lds);
+    g_gemm.set_split_jackpot(g_split_jackpot);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -417,6 +423,10 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     }
     printf("[ocl] LDS staging: %s (--ocl-lds %s)\n", g_use_lds ? "on" : "off",
            g_use_lds ? "on" : "off");
+    printf("[ocl] jackpot: %s\n",
+           g_split_jackpot ? "separate kernel, 16 msg words/tile via global memory "
+                             "(--no-fused-jackpot)"
+                           : "fused into the GEMM kernel (default)");
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {
