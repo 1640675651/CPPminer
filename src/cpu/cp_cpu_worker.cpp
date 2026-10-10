@@ -72,6 +72,7 @@ static const char* simd_isa_label(Case33Isa isa, Case33SseTile tile)
     case Case33Isa::AvxVnni: return "AVX-VNNI";
     case Case33Isa::Avx2: return "AVX2";
     case Case33Isa::Sse: return "SSSE3";
+    case Case33Isa::I8mm: return "I8MM";
     case Case33Isa::DotProd: return "DotProd";
     case Case33Isa::Neon: return "NEON";
     case Case33Isa::Scalar: return "scalar";
@@ -266,6 +267,9 @@ extern "C" int cp_cpu_worker_set_simd_isa(CpSimdIsa isa)
         break;
     case CP_SIMD_DOTPROD:
         g_isa_pref = Case33Isa::DotProd;
+        break;
+    case CP_SIMD_I8MM:
+        g_isa_pref = Case33Isa::I8mm;
         break;
     case CP_SIMD_AUTO:
     case CP_SIMD_HYBRID: /* quantus-only split; the GEMM path has no hybrid mode */

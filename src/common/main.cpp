@@ -179,8 +179,8 @@ static void print_usage(void)
     printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
     printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avx512vnni, avxvnni,\n");
-    printf("                       avx512 (base F+BW, alias avx512bw), avx2, ssse3, dotprod,\n");
-    printf("                       neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
+    printf("                       avx512 (base F+BW, alias avx512bw), avx2, ssse3, i8mm,\n");
+    printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("                       quantus: hybrid = scalar + avx2 split across SMT siblings,\n");
     printf("                       auto = best available (currently hybrid), avx2 = all\n");
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
@@ -477,6 +477,7 @@ int main(int argc, char** argv)
             else if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "i8mm")) simd_isa = CP_SIMD_I8MM;
             else if(!strcmp(env, "dotprod")) simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(env, "neon")) simd_isa = CP_SIMD_NEON;
             else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
@@ -859,13 +860,15 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_NEON;
             else if(!strcmp(isa, "dotprod"))
                 simd_isa = CP_SIMD_DOTPROD;
+            else if(!strcmp(isa, "i8mm"))
+                simd_isa = CP_SIMD_I8MM;
             else if(!strcmp(isa, "scalar"))
                 simd_isa = CP_SIMD_SCALAR;
             else if(!strcmp(isa, "hybrid"))
                 simd_isa = CP_SIMD_HYBRID;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni|avx512|avx2|ssse3|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni|avx512|avx2|ssse3|i8mm|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }

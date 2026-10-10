@@ -98,13 +98,27 @@ Case33CpuFeatures case33_detect_cpu_features() {
     features.neon = true;
 #if defined(__linux__) && defined(HWCAP_ASIMDDP)
     features.dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+    /* FEAT_I8MM: AT_HWCAP2 bit 13 on aarch64 Linux/Android (HWCAP2_I8MM). */
+#if !defined(HWCAP2_I8MM)
+#define HWCAP2_I8MM (1UL << 13)
+#endif
+    features.i8mm = (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
 #elif defined(__APPLE__)
     int value = 0;
     size_t size = sizeof(value);
     features.dotprod = sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size,
                                     nullptr, 0) == 0 && value != 0;
+    value = 0;
+    size = sizeof(value);
+    features.i8mm = sysctlbyname("hw.optional.arm.FEAT_I8MM", &value, &size,
+                                 nullptr, 0) == 0 && value != 0;
 #elif defined(_WIN32) && defined(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE)
     features.dotprod = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    /* The whole binary was compiled for I8MM; the CPU must have it. */
+    features.i8mm = true;
+    features.dotprod = true;
 #endif
 #elif defined(__arm__)
 #if defined(__linux__) && defined(HWCAP_NEON)

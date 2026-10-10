@@ -16,7 +16,7 @@ runtime-supported path.
 | Target | `--simd auto` order | Runtime check |
 |---|---|---|
 | x86/x86-64 | AVX512-VNNI, then AVX-VNNI, then AVX512-BW, then AVX2, then SSSE3, then scalar | CPUID; AVX2/VNNI require OS AVX state via XCR0; AVX-VNNI is leaf 7.1 EAX[4]; AVX512-BW needs leaf 7.0 EBX[16] F, EBX[30] BW, EBX[31] VL and XCR0 bits 1,2,5,6,7 (ZMM/opmask state); AVX512-VNNI additionally needs ECX[11] VNNI |
-| AArch64 | DotProd, then NEON, then scalar | DotProd is detected per OS; Advanced SIMD is required by the AArch64 architecture profile |
+| AArch64 | I8MM, then DotProd, then NEON, then scalar | I8MM and DotProd are detected per OS; Advanced SIMD is required by the AArch64 architecture profile |
 | Other targets | scalar | None |
 
 Forcing an unavailable ISA, such as `--simd neon` on x86 or `--simd avx2` on
@@ -57,8 +57,9 @@ rows and columns stay in vector registers at one time.
 | AVX-VNNI | `case33_gemm_xor_avxvnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 | Uses one `vpdpbusd` per rank-4 update |
 | AVX512-BW | `case33_gemm_xor_avx512bw.cpp` | Same u8×s8 semantics as AVX2 fast path | Two vertically adjacent 8x16 tiles as one 16x16 zmm block | `vpmaddubsw` + `vpmaddwd` (ones) + `vpaddd` at 512 bits, sharing each B broadcast across both tiles; 32 registers so no spills. Single tiles (`CP_AVX512_PAIR=0`) and exact s8s8 mode (no `vpsignb` in AVX-512) use the AVX2 kernel |
 | AVX512-VNNI | `case33_gemm_xor_avx512vnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 (ymm), or two vertically adjacent 8x16 tiles as one 16x16 zmm block | EVEX `vpdpbusd`; 32 registers so no spills. The zmm pair shares each B broadcast across both tiles; `CP_AVX512_PAIR=0` forces the ymm single-tile form. Exact s8s8 mode always uses the ymm form (no `vpsignb` in AVX-512) |
-| DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | Two 8x8 register tiles | Uses `vdotq_s32`; optional ARMv8.2 extension |
-| NEON | `case33_gemm_xor_neon.cpp` | Exact signed widening `int8 -> int16`, then `int16 * int16 -> int32` | Two 8x8 register tiles | Uses `vmlal_s16`; baseline AArch64 NEON only |
+| I8MM | `case33_gemm_xor_i8mm.cpp` | Exact signed 2x8 by 8x2 byte matrix multiply `int8 * int8 -> int32` (32 MAC per instruction) | Two 8x8 register tiles, accumulators kept across all KR panels | Uses `vmmlaq_s32` (`smmla`); two packed 4-k groups are interleaved with `vzip1q_s32`/`vzip2q_s32` into the 2x8 operands; optional ARMv8.6 extension |
+| DotProd | `case33_gemm_xor_dotprod.cpp` | Exact signed byte dot product `int8 * int8 -> int32` | Two 8x8 register tiles, accumulators kept across all KR panels | Uses `vdotq_laneq_s32` (B column selected by lane, 2 loads per 8 cols x 4 k); optional ARMv8.2 extension |
+| NEON | `case33_gemm_xor_neon.cpp` | Exact `int8 * int8 -> int16` (two products per lane), pairwise-added into `int32` | Four 8x4 register tiles, accumulators kept across all KR panels | Uses `vmull_s8`/`vmlal_s8` + `vpadalq_s16`; relies on the Pearl operand range [-127, 126] so two products fit `int16`; baseline AArch64 NEON only |
 
 The ARM paths compute columns `0..7` and `8..15` as separate register tiles.
 Each half uses 16 vector accumulators: one four-lane `int32` accumulator for
@@ -98,6 +99,13 @@ DotProd is an optional ARMv8.2 extension. Linux and Android detect it through
 `PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE`. The DotProd source is compiled with
 `-march=armv8.2-a+dotprod` (or `/arch:armv8.2` on MSVC) and is never called
 unless the runtime check succeeds.
+
+I8MM (`smmla`) is an optional ARMv8.6 extension. Linux and Android detect it
+through `getauxval(AT_HWCAP2) & HWCAP2_I8MM` (bit 13); Apple uses
+`hw.optional.arm.FEAT_I8MM`; a binary built with `__ARM_FEATURE_MATMUL_INT8`
+globally assumes it. The I8MM source is compiled with
+`-march=armv8.2-a+dotprod+i8mm` (GCC/clang only; MSVC gets a stub) and is
+preferred over DotProd when available (`--simd i8mm` forces it).
 
 ### NEON signed widening arithmetic
 
@@ -151,6 +159,7 @@ baseline.
 | AVX512-BW kernel | `-mavx512f -mavx512bw -mavx512vl` | `/arch:AVX512` |
 | AVX512-VNNI kernel | `-mavx512f -mavx512bw -mavx512vl -mavx512vnni` | `/arch:AVX512` |
 | DotProd kernel | `-march=armv8.2-a+dotprod` | `/arch:armv8.2` |
+| I8MM kernel | `-march=armv8.2-a+dotprod+i8mm` | not available (stub) |
 | BLAKE3 SSE2/SSE4.1/AVX2/AVX-512 kernels | Per-source ISA options | Per-source `/arch:` options |
 
 The SSSE3 source also uses a GCC/Clang `target("ssse3")` attribute on its
