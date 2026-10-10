@@ -111,98 +111,6 @@ void cp_init_workdir(void)
 #endif
 }
 
-static void cp_resolve_python(void)
-{
-    const char* env_py = getenv("CP_PYTHON");
-    if(!env_py || !env_py[0]) env_py = getenv("PEARL_PYTHON");
-    if(env_py && env_py[0]){
-        strncpy(g_python_exe, env_py, sizeof(g_python_exe) - 1);
-        g_python_exe[sizeof(g_python_exe) - 1] = 0;
-    }
-
-#ifdef _WIN32
-    if(!cp_file_exists(g_python_exe)){
-        char found[MAX_PATH];
-        if(SearchPathA(NULL, "python.exe", NULL, MAX_PATH, found, NULL)){
-            strncpy(g_python_exe, found, sizeof(g_python_exe) - 1);
-            g_python_exe[sizeof(g_python_exe) - 1] = 0;
-        }
-    }
-#endif
-
-    cp_path_abs(g_python_exe, sizeof(g_python_exe));
-    cp_path_to_posix(g_python_exe);
-
-    if(!cp_file_exists(g_python_exe)){
-        fprintf(stderr,
-            "[plain] python not found: %s\n"
-            "  Set CP_PYTHON (or PEARL_PYTHON) or pass --python\n",
-            g_python_exe);
-    }
-}
-
-static int cp_run_cmd(char* cmdline)
-{
-    printf("[host] %s\n", cmdline); fflush(stdout);
-#ifdef _WIN32
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-    if(!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, g_workdir, &si, &pi)){
-        fprintf(stderr, "[host] CreateProcess failed (err=%lu)\n", (unsigned long)GetLastError());
-        return -1;
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD ec = 1;
-    GetExitCodeProcess(pi.hProcess, &ec);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return (int)ec;
-#else
-    return system(cmdline);
-#endif
-}
-
-int cp_run_python(const char* subcmd)
-{
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\" %s", g_python_exe, g_host_bridge, subcmd);
-    return cp_run_cmd(cmd);
-}
-
-void cp_resolve_paths(int argc, char** argv)
-{
-    if(!cp_file_exists(g_host_bridge)){
-        char alt[768];
-        snprintf(alt, sizeof(alt), "%s/scripts/plain_proof_host.py", g_workdir);
-        if(cp_file_exists(alt)){
-            strncpy(g_host_bridge, alt, sizeof(g_host_bridge) - 1);
-            g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
-        } else {
-            snprintf(alt, sizeof(alt), "scripts/plain_proof_host.py");
-            if(cp_file_exists(alt)){
-                strncpy(g_host_bridge, alt, sizeof(g_host_bridge) - 1);
-                g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
-            }
-        }
-    }
-
-    cp_path_abs(g_host_bridge, sizeof(g_host_bridge));
-    cp_path_to_posix(g_host_bridge);
-
-    if(!cp_file_exists(g_host_bridge)){
-        fprintf(stderr, "[plain] host bridge not found: %s\n", g_host_bridge);
-    }
-
-    cp_resolve_python();
-    printf("[plain] workdir=%s\n[plain] python=%s\n[plain] bridge=%s\n",
-           g_workdir, g_python_exe, g_host_bridge);
-    fflush(stdout);
-    (void)argc; (void)argv;
-}
-
 int cp_read_file_bin(const char* path, void* buf, size_t nbytes)
 {
     FILE* f = fopen(path, "rb");
@@ -367,28 +275,68 @@ int cp_pp_hash_tile_w(void)
     return cp_active_hash_w();
 }
 
-void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
+/* 256-bit LE target from a long double value (saturates at 2^256 - 1). */
+static void target_from_ld(long double v, uint32_t tgt[8])
 {
     memset(tgt, 0, 8 * sizeof(uint32_t));
-    long double exp_val = 256.0L - (long double)difficulty
-        + log2l((long double)(R_RANK * cp_active_hash_h() * cp_active_hash_w()));
+    if(!(v > 0.0L)) return;
+    if(!isfinite((double)v) || v >= 115792089237316195423570985008687907853269984665640564039457584007913129639936.0L){
+        for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
+        return;
+    }
+    const long double base = 4294967296.0L;
+    for(int i=0;i<8;i++){
+        long double rem = fmodl(v, base);
+        if(rem < 0.0L) rem = 0.0L;
+        if(rem > 4294967295.0L) rem = 4294967295.0L;
+        tgt[i] = (uint32_t)rem;
+        v = floorl(v / base);
+        if(v <= 0.0L) break;
+    }
+}
+
+void cp_mock_target_from_difficulty(double difficulty, uint32_t tgt[8])
+{
+    /* Offline mock: the unscaled share target is 2^(256 - D). The hash tile is
+     * applied once, later, by cp_scale_jackpot_target, so the mock share rate
+     * per attempt does not depend on the tile shape. */
+    memset(tgt, 0, 8 * sizeof(uint32_t));
+    const long double exp_val = 256.0L - (long double)difficulty;
     if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val > 0.0L){
-        long double v = powl(2.0L, exp_val);
-        if(!isfinite((double)v)){
-            for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
-        } else {
-            long double base = 4294967296.0L;
-            for(int i=0;i<8;i++){
-                long double rem = fmodl(v, base);
-                if(rem < 0.0L) rem = 0.0L;
-                if(rem > 4294967295.0L) rem = 4294967295.0L;
-                tgt[i] = (uint32_t)rem;
-                v = floorl(v / base);
-                if(v <= 0.0L) break;
+        target_from_ld(powl(2.0L, exp_val), tgt);
+    }
+}
+
+void cp_pool_target_from_difficulty(double difficulty, uint32_t tgt[8])
+{
+    /* Stratum convention: target = (0xFFFF << 208) / diff, e.g. diff 26000 ->
+     * 0000000000028544877baaede211544877baaede211544877baaede211544877. Exact
+     * 256-bit division for integral difficulties; fractional ones go through
+     * long double. Only used when mining.notify carries no target. */
+    memset(tgt, 0, 8 * sizeof(uint32_t));
+    if(!(difficulty > 0.0)) return;
+    const long double d = (long double)difficulty;
+    /* 2^64 is exact in long double; with MSVC's 53-bit long double the
+     * literal 2^64 - 1 would round up to it and overflow the cast. */
+    if(d == floorl(d) && d < 18446744073709551616.0L){
+        const uint64_t div = (uint64_t)d;
+        /* numerator 0xFFFF << 208 as LE 32-bit words: word 6 = 0xFFFF0000 */
+        const uint32_t num[8] = {0, 0, 0, 0, 0, 0, 0xFFFF0000u, 0};
+        /* Bitwise long division: rem < div, so 2*rem + 1 fits in 65 bits; the
+         * bit shifted out of rem marks the cases where it must exceed div. */
+        uint64_t rem = 0;
+        for(int bit = 255; bit >= 0; bit--){
+            const uint64_t carry = rem >> 63;
+            rem = (rem << 1) | ((num[bit >> 5] >> (bit & 31)) & 1u);
+            if(carry || rem >= div){
+                rem -= div;
+                tgt[bit >> 5] |= 1u << (bit & 31);
             }
         }
+    } else {
+        target_from_ld(65535.0L * powl(2.0L, 208.0L) / d, tgt);
     }
 }
 

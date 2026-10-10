@@ -1,12 +1,12 @@
 [package]
-name = "cp-wgpu-ffi"
+name = "cp-quantus-wgpu-ffi"
 version = "0.1.0"
 edition = "2021"
 description = "C FFI: Quantus wgpu GpuEngine for CPPminer"
 publish = false
 
 [lib]
-name = "cp_wgpu_ffi"
+name = "cp_quantus_wgpu_ffi"
 crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]

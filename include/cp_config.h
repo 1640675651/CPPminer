@@ -39,6 +39,8 @@
 #define CP_MATRIX_UNIT        1024
 #define CP_MATRIX_UNITS_MAX   256
 #define CP_MATRIX_AREA_MAX    (128 * 128) /* max m_units * n_units */
+/* Hexagon: 128x128 macro blocks per DSP launch, rows and columns (32 x 32 = 4096 x 4096). */
+#define CP_HEXAGON_LAUNCH_MACROS_DEFAULT 32
 
 #define MAX_GPUS 16
 
@@ -60,9 +62,9 @@
 #define CP_JOB_CANCELLED (-1)
 
 /* Offline --mock defaults (different difficulty definitions per algo).
- * Pearl: cp_target_from_difficulty jackpot curve (~few–tens of seconds at --m 8 --n 8).
+ * Pearl: 2^(256 - D) unscaled target, tile applied once (~few–tens of seconds at --m 8 --n 8).
  * Quantus: Bitcoin-style U512::MAX / D (~1e6 hashes expected). */
-#define CP_MOCK_DIFF_PEARL_DEFAULT    58.0
+#define CP_MOCK_DIFF_PEARL_DEFAULT    44.0
 #define CP_MOCK_DIFF_QUANTUS_DEFAULT  1000000.0
 
 #endif /* CP_CONFIG_H */

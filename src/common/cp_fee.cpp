@@ -10,8 +10,6 @@
  * To change an address:
  *   python internal/encode_fee_wallet.py 'prl1...'   # or qzpp...
  * and paste the printed bytes into the matching k_*_dev_wallet_enc below.
- *
- * Quantus fee wallet is empty until a qzpp address is encoded; fee stays off.
  */
 
 static const unsigned char k_dev_wallet_key[] = {
@@ -27,9 +25,13 @@ static const unsigned char k_pearl_dev_wallet_enc[] = {
     0x38, 0x27, 0x4f,
 };
 
-/* Placeholder: no Quantus fee address encoded yet (len 0 → fee disabled). */
-static const unsigned char k_quantus_dev_wallet_enc[1] = {0};
-static const size_t k_quantus_dev_wallet_enc_len = 0;
+static const unsigned char k_quantus_dev_wallet_enc[] = {
+    0x12, 0x0a, 0xf0, 0x1d, 0x21, 0x3d, 0x33, 0x43, 0x19, 0x54, 0x00, 0xfa,
+    0x37, 0x21, 0x07, 0x34, 0x7e, 0x43, 0x50, 0x32, 0xfc, 0x00, 0x0e, 0x5c,
+    0x03, 0x42, 0x09, 0x15, 0x01, 0xcd, 0x18, 0x38, 0x0a, 0x38, 0x45, 0x19,
+    0x3a, 0x32, 0xf1, 0x18, 0x5d, 0x58, 0x3b, 0x66, 0x32, 0x09, 0x18, 0xf3,
+    0x0a,
+};
 
 static char g_user_wallet[256];
 static char g_dev_wallet[256];
@@ -37,8 +39,19 @@ static int g_enabled = 0;
 static int g_auth_is_dev = 0;
 static int g_fee_active = 0;
 static uint64_t g_debt = 0;
-static uint64_t g_tiles_per_matrix = 0; /* T: tiles (Pearl) or hash quantum (Quantus) */
+static uint64_t g_tiles_per_matrix = 0; /* T: tiles (Pearl) or turn length in us (Quantus) */
 static CpAlgoId g_algo = CP_ALGO_PEARL;
+
+static int time_based(void){ return g_algo == CP_ALGO_QUANTUS; }
+
+const char* cp_fee_format(uint64_t units, char* buf, int cap)
+{
+    if(time_based())
+        snprintf(buf, (size_t)cap, "%.1f s", (double)units / 1e6);
+    else
+        snprintf(buf, (size_t)cap, "%llu tiles", (unsigned long long)units);
+    return buf;
+}
 
 static void load_dev_wallet(CpAlgoId algo)
 {
@@ -46,7 +59,7 @@ static void load_dev_wallet(CpAlgoId algo)
     size_t n = sizeof(k_pearl_dev_wallet_enc);
     if(algo == CP_ALGO_QUANTUS){
         enc = k_quantus_dev_wallet_enc;
-        n = k_quantus_dev_wallet_enc_len;
+        n = sizeof(k_quantus_dev_wallet_enc);
     }
     g_dev_wallet[0] = 0;
     if(n == 0) return;
@@ -96,17 +109,19 @@ void cp_fee_set_tiles_per_matrix(uint64_t tiles_per_matrix)
 {
     if(tiles_per_matrix == 0) return;
     const int first = (g_tiles_per_matrix == 0);
+    char a[48], b[48];
     if(!first && g_tiles_per_matrix != tiles_per_matrix){
-        printf("[fee] tiles/matrix T changed %llu -> %llu (threshold 100*T)\n",
-               (unsigned long long)g_tiles_per_matrix,
-               (unsigned long long)tiles_per_matrix);
+        printf("[fee] T changed %s -> %s (threshold 100*T)\n",
+               cp_fee_format(g_tiles_per_matrix, a, sizeof(a)),
+               cp_fee_format(tiles_per_matrix, b, sizeof(b)));
         fflush(stdout);
     }
     g_tiles_per_matrix = tiles_per_matrix;
     if(first && g_enabled){
         g_debt = ((uint64_t)CP_FEE_PERIOD / 2) * tiles_per_matrix;
-        printf("[fee] tile-debt seeded at 50*T = %llu (T=%llu)\n",
-               (unsigned long long)g_debt, (unsigned long long)tiles_per_matrix);
+        printf("[fee] debt seeded at 50*T = %s (T=%s)\n",
+               cp_fee_format(g_debt, a, sizeof(a)),
+               cp_fee_format(tiles_per_matrix, b, sizeof(b)));
         fflush(stdout);
     }
 }
@@ -127,8 +142,10 @@ void cp_fee_prepare_matrix(void)
     if(!g_enabled || g_tiles_per_matrix == 0) return;
     if(!g_fee_active && g_debt >= threshold_tiles()){
         g_fee_active = 1;
-        printf("[fee] debt %llu >= 100*T (%llu): starting fee cycle\n",
-               (unsigned long long)g_debt, (unsigned long long)threshold_tiles());
+        char a[48], b[48];
+        printf("[fee] debt %s >= 100*T (%s): starting fee cycle\n",
+               cp_fee_format(g_debt, a, sizeof(a)),
+               cp_fee_format(threshold_tiles(), b, sizeof(b)));
         fflush(stdout);
     }
 }
@@ -155,13 +172,10 @@ void cp_fee_note_tiles(uint64_t tiles)
             if(pay >= g_debt) g_debt = 0;
             else g_debt -= pay;
         }
-        if(g_debt < threshold_tiles()){
-            if(g_fee_active){
-                printf("[fee] debt %llu < 100*T (%llu): fee cycle complete\n",
-                       (unsigned long long)g_debt,
-                       (unsigned long long)threshold_tiles());
-                fflush(stdout);
-            }
+        if(time_based() ? g_debt == 0 : g_debt < threshold_tiles()){
+            char a[48];
+            printf("[fee] debt %s: fee cycle complete\n", cp_fee_format(g_debt, a, sizeof(a)));
+            fflush(stdout);
             g_fee_active = 0;
         }
     } else {

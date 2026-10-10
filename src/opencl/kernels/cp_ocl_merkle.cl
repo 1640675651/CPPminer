@@ -22,12 +22,12 @@ inline void d_mt_set_leaf_word(__local uint* smem, int word, int leaf, int smem_
     smem[(size_t)word * (size_t)smem_cols + (size_t)leaf] = v;
 }
 
-inline void d_mt_load_key_g(__global const uchar *job_key, uint key[8]) {
+inline void d_mt_load_key_g(__global const uchar *job_key, uint *key) {
     d_b3_key_words_g(job_key, key);
 }
 
-inline void d_mt_parent_cv(const uint key[8], const uint left[8], const uint right[8],
-                           int as_root, uint out[8]) {
+inline void d_mt_parent_cv(const uint *key, const uint *left, const uint *right,
+                           int as_root, uint *out) {
     uint cv[8];
     for (int i = 0; i < 8; i++) {
         cv[i] = key[i];
