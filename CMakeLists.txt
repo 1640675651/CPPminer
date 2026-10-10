@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 
 # Backends (enable independently).
 option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
+option(NO_I8MM          "Build without the AArch64 I8MM (smmla) CPU kernel" OFF)
 option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
@@ -198,8 +199,37 @@ if(CP_ENABLE_CPU)
         else()
             set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
                 PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
-            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_i8mm.cpp
-                PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
+            if(NO_I8MM)
+                message(STATUS "I8MM CPU kernel disabled (NO_I8MM=ON); --simd i8mm is "
+                    "unavailable in this binary")
+            else()
+                # +i8mm needs GCC >= 10 / Clang >= 11; older compilers reject the flag.
+                include(CheckCXXSourceCompiles)
+                set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+dotprod+i8mm")
+                check_cxx_source_compiles("
+                    #include <arm_neon.h>
+                    int main() {
+                        int32x4_t acc = vdupq_n_s32(0);
+                        acc = vmmlaq_s32(acc, vdupq_n_s8(1), vdupq_n_s8(1));
+                        return vgetq_lane_s32(acc, 0) == 8 ? 0 : 1;
+                    }" CP_CXX_HAS_I8MM)
+                unset(CMAKE_REQUIRED_FLAGS)
+                if(CP_CXX_HAS_I8MM)
+                    set_source_files_properties(src/cpu/gemm/case33_gemm_xor_i8mm.cpp
+                        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
+                    add_compile_definitions(CP_HAVE_I8MM_KERNEL=1)
+                else()
+                    # Retest on the next configure (e.g. after a compiler upgrade).
+                    unset(CP_CXX_HAS_I8MM CACHE)
+                    message(FATAL_ERROR
+                        "The compiler (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}) "
+                        "cannot build -march=armv8.2-a+dotprod+i8mm (needs GCC >= 10 or "
+                        "Clang >= 11).\n"
+                        "Upgrade the compiler, or reconfigure with -DNO_I8MM=ON to build "
+                        "without the I8MM CPU kernel: the binary will then not have the I8MM "
+                        "path, and CPUs with I8MM will use the slower DotProd kernel.")
+                endif()
+            endif()
         endif()
     endif()
     add_compile_definitions(CP_ENABLE_CPU=1)

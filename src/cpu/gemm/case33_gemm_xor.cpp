@@ -54,12 +54,14 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
     const bool avx512_bw = CASE33_X86 && features.avx512_bw;
     const bool avx2 = CASE33_X86 && features.avx2;
     const bool ssse3 = CASE33_X86 && features.ssse3;
-    /* The I8MM TU is only compiled with intrinsics on GCC/clang (-march=...+i8mm). */
-#if defined(_MSC_VER) && !defined(__clang__)
-    const bool i8mm = false;
+    /* Without CP_HAVE_I8MM_KERNEL the I8MM TU is an empty stub (MSVC or NO_I8MM=ON),
+     * so it must never be selected. */
+#if defined(CP_HAVE_I8MM_KERNEL)
+    const bool i8mm_built = true;
 #else
-    const bool i8mm = case33_is_aarch64_build() && features.i8mm;
+    const bool i8mm_built = false;
 #endif
+    const bool i8mm = i8mm_built && case33_is_aarch64_build() && features.i8mm;
     const bool dotprod = case33_is_aarch64_build() && features.dotprod;
     const bool neon = case33_is_aarch64_build() && features.neon;
     switch (pref) {
@@ -102,6 +104,12 @@ bool resolve_isa(Case33Isa pref, Case33Isa *out, char *error, size_t error_size)
         else if (neon) *out = Case33Isa::Neon;
         else *out = Case33Isa::Scalar;
         return true;
+    }
+    if (pref == Case33Isa::I8mm && !i8mm_built) {
+        std::snprintf(error, error_size,
+                      "I8MM kernel not compiled into this build (built with NO_I8MM=ON, "
+                      "or MSVC)");
+        return false;
     }
     std::snprintf(error, error_size, "requested SIMD ISA is unavailable on this build or CPU");
     return false;

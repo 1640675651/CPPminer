@@ -3,8 +3,11 @@
 ## v0.6 (tentative)
 ### New features
 - Experimental hexagon backend for qualcomm devices
-- AVX512-VNNI CPU kernel (`--simd avx512vnni`, auto-selected on Zen4-class CPUs)
-- Base AVX-512 CPU kernel (AVX512F + AVX512BW, no VNNI; `--simd avx512`, auto-selected on e.g. Skylake-X/SP)
+- AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
+- ARM i8mm kernel
+
+### Fix & Enhancements
+- NEON DotProd and basic NEON kernel rewrite, reduce instruction count and improve speed
 
 ### Pearl Hexagon
 - Self-guided loop on the DSP, negligible kernel launch overhead
