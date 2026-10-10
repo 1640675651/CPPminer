@@ -519,9 +519,11 @@ set(_cp_cargo_env CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target)
 # standard library (rustup target add aarch64-linux-android, or conda-forge's
 # rust-std-aarch64-linux-android at the rustc version); without it, use the proof stub.
 # The archive then lands in target/<triple>/, apart from any host build's.
+# A native build in Termux also sets ANDROID but has no ANDROID_ABI; its cargo already
+# targets the device, so it takes the host path.
 set(_cp_rust_target "")
 set(_cp_rust_target_ok TRUE)
-if(ANDROID)
+if(ANDROID AND CMAKE_CROSSCOMPILING)
     if(ANDROID_ABI STREQUAL "arm64-v8a")
         set(_cp_rust_target aarch64-linux-android)
     elseif(ANDROID_ABI STREQUAL "x86_64")
@@ -626,7 +628,7 @@ if(_cp_link_proof_ffi)
             "-framework Security"
             "-framework CoreFoundation"
             "-framework SystemConfiguration")
-    elseif(ANDROID)
+    elseif(ANDROID AND CMAKE_CROSSCOMPILING)
         # pthread is part of Android's libc; Rust's std also needs liblog and libunwind.
         target_link_libraries(cppminer PRIVATE dl log unwind m)
     else()
