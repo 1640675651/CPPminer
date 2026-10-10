@@ -84,7 +84,9 @@ static void qpow_log_simd_map(const std::vector<int>& cpu_of, int n_avx2)
 extern "C" int cp_qpow_set_simd_isa(CpSimdIsa isa)
 {
     g_qpow_simd = isa;
-    if((isa == CP_SIMD_AVX2 || isa == CP_SIMD_AVXVNNI) && !qpow::cpu_has_avx2()){
+    if((isa == CP_SIMD_AVX2 || isa == CP_SIMD_AVXVNNI || isa == CP_SIMD_AVX512VNNI ||
+        isa == CP_SIMD_AVX512BW) &&
+       !qpow::cpu_has_avx2()){
         fprintf(stderr, "[qpow] --simd avx2 requested but this CPU has no AVX2\n");
         return -1;
     }
@@ -98,6 +100,8 @@ static int qpow_avx2_thread_count(int nthreads)
     switch(g_qpow_simd){
     case CP_SIMD_AVX2:
     case CP_SIMD_AVXVNNI:
+    case CP_SIMD_AVX512VNNI: /* no AVX-512 Poseidon2 kernel yet; all threads AVX2 */
+    case CP_SIMD_AVX512BW:
         return nthreads;
     case CP_SIMD_AUTO:   /* best available: hybrid today; an AVX-512 kernel may
                           * change what auto picks, hybrid stays as defined. */
