@@ -15,6 +15,7 @@ extern "C" {
  *   3 = contiguous 8x8 (8 A rows + 8 B^T rows)
  *   4 = contiguous 4x8 (4 A rows + 8 B^T rows)
  *   5 = contiguous 16x16 (16 A rows + 16 B^T rows)
+ *   6 = contiguous 4x64 (4 A rows + 64 B^T rows; Hexagon HVX register-tile half)
  */
 #define CP_TILE_LAYOUT_SCATTERED  0
 #define CP_TILE_LAYOUT_CONTIGUOUS 1
@@ -22,6 +23,7 @@ extern "C" {
 #define CP_TILE_LAYOUT_CONTIGUOUS_8x8 3
 #define CP_TILE_LAYOUT_CONTIGUOUS_4x8 4
 #define CP_TILE_LAYOUT_CONTIGUOUS_16x16 5
+#define CP_TILE_LAYOUT_CONTIGUOUS_4x64 6
 
 /* Build plain_proof base64 in-process (Rust/pearl-blake3). Returns 0 on ok, -1 on error.
  * mining_config is retained for ABI compatibility but job_key is derived from tile_layout.

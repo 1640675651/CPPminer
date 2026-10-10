@@ -5,7 +5,7 @@
 
 extern "C" int cp_wgpu_list_devices(void)
 {
-    fprintf(stderr, "[wgpu] stub: cp-wgpu-ffi not linked (build with cargo)\n");
+    fprintf(stderr, "[wgpu] stub: cp-quantus-wgpu-ffi not linked (build with cargo)\n");
     return 0;
 }
 
@@ -16,7 +16,7 @@ extern "C" int cp_wgpu_init(uint32_t batch_size, int allow_integrated,
     (void)allow_integrated;
     (void)devices;
     (void)ndev;
-    fprintf(stderr, "[wgpu] stub: cp-wgpu-ffi not linked (build with cargo)\n");
+    fprintf(stderr, "[wgpu] stub: cp-quantus-wgpu-ffi not linked (build with cargo)\n");
     return -1;
 }
 

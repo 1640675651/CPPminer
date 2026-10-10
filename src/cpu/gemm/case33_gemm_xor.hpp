@@ -16,9 +16,12 @@ enum class Case33PrepackMode {
 /* ISA preference for micro-kernel dispatch. */
 enum class Case33Isa {
     Auto,    /* architecture-specific best ISA, else scalar */
+    Avx512Vnni, /* prefer AVX512-VNNI (EVEX vpdpbusd); fall back if unavailable */
     AvxVnni, /* prefer AVX-VNNI vpdpbusd; fall back if unavailable */
+    Avx512Bw, /* prefer base AVX-512 (F+BW, zmm vpmaddubsw); fall back if unavailable */
     Avx2,    /* prefer AVX2 maddubs; fall back if unavailable */
     Sse,     /* force SSSE3 path (disable AVX2); tile via Case33SseTile */
+    I8mm,    /* force AArch64 I8MM (smmla) path */
     DotProd, /* force AArch64 DotProd path */
     Neon,    /* force AArch64 Advanced SIMD path */
     Scalar,  /* force scalar reference ukernel */
@@ -99,7 +102,8 @@ private:
     bool setup_dims_(int M, int N, int K);
     bool use_fast_u8s8_() const {
         return int8_mode_ == Case32Int8Mode::FastU8S8 &&
-               (isa_used_ == Case33Isa::AvxVnni || isa_used_ == Case33Isa::Avx2 ||
+               (isa_used_ == Case33Isa::Avx512Vnni || isa_used_ == Case33Isa::AvxVnni ||
+                isa_used_ == Case33Isa::Avx512Bw || isa_used_ == Case33Isa::Avx2 ||
                 isa_used_ == Case33Isa::Sse);
     }
     void update_backend_label_();

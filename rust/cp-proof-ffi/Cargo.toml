@@ -6,7 +6,7 @@ description = "C FFI: build and verify LuckyPool plain_proof (pearl-blake3 + zk-
 
 [lib]
 name = "cp_proof_ffi"
-crate-type = ["staticlib", "rlib", "cdylib"]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 pearl-blake3 = { path = "../../third_party/pearl-blake3", features = ["serde"] }

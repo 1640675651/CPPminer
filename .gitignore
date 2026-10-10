@@ -1,8 +1,11 @@
 /build/
+/dist/
 /kernels/
 /rust/cp-proof-ffi/target/
-/rust/cp-wgpu-ffi/target/
+/rust/cp-quantus-wgpu-ffi/target/
 /rust/cp-pearl-wgpu-ffi/target/
+/src/pearl/hexagon/dsp/hexagon_*/
+/src/pearl/hexagon/dsp/android_*/
 /third_party/blake3/
 /third_party/quantus-miner/
 /third_party/onednn-src/

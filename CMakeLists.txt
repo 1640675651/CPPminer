@@ -2,10 +2,12 @@ cmake_minimum_required(VERSION 3.18)
 
 # Backends (enable independently).
 option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
+option(NO_I8MM          "Build without the AArch64 I8MM (smmla) CPU kernel" OFF)
 option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
 option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
 option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
+option(CP_ENABLE_HEXAGON "Build Pearl Hexagon cDSP (HVX) worker (Android/Linux on Snapdragon)" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -21,8 +23,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU AND NOT CP_ENABLE_HEXAGON)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU, CP_ENABLE_HEXAGON")
 endif()
 
 set(_cp_langs CXX C)
@@ -76,6 +78,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/onednn
     ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
     ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/hexagon
     ${CMAKE_SOURCE_DIR}/src/qpow/opencl
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
@@ -177,9 +180,12 @@ if(CP_ENABLE_CPU)
         src/cpu/gemm/case33_cpu_features.cpp
         src/cpu/gemm/case33_gemm_xor_neon.cpp
         src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+        src/cpu/gemm/case33_gemm_xor_i8mm.cpp
     )
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
         list(APPEND CP_SOURCES
+            src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
             src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
             src/cpu/gemm/case33_gemm_xor_avx2.cpp
             src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
@@ -189,9 +195,41 @@ if(CP_ENABLE_CPU)
         if(MSVC)
             set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:armv8.2")
+            # MSVC has no I8MM switch / intrinsics gate; the TU compiles to a no-op stub.
         else()
             set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
                 PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            if(NO_I8MM)
+                message(STATUS "I8MM CPU kernel disabled (NO_I8MM=ON); --simd i8mm is "
+                    "unavailable in this binary")
+            else()
+                # +i8mm needs GCC >= 10 / Clang >= 11; older compilers reject the flag.
+                include(CheckCXXSourceCompiles)
+                set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+dotprod+i8mm")
+                check_cxx_source_compiles("
+                    #include <arm_neon.h>
+                    int main() {
+                        int32x4_t acc = vdupq_n_s32(0);
+                        acc = vmmlaq_s32(acc, vdupq_n_s8(1), vdupq_n_s8(1));
+                        return vgetq_lane_s32(acc, 0) == 8 ? 0 : 1;
+                    }" CP_CXX_HAS_I8MM)
+                unset(CMAKE_REQUIRED_FLAGS)
+                if(CP_CXX_HAS_I8MM)
+                    set_source_files_properties(src/cpu/gemm/case33_gemm_xor_i8mm.cpp
+                        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
+                    add_compile_definitions(CP_HAVE_I8MM_KERNEL=1)
+                else()
+                    # Retest on the next configure (e.g. after a compiler upgrade).
+                    unset(CP_CXX_HAS_I8MM CACHE)
+                    message(FATAL_ERROR
+                        "The compiler (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}) "
+                        "cannot build -march=armv8.2-a+dotprod+i8mm (needs GCC >= 10 or "
+                        "Clang >= 11).\n"
+                        "Upgrade the compiler, or reconfigure with -DNO_I8MM=ON to build "
+                        "without the I8MM CPU kernel: the binary will then not have the I8MM "
+                        "path, and CPUs with I8MM will use the slower DotProd kernel.")
+                endif()
+            endif()
         endif()
     endif()
     add_compile_definitions(CP_ENABLE_CPU=1)
@@ -403,8 +441,25 @@ else()
     add_compile_definitions(CP_ENABLE_WGPU=0)
 endif()
 
+# Hexagon cDSP: the host side needs no SDK (libcdsprpc.so is loaded at run time). The DSP
+# library (libpearlx_skel.so) is built separately with the Hexagon SDK: src/pearl/hexagon/dsp.
+if(CP_ENABLE_HEXAGON)
+    if(WIN32 OR APPLE)
+        message(FATAL_ERROR "CP_ENABLE_HEXAGON targets Android/Linux on Snapdragon")
+    endif()
+    list(APPEND CP_SOURCES
+        src/pearl/hexagon/cp_pearl_hexagon_worker.cpp
+        src/pearl/hexagon/cp_pearlx_client.c)
+    add_compile_definitions(CP_ENABLE_HEXAGON=1)
+else()
+    add_compile_definitions(CP_ENABLE_HEXAGON=0)
+endif()
+
 add_executable(cppminer ${CP_SOURCES} ${CP_QPOW_AVX2_OBJECTS})
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
+if(CP_ENABLE_HEXAGON)
+    target_link_libraries(cppminer PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(CP_ENABLE_CUDA)
     target_link_libraries(cppminer PRIVATE CUDA::cudart)
@@ -453,6 +508,10 @@ elseif(CP_ENABLE_ONEDNN)
 endif()
 
 # Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
+# CP_PROOF_FFI=OFF forces the stub, e.g. for a cross build where cargo cannot
+# target the device (-DCARGO_EXECUTABLE=...-NOTFOUND does not stick: find_program
+# re-searches a NOTFOUND cache entry on every reconfigure).
+option(CP_PROOF_FFI "Build and link the Rust proof FFI (needs cargo for the target)" ON)
 set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi)
 set(CP_PROOF_FFI_MANIFEST ${CP_PROOF_FFI_DIR}/Cargo.toml)
 find_program(CARGO_EXECUTABLE cargo
@@ -483,23 +542,68 @@ else()
     set(_cp_cargo_args build --release)
     set(_cp_cargo_profile release)
 endif()
+set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile})
+set(_cp_cargo_env CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target)
+# Android cross-builds (NDK toolchain file): build the crate for the Android target, with
+# the NDK's clang and llvm-ar for any C code in its dependencies. Needs that target's Rust
+# standard library (rustup target add aarch64-linux-android, or conda-forge's
+# rust-std-aarch64-linux-android at the rustc version); without it, use the proof stub.
+# The archive then lands in target/<triple>/, apart from any host build's.
+# A native build in Termux also sets ANDROID but has no ANDROID_ABI; its cargo already
+# targets the device, so it takes the host path.
+set(_cp_rust_target "")
+set(_cp_rust_target_ok TRUE)
+if(ANDROID AND CMAKE_CROSSCOMPILING)
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(_cp_rust_target aarch64-linux-android)
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(_cp_rust_target x86_64-linux-android)
+    else()
+        message(FATAL_ERROR "cp-proof-ffi: no Rust target for ANDROID_ABI ${ANDROID_ABI}")
+    endif()
+    string(REPLACE "-" "_" _cp_rust_target_env ${_cp_rust_target})
+    list(APPEND _cp_cargo_args --target ${_cp_rust_target})
+    set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_rust_target}/${_cp_cargo_profile})
+    list(APPEND _cp_cargo_env
+        CC_${_cp_rust_target_env}=${CMAKE_C_COMPILER}
+        CFLAGS_${_cp_rust_target_env}=--target=${CMAKE_C_COMPILER_TARGET}
+        AR_${_cp_rust_target_env}=${CMAKE_AR})
+    if(CP_PROOF_FFI AND CARGO_EXECUTABLE)
+        get_filename_component(_cp_cargo_dir ${CARGO_EXECUTABLE} DIRECTORY)
+        find_program(RUSTC_EXECUTABLE rustc HINTS ${_cp_cargo_dir} NO_DEFAULT_PATH)
+        find_program(RUSTC_EXECUTABLE rustc)
+        set(_cp_rust_sysroot "")
+        if(RUSTC_EXECUTABLE)
+            execute_process(COMMAND ${RUSTC_EXECUTABLE} --print sysroot
+                OUTPUT_VARIABLE _cp_rust_sysroot OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+        if(NOT IS_DIRECTORY "${_cp_rust_sysroot}/lib/rustlib/${_cp_rust_target}")
+            set(_cp_rust_target_ok FALSE)
+            message(WARNING "cp_proof_ffi: Rust has no ${_cp_rust_target} standard library "
+                "(rustup target add ${_cp_rust_target}, or conda-forge "
+                "rust-std-${_cp_rust_target}), so cargo cannot build the proof FFI")
+        endif()
+    endif()
+endif()
 # The name depends on the toolchain, not the OS: an MSVC-targeting cargo emits
 # cp_proof_ffi.lib, while a MinGW-targeting one emits libcp_proof_ffi.a. Keying
 # this off WIN32 broke the MinGW/MSYS2 build, which is still Windows.
 if(MSVC)
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/cp_proof_ffi.lib)
+    set(_cp_proof_lib ${_cp_cargo_out}/cp_proof_ffi.lib)
 else()
-    set(_cp_proof_lib ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile}/libcp_proof_ffi.a)
+    set(_cp_proof_lib ${_cp_cargo_out}/libcp_proof_ffi.a)
 endif()
 
 set(_cp_link_proof_ffi FALSE)
-if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
+if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_rust_target_ok AND _cp_proof_deps_ok
+   AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
         ${CP_PROOF_FFI_DIR}/src/*.rs)
     add_custom_command(
         OUTPUT ${_cp_proof_lib}
         COMMAND ${CMAKE_COMMAND} -E env
-            CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target
+            ${_cp_cargo_env}
             ${CARGO_EXECUTABLE} ${_cp_cargo_args}
             --manifest-path ${CP_PROOF_FFI_MANIFEST}
         WORKING_DIRECTORY ${CP_PROOF_FFI_DIR}
@@ -518,12 +622,20 @@ if(CARGO_EXECUTABLE AND _cp_proof_deps_ok AND EXISTS ${CP_PROOF_FFI_MANIFEST})
     add_dependencies(cppminer cp_proof_ffi_build)
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
-elseif(EXISTS ${_cp_proof_lib})
+elseif(CP_PROOF_FFI AND EXISTS ${_cp_proof_lib} AND (NOT CMAKE_CROSSCOMPILING OR _cp_rust_target))
     # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
+    # Not when cross-compiling to a target without its own directory: the
+    # archive in target/release/ was built for the host, and lld only reports
+    # "archive member is neither ET_REL nor LLVM bitcode" at link time.
     set(_cp_link_proof_ffi TRUE)
     message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
 else()
-    if(NOT CARGO_EXECUTABLE)
+    if(NOT CP_PROOF_FFI)
+        message(STATUS "cp_proof_ffi: disabled (CP_PROOF_FFI=OFF); using proof stub")
+    elseif(NOT _cp_rust_target_ok)
+        message(WARNING "cp_proof_ffi: no ${_cp_rust_target} build; using proof stub "
+            "(no share submit proofs)")
+    elseif(NOT CARGO_EXECUTABLE)
         message(WARNING "cargo not found; using proof stub (no share submit proofs)")
     elseif(NOT _cp_proof_deps_ok)
         message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
@@ -546,6 +658,9 @@ if(_cp_link_proof_ffi)
             "-framework Security"
             "-framework CoreFoundation"
             "-framework SystemConfiguration")
+    elseif(ANDROID AND CMAKE_CROSSCOMPILING)
+        # pthread is part of Android's libc; Rust's std also needs liblog and libunwind.
+        target_link_libraries(cppminer PRIVATE dl log unwind m)
     else()
         target_link_libraries(cppminer PRIVATE pthread dl m)
     endif()
@@ -553,21 +668,21 @@ endif()
 
 # Quantus wgpu GpuEngine FFI (cdylib preferred: bundles wgpu/DX12/Vulkan deps).
 if(CP_ENABLE_WGPU)
-    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-wgpu-ffi)
+    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-quantus-wgpu-ffi)
     set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
     set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/third_party/quantus-miner/crates/engine-gpu/Cargo.toml)
     if(WIN32)
         if(MSVC)
-            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll.lib)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll.lib)
         else()
-            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dll.a)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dll.a)
         endif()
-        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.dll)
-        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_wgpu_ffi.lib)
+        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.lib)
     else()
-        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.so)
-        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.dylib)
-        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_wgpu_ffi.a)
+        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.so)
+        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dylib)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.a)
     endif()
 
     set(_cp_link_wgpu_ffi FALSE)
@@ -593,23 +708,23 @@ if(CP_ENABLE_WGPU)
                 ${CP_WGPU_FFI_DIR}/Cargo.lock
                 ${_cp_wgpu_rs}
                 ${_cp_engine_gpu}
-            COMMENT "Building cp-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            COMMENT "Building cp-quantus-wgpu-ffi (cargo ${_cp_cargo_profile})"
             VERBATIM
             USES_TERMINAL
         )
-        add_custom_target(cp_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
-        add_dependencies(cppminer cp_wgpu_ffi_build)
+        add_custom_target(cp_quantus_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
+        add_dependencies(cppminer cp_quantus_wgpu_ffi_build)
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
+        message(STATUS "cp_quantus_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
     elseif(WIN32 AND EXISTS ${_cp_wgpu_implib})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
     elseif(APPLE AND EXISTS ${_cp_wgpu_dylib})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
     elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_wgpu_so})
         set(_cp_link_wgpu_ffi TRUE)
-        message(STATUS "cp_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
     else()
         set(_cp_wgpu_use_stub TRUE)
         if(NOT CARGO_EXECUTABLE)
@@ -617,7 +732,7 @@ if(CP_ENABLE_WGPU)
         elseif(NOT EXISTS ${_cp_engine_gpu})
             message(WARNING "third_party/quantus-miner missing; wgpu stub (run build.ps1/build.sh -Backend Wgpu)")
         else()
-            message(WARNING "cp-wgpu-ffi unavailable; wgpu stub")
+            message(WARNING "cp-quantus-wgpu-ffi unavailable; wgpu stub")
         endif()
         target_sources(cppminer PRIVATE src/qpow/wgpu/cp_wgpu_stub.cpp)
     endif()
@@ -627,8 +742,8 @@ if(CP_ENABLE_WGPU)
             target_link_libraries(cppminer PRIVATE ${_cp_wgpu_implib})
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_wgpu_ffi.dll"
-                COMMENT "Copy cp_wgpu_ffi.dll next to cppminer")
+                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_quantus_wgpu_ffi.dll"
+                COMMENT "Copy cp_quantus_wgpu_ffi.dll next to cppminer")
             if(NOT _cp_link_proof_ffi)
                 target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
             endif()
@@ -652,8 +767,8 @@ if(CP_ENABLE_WGPU)
             endif()
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.dylib"
-                COMMENT "Copy libcp_wgpu_ffi.dylib next to cppminer")
+                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.dylib next to cppminer")
         else()
             target_link_libraries(cppminer PRIVATE ${_cp_wgpu_so})
             set_target_properties(cppminer PROPERTIES
@@ -664,8 +779,8 @@ if(CP_ENABLE_WGPU)
             endif()
             add_custom_command(TARGET cppminer POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_wgpu_ffi.so"
-                COMMENT "Copy libcp_wgpu_ffi.so next to cppminer")
+                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.so"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.so next to cppminer")
         endif()
     endif()
 
@@ -773,6 +888,10 @@ if(MSVC)
             PROPERTIES
                 COMPILE_OPTIONS "/arch:AVX2"
                 COMPILE_DEFINITIONS "__AVXVNNI__")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 
     endif()
 else()
@@ -807,6 +926,19 @@ else()
         endif()
         unset(_cp_gomp_static)
     endif()
+    if(ANDROID AND CMAKE_CROSSCOMPILING)
+        # NDK cross-builds: FindOpenMP picks the NDK's libomp.so, which Android's linker only
+        # finds through LD_LIBRARY_PATH (it never looks next to the executable). Link the
+        # NDK's libomp.a instead so the miner runs on its own.
+        execute_process(
+            COMMAND ${CMAKE_CXX_COMPILER} --target=${CMAKE_CXX_COMPILER_TARGET}
+                    -print-file-name=libomp.a
+            OUTPUT_VARIABLE _cp_omp_static OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(IS_ABSOLUTE "${_cp_omp_static}" AND EXISTS "${_cp_omp_static}")
+            set(OpenMP_omp_LIBRARY "${_cp_omp_static}" CACHE FILEPATH "" FORCE)
+        endif()
+        unset(_cp_omp_static)
+    endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(cppminer PRIVATE OpenMP::OpenMP_CXX)
@@ -827,6 +959,10 @@ else()
             PROPERTIES COMPILE_OPTIONS "-mavx2")
         set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl")
     endif()
 endif()
 
@@ -900,4 +1036,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} HEXAGON=${CP_ENABLE_HEXAGON} CUBLAS=${CP_ENABLE_CUBLAS}")

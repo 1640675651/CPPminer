@@ -14,8 +14,6 @@ void cp_path_to_posix(char* path);
 void cp_path_abs(char* path, size_t cap);
 
 void cp_init_workdir(void);
-void cp_resolve_paths(int argc, char** argv);
-int cp_run_python(const char* subcmd);
 
 int cp_read_file_bin(const char* path, void* buf, size_t nbytes);
 int cp_read_file_text(const char* path, char* out, int cap);

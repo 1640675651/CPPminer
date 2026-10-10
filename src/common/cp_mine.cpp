@@ -24,7 +24,7 @@ void cp_mine_init_host_buffers(void)
      * Share-witness backends prove from device sub-roots and need neither buffer; CPU proves
      * its all-zero B^T without one. */
     if (!cp_worker_supports_share_witness()) {
-        h_Ap_global = (int8_t *)calloc(1, szAp);
+        h_Ap_global = cp_worker_alloc_host_signal_a(szAp);
         if (!h_Ap_global) {
             fprintf(stderr, "OOM host matrices\n");
             exit(1);
@@ -53,7 +53,7 @@ void cp_mine_free_host_buffers(void)
         cp_share_queue_destroy(g_share_queue);
         g_share_queue = NULL;
     }
-    free(h_Ap_global);
+    cp_worker_free_host_signal_a(h_Ap_global);
     free(h_BpT_global);
     h_Ap_global = NULL;
     h_BpT_global = NULL;

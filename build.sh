@@ -8,6 +8,7 @@
 #   ./build.sh --backend cuda --cuda-arch 61
 #   ./build.sh --backend cpu,opencl
 #   ./build.sh --backend cpu,wgpu
+#   ./build.sh --backend cpu,hexagon   (Termux on Snapdragon; DSP library: src/pearl/hexagon/dsp)
 #   ./build.sh --backend cpu,cuda,opencl --cuda-arch 75
 #   ./build.sh --backend cuda --enable-cublas
 #
@@ -53,7 +54,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --backend CPU[,CUDA[,OpenCl[,OneDnn[,wgpu]]]]  Backends to build (default: cpu)"
+            echo "  --backend CPU[,CUDA[,OpenCl[,OneDnn[,wgpu[,hexagon]]]]]  Backends to build (default: cpu)"
             echo "  --cuda-arch ARCH               CUDA compute arch e.g. 75, 86 (default: auto)"
             echo "  --enable-cublas                Link cuBLAS (requires CUDA)"
             echo "  --help, -h                     Show this help"
@@ -71,6 +72,7 @@ ENABLE_CUDA=0
 ENABLE_OPENCL=0
 ENABLE_ONEDNN=0
 ENABLE_WGPU=0
+ENABLE_HEXAGON=0
 for b in "${BACKENDS[@]}"; do
     case "$b" in
         cpu)    ENABLE_CPU=1 ;;
@@ -78,8 +80,9 @@ for b in "${BACKENDS[@]}"; do
         opencl) ENABLE_OPENCL=1 ;;
         onednn) ENABLE_ONEDNN=1 ;;
         wgpu)   ENABLE_WGPU=1 ;;
+        hexagon) ENABLE_HEXAGON=1 ;;
         *)
-            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn, wgpu)" >&2
+            echo "Unknown backend: $b (valid: cpu, cuda, opencl, onednn, wgpu, hexagon)" >&2
             exit 1
             ;;
     esac
@@ -91,8 +94,8 @@ fi
 if (( ENABLE_CUBLAS && ENABLE_CUDA == 0 )); then
     echo "--enable-cublas requires --backend cuda" >&2; exit 1
 fi
-if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 && ENABLE_WGPU == 0 )); then
-    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn,wgpu" >&2; exit 1
+if (( ENABLE_CPU == 0 && ENABLE_CUDA == 0 && ENABLE_OPENCL == 0 && ENABLE_ONEDNN == 0 && ENABLE_WGPU == 0 && ENABLE_HEXAGON == 0 )); then
+    echo "Enable at least one backend: --backend cpu,cuda,opencl,onednn,wgpu,hexagon" >&2; exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -296,7 +299,7 @@ find_cmake() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} WGPU=${ENABLE_WGPU} CUBLAS=${ENABLE_CUBLAS}"
+log "Backends: CPU=${ENABLE_CPU} CUDA=${ENABLE_CUDA} OpenCL=${ENABLE_OPENCL} OneDNN=${ENABLE_ONEDNN} WGPU=${ENABLE_WGPU} HEXAGON=${ENABLE_HEXAGON} CUBLAS=${ENABLE_CUBLAS}"
 
 ensure_blake3
 
@@ -344,6 +347,7 @@ if [[ -n "$CMAKE_EXE" ]]; then
         -DCP_ENABLE_OPENCL=$(( ENABLE_OPENCL ? 1 : 0 ))
         -DCP_ENABLE_ONEDNN=$(( ENABLE_ONEDNN ? 1 : 0 ))
         -DCP_ENABLE_WGPU=$(( ENABLE_WGPU ? 1 : 0 ))
+        -DCP_ENABLE_HEXAGON=$(( ENABLE_HEXAGON ? 1 : 0 ))
         -DCP_ENABLE_CUBLAS=$(( ENABLE_CUBLAS ? 1 : 0 ))
     )
 
@@ -394,9 +398,9 @@ if [[ -n "$CMAKE_EXE" ]]; then
     if (( ENABLE_WGPU )); then
         exe_dir=$(dirname "$exe")
         for runtime in \
-            cp_wgpu_ffi.dll cp_pearl_wgpu_ffi.dll \
-            libcp_wgpu_ffi.so libcp_pearl_wgpu_ffi.so \
-            libcp_wgpu_ffi.dylib libcp_pearl_wgpu_ffi.dylib; do
+            cp_quantus_wgpu_ffi.dll cp_pearl_wgpu_ffi.dll \
+            libcp_quantus_wgpu_ffi.so libcp_pearl_wgpu_ffi.so \
+            libcp_quantus_wgpu_ffi.dylib libcp_pearl_wgpu_ffi.dylib; do
             if [[ -f "${exe_dir}/${runtime}" ]]; then
                 cp -f "${exe_dir}/${runtime}" "${PROJECT_ROOT}/${runtime}"
                 log "Copied ${runtime} next to ${cp_out_name}"
