@@ -45,6 +45,9 @@ struct Case33GemmOcl {
     /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
     void set_use_lds(int on);
     bool use_lds() const { return use_lds_; }
+    /* Register double-buffered k-group loop (CASE32_PIPELINE). Default off. */
+    void set_double_buffer(int on);
+    bool double_buffer() const { return double_buffer_; }
 
 
 
@@ -156,6 +159,8 @@ private:
     bool use_cpm_int_ = false;
 
     bool use_lds_ = false;
+    bool double_buffer_ = false;
+    int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 

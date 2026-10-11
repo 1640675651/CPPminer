@@ -161,6 +161,7 @@ cppminer --backend opencl --devices 0 --mock
 | `--ocl-dot MODE` | Dot backend: `auto` (default; AMD sudot→sdot4→KHR→scalar), `sudot`, `sdot4`, `khr`, `force-khr`, `asm`, or `off` |
 | `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
+| `--ocl-double-buff on/off` | Register double-buffered GEMM k-group loop (default `off`; faster on some GPUs, but more registers per work-item can spill on others) |
 
 `--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-macro` sets the WG macro block (work-group covers one macro); it is independent of the register tile. Examples: `--ocl-tile 4x8 --ocl-macro 64x64` or `--ocl-tile 4x8/64x64`. `--ocl-issue` / `--ocl-dot` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** picks the best available accelerated dot, then float **B-scalar broadcast** fallback.
 

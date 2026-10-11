@@ -107,6 +107,8 @@ static void print_usage(void)
     printf("                     force-khr, asm, or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
+    printf("  --ocl-double-buff on|off  OpenCL register double-buffered GEMM loop (default off;\n");
+    printf("                     faster on some GPUs, more registers: may spill on others)\n");
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("  --wgpu-lds on|off  wgpu (pearl) stage A/B in workgroup memory\n");
@@ -505,6 +507,7 @@ int main(int argc, char** argv)
     int ocl_dot_policy = 0; /* Case32OclDotPolicy */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
+    int ocl_double_buff = 0;
     int wgpu_lds = -1;
     int wgpu_tile_mr = 0;
     int wgpu_tile_nr = 0;
@@ -691,6 +694,22 @@ int main(int argc, char** argv)
                 ocl_lds = 0;
             } else {
                 fprintf(stderr, "invalid --ocl-lds %s (expected on or off)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-double-buff", 17)){
+            const char* v = argv[i] + 17;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-double-buff requires on or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
+                ocl_double_buff = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
+                ocl_double_buff = 0;
+            } else {
+                fprintf(stderr, "invalid --ocl-double-buff %s (expected on or off)\n", v);
                 return 1;
             }
 #endif
@@ -1123,6 +1142,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_cpm_int(1);
     if(ocl_lds)
         cp_worker_set_ocl_lds(1);
+    if(ocl_double_buff)
+        cp_worker_set_ocl_double_buff(1);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(wgpu_lds >= 0)

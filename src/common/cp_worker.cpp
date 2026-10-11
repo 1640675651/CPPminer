@@ -328,6 +328,15 @@ extern "C" void cp_worker_set_ocl_lds(int on)
 #endif
 }
 
+extern "C" void cp_worker_set_ocl_double_buff(int on)
+{
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    cp_opencl_worker_set_double_buffer(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_set_wgpu_lds(int mode)
 {
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU

@@ -60,6 +60,10 @@ Optional `__local` A/B panel staging with work-group barriers (`CASE32_USE_LDS`)
 
 On most GPUs this **regressed** scan throughput: barrier + global→local copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
 
+### Register double buffer (`--ocl-double-buff`)
+
+The coalesced, non-LDS k-group loop can prefetch the next k-group's A/B packs into a second register set while the current one feeds the dot4s (`CASE32_PIPELINE`). Default **off**: it raises VGPR use (Radeon 780M: 206 instead of 180, 4 instead of 5 waves/SIMD) and may spill on devices with fewer registers. Measured gains: about +2.5% on the 780M (gfx1103) and 5.1 -> 5.4 TMAC/s on a Radeon 5500M (gfx1012). Ignored with `--ocl-lds on` or an odd `KGROUPS`.
+
 ## packed
 
 ```text
