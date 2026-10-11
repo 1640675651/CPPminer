@@ -162,6 +162,8 @@ private:
     bool double_buffer_ = false;
     int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
+    bool gcn_mad24_ = false; /* scalar backend uses the GCN mad24 nest (CP_OCL_GCN) */
+
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
     bool using_integer_dot_ = false;
@@ -171,6 +173,8 @@ private:
     bool using_builtin_dot_ = false;
 
     bool using_cpm_ = false;
+
+    bool using_gcn_ = false;
 
 
 

@@ -10,6 +10,8 @@ extern "C" {
 #endif
 
 void cp_opencl_worker_init(int *devices, int ndev);
+/* Nonzero once the OpenCL context and kernels are built. */
+int cp_opencl_worker_is_ready(void);
 void cp_opencl_worker_shutdown(void);
 void cp_opencl_worker_set_macro_batch(int batch);
 /* Restrict OpenCL enumeration to platform index (default -1 = all). */
