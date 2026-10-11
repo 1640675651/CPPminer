@@ -45,6 +45,9 @@ struct Case33GemmOcl {
     /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
     void set_use_lds(int on);
     bool use_lds() const { return use_lds_; }
+    /* Register double-buffered k-group loop (CASE32_PIPELINE). Default off. */
+    void set_double_buffer(int on);
+    bool double_buffer() const { return double_buffer_; }
 
 
 
@@ -58,6 +61,10 @@ struct Case33GemmOcl {
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                              const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                              int salted, uint8_t a_key_out[32]);
+    /* Keyed digest of the all-zero B^T (n x K) for zero-B jobs, on the GPU. */
+    bool zero_b_digest_gpu(int n, int K, const uint8_t job_key[32], uint8_t out[32]) {
+        return prep_.ready() && prep_.zero_matrix_keyed_hash(n, K, job_key, out);
+    }
     bool read_A_sig(int8_t *h_A_sig);
     int a_witness_subroots() const { return prep_.a_witness_subroots(); }
     bool read_A_witness(const uint32_t *block_idx, int num_blocks, size_t block_bytes,
@@ -152,6 +159,8 @@ private:
     bool use_cpm_int_ = false;
 
     bool use_lds_ = false;
+    bool double_buffer_ = false;
+    int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
     bool gcn_mad24_ = false; /* scalar backend uses the GCN mad24 nest (CP_OCL_GCN) */
 

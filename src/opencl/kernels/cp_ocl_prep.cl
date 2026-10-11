@@ -63,6 +63,22 @@ __kernel void ocl_gen_random_matrix(ulong rng_seed, int matrix_tag, int total_el
     out[idx] = (char)((int)((s >> 32) % 128u) - 64);
 }
 
+/* ocl_gen_random_matrix values, 16 consecutive elements per work item (total % 16 == 0). */
+__kernel void ocl_gen_random_matrix16(ulong rng_seed, int matrix_tag, int total_elems,
+                                      __global char *out) {
+    const int base = (int)get_global_id(0) * 16;
+    if (base >= total_elems) {
+        return;
+    }
+    const ulong tag = rng_seed ^ ((ulong)matrix_tag * 0xD1B54A32D192ED03UL);
+    char v[16];
+    for (int j = 0; j < 16; ++j) {
+        const ulong s = cp_splitmix64(tag ^ (ulong)(base + j) * 0x9E3779B97F4A7C15UL);
+        v[j] = (char)((int)((s >> 32) % 128u) - 64);
+    }
+    vstore16(vload16(0, v), 0, out + base);
+}
+
 __kernel void ocl_build_perm_pairs(int is_b, __global const uchar *noise_seed, int k, int rank,
                                    __global uint *pairs_out) {
     const int block_idx = (int)get_global_id(0);
@@ -120,18 +136,17 @@ __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const ucha
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (col == 0) {
+    /* every column's work-item stores its own 4-byte k-group words */
+    {
         const size_t block_base =
                 ((size_t)jm * (size_t)blocks_k + (size_t)kb) * (size_t)MACRO_KB_BLOCK_B;
         for (int kg = 0; kg < K_GROUPS; ++kg) {
             const size_t dst = block_base + (size_t)kg * (size_t)MACRO_KG_STRIP_B +
-                               (size_t)tc * (size_t)KG_SLICE_B;
-            for (int j = 0; j < NR; ++j) {
-                for (int ko = 0; ko < 4; ++ko) {
-                    b_pre_out[dst + (size_t)j * 4 + (size_t)ko] =
-                            stripe[(size_t)j][(size_t)kg * 4 + (size_t)ko];
-                }
-            }
+                               (size_t)tc * (size_t)KG_SLICE_B + (size_t)col * 4;
+            const uint w = (uint)stripe[col][kg * 4] | ((uint)stripe[col][kg * 4 + 1] << 8) |
+                           ((uint)stripe[col][kg * 4 + 2] << 16) |
+                           ((uint)stripe[col][kg * 4 + 3] << 24);
+            *(__global uint *)(b_pre_out + dst) = w;
         }
     }
 }
@@ -164,19 +179,97 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (row == 0) {
+    /* Every row's work-item stores its own 4-byte k-group words (thread 0 storing the whole
+       stripe byte by byte took 7 ms per 512 MB A on an R9700). */
+    {
         const size_t block_base =
                 ((size_t)im * (size_t)blocks_k + (size_t)kb) * (size_t)MACRO_KB_BLOCK_A;
         for (int kg = 0; kg < K_GROUPS; ++kg) {
             const size_t dst = block_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
-                               (size_t)tr * (size_t)KG_BYTES_A;
-            for (int r = 0; r < MR; ++r) {
-                for (int ko = 0; ko < 4; ++ko) {
-                    a_pre_out[dst + (size_t)r * 4 + (size_t)ko] =
-                            stripe[r][(size_t)kg * 4 + (size_t)ko];
-                }
-            }
+                               (size_t)tr * (size_t)KG_BYTES_A + (size_t)row * 4;
+            const uint w = (uint)stripe[row][kg * 4] | ((uint)stripe[row][kg * 4 + 1] << 8) |
+                           ((uint)stripe[row][kg * 4 + 2] << 16) |
+                           ((uint)stripe[row][kg * 4 + 3] << 24);
+            *(__global uint *)(a_pre_out + dst) = w;
         }
+    }
+}
+
+/* Same bytes as ocl_fused_prepack_a, one 256-wide work group per (im, kb) block, or per
+ * 1/FPA_SPLIT of its rows. The rows' uniform noise (el_rows, R_RANK bytes per row, from
+ * ocl_uniform_rows) and the signal tile are staged in local memory with a 4-byte row pad, so
+ * lanes that read the same k of neighbouring rows hit different banks. Output word of block row
+ * r and k group kg is kg * MACRO_M + r (byte offset kg * MACRO_KG_STRIP_A + r * 4), so stores
+ * are coalesced. FPA_SPLIT (host, from the device's local memory size): 1 needs ~34 KB at
+ * MACRO_M 128; AMD's Windows driver gives a work group 32 KB, so it gets 2. */
+#ifndef FPA_SPLIT
+#define FPA_SPLIT 1
+#endif
+#define FPA_WG 256
+#define FPA_ROWS (MACRO_M / FPA_SPLIT)
+#define FPA_SW (KR / 4 + 1)
+#define FPA_EW (R_RANK / 4 + 1)
+__kernel __attribute__((reqd_work_group_size(FPA_WG, 1, 1))) void
+ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
+                       __global const uint *pairs, __global const char *a_signal, int K,
+                       int blocks_k) {
+    __local uint sig[FPA_ROWS * FPA_SW];
+    __local uint el[FPA_ROWS * FPA_EW];
+    __local uchar p0[KR];
+    __local uchar p1[KR];
+
+    const int g = (int)get_group_id(0);
+    const int part = g % FPA_SPLIT;
+    const int blk = g / FPA_SPLIT;
+    const int kb = blk % blocks_k;
+    const int im = blk / blocks_k;
+    const int t = (int)get_local_id(0);
+    const int rbase = part * FPA_ROWS; /* first block row of this group */
+    const int row0 = im * MACRO_M + rbase;
+    const int k0 = kb * KR;
+
+    for (int i = t; i < FPA_ROWS * (KR / 16); i += FPA_WG) {
+        const int r = i / (KR / 16);
+        const int c = i % (KR / 16);
+        const uint4 v =
+                *(__global const uint4 *)(a_signal + (size_t)(row0 + r) * (size_t)K + k0 + c * 16);
+        __local uint *d = sig + r * FPA_SW + c * 4;
+        d[0] = v.x;
+        d[1] = v.y;
+        d[2] = v.z;
+        d[3] = v.w;
+    }
+    for (int i = t; i < FPA_ROWS * (R_RANK / 16); i += FPA_WG) {
+        const int r = i / (R_RANK / 16);
+        const int c = i % (R_RANK / 16);
+        const uint4 v = *(__global const uint4 *)(el_rows + (size_t)(row0 + r) * (R_RANK / 4) +
+                                                   c * 4);
+        __local uint *d = el + r * FPA_EW + c * 4;
+        d[0] = v.x;
+        d[1] = v.y;
+        d[2] = v.z;
+        d[3] = v.w;
+    }
+    for (int i = t; i < KR; i += FPA_WG) {
+        p0[i] = (uchar)pairs[(size_t)(k0 + i) * 2];
+        p1[i] = (uchar)pairs[(size_t)(k0 + i) * 2 + 1];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    __global uint *dst = a_pre_out + ((size_t)im * (size_t)blocks_k + (size_t)kb) *
+                                             (size_t)(MACRO_KB_BLOCK_A / 4);
+    for (int w = t; w < FPA_ROWS * K_GROUPS; w += FPA_WG) {
+        const int kg = w / FPA_ROWS;
+        const int r = w % FPA_ROWS;
+        const uint s = sig[r * FPA_SW + kg];
+        const __local uchar *e = (const __local uchar *)(el + r * FPA_EW);
+        uint out = 0;
+        for (int b = 0; b < 4; ++b) {
+            const int k = kg * 4 + b;
+            const uint v = (s >> (8 * b)) + (uint)e[p0[k]] - (uint)e[p1[k]];
+            out |= (v & 0xffu) << (8 * b);
+        }
+        dst[kg * MACRO_M + rbase + r] = out;
     }
 }
 
@@ -205,6 +298,66 @@ __kernel void ocl_noisy_matrix_rowmajor(__global char *out, __global const uchar
         dst[l] = (char)(sig + (pos - neg));
     }
     for (int l = K; l < out_lda; ++l) {
+        dst[l] = 0;
+    }
+}
+
+/* Uniform noise rows for ocl_noisy_matrix_rowmajor_wg: one work item per row,
+ * rank bytes per row at el_out + row*rank. */
+__kernel void ocl_uniform_rows(__global const uchar *noise_seed, int rows, int rank, int is_b,
+                               __global uchar *el_out) {
+    const int row = (int)get_global_id(0);
+    if (row >= rows) {
+        return;
+    }
+    uchar el[R_RANK];
+    ocl_generate_uniform_row_glob(row, rank, noise_seed, is_b, el);
+    __global uchar *dst = el_out + (size_t)row * (size_t)rank;
+    for (int j = 0; j < rank; ++j) {
+        dst[j] = el[j];
+    }
+}
+
+/* Same result as ocl_noisy_matrix_rowmajor, one work group per row: the row's
+ * uniform values sit in local memory and each work item handles 16 consecutive
+ * k with vector loads/stores, so neighbouring lanes touch neighbouring bytes. */
+__kernel void ocl_noisy_matrix_rowmajor_wg(__global char *out, __global const uchar *el_rows,
+                                           __global const uint *pairs, int rows, int K, int rank,
+                                           int has_signal, __global const char *signal,
+                                           int out_lda) {
+    __local uchar el[R_RANK];
+    const int row = (int)get_group_id(0);
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+    if (row >= rows || out_lda < K) {
+        return; /* uniform across the work group */
+    }
+    for (int j = lid; j < rank; j += lsz) {
+        el[j] = el_rows[(size_t)row * (size_t)rank + (size_t)j];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    __global char *dst = out + (size_t)row * (size_t)out_lda;
+    __global const char *src = signal + (size_t)row * (size_t)K;
+    for (int l0 = lid * 16; l0 < K; l0 += lsz * 16) {
+        const int n = min(16, K - l0);
+        char v[16];
+        for (int j = 0; j < n; ++j) {
+            const int l = l0 + j;
+            const int pos = (int)(char)el[pairs[(size_t)l * 2]];
+            const int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
+            const int sig = has_signal ? (int)src[l] : 0;
+            v[j] = (char)(sig + (pos - neg));
+        }
+        if (n == 16) {
+            vstore16(vload16(0, v), 0, dst + l0);
+        } else {
+            for (int j = 0; j < n; ++j) {
+                dst[l0 + j] = v[j];
+            }
+        }
+    }
+    for (int l = K + lid; l < out_lda; l += lsz) {
         dst[l] = 0;
     }
 }

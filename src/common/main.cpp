@@ -72,6 +72,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("|wgpu");
 #endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("|hexagon");
+#endif
     printf(" (built: ");
     {
         int first = 1;
@@ -80,6 +83,7 @@ static void print_usage(void)
         if(cp_worker_has_opencl()){ printf("%sopencl", first ? "" : ","); first = 0; }
         if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
         if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
+        if(cp_worker_has_hexagon()){ printf("%shexagon", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
@@ -103,6 +107,8 @@ static void print_usage(void)
     printf("                     force-khr, asm, or off\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
+    printf("  --ocl-double-buff on|off  OpenCL register double-buffered GEMM loop (default off;\n");
+    printf("                     faster on some GPUs, more registers: may spill on others)\n");
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     printf("  --wgpu-lds on|off  wgpu (pearl) stage A/B in workgroup memory\n");
@@ -110,6 +116,14 @@ static void print_usage(void)
     printf("  --wgpu-tile MxN[/MmMm]  wgpu (pearl) register tile: 4x4, 4x8, 8x8 (default), 8x16;\n");
     printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
+#endif
+#if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
+    printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
+    printf("                     bytes (1 GiB at the default size; smaller --m/--n on phones);\n");
+    printf("                     DSP launch = --row-period-batch x --batch-size 128x128 macro\n");
+    printf("                     blocks (default %d x %d); --fused-jackpot runs the jackpot on\n",
+           CP_HEXAGON_LAUNCH_MACROS_DEFAULT, CP_HEXAGON_LAUNCH_MACROS_DEFAULT);
+    printf("                     the DSP (~1%% slower, almost no CPU)\n");
 #endif
     printf("  --m N, --n N         matrix rows/cols in units of %d (default %d; each <= %d,\n",
            CP_MATRIX_UNIT, M_DIM / CP_MATRIX_UNIT, CP_MATRIX_UNITS_MAX);
@@ -153,8 +167,6 @@ static void print_usage(void)
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
-    printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
-    printf("  --host-bridge PATH   plain_proof_host.py path\n");
     printf("  --dry-run            build proof but do not submit\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
     printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
@@ -168,7 +180,8 @@ static void print_usage(void)
            CP_MOCK_DIFF_QUANTUS_DEFAULT);
     printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avxvnni, avx2, ssse3,\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avx512vnni, avxvnni,\n");
+    printf("                       avx512 (base F+BW, alias avx512bw), avx2, ssse3, i8mm,\n");
     printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("                       quantus: hybrid = scalar + avx2 split across SMT siblings,\n");
     printf("                       auto = best available (currently hybrid), avx2 = all\n");
@@ -360,10 +373,11 @@ reconnect:
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
-        printf("[fee] logged in as %s (debt=%llu / 100*T=%llu)\n",
+        char debt_s[48], thr_s[48];
+        printf("[fee] logged in as %s (debt=%s / 100*T=%s of hashing time)\n",
                cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
-               (unsigned long long)cp_fee_debt(),
-               (unsigned long long)cp_fee_threshold());
+               cp_fee_format(cp_fee_debt(), debt_s, sizeof(debt_s)),
+               cp_fee_format(cp_fee_threshold(), thr_s, sizeof(thr_s)));
         fflush(stdout);
     }
     printf("[net] session=%s first_job=%s\n", session, first_job.job_id);
@@ -446,7 +460,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
-    int onednn_fused_jackpot = 0;
+    int fused_jackpot = 0;
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
@@ -455,11 +469,17 @@ int main(int argc, char** argv)
         const char* env = getenv("CP_SIMD");
         if(!env) env = getenv("CASE33_ISA");
         if(env){
-            if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
+            if(!strcmp(env, "avx512vnni") || !strcmp(env, "avx512-vnni"))
+                simd_isa = CP_SIMD_AVX512VNNI;
+            else if(!strcmp(env, "avx512") || !strcmp(env, "avx512bw") ||
+                    !strcmp(env, "avx512-bw"))
+                simd_isa = CP_SIMD_AVX512BW;
+            else if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
                 simd_isa = CP_SIMD_AVXVNNI;
             else if(!strcmp(env, "avx2")) simd_isa = CP_SIMD_AVX2;
             else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
                 simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "i8mm")) simd_isa = CP_SIMD_I8MM;
             else if(!strcmp(env, "dotprod")) simd_isa = CP_SIMD_DOTPROD;
             else if(!strcmp(env, "neon")) simd_isa = CP_SIMD_NEON;
             else if(!strcmp(env, "scalar")) simd_isa = CP_SIMD_SCALAR;
@@ -487,6 +507,7 @@ int main(int argc, char** argv)
     int ocl_dot_policy = 0; /* Case32OclDotPolicy */
     int ocl_cpm_int = 0;
     int ocl_lds = 0;
+    int ocl_double_buff = 0;
     int wgpu_lds = -1;
     int wgpu_tile_mr = 0;
     int wgpu_tile_nr = 0;
@@ -527,6 +548,7 @@ int main(int argc, char** argv)
             else if(!strcmp(b, "opencl")) backend_sel = CP_BACKEND_OPENCL;
             else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
             else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
+            else if(!strcmp(b, "hexagon")) backend_sel = CP_BACKEND_HEXAGON;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -674,6 +696,22 @@ int main(int argc, char** argv)
                 fprintf(stderr, "invalid --ocl-lds %s (expected on or off)\n", v);
                 return 1;
             }
+        } else if(!strncmp(argv[i], "--ocl-double-buff", 17)){
+            const char* v = argv[i] + 17;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-double-buff requires on or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
+                ocl_double_buff = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
+                ocl_double_buff = 0;
+            } else {
+                fprintf(stderr, "invalid --ocl-double-buff %s (expected on or off)\n", v);
+                return 1;
+            }
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
         } else if(!strncmp(argv[i], "--wgpu-lds", 10)){
@@ -796,9 +834,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             cutlass_fused = 0;
         } else if(!strcmp(argv[i], "--fused-jackpot")){
-            onednn_fused_jackpot = 1;
+            fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
-            onednn_fused_jackpot = 0;
+            fused_jackpot = 0;
         } else if(!strcmp(argv[i], "--onednn-layout")){
             if(i + 1 >= argc){
                 fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
@@ -825,6 +863,11 @@ int main(int argc, char** argv)
             const char* isa = argv[++i];
             if(!strcmp(isa, "auto"))
                 simd_isa = CP_SIMD_AUTO;
+            else if(!strcmp(isa, "avx512vnni") || !strcmp(isa, "avx512-vnni"))
+                simd_isa = CP_SIMD_AVX512VNNI;
+            else if(!strcmp(isa, "avx512") || !strcmp(isa, "avx512bw") ||
+                    !strcmp(isa, "avx512-bw"))
+                simd_isa = CP_SIMD_AVX512BW;
             else if(!strcmp(isa, "avxvnni") || !strcmp(isa, "vnni") ||
                     !strcmp(isa, "avx-vnni"))
                 simd_isa = CP_SIMD_AVXVNNI;
@@ -836,13 +879,15 @@ int main(int argc, char** argv)
                 simd_isa = CP_SIMD_NEON;
             else if(!strcmp(isa, "dotprod"))
                 simd_isa = CP_SIMD_DOTPROD;
+            else if(!strcmp(isa, "i8mm"))
+                simd_isa = CP_SIMD_I8MM;
             else if(!strcmp(isa, "scalar"))
                 simd_isa = CP_SIMD_SCALAR;
             else if(!strcmp(isa, "hybrid"))
                 simd_isa = CP_SIMD_HYBRID;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|hybrid|avxvnni|avx2|ssse3|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni|avx512|avx2|ssse3|i8mm|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }
@@ -852,12 +897,6 @@ int main(int argc, char** argv)
             prepack_test = 1;
         } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
             g_max_nonce = atoi(argv[++i]);
-        } else if(!strcmp(argv[i], "--python") && i + 1 < argc){
-            strncpy(g_python_exe, argv[++i], sizeof(g_python_exe) - 1);
-            g_python_exe[sizeof(g_python_exe) - 1] = 0;
-        } else if(!strcmp(argv[i], "--host-bridge") && i + 1 < argc){
-            strncpy(g_host_bridge, argv[++i], sizeof(g_host_bridge) - 1);
-            g_host_bridge[sizeof(g_host_bridge) - 1] = 0;
         } else if(!strcmp(argv[i], "--worker") && i + 1 < argc){
             strncpy(worker_global, argv[++i], sizeof(worker_global) - 1);
             worker_global[sizeof(worker_global) - 1] = 0;
@@ -1103,6 +1142,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_cpm_int(1);
     if(ocl_lds)
         cp_worker_set_ocl_lds(1);
+    if(ocl_double_buff)
+        cp_worker_set_ocl_double_buff(1);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(wgpu_lds >= 0)
@@ -1352,11 +1393,20 @@ int main(int argc, char** argv)
 #endif
     cp_worker_set_period_batch(batch_size);
     cp_worker_set_row_period_batch(row_period_batch);
+    if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+        /* Launch = row x col 128x128 macro blocks; the shared defaults mean "not set". */
+        if(batch_size == CP_PERIOD_BATCH_DEFAULT)
+            batch_size = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        if(row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT)
+            row_period_batch = CP_HEXAGON_LAUNCH_MACROS_DEFAULT;
+        cp_worker_set_hexagon_launch(row_period_batch, batch_size);
+        cp_worker_set_hexagon_fused_jackpot(fused_jackpot);
+    }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
      * Period batch must be set before init (backend banner + scan loop read batch at init). */
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN){
-        cp_onednn_worker_set_fused_jackpot(onednn_fused_jackpot);
+        cp_onednn_worker_set_fused_jackpot(fused_jackpot);
         if(onednn_layout){
             cp_onednn_worker_set_gemm_layout(onednn_layout);
         }
@@ -1407,7 +1457,6 @@ int main(int argc, char** argv)
     }
 
     cp_init_workdir();
-    cp_resolve_paths(argc, argv);
 
     {
         double host_mib = ((double)g_m_active * K_DIM + (double)g_n_active * K_DIM)
@@ -1419,6 +1468,7 @@ int main(int argc, char** argv)
         const char *tile_layout_name =
             cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16) ? "contiguous 16x16 blocks"
+            : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x64) ? "contiguous 4x64 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -1463,7 +1513,7 @@ int main(int argc, char** argv)
             /* oneDNN row/col period-batch is in hash tiles (see Case33GemmOnednn scan). */
             const double panel_tiles =
                     (double)row_period_batch * (double)batch_size;
-            if(onednn_fused_jackpot){
+            if(fused_jackpot){
                 printf("[mode] scan: oneDNN fused GEMM + in-reg XOR/BLAKE3 + GPU jackpot\n");
                 printf("[mode] period batch: row=%d col=%d\n", row_period_batch, batch_size);
             } else {
@@ -1482,6 +1532,16 @@ int main(int argc, char** argv)
                 }
                 printf("[mode] device layout %s on Intel GPU\n", layout_msg);
             }
+        } else if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
+            const int lrows = row_period_batch * 128 < g_m_active ? row_period_batch * 128
+                                                                   : g_m_active;
+            const int lcols = batch_size * 128 < g_n_active ? batch_size * 128 : g_n_active;
+            printf("[mode] scan: cDSP HVX fused GEMM + XOR (4x64 hash tiles) + %s\n",
+                   fused_jackpot ? "DSP jackpot (--fused-jackpot)" : "host jackpot");
+            printf("[mode] DSP launch: %dx%d macro blocks of 128x128 = %dx%d "
+                   "(--row-period-batch x --batch-size), %d hash tiles\n",
+                   lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
+            printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");

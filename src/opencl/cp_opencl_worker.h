@@ -33,6 +33,8 @@ void cp_opencl_worker_set_dot_policy(int policy);
 void cp_opencl_worker_set_cpm_int(int on);
 /* Stage A/B in __local (default off). */
 void cp_opencl_worker_set_use_lds(int on);
+/* Register double-buffered GEMM k-group loop (default off). */
+void cp_opencl_worker_set_double_buffer(int on);
 /* Apply tile override or auto-detect for device before kernel build. */
 void cp_opencl_configure_tile(int device_index, int platform_filter);
 /* Same as above using worker platform filter (-1 = all platforms). */

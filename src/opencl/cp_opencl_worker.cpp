@@ -57,6 +57,7 @@ static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
 static int g_cpm_int = 0;
 static int g_use_lds = 0;
+static int g_double_buffer = 0;
 
 namespace {
 
@@ -134,8 +135,26 @@ static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
     g_zero_b.use_cpu_prep = 0;
     g_zero_b.B_noisy.clear();
 
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
-                               g_zero_b.b_noise_seed);
+    /* The keyed digest of the all-zero B^T on the GPU (~2 ms on an R9700 vs 0.78 s on the
+       CPU per job); CP_OCL_ZERO_B_CHECK=1 compares it with the CPU path. */
+    uint8_t hash_b[32];
+    if (g_gemm.zero_b_digest_gpu(n, K_DIM, job_key, hash_b)) {
+        pearl_b_noise_seed_from_root(job_key, hash_b, n, g_zero_b.salted, g_zero_b.b_noise_seed);
+        const char *chk = getenv("CP_OCL_ZERO_B_CHECK");
+        if (chk && chk[0] && chk[0] != '0') {
+            uint8_t ref[32];
+            pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, ref);
+            const bool same = memcmp(ref, g_zero_b.b_noise_seed, 32) == 0;
+            printf("[ocl] zero-B GPU digest %s the CPU path\n", same ? "matches" : "DIFFERS FROM");
+            fflush(stdout);
+            if (!same) {
+                memcpy(g_zero_b.b_noise_seed, ref, 32);
+            }
+        }
+    } else {
+        pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
+                                   g_zero_b.b_noise_seed);
+    }
     if (!g_gemm.prepare_job_gpu(m, n, K_DIM, g_zero_b.b_noise_seed)) {
         g_zero_b.ready = 0;
         fprintf(stderr, "[ocl] prepare_job_gpu failed\n");
@@ -295,6 +314,10 @@ extern "C" void cp_opencl_worker_set_use_lds(int on) {
     g_use_lds = on ? 1 : 0;
 }
 
+extern "C" void cp_opencl_worker_set_double_buffer(int on) {
+    g_double_buffer = on ? 1 : 0;
+}
+
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
     int tile_mr = 4;
     int tile_nr = 8;
@@ -421,6 +444,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(g_dot_policy));
     g_gemm.set_cpm_int(g_cpm_int);
     g_gemm.set_use_lds(g_use_lds);
+    g_gemm.set_double_buffer(g_double_buffer);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -456,6 +480,9 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     }
     printf("[ocl] LDS staging: %s (--ocl-lds %s)\n", g_use_lds ? "on" : "off",
            g_use_lds ? "on" : "off");
+    printf("[ocl] register double buffer: %s (--ocl-double-buff %s)%s\n",
+           g_double_buffer ? "on" : "off", g_double_buffer ? "on" : "off",
+           g_double_buffer && g_use_lds ? "; not used with --ocl-lds on" : "");
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {

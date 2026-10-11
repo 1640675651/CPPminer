@@ -1,0 +1,88 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface pearlx : remote_handle64 {
+   // Pearl GEMM + milestone XOR on the Hexagon cDSP (gemm_xor Case 1.1). All
+   // values are int8, multiplied signed x signed. Hash tiles are 4 rows x 64
+   // columns: each half of a 4 x 128 register tile.
+
+   // Job setup: noisy B^T, n rows of k values each (row j = column j of B).
+   // The DSP packs it into its own memory and keeps it until the next set_b or
+   // close. n must be a multiple of 128, k a multiple of 128 and at most 4096.
+   long set_b(in sequence<int8> bt, in long n, in long k, rout uint64 dsp_us);
+
+   // Row panel: noisy A rows (row-major, `rows` x k; rows a multiple of 4),
+   // packed into DSP memory for the gemm_xor calls that follow. nthreads <= 0
+   // uses every HVX context.
+   long set_a(in sequence<int8> a, in long rows, in long nthreads, rout uint64 dsp_us);
+
+   // The packed row panel against columns [col0, col0 + ncols) of B (both
+   // multiples of 128). After each milestone ms (k < 128 * (ms + 1)) the int32
+   // partials of every 4 x 64 hash tile are XORed into one word.
+   // xr: one record of lines * 32 words per register tile, column tile nt
+   // (128 columns, counted from col0) major then row tile t (4 rows),
+   // lines = ceil(k / 128 * 2 / 32): word ms * 2 + h of the record at
+   // (nt * rows / 4 + t) * lines * 32 is hash tile (rows 4t.., columns
+   // col0 + 128 nt + 64 h ..) after milestone ms. xr must be 128-byte aligned.
+   long gemm_xor(in long col0, in long ncols, rout sequence<uint32> xr, rout uint64 dsp_us);
+
+   // hvx_contexts: 128-byte HVX units available. clock_vote_err: 0 if the
+   // max-clock request made at open succeeded. clock_mhz: current DSP core clock.
+   // vtcm_kb: total VTCM on this DSP (-1 if the query fails).
+   long info(rout long hvx_contexts, rout long clock_vote_err, rout long clock_mhz,
+             rout long vtcm_kb);
+
+   // Like gemm_xor, with the jackpot on the DSP instead of returning the XORs (k = 4096).
+   // key_bound: the attempt's BLAKE3 key (8 words), then the bound (8 words, little-endian,
+   // word 7 most significant). A hash tile hits when the keyed BLAKE3 of its folded
+   // milestone XORs is at or below the bound. hit: [0] hits found, [1] the first hit's row
+   // (from the panel's first row), [2] its column, [3..34] its 32 milestone XORs. "First"
+   // is in (column tile, row tile, half) order. stop_on_hit = 1 stops at the column tiles
+   // being processed when a hit is found, so hit[0] then counts only what was checked.
+   long scan(in long col0, in long ncols, in sequence<uint32> key_bound, in long stop_on_hit,
+             rout sequence<uint32> hit, rout uint64 dsp_us);
+
+   // Noise generated on the DSP, bit for bit as cp_noise.c (rank 128). seed_label: the
+   // noise seed (8 little-endian words) then the 32-byte label ("B_tensor" / "A_tensor")
+   // as 8 words. pairs: the k permutation pairs (first, second), 2k words.
+   // set_b_gen: like set_b with noisy B (signal B = 0) generated and packed on the DSP;
+   // noise row j is column j.
+   long set_b_gen(in long n, in long k, in sequence<uint32> seed_label,
+                  in sequence<uint32> pairs, rout uint64 dsp_us);
+   // set_a_gen: like set_a, from the signal rows: the panel is signal + noise, noise row
+   // row0 + r for panel row r. rows must be a multiple of 128.
+   long set_a_gen(in sequence<int8> a_sig, in long row0, in long rows, in long nthreads,
+                  in sequence<uint32> seed_label, in sequence<uint32> pairs,
+                  rout uint64 dsp_us);
+
+   // Keyed BLAKE3 chaining values of the 1 KB chunks of raw_len bytes (a multiple of
+   // 32 KB): the leaves of cp_noise.c's matrix hashes. data empty: raw_len zero bytes.
+   // key: 8 words. cvs: 8 words per chunk, in chunk order. data and cvs 128-byte aligned.
+   long chunk_cvs(in sequence<int8> data, in long raw_len, in sequence<uint32> key,
+                  rout sequence<uint32> cvs, rout uint64 dsp_us);
+
+   // An attempt's launches, run back to back by the DSP itself: for each row panel of
+   // rows [row0, row0 + rows) (panel_rows at a time), set_a_gen from a_sig (those rows of
+   // signal A), then gemm_xor against launch_cols columns at a time across all of B.
+   // Launches are numbered from s0.
+   // Records mode (key_bound empty): launch s writes its records to slot s % nbuf of xr
+   // (xr split into nbuf equal slots), in gemm_xor's layout, for the host's jackpot; it
+   // starts once launch s - nbuf is checked.
+   // Jackpot mode (key_bound as for scan, k = 4096): each launch runs the jackpot on the
+   // DSP instead, and xr is unused. The first launch with a hit stops the run and reports
+   // its first hit in ctl.
+   // ctl (128 words, 128-byte aligned) is shared with the host while the call runs. The
+   // DSP writes words 0..63 only: [0] launches finished (s + 1 after launch s, counted
+   // from 0, not from s0), [1] the host's epoch as read at the start, [2] state (1 running,
+   // 2 done, 3 stopped, 4 failed, 5 hit), and in jackpot mode [3] the hit launch's hits,
+   // [4] the hit's row, [5] its column, [8..39] its 32 milestone XORs. The host writes
+   // words 64..127 only: [64] launches checked, [65] stop (nonzero: stop at the next
+   // column tile), [66] epoch, [67] self-test only: microseconds to idle after each
+   // launch (0 in the miner). launched: launches finished in this call.
+   long scan_run(in sequence<int8> a_sig, in long row0, in long rows, in long panel_rows,
+                 in long launch_cols, in long s0, in long nbuf, in long nthreads,
+                 in sequence<uint32> seed_label, in sequence<uint32> pairs,
+                 in sequence<uint32> key_bound, rout sequence<uint32> ctl,
+                 rout sequence<uint32> xr, rout uint64 dsp_us, rout uint64 wait_us,
+                 rout long launched);
+};

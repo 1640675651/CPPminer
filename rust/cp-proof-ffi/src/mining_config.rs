@@ -200,6 +200,21 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_4x64_config_bytes_match_embedded() {
+        let rows: Vec<u32> = (0..4).map(|i| i as u32).collect();
+        let cols: Vec<u32> = (0..64).map(|i| i as u32).collect();
+        let cfg = mining_config_bytes(4096, 128, &rows, &cols).expect("contiguous 4x64 cfg");
+        // PEARL_CONTIGUOUS_4x64_CONFIG in cp_noise.c.
+        const EMBEDDED: [u8; 52] = [
+            0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(cfg, EMBEDDED);
+    }
+
+    #[test]
     fn cutlass_config_bytes_match_embedded() {
         let rows: Vec<u32> = vec![0, 1, 2, 3, 16, 17, 18, 19];
         let cols: Vec<u32> = vec![0, 1, 2, 3, 32, 33, 34, 35];

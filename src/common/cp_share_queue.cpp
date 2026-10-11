@@ -150,9 +150,9 @@ void CpShareQueueImpl::return_snapshot_matrices(ShareSnapshot *snap) {
     std::lock_guard<std::mutex> lock(mtx);
     if (snap->a_sig) {
         if (shutdown) {
-            free(snap->a_sig);
+            cp_worker_free_host_signal_a(snap->a_sig);
         } else if (returned_a) {
-            free(returned_a);
+            cp_worker_free_host_signal_a(returned_a);
             returned_a = snap->a_sig;
         } else {
             returned_a = snap->a_sig;
@@ -180,7 +180,7 @@ static void share_snapshot_delete(ShareSnapshot *snap) {
         return;
     }
     /* Matrices should already have been returned; free any leftovers. */
-    free(snap->a_sig);
+    cp_worker_free_host_signal_a(snap->a_sig);
     if (snap->bt_owned) {
         free(snap->bt_sig);
     }
@@ -205,6 +205,8 @@ static const uint8_t *mining_cfg_for_layout(int tile_layout) {
         return PEARL_CONTIGUOUS_4x8_CONFIG;
     case CP_TILE_LAYOUT_CONTIGUOUS_16x16:
         return PEARL_CONTIGUOUS_16x16_CONFIG;
+    case CP_TILE_LAYOUT_CONTIGUOUS_4x64:
+        return PEARL_CONTIGUOUS_4x64_CONFIG;
     case CP_TILE_LAYOUT_CONTIGUOUS:
         return PEARL_CONTIGUOUS_CONFIG;
     default:
@@ -445,7 +447,7 @@ extern "C" void cp_share_queue_destroy(CpShareQueue *q) {
         q->impl.pending.pop_front();
         share_snapshot_delete(snap);
     }
-    free(q->impl.returned_a);
+    cp_worker_free_host_signal_a(q->impl.returned_a);
     free(q->impl.returned_bt);
     q->impl.returned_a = nullptr;
     q->impl.returned_bt = nullptr;
@@ -622,7 +624,7 @@ extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit
          * pointers first — but we are about to hand off the caller's current buffers. Any
          * stale returned_* would leak; free them (miner should have reclaimed already). */
         if (q->impl.returned_a) {
-            free(q->impl.returned_a);
+            cp_worker_free_host_signal_a(q->impl.returned_a);
             q->impl.returned_a = nullptr;
         }
         if (q->impl.returned_bt) {
