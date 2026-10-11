@@ -8,6 +8,7 @@
 
 ### Fix & Enhancements
 - NEON DotProd and basic NEON kernel rewrite, reduce instruction count and improve speed
+- OpenCL `--ocl-cpm-type auto|float|int|mad24`: `mad24` is now an explicit choice (auto keeps it on AMD GCN gfx6-8); `int` accumulates straight into the int32 tile instead of a separate panel
 
 ### Pearl Hexagon
 - Self-guided loop on the DSP, negligible kernel launch overhead

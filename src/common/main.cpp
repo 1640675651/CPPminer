@@ -105,7 +105,8 @@ static void print_usage(void)
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-dot MODE     OpenCL dot backend: auto (default), sudot, sdot4, khr,\n");
     printf("                     force-khr, asm, or off\n");
-    printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
+    printf("  --ocl-cpm-type T   OpenCL scalar (no int8 dot) MAC: auto (default), float, int,\n");
+    printf("                     or mad24 (auto = mad24 on AMD GCN gfx6-8, else float)\n");
     printf("  --ocl-lds on|off   OpenCL stage A/B in local memory (default off)\n");
     printf("  --ocl-double-buff on|off  OpenCL register double-buffered GEMM loop (default off;\n");
     printf("                     faster on some GPUs, more registers: may spill on others)\n");
@@ -505,7 +506,7 @@ int main(int argc, char** argv)
     int ocl_macro_n = 0;
     int ocl_issue_mode = 0; /* 0=auto, 1=broadcast, 2=packed */
     int ocl_dot_policy = 0; /* Case32OclDotPolicy */
-    int ocl_cpm_int = 0;
+    int ocl_cpm_type = 0; /* Case32OclCpmType: 0=auto, 1=float, 2=int, 3=mad24 */
     int ocl_lds = 0;
     int ocl_double_buff = 0;
     int wgpu_lds = -1;
@@ -669,15 +670,20 @@ int main(int argc, char** argv)
             if(*v == '=') v++;
             else if(*v == '\0' && i + 1 < argc) v = argv[++i];
             else {
-                fprintf(stderr, "--ocl-cpm-type requires float or int\n");
+                fprintf(stderr, "--ocl-cpm-type requires auto, float, int, or mad24\n");
                 return 1;
             }
-            if(!strcmp(v, "float") || !strcmp(v, "fp32")){
-                ocl_cpm_int = 0;
+            if(!strcmp(v, "auto")){
+                ocl_cpm_type = 0;
+            } else if(!strcmp(v, "float") || !strcmp(v, "fp32")){
+                ocl_cpm_type = 1;
             } else if(!strcmp(v, "int") || !strcmp(v, "int32")){
-                ocl_cpm_int = 1;
+                ocl_cpm_type = 2;
+            } else if(!strcmp(v, "mad24")){
+                ocl_cpm_type = 3;
             } else {
-                fprintf(stderr, "invalid --ocl-cpm-type %s (expected float or int)\n", v);
+                fprintf(stderr,
+                        "invalid --ocl-cpm-type %s (expected auto, float, int, or mad24)\n", v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-lds", 9)){
@@ -1138,8 +1144,8 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_issue_mode(ocl_issue_mode);
     if(ocl_dot_policy != 0)
         cp_worker_set_ocl_dot_policy(ocl_dot_policy);
-    if(ocl_cpm_int)
-        cp_worker_set_ocl_cpm_int(1);
+    if(ocl_cpm_type != 0)
+        cp_worker_set_ocl_cpm_type(ocl_cpm_type);
     if(ocl_lds)
         cp_worker_set_ocl_lds(1);
     if(ocl_double_buff)

@@ -16,7 +16,9 @@
 // Issue shape (matches beignet-fix / case36):
 //   !CASE32_PACKED_DOT (scalar / --ocl-issue broadcast): CLBlast GEMMK=0 cpm += aval * bscalar
 //   CASE32_PACKED_DOT (--ocl-issue packed or DPI): per-C case32_dot4
-//   --ocl-cpm-type int (CASE32_CPM_INT): int4 cpm; default float4 mad. CASE32_NO_DPI blocks
+//   --ocl-cpm-type float (default): float4 mad into a cpm panel, flushed to int32 every KR.
+//   --ocl-cpm-type int (CASE32_CPM_INT): int4 mul+add straight into acc (no panel).
+//   --ocl-cpm-type mad24 (CASE32_GCN_MAD24): scalar mad24 straight into acc. CASE32_NO_DPI blocks
 //   auto-enabling KHR DPI when the host requests the scalar cpm nest.
 
 #ifndef MR
@@ -223,6 +225,14 @@ inline bool digest_beats_target(const uint digest[8], __global const uint *bound
 #else
 #define CASE32_PACKED_DOT 0
 #endif
+/* Separate cpm panel (zeroed and flushed into acc every KR): float broadcast only. The int
+   broadcast nest accumulates straight into acc (int32 wraps identically), saving MR*NR
+   live registers and the per-KR zero/flush. */
+#if !CASE32_PACKED_DOT && !CASE32_CPM_INT
+#define CASE32_CPM_PANEL 1
+#else
+#define CASE32_CPM_PANEL 0
+#endif
 
 inline int case32_dot4(int acc, int a_pack, int b_pack) {
 #if defined(CASE32_USE_ASM_DOT)
@@ -331,6 +341,47 @@ inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
         }
     }
 }
+
+#if CASE32_CPM_INT
+/* Same broadcast issue as case32_cpm_kgroup, accumulated straight into acc: lane l of
+   cpm[j * CPM_COLVEC + mi] is acc[j * MR + mi * VWM + l]. Keep the int4 CASE32_CPM_MAD form:
+   the AMD compiler turns that chain into v_dot4 on gfx1012 (5500M: 5.1 TMAC/s with
+   --ocl-dot off), while the same math as scalar acc[] += a * b stays at ~1.0 TMAC/s. */
+static inline void case32_cpm_kgroup_direct(__private int *acc, __private const int *a_pack,
+                                            __private const int *b_pack) {
+    char4 ar[MR];
+    char4 br[NR];
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        ar[i] = as_char4(a_pack[i]);
+    }
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        br[j] = as_char4(b_pack[j]);
+    }
+    #pragma unroll
+    for (int k = 0; k < RANK; ++k) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const cpm_vec aval = case32_apm(ar, mi * VWM, k);
+            #pragma unroll
+            for (int j = 0; j < NR; ++j) {
+                const int base = j * MR + mi * VWM;
+                int4 c = (int4)(acc[base + 0], acc[base + 1], acc[base + 2], acc[base + 3]);
+                c = CASE32_CPM_MAD(aval, case32_char_lane(br[j], k), c);
+                acc[base + 0] = c.s0;
+                acc[base + 1] = c.s1;
+                acc[base + 2] = c.s2;
+                acc[base + 3] = c.s3;
+            }
+        }
+    }
+}
+
+/* acc is updated on every MAC here, so every loop over acc must unroll or a rolled
+   dynamic index sends the whole array to scratch (see the GCN note below). */
+#define CASE32_ACC_UNROLL _Pragma("unroll")
+#endif
 #endif
 
 #if defined(CASE32_GCN_MAD24)
@@ -370,8 +421,11 @@ inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
    acc[] once per KR. Unroll those loops on this path. */
 #define CASE32_ACC_UNROLL _Pragma("unroll")
 
-inline void case32_gcn_kgroup(__private int *acc, __private const int *a_pack,
-                              __private const int *b_pack) {
+/* static: a plain C99 inline has no external definition; when the AMD Windows driver
+   declines to inline it (mad24 library call), linking fails with "undefined hidden
+   symbol: case32_gcn_kgroup". */
+static inline void case32_gcn_kgroup(__private int *acc, __private const int *a_pack,
+                                     __private const int *b_pack) {
 /* k-loop unroll. RX 580 (AMD Windows driver, 8k, with the register double-buffered
    k-group loop): rolled 2.17 vs unrolled 2.10 TMAC/s, both with acc[] in registers
    (full pool size: 1.9 vs 1.38 for the float cpm nest).
@@ -406,8 +460,9 @@ inline void case32_gcn_kgroup(__private int *acc, __private const int *a_pack,
 #define CASE32_ACC_UNROLL
 #endif
 
-inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
-                                __private const int *a_pack, __private const int *b_pack) {
+static inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
+                                       __private const int *a_pack,
+                                       __private const int *b_pack) {
 #if defined(CASE32_GCN_MAD24)
     (void)cpm;
     case32_gcn_kgroup(acc, a_pack, b_pack);
@@ -422,6 +477,9 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
             acc[base + i] = case32_dot4(acc[base + i], a_pack[i], b0);
         }
     }
+#elif CASE32_CPM_INT
+    (void)cpm;
+    case32_cpm_kgroup_direct(acc, a_pack, b_pack);
 #else
     (void)acc;
     case32_cpm_kgroup(cpm, a_pack, b_pack);
@@ -581,7 +639,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         for (int i = 0; i < NR * MR; ++i) {
             acc[i] = 0;
         }
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         cpm_vec cpm[CPM_NVEC];
 #endif
 #if CASE32_PIPELINE
@@ -607,7 +665,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
         int ms = 0;
         for (int kb = 0; kb < blocks_k; ++kb) {
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         case32_cpm_zero(cpm);
 #endif
 #if defined(CASE32_COALESCE)
@@ -651,7 +709,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                     for (int j = 0; j < NR; ++j) {
                         b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
                     }
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
                     case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
                     case32_accum_kgroup(acc, cpm, a_pack, b_pack);
@@ -670,14 +728,14 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
             case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
             case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
 #else
             case32_accum_kgroup(acc, cpm, a_p0, b_p0);
 #endif
             case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
             case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
 #else
             case32_accum_kgroup(acc, cpm, a_p1, b_p1);
@@ -697,7 +755,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             int b_pack[NR];
             case32_load_a_pack(a_pack, a_kg);
             case32_load_b_pack(b_pack, b_kg);
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
             case32_accum_kgroup(acc, cpm, a_pack, b_pack);
@@ -720,14 +778,14 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
             int b_pack[NR];
             case32_load_a_pack(a_pack, a_kg);
             case32_load_b_pack(b_pack, b_kg);
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
             case32_accum_kgroup(acc, cpm, a_pack, b_pack);
 #endif
         }
 #endif
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         case32_cpm_flush(acc, cpm);
 #endif
         /* One milestone per KR panel (KR == R_RANK). Cumulative acc across kb. */

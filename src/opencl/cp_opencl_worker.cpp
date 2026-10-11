@@ -55,7 +55,7 @@ static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
-static int g_cpm_int = 0;
+static int g_cpm_type = 0; /* Case32OclCpmType */
 static int g_use_lds = 0;
 static int g_double_buffer = 0;
 
@@ -306,8 +306,8 @@ extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
     g_dot_policy = policy;
 }
 
-extern "C" void cp_opencl_worker_set_cpm_int(int on) {
-    g_cpm_int = on ? 1 : 0;
+extern "C" void cp_opencl_worker_set_cpm_type(int type) {
+    g_cpm_type = (type >= 0 && type <= 3) ? type : 0;
 }
 
 extern "C" void cp_opencl_worker_set_use_lds(int on) {
@@ -442,7 +442,7 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_macro_batch(g_macro_batch);
     g_gemm.set_issue_mode(g_issue_mode);
     g_gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(g_dot_policy));
-    g_gemm.set_cpm_int(g_cpm_int);
+    g_gemm.set_cpm_type(static_cast<Case32OclCpmType>(g_cpm_type));
     g_gemm.set_use_lds(g_use_lds);
     g_gemm.set_double_buffer(g_double_buffer);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
@@ -466,17 +466,18 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
                "dot_acc_sat may not beat cpm. Try --backend onednn for Intel GPU perf.\n");
     }
     if (g_issue_mode == 1) {
-        printf("[ocl] issue: broadcast/cpm %s (--ocl-issue broadcast%s)\n",
-               g_cpm_int ? "int" : "float",
-               g_cpm_int ? ", --ocl-cpm-type int" : "");
+        printf("[ocl] issue: broadcast (--ocl-issue broadcast)\n");
     } else if (g_issue_mode == 2) {
         printf("[ocl] issue: packed (--ocl-issue packed)\n");
-        if (g_cpm_int) {
-            fprintf(stderr,
-                    "[ocl] warning: --ocl-cpm-type int ignored without cpm/broadcast issue\n");
-        }
-    } else if (g_cpm_int) {
-        printf("[ocl] cpm tile: int8 lanes, int32 acc (--ocl-cpm-type int)\n");
+    }
+    if (g_gemm.cpm_type_used()) {
+        printf("[ocl] cpm type: %s (%s)\n", g_gemm.cpm_type_name(),
+               g_cpm_type == 0 ? "auto" : "--ocl-cpm-type");
+    } else if (g_cpm_type != 0) {
+        fprintf(stderr,
+                "[ocl] warning: --ocl-cpm-type ignored: %s\n",
+                g_issue_mode == 2 ? "--ocl-issue packed uses per-element dot4"
+                                  : "an int8 dot backend is in use (scalar nest not built)");
     }
     printf("[ocl] LDS staging: %s (--ocl-lds %s)\n", g_use_lds ? "on" : "off",
            g_use_lds ? "on" : "off");

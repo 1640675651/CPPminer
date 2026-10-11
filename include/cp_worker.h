@@ -57,8 +57,8 @@ void cp_worker_set_ocl_issue_mode(int mode);
 void cp_worker_set_ocl_issue_broadcast(int on);
 /* OpenCL-only: dot backend. 0=auto, 1=force-khr, 2=off, 3=sudot, 4=sdot4, 5=asm, 6=khr. */
 void cp_worker_set_ocl_dot_policy(int policy);
-/* OpenCL-only: broadcast cpm type. 0 = float (default), 1 = int32. */
-void cp_worker_set_ocl_cpm_int(int on);
+/* OpenCL-only: scalar MAC nest. 0 = auto (default), 1 = float, 2 = int, 3 = mad24. */
+void cp_worker_set_ocl_cpm_type(int type);
 /* OpenCL-only: stage A/B panels in local memory (0 = off default, 1 = on). */
 void cp_worker_set_ocl_lds(int on);
 /* OpenCL-only: register double-buffered GEMM k-group loop (0 = off default, 1 = on). */

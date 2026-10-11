@@ -217,8 +217,15 @@ void Case33GemmOcl::set_issue_broadcast(int on) {
     issue_mode_ = on ? 1 : 0;
 }
 
-void Case33GemmOcl::set_cpm_int(int on) {
-    use_cpm_int_ = on != 0;
+const char *Case33GemmOcl::cpm_type_name() const {
+    switch (resolved_cpm_type_) {
+    case Case32OclCpmType::Int:
+        return "int";
+    case Case32OclCpmType::Mad24:
+        return "mad24";
+    default:
+        return "float";
+    }
 }
 
 void Case33GemmOcl::set_use_lds(int on) {
@@ -289,9 +296,11 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                              backend == Case32OclDotBackend::KhrDpiForce;
         const bool force_ext = backend == Case32OclDotBackend::KhrDpiForce;
         const bool scalar = backend == Case32OclDotBackend::Scalar;
-        const bool gcn = scalar && gcn_mad24_ && issue_mode_ == 0;
-        const char *label = gcn ? "GCN scalar mad24 (no int8 dot)"
-                                : dot_backend_label(backend, issue_mode_, use_cpm_int_);
+        const bool gcn =
+                scalar && resolved_cpm_type_ == Case32OclCpmType::Mad24 && issue_mode_ != 2;
+        const bool cpm_int = resolved_cpm_type_ == Case32OclCpmType::Int;
+        const char *label = gcn ? "scalar mad24 (no int8 dot)"
+                                : dot_backend_label(backend, issue_mode_, cpm_int);
 
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
@@ -330,7 +339,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             std::fflush(stdout);
         } else if (scalar) {
             build_opts += " -DCASE32_NO_DPI=1";
-            if (use_cpm_int_) {
+            if (cpm_int) {
                 build_opts += " -DCASE32_CPM_INT=1";
             }
             if (issue_mode_ == 2) {
@@ -370,6 +379,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             using_builtin_dot_ = use_builtin || use_sudot;
             using_cpm_ = scalar && !gcn && issue_mode_ != 2;
             using_gcn_ = gcn;
+            cpm_type_used_ = scalar && issue_mode_ != 2;
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", status_label);
             return true;
         };
@@ -439,15 +449,25 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
     const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
                                ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
 
-    /* GCN gfx6-8 have no int8 dot instructions, so the build falls through to the scalar
-       backend; there use the direct mad24 nest (the float cpm panel spills on gfx803).
-       CP_OCL_GCN=1/0 forces it on/off for the scalar backend on any device. */
-    gcn_mad24_ = vendor_is_amd && amd_gcn_pre_gfx9(ocl_.device_name);
-    if (const char *g = std::getenv("CP_OCL_GCN")) {
-        if (g[0]) {
-            gcn_mad24_ = std::atoi(g) != 0;
+    /* --ocl-cpm-type auto: GCN gfx6-8 have no int8 dot instructions, so the build falls
+       through to the scalar backend; there use the direct mad24 nest (the float cpm panel
+       spills on gfx803). Only with --ocl-issue auto; broadcast keeps the float panel.
+       CP_OCL_GCN=1/0 overrides the GCN detection. */
+    resolved_cpm_type_ = cpm_type_;
+    if (cpm_type_ == Case32OclCpmType::Auto) {
+        bool gcn_auto = vendor_is_amd && amd_gcn_pre_gfx9(ocl_.device_name);
+        if (const char *g = std::getenv("CP_OCL_GCN")) {
+            if (g[0]) {
+                gcn_auto = std::atoi(g) != 0;
+            }
         }
+        resolved_cpm_type_ = (gcn_auto && issue_mode_ == 0) ? Case32OclCpmType::Mad24
+                                                            : Case32OclCpmType::Float;
+    } else if (cpm_type_ == Case32OclCpmType::Mad24 && !vendor_is_amd) {
+        std::fprintf(stderr, "[ocl] note: --ocl-cpm-type mad24 is only native on AMD; "
+                             "it may be slower than float or int on this device\n");
     }
+    cpm_type_used_ = false;
 
     /* One macro block per work-group whenever the device allows it (run_macro_batch_
        then launches with local = kMacroWorkItems); tell the compiler the exact size via
@@ -583,8 +603,10 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
 
-    const char *dot_kind = using_gcn_ ? "gcn mad24"
-                                      : dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
+    const char *dot_kind =
+            using_gcn_ ? "scalar mad24"
+                       : dot_kind_short(adopted_backend_, issue_mode_,
+                                        resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
@@ -632,8 +654,10 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         return false;
     }
 
-    const char *dot_kind = using_gcn_ ? "gcn mad24"
-                                      : dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
+    const char *dot_kind =
+            using_gcn_ ? "scalar mad24"
+                       : dot_kind_short(adopted_backend_, issue_mode_,
+                                        resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,

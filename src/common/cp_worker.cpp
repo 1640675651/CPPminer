@@ -316,12 +316,12 @@ extern "C" void cp_worker_set_ocl_dot_policy(int policy)
 #endif
 }
 
-extern "C" void cp_worker_set_ocl_cpm_int(int on)
+extern "C" void cp_worker_set_ocl_cpm_type(int type)
 {
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-    cp_opencl_worker_set_cpm_int(on);
+    cp_opencl_worker_set_cpm_type(type);
 #else
-    (void)on;
+    (void)type;
 #endif
 }
 

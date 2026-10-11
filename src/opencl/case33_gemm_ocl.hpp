@@ -40,8 +40,12 @@ struct Case33GemmOcl {
     void set_issue_mode(int mode);
     /* Legacy: on → broadcast (1), off → auto (0). */
     void set_issue_broadcast(int on);
-    /* Broadcast/cpm element type: 0 = float4 mad (default), 1 = int32. Ignored if packed. */
-    void set_cpm_int(int on);
+    /* Scalar (no int8 dot) MAC nest. Auto resolves at build; ignored with packed issue. */
+    void set_cpm_type(Case32OclCpmType type) { cpm_type_ = type; }
+    /* True when the adopted kernel is the scalar broadcast/mad24 nest. */
+    bool cpm_type_used() const { return cpm_type_used_; }
+    /* Resolved nest: "float", "int", or "mad24". */
+    const char *cpm_type_name() const;
     /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
     void set_use_lds(int on);
     bool use_lds() const { return use_lds_; }
@@ -156,13 +160,13 @@ private:
 
     int issue_mode_ = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 
-    bool use_cpm_int_ = false;
+    Case32OclCpmType cpm_type_ = Case32OclCpmType::Auto;
+    Case32OclCpmType resolved_cpm_type_ = Case32OclCpmType::Float;
+    bool cpm_type_used_ = false;
 
     bool use_lds_ = false;
     bool double_buffer_ = false;
     int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
-
-    bool gcn_mad24_ = false; /* scalar backend uses the GCN mad24 nest (CP_OCL_GCN) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 

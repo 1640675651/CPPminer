@@ -159,7 +159,7 @@ cppminer --backend opencl --devices 0 --mock
 | `--ocl-macro MxN` | Macro block: `64x64` or `128x128` (default `128x128`, independent of tile) |
 | `--ocl-issue MODE` | GEMM issue: `auto` (default), `broadcast` (B-scalar `mad`), or `packed` (per-C `dot4`) |
 | `--ocl-dot MODE` | Dot backend: `auto` (default; AMD sudot→sdot4→KHR→scalar), `sudot`, `sdot4`, `khr`, `force-khr`, `asm`, or `off` |
-| `--ocl-cpm-type T` | Broadcast accumulate type: `float` (default) or `int` |
+| `--ocl-cpm-type T` | Scalar (no int8 dot) MAC: `auto` (default; `mad24` on AMD GCN gfx6-8, else `float`), `float`, `int`, or `mad24` |
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
 | `--ocl-double-buff on/off` | Register double-buffered GEMM k-group loop (default `off`; faster on some GPUs, but more registers per work-item can spill on others) |
 
