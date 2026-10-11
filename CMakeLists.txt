@@ -33,6 +33,12 @@ if(CP_ENABLE_CUDA)
 endif()
 project(cppminer LANGUAGES ${_cp_langs})
 
+if(MSVC)
+    # Sources are UTF-8 without BOM; otherwise MSVC reads them in the system code page
+    # (e.g. 936 on Chinese Windows) and warns C4819.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 include(CTest)
 if(BUILD_TESTING)

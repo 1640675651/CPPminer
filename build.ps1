@@ -360,17 +360,25 @@ function Ensure-Blake3 {
 function Invoke-External {
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Command,
-        [Parameter(Mandatory = $true)][string]$FailureMessage
+        [Parameter(Mandatory = $true)][string]$FailureMessage,
+        # Write straight to the console instead of piping through PowerShell. MSBuild switches
+        # the console to UTF-8 on non-English Windows; piped output would still be decoded
+        # with the old code page (e.g. 936) and come out garbled.
+        [switch]$Direct
     )
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $exitCode = 0
     try {
-        & $Command 2>&1 | ForEach-Object {
-            if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                Write-Host $_.ToString()
-            } else {
-                Write-Host $_
+        if ($Direct) {
+            & $Command
+        } else {
+            & $Command 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                    Write-Host $_.ToString()
+                } else {
+                    Write-Host $_
+                }
             }
         }
         if ($null -ne $LASTEXITCODE) { $exitCode = $LASTEXITCODE }
@@ -442,7 +450,7 @@ try {
     Write-Host "=== CMake configure ==="
     Invoke-External -Command { & $script:CmakeExe @cmakeArgs } -FailureMessage "cmake configure failed"
     Write-Host "=== CMake build ==="
-    Invoke-External -Command { & $script:CmakeExe --build $CmakeBuild --config Release } -FailureMessage "cmake build failed"
+    Invoke-External -Command { & $script:CmakeExe --build $CmakeBuild --config Release } -FailureMessage "cmake build failed" -Direct
 
     $built = @(
         (Join-Path $CmakeBuild "Release\cppminer.exe"),

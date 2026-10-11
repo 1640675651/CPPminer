@@ -46,7 +46,7 @@
 
 static void print_usage(void)
 {
-    printf("CPminer 鈥?multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("CPminer - multi-algo LuckyPool miner (pearl / quantus)\n");
     printf("  --algo NAME        pearl (default) or quantus\n");
     {
         char pb[64], qb[64];

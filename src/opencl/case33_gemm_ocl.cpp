@@ -447,6 +447,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         if (g[0]) {
             gcn_mad24_ = std::atoi(g) != 0;
         }
+    }
+
     /* One macro block per work-group whenever the device allows it (run_macro_batch_
        then launches with local = kMacroWorkItems); tell the compiler the exact size via
        reqd_work_group_size. Larger-than-device shapes keep the sliced launch and no

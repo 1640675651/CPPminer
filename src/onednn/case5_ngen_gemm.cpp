@@ -344,7 +344,7 @@ bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) 
     if (err) {
         *err = std::string("Case 5 requires XeLP/Gen12LP or XeHPG (Core Ultra MTL/ARL). Detected ")
                + product_family_name(product.family)
-               + " — unsupported ISA for Case 5.";
+               + " - unsupported ISA for Case 5.";
     }
     return false;
 }
