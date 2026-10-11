@@ -94,9 +94,10 @@
 #endif
 /* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
    KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
-   -DCASE32_PIPELINE=0 restores the plain load-then-dot loop. */
+   Off by default (--ocl-double-buff on sets -DCASE32_PIPELINE=1): the second register set
+   raises VGPR pressure and can spill or lose occupancy on some devices. */
 #ifndef CASE32_PIPELINE
-#define CASE32_PIPELINE 1
+#define CASE32_PIPELINE 0
 #endif
 #if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
 #undef CASE32_PIPELINE

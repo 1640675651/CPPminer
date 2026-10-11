@@ -195,6 +195,10 @@ void Case33GemmOcl::set_use_lds(int on) {
     use_lds_ = on != 0;
 }
 
+void Case33GemmOcl::set_double_buffer(int on) {
+    double_buffer_ = on != 0;
+}
+
 Case33GemmOcl::~Case33GemmOcl() {
     if (kernel_) {
         clReleaseKernel(kernel_);
@@ -270,6 +274,7 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DCASE32_WI_ROWMAJOR=" +
                       std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
+        build_opts += double_buffer_ ? " -DCASE32_PIPELINE=1" : " -DCASE32_PIPELINE=0";
         if (reqd_wg_size_ > 0) {
             build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
         }
@@ -336,7 +341,8 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=" +
                         std::to_string(case32::wi_row_major() ? 1 : 0) +
-                        (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0");
+                        (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0") +
+                        (double_buffer_ ? " -DCASE32_PIPELINE=1" : " -DCASE32_PIPELINE=0");
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
                 }
