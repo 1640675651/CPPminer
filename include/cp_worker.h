@@ -47,7 +47,7 @@ int cp_worker_list_devices(void);
 void cp_worker_set_ocl_platform(int platform_index);
 /* OneDNN-only: same as --ocl-platform (shared OpenCL enumeration). */
 void cp_worker_set_onednn_platform(int platform_index);
-/* OpenCL-only: register tile MR x NR (4x4, 4x8, 8x8, or 8x16). mr<=0 restores auto (4x8; 8x16 on AMD). */
+/* OpenCL-only: register tile MR x NR (2x4, 4x4, 4x8, 8x8, or 8x16). mr<=0 restores auto (4x8; 8x16 on AMD). */
 void cp_worker_set_ocl_tile(int mr, int nr);
 /* OpenCL-only: macro block 64x64 or 128x128. <=0 restores default 128x128. */
 void cp_worker_set_ocl_macro(int macro_m, int macro_n);

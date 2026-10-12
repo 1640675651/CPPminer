@@ -1,9 +1,10 @@
 #pragma once
 
 // Case 3.2 blocking constants (shared by host prepack and OpenCL kernels).
-// Register tile is 4x4, 4x8, 8x8, or 8x16 (selected via --ocl-tile / AMD auto-detect).
+// Register tile is 2x4, 4x4, 4x8, 8x8, or 8x16 (selected via --ocl-tile / AMD auto-detect).
 // Macro block is 64×64 or 128×128 (selected via --ocl-macro; independent of tile).
-// Pearl hash tiles contain at least 32 cells, so one WI walks two 4x4 halves of a 4x8 hash.
+// Pearl hash tiles contain at least 32 cells, so one WI walks two 4x4 halves of a 4x8 hash
+// (4x4 tile) or its four 2x4 quarters (2x4 tile).
 // Fused GEMM private memory: see docs/memory.md (Beignet 8×8 ≈384 B/WI, 8×16 ≈1152 B/WI).
 
 #include "cp_config.h"

@@ -36,6 +36,16 @@
 #if (HASH_NR % NR) != 0 || HASH_REG_TILES_N < 1 || HASH_REG_TILES_N > 2
 #error HASH_NR must contain one or two register tiles
 #endif
+/* A WI owns one HASH_MR x HASH_NR hash tile and walks K once per register tile in it
+   (2x4 register tile: 4x8 hash tile = 2x2 register tiles). */
+#ifndef HASH_MR
+#define HASH_MR MR
+#endif
+#define HASH_REG_TILES_M (HASH_MR / MR)
+#if (HASH_MR % MR) != 0 || HASH_REG_TILES_M < 1 || HASH_REG_TILES_M > 2
+#error HASH_MR must contain one or two register tiles
+#endif
+#define HASH_REG_TILES (HASH_REG_TILES_M * HASH_REG_TILES_N)
 #ifndef KR
 #define KR 128
 #endif
@@ -55,7 +65,14 @@
 #define RANK 4
 #endif
 #ifndef VWM
+#if (MR % 4) == 0
 #define VWM 4
+#else
+#define VWM 2
+#endif
+#endif
+#if VWM != 2 && VWM != 4
+#error VWM must be 2 or 4
 #endif
 #ifndef VWN
 #define VWN 4
@@ -77,8 +94,9 @@
 #ifndef MICRO_N
 #define MICRO_N (MACRO_N / NR)
 #endif
+#define HASH_MICRO_M (MACRO_M / HASH_MR)
 #define HASH_MICRO_N (MACRO_N / HASH_NR)
-#define HASH_PER_MACRO (MICRO_M * HASH_MICRO_N)
+#define HASH_PER_MACRO (HASH_MICRO_M * HASH_MICRO_N)
 #ifndef CASE33_SPLIT_JACKPOT
 #define CASE33_SPLIT_JACKPOT 0
 #endif
@@ -121,17 +139,28 @@
 #ifndef CASE32_CPM_INT
 #define CASE32_CPM_INT 0
 #endif
+#if VWM == 4
+typedef int4 cpm_ivec;
+#define CASE32_CPM_TO_INT(v) convert_int4(v)
+#else
+typedef int2 cpm_ivec;
+#define CASE32_CPM_TO_INT(v) convert_int2(v)
+#endif
 #if CASE32_CPM_INT
 typedef int cpm_lane;
-typedef int4 cpm_vec;
-#define CASE32_CPM_ZERO ((int4)(0))
-#define CASE32_CPM_SPLAT(b) ((int4)(b))
+typedef cpm_ivec cpm_vec;
+#define CASE32_CPM_ZERO ((cpm_vec)(0))
+#define CASE32_CPM_SPLAT(b) ((cpm_vec)(b))
 #define CASE32_CPM_MAD(aval, bsc, c) ((aval) * CASE32_CPM_SPLAT(bsc) + (c))
 #else
 typedef float cpm_lane;
+#if VWM == 4
 typedef float4 cpm_vec;
-#define CASE32_CPM_ZERO ((float4)(0.0f))
-#define CASE32_CPM_SPLAT(b) ((float4)(b))
+#else
+typedef float2 cpm_vec;
+#endif
+#define CASE32_CPM_ZERO ((cpm_vec)(0.0f))
+#define CASE32_CPM_SPLAT(b) ((cpm_vec)(b))
 #define CASE32_CPM_MAD(aval, bsc, c) mad((aval), CASE32_CPM_SPLAT(bsc), (c))
 #endif
 /* How many coalesce kg-strips to stage in LDS at once (Case 3.4; keep SLM modest). */
@@ -308,8 +337,12 @@ inline cpm_lane case32_char_lane(char4 c, int k) {
 }
 
 inline cpm_vec case32_apm(__private const char4 *ar, int row0, int k) {
+#if VWM == 4
     return (cpm_vec)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k),
                      case32_char_lane(ar[row0 + 2], k), case32_char_lane(ar[row0 + 3], k));
+#else
+    return (cpm_vec)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k));
+#endif
 }
 
 inline void case32_cpm_zero(__private cpm_vec *cpm) {
@@ -361,12 +394,14 @@ inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
     for (int j = 0; j < NR; ++j) {
         #pragma unroll
         for (int mi = 0; mi < CPM_COLVEC; ++mi) {
-            const int4 t = convert_int4(cpm[j * CPM_COLVEC + mi]);
+            const cpm_ivec t = CASE32_CPM_TO_INT(cpm[j * CPM_COLVEC + mi]);
             const int base = j * MR + mi * VWM;
             acc[base + 0] += t.s0;
             acc[base + 1] += t.s1;
+#if VWM == 4
             acc[base + 2] += t.s2;
             acc[base + 3] += t.s3;
+#endif
         }
     }
 }
@@ -396,12 +431,18 @@ static inline void case32_cpm_kgroup_direct(__private int *acc, __private const 
             #pragma unroll
             for (int j = 0; j < NR; ++j) {
                 const int base = j * MR + mi * VWM;
+#if VWM == 4
                 int4 c = (int4)(acc[base + 0], acc[base + 1], acc[base + 2], acc[base + 3]);
+#else
+                int2 c = (int2)(acc[base + 0], acc[base + 1]);
+#endif
                 c = CASE32_CPM_MAD(aval, case32_char_lane(br[j], k), c);
                 acc[base + 0] = c.s0;
                 acc[base + 1] = c.s1;
+#if VWM == 4
                 acc[base + 2] = c.s2;
                 acc[base + 3] = c.s3;
+#endif
             }
         }
     }
@@ -516,7 +557,7 @@ static inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cp
 }
 
 /* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
-   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   A: MR*RANK contiguous bytes at rt*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
    In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
    KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
    load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
@@ -630,7 +671,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     int im;
     case33_macro_tile(mb, macro_rows, macro_cols, &im, &jm);
 
-    const int tr0 = im * MICRO_M;
+    /* tr / tr_global index hash-tile rows (one per WI); rt indexes the register-tile
+       row being computed, which differs only when HASH_REG_TILES_M > 1. */
+    const int tr0 = im * HASH_MICRO_M;
     const int tc0 = jm * MICRO_N;
     const int hash_tc0 = jm * HASH_MICRO_N;
 
@@ -662,7 +705,11 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
     __local uchar lds_b[KG_LDS_CHUNK * MACRO_KG_STRIP_B];
     const int active = (tr_in_slice < micro_m_count);
 #endif
-    for (int reg_half = 0; reg_half < HASH_REG_TILES_N; ++reg_half) {
+    for (int reg = 0; reg < HASH_REG_TILES; ++reg) {
+        const int reg_m = reg / HASH_REG_TILES_N;
+        const int reg_half = reg - reg_m * HASH_REG_TILES_N;
+        const int rt = tr * HASH_REG_TILES_M + reg_m;
+        const int rt_global = im * MICRO_M + rt;
         const int tc = hash_tc * HASH_REG_TILES_N + reg_half;
         const int tc_global = tc0 + tc;
         int acc[NR * MR];
@@ -681,7 +728,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
            consumed; the loop is unrolled x2 so buffers alternate without copies. */
         __global const char *a_run =
                 a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
-                (size_t)tr * (size_t)KG_BYTES_A;
+                (size_t)rt * (size_t)KG_BYTES_A;
         __global const char *b_run =
                 b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
                 (size_t)tc * (size_t)KG_SLICE_B;
@@ -726,7 +773,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 for (int kgi = 0; kgi < nkg; ++kgi) {
                     __local const uchar *a_kg =
                             lds_a + (size_t)kgi * (size_t)MACRO_KG_STRIP_A +
-                            (size_t)tr * (size_t)KG_BYTES_A;
+                            (size_t)rt * (size_t)KG_BYTES_A;
                     __local const uchar *b_kg =
                             lds_b + (size_t)kgi * (size_t)MACRO_KG_STRIP_B +
                             (size_t)tc * (size_t)KG_SLICE_B;
@@ -777,7 +824,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg =
                     a_pre + a_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
-                    (size_t)tr * (size_t)KG_BYTES_A;
+                    (size_t)rt * (size_t)KG_BYTES_A;
             __global const char *b_kg =
                     b_pre + b_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_B +
                     (size_t)tc * (size_t)KG_SLICE_B;
@@ -794,7 +841,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         }
 #endif
 #else
-        __global const char *a_tile = a_pre + (size_t)tr_global * (size_t)blocks_k *
+        __global const char *a_tile = a_pre + (size_t)rt_global * (size_t)blocks_k *
                                               (size_t)PANEL_A +
                                       (size_t)kb * (size_t)PANEL_A;
         __global const char *b_tile = b_pre + (size_t)tc_global * (size_t)blocks_k *
@@ -854,8 +901,8 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                         out_idx = (ulong)ms * (ulong)tile_count +
                                   (ulong)hash_spatial_id;
                     }
-#if HASH_REG_TILES_N > 1
-                    if (reg_half == 0) {
+#if HASH_REG_TILES > 1
+                    if (reg == 0) {
                         tile_xor[out_idx] = x;
                     } else {
                         tile_xor[out_idx] ^= x;
@@ -923,7 +970,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         return;
     }
 
-    const int t_rows = im * MACRO_M + tr * MR;
+    const int t_rows = im * MACRO_M + tr * HASH_MR;
     const int t_cols = jm * MACRO_N + hash_tc * HASH_NR;
     if (out_t_rows != 0) {
         *out_t_rows = t_rows;
@@ -969,6 +1016,6 @@ __kernel void case33_jackpot_scan(__global const uint *msg_words, int mb_begin, 
     int im;
     int jm;
     case33_macro_tile(mb_begin + g, macro_rows, macro_cols, &im, &jm);
-    *out_t_rows = im * MACRO_M + tr * MR;
+    *out_t_rows = im * MACRO_M + tr * HASH_MR;
     *out_t_cols = jm * MACRO_N + hash_tc * HASH_NR;
 }

@@ -382,6 +382,7 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                                         bool use_fast_u8s8) {
     const int macro_blocks = macro_cols * macro_rows;
     const int register_tiles_per_hash = hash_tile_nr() / kNR;
+    const int register_tiles_per_hash_m = hash_tile_mr() / kMR;
 
     for (int mb = 0; mb < macro_blocks; ++mb) {
         const int jm = mb / macro_rows;
@@ -402,8 +403,11 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
             const int tr_global = tr0 + tr;
             const int tc_global = tc0 + tc;
             const int hash_tc_global = tc_global / register_tiles_per_hash;
+            const int hash_tr_global = tr_global / register_tiles_per_hash_m;
+            const bool first_in_hash = (tc % register_tiles_per_hash) == 0 &&
+                                       (tr % register_tiles_per_hash_m) == 0;
             const size_t spatial_id =
-                    static_cast<size_t>(tr_global) * static_cast<size_t>(tile_cols) +
+                    static_cast<size_t>(hash_tr_global) * static_cast<size_t>(tile_cols) +
                     static_cast<size_t>(hash_tc_global);
 
             std::vector<int32_t> tile_c(static_cast<size_t>(kNR * kMR), 0);
@@ -466,7 +470,7 @@ void reference_macro_tile_xor_coalesced(const int8_t *a_pre, const int8_t *b_pre
                 uint32_t &hash_xor =
                         tile_xor[static_cast<size_t>(ms) * tile_count + spatial_id];
                 const uint32_t register_xor = xor_tile_host(tile_c.data(), kNR * kMR);
-                if ((tc % register_tiles_per_hash) == 0) {
+                if (first_in_hash) {
                     hash_xor = register_xor;
                 } else {
                     hash_xor ^= register_xor;

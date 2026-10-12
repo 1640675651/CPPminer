@@ -29,6 +29,12 @@ int kMacroKbBlockB = kKGroups * kMacroKgStripB;
 
 namespace {
 
+/* Narrow register tiles still hash 4x8 tiles: 4x4 walks two register tiles along N,
+   2x4 walks 2x2 register tiles. */
+int hash_mr_for(int mr) { return mr == 2 ? 4 : mr; }
+
+int hash_nr_for(int nr) { return nr == 4 ? 8 : nr; }
+
 void update_derived() {
     kKR = R_RANK;
     kMicroPerMacroM = kMacroM / kMR;
@@ -49,6 +55,9 @@ void update_derived() {
 }
 
 bool is_supported_tile(int mr, int nr) {
+    if (mr == 2 && nr == 4) {
+        return true;
+    }
     if (mr == 4 && nr == 4) {
         return true;
     }
@@ -81,7 +90,8 @@ void default_macro(int *macro_m, int *macro_n) {
 
 bool configure(int mr, int nr, int macro_m, int macro_n) {
     if (!is_supported_tile(mr, nr)) {
-        std::fprintf(stderr, "[ocl] register tile must be 4x4, 4x8, 8x8, or 8x16 (got %dx%d)\n",
+        std::fprintf(stderr,
+                     "[ocl] register tile must be 2x4, 4x4, 4x8, 8x8, or 8x16 (got %dx%d)\n",
                      mr, nr);
         return false;
     }
@@ -104,8 +114,9 @@ bool configure(int mr, int nr, int macro_m, int macro_n) {
         std::fprintf(stderr, "[ocl] KR/rank layout mismatch\n");
         return false;
     }
-    const int hash_nr = (mr == 4 && nr == 4) ? 8 : nr;
-    const int work_items = (macro_m / mr) * (macro_n / hash_nr);
+    const int hash_mr = hash_mr_for(mr);
+    const int hash_nr = hash_nr_for(nr);
+    const int work_items = (macro_m / hash_mr) * (macro_n / hash_nr);
     if (work_items > kMacroWorkItemsMax) {
         std::fprintf(stderr,
                      "[ocl] tile %dx%d / macro %dx%d needs %d work-items per macro (max %d)\n",
@@ -120,9 +131,9 @@ bool configure(int mr, int nr, int macro_m, int macro_n) {
     return true;
 }
 
-int hash_tile_mr() { return kMR; }
+int hash_tile_mr() { return hash_mr_for(kMR); }
 
-int hash_tile_nr() { return (kMR == 4 && kNR == 4) ? 8 : kNR; }
+int hash_tile_nr() { return hash_nr_for(kNR); }
 
 bool wi_row_major() { return false; }
 

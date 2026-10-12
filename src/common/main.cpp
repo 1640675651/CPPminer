@@ -99,7 +99,7 @@ static void print_usage(void)
 #endif
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-    printf("  --ocl-tile MxN[/MmMm]  OpenCL register tile: 4x4, 4x8 (default), 8x8, 8x16 (auto on AMD);\n");
+    printf("  --ocl-tile MxN[/MmMm]  OpenCL register tile: 2x4, 4x4, 4x8 (default), 8x8, 8x16 (auto on AMD);\n");
     printf("                         optional /64x64 or /128x128 macro (same as --ocl-macro)\n");
     printf("  --ocl-macro MxN    OpenCL macro block: 64x64 or 128x128 (default 128x128)\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
@@ -588,15 +588,16 @@ int main(int argc, char** argv)
                 ocl_macro_n = tile_macro_n;
             } else {
                 fprintf(stderr,
-                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
+                        "invalid --ocl-tile %s (expected 2x4, 4x4, 4x8, 8x8, 8x16, "
                         "or MxN/64x64|128x128)\n",
                         v);
                 return 1;
             }
-            if(!((ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
+            if(!((ocl_tile_mr == 2 && ocl_tile_nr == 4) ||
+                 (ocl_tile_mr == 4 && (ocl_tile_nr == 4 || ocl_tile_nr == 8)) ||
                  (ocl_tile_mr == 8 && (ocl_tile_nr == 8 || ocl_tile_nr == 16)))){
                 fprintf(stderr,
-                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
+                        "invalid --ocl-tile %s (expected 2x4, 4x4, 4x8, 8x8, or 8x16)\n", v);
                 return 1;
             }
             if(nfields == 4 &&
