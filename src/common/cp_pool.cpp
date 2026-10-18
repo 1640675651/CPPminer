@@ -11,6 +11,12 @@
 #include "cp_cpu_affinity.h"
 #endif
 
+#ifdef _WIN32
+#include <mstcpip.h> /* SIO_KEEPALIVE_VALS, struct tcp_keepalive */
+#else
+#include <netinet/tcp.h> /* TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT, TCP_NODELAY */
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -23,6 +29,47 @@
 static int tcp_sock = -1;
 static std::atomic<double> g_diff{32.0};
 static std::atomic<int> g_submit_inflight{0};
+/* cp_now_sec() when the in-flight submit was sent; the reader gives up on the
+ * connection when no reply arrives within CP_SUBMIT_ACK_TIMEOUT_SEC. */
+static std::atomic<double> g_submit_sent_at{0.0};
+#define CP_SUBMIT_ACK_TIMEOUT_SEC 60.0
+
+/* Pools and middleboxes drop idle stratum connections without a RST. Without
+ * probes the miner keeps scanning a stale job and queues every submit into a
+ * dead socket (seen on Kryptex: 127 KB unacknowledged, 9 retransmits, no
+ * notify for 10 minutes, nothing in the log). Probe after 30 s idle, every
+ * 10 s, give up after 3, so a dead peer is noticed within about a minute and
+ * NAT/load-balancer entries stay fresh. TCP_NODELAY: every message is one
+ * small JSON line that should go out at once. */
+static void tcp_tune(cp_sock_t s)
+{
+    int one = 1;
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&one, sizeof(one));
+    struct tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = 30000;
+    ka.keepaliveinterval = 10000;
+    DWORD ret = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &ret, NULL, NULL);
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+#else
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    int idle = 30, intvl = 10, cnt = 3;
+#if defined(TCP_KEEPIDLE)
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#elif defined(TCP_KEEPALIVE) /* macOS */
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#endif
+#if defined(TCP_KEEPINTVL)
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#if defined(TCP_KEEPCNT)
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+}
 static std::atomic<int> g_net_reader_run{0};
 static std::atomic<int> g_net_conn_lost{0};
 static std::mutex g_net_mx;
@@ -57,6 +104,7 @@ static int tcp_connect(const char* host, int port)
         CP_SOCK_CLOSE(s);
         return (int)CP_INVALID_SOCK;
     }
+    tcp_tune(s);
     return (int)s;
 }
 
@@ -229,7 +277,22 @@ static void pool_net_reader_thread(void)
             printf("[net] invalid or oversized pool message\n"); fflush(stdout);
             return;
         }
-        if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load()) continue;
+        if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load()){
+            /* A submit that gets no reply is the first visible symptom of a
+             * dead connection (keepalive catches the rest); reconnect rather
+             * than mine on. */
+            if(g_submit_inflight.load() &&
+               cp_now_sec() - g_submit_sent_at.load() > CP_SUBMIT_ACK_TIMEOUT_SEC){
+                g_submit_inflight.store(0);
+                g_net_conn_lost.store(1);
+                g_inbox_cv.notify_all();
+                printf("[net] no pool reply to submit for %.0f s; treating the connection as lost\n",
+                       CP_SUBMIT_ACK_TIMEOUT_SEC);
+                fflush(stdout);
+                return;
+            }
+            continue;
+        }
         std::lock_guard<std::mutex> lk(g_net_mx);
         int n = recv(tcp_sock, net_buf + net_pos,
                      (int)sizeof(net_buf) - net_pos - 1, 0);
@@ -393,6 +456,7 @@ int cp_pool_conn_lost(void)
 
 void cp_pool_set_submit_inflight(int on)
 {
+    if(on) g_submit_sent_at.store(cp_now_sec());
     g_submit_inflight.store(on);
 }
 
