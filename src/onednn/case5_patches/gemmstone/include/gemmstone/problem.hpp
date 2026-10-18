@@ -212,6 +212,7 @@ struct GEMMProblem : public CommonProblem {
     int case5XorMaxMilestones = 1;                  // K / milestone_k (K-loop milestone count)
     int case5XorOutputMilestones = 0;               // Case5.4: global tile_xor rows (0 → max/2 when wrap)
     int case5XorPeriod = 1;                         // Store every N unrollK panels (KR=128 -> 4 when k32)
+    int case5XorEveryK = 0;                         // Store every N k inside a panel (0 → unrollK; for unrollK > KR)
     int case5XorSubM = 0;                           // Logical sub-tile height (<= unrollM)
     int case5XorSubN = 0;                           // Logical sub-tile width (<= unrollN)
     int case5XorSubGridM = 1;                       // Sub-tiles per thread along M

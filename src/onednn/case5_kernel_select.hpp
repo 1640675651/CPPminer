@@ -23,6 +23,8 @@ struct CatalogCandidate {
     std::string strategy;
     bool seed_gen12_unroll = false;
     bool from_catalog = false;
+    int unroll_m = 0; // non-catalog candidates: explicit unroll (0 = parser default)
+    int unroll_n = 0;
 };
 
 struct Case5CandidateList {
