@@ -151,6 +151,39 @@ inline void case5_resolve_gemm_layouts(int cli_a_layout, int cli_b_layout, bool 
     }
 }
 
+// XMX interleaved fold (default on where applicable). CASE5_XOR_INTERLEAVE=0 restores the end-of-step fold.
+inline bool case5_tile_xor_interleave_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CASE5_XOR_INTERLEAVE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+// CASE5_XOR_NOSTORE=1: no milestone code at all (GEMM-only timing reference; no valid output).
+inline bool case5_tile_xor_nostore_env() {
+    const char *v = std::getenv("CASE5_XOR_NOSTORE");
+    return v && v[0] && v[0] != '0';
+}
+
+// tile_xor is tile-major: the num_ms milestone words of spatial tile sid are contiguous at
+// sid * num_ms (layout 2, what the kernels write). Layout 0 is the original [ms][tile] order
+// (sid + ms * tile_count); layout 1 the thread-major diagnostic order of the gemm_xor harness.
+constexpr int kCase5TileXorLayout = 2;
+inline size_t case5_tile_xor_index(int layout, int ms, int num_ms, int sid, int tile_count,
+                                   int sub_grid_n = 1) {
+    switch (layout) {
+    case 1: {
+        const int g = sub_grid_n > 0 ? sub_grid_n : 1;
+        return static_cast<size_t>(sid / g) * static_cast<size_t>(num_ms) * g
+                + static_cast<size_t>(ms) * g + static_cast<size_t>(sid % g);
+    }
+    case 2:
+        return static_cast<size_t>(sid) * static_cast<size_t>(num_ms) + static_cast<size_t>(ms);
+    default:
+        return static_cast<size_t>(ms) * static_cast<size_t>(tile_count) + static_cast<size_t>(sid);
+    }
+}
 // One XOR word per thread over the full unrollM x unrollN panel (no sub-tiling).
 inline void case5_native_xor_subtile_dims(int unrollM, int unrollN, XorSubtileDims &d) {
     d.ownedM = unrollM;
@@ -294,7 +327,7 @@ inline void fprint_jackpot_words_hex(FILE *out, const char *label, const uint32_
     std::fprintf(out, "\n");
 }
 
-// Set CASE5_DUMP_TILE_XOR=1 to print tile_xor[ms * tile_count + lr * tile_cols + lc] after readback.
+// Set CASE5_DUMP_TILE_XOR=1 to print tile_xor (indexed per the layout argument) after readback.
 // Optional CASE5_DUMP_TILE_XOR_VERBOSE=1 lists every non-zero slot with (ms, lr, lc, idx).
 inline bool case5_dump_tile_xor_enabled() {
     static const bool on = [] {
@@ -314,7 +347,7 @@ inline bool case5_dump_tile_xor_verbose() {
 
 inline void dump_case5_tile_xor(const std::vector<uint32_t> &got, int num_ms, int tile_rows,
                                 int tile_cols, int tile_count, uint32_t expect_match = 0,
-                                bool mark_expected = false) {
+                                bool mark_expected = false, int layout = 0) {
     if (!case5_dump_tile_xor_enabled()) {
         return;
     }
@@ -335,9 +368,8 @@ inline void dump_case5_tile_xor(const std::vector<uint32_t> &got, int num_ms, in
         for (int lr = 0; lr < tile_rows; ++lr) {
             std::fputc(' ', stderr);
             for (int lc = 0; lc < tile_cols; ++lc) {
-                const size_t idx = static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
-                                   static_cast<size_t>(lr) * static_cast<size_t>(tile_cols) +
-                                   static_cast<size_t>(lc);
+                const size_t idx = case5_tile_xor_index(layout == 1 ? 0 : layout, ms, num_ms,
+                                                        lr * tile_cols + lc, tile_count, 1);
                 const uint32_t v = idx < got.size() ? got[idx] : 0u;
                 char mark = '.';
                 if (mark_expected) {
@@ -364,8 +396,11 @@ inline void dump_case5_tile_xor(const std::vector<uint32_t> &got, int num_ms, in
             if (v == 0u) {
                 continue;
             }
-            const size_t ms = idx / static_cast<size_t>(tile_count);
-            const size_t rem = idx % static_cast<size_t>(tile_count);
+            const bool tile_major = (layout == 2) && num_ms > 0;
+            const size_t ms = tile_major ? idx % static_cast<size_t>(num_ms)
+                                         : idx / static_cast<size_t>(tile_count);
+            const size_t rem = tile_major ? idx / static_cast<size_t>(num_ms)
+                                          : idx % static_cast<size_t>(tile_count);
             const size_t lr = rem / static_cast<size_t>(tile_cols);
             const size_t lc = rem % static_cast<size_t>(tile_cols);
             std::fprintf(stderr, "  idx=%zu ms=%zu lr=%zu lc=%zu val=0x%08x\n", idx, ms, lr, lc,
@@ -443,9 +478,7 @@ inline Case5TileXorZeroAudit audit_case5_tile_xor_zeros(const uint32_t *data, si
     for (int sid = 0; sid < tile_count; ++sid) {
         bool any_nonzero = false;
         for (int ms = 0; ms < num_ms; ++ms) {
-            const size_t idx =
-                    static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
-                    static_cast<size_t>(sid);
+            const size_t idx = case5_tile_xor_index(kCase5TileXorLayout, ms, num_ms, sid, tile_count);
             if (idx < out.total_words && data[idx] != 0u) {
                 any_nonzero = true;
                 break;
@@ -459,9 +492,7 @@ inline Case5TileXorZeroAudit audit_case5_tile_xor_zeros(const uint32_t *data, si
     for (int ms = 0; ms < num_ms; ++ms) {
         int zero_sids = 0;
         for (int sid = 0; sid < tile_count; ++sid) {
-            const size_t idx =
-                    static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
-                    static_cast<size_t>(sid);
+            const size_t idx = case5_tile_xor_index(kCase5TileXorLayout, ms, num_ms, sid, tile_count);
             if (idx >= out.total_words || data[idx] == 0u) {
                 ++zero_sids;
             }
@@ -524,7 +555,7 @@ inline bool verify_case5_tile_xor(const std::vector<uint32_t> &got, const int8_t
                                   int milestone_k, int unroll_m, int unroll_n, int /*wg_m*/,
                                   int /*wg_n*/, bool /*coop_split_a*/, bool /*coop_split_b*/,
                                   int sub_m, int sub_n, int sub_grid_m, int sub_grid_n,
-                                  int tile_rows, int tile_cols, int tile_count) {
+                                  int tile_rows, int tile_cols, int tile_count, int layout = 0) {
     std::vector<int32_t> c(static_cast<size_t>(M) * static_cast<size_t>(N), 0);
 
     const int active_tr = (M + unroll_m - 1) / unroll_m;
@@ -579,10 +610,8 @@ inline bool verify_case5_tile_xor(const std::vector<uint32_t> &got, const int8_t
                         if (lr < 0 || lr >= tile_rows || lc < 0 || lc >= tile_cols) {
                             continue;
                         }
-                        const size_t idx =
-                                static_cast<size_t>(ms) * static_cast<size_t>(tile_count) +
-                                static_cast<size_t>(lr) * static_cast<size_t>(tile_cols) +
-                                static_cast<size_t>(lc);
+                        const size_t idx = case5_tile_xor_index(layout, ms, num_ms,
+                                lr * tile_cols + lc, tile_count, sub_grid_n);
                         if (idx >= got.size() || got[idx] != x) {
                             std::fprintf(stderr,
                                          "tile_xor mismatch ms=%d idM=%d idN=%d sr=%d sc=%d "

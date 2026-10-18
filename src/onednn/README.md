@@ -46,7 +46,7 @@ cppminer.exe --backend onednn --wallet prl1... --worker rig01 --mock
 cppminer.exe --backend onednn --onednn-layout NT --mock --mock-diff 50
 ```
 
-Default panel batching: `--row-period-batch 256 --batch-size 256` (256×256 hash tiles per GEMM panel). Override with CLI flags.
+Default panel batching: `--row-period-batch 256 --batch-size 256` (256×256 hash tiles per GEMM panel); systolic (XMX, Arc) kernels default to 1024×1024. Override with CLI flags.
 
 **Layout names** (C always column-major N): two letters for A then B — `TN` (default), `TT`, `NT`, `NN`. Override with `--onednn-layout` or env `CASE5_GEMM_LAYOUT=TN|TT|NT|NN` (legacy three-letter forms like `TNN` still work). Also `CASE5_A_LAYOUT` / `CASE5_B_LAYOUT`: `row`/`col`.
 
@@ -54,11 +54,20 @@ Default panel batching: `--row-period-batch 256 --batch-size 256` (256×256 hash
 
 | Item | Choice |
 |------|--------|
-| Kernel | oneDNN `kernel.db` `select()` + pearl 8×16 tile filter + fallbacks |
-| XOR | Milestone K=128 → `xor_period = 128/unrollK`; gemmstone `case5_tile_xor` hook |
+| Kernel | XeHPG with XMX: built-in measured-best strategy first (`sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf ...`, 16×64 per thread; `CASE5_PREFER=0` skips it), then oneDNN `kernel.db` `select()` (A380-tuned 16×32 entry moved to the front) + fallbacks. Operand alignment comes from the leading dimensions before catalog matching. |
+| XOR | Milestone K=128: `xor_period = 128/unrollK`, or every 128 k inside the panel when unrollK > 128; gemmstone `case5_tile_xor` hook |
+| XMX fold | For one milestone per k-unroll and a 1×4/1×8 sub-tile grid (the preferred strategy): the fold is split at dpas chain boundaries (upper rows after pass 0 of the milestone's last step, lower rows after pass 0 of the next step), SIMD16 column pairs with 3-input `bfn` xor into 16-lane accumulators, one packed reduction, and per-pass dpas chains only in the first/last step of a milestone (`xaf` elsewhere). `CASE5_XOR_INTERLEAVE=0` restores the end-of-step fold. |
+| tile_xor | **Tile-major**: the milestone words of spatial tile `sid` are contiguous at `sid * num_ms` (folded 16-word messages likewise at `sid * 16`). On XMX each thread buffers 16 milestones per sub-tile and writes one 64-byte line per sub-tile every 16 milestones; elsewhere one dword per milestone. |
 | Layout | Host A/B (Pearl) → device gemmstone layouts via GPU/CPU prep. Default **TN** (A row, B col). Also `TT`, `NT`, `NN` via `--onednn-layout` or `CASE5_GEMM_LAYOUT`. |
-| Jackpot | GPU `cp_onednn_jackpot_scan` after GEMM (`tile_xor` buffer) or fused in-kernel (`--fused-jackpot`) |
+| Jackpot | GPU `cp_onednn_jackpot_scan` after GEMM (`tile_xor` buffer, tile-major) or fused in-kernel (`--fused-jackpot`) |
 | HW | Gen12LP or XeHPG only (`case5_ngen::is_supported_device`) |
+
+Arc A770, mock scan at 131072², per attempt (GEMM + tile-major store + device jackpot): **95 TMAC/s**
+with the built-in strategy, 75 TMAC/s with `CASE5_PREFER=0` (the A380-tuned catalog-333 kernel);
+`--fused-jackpot` 66 TMAC/s. UHD 770 (catalog-30): 1.35 TMAC/s. Mock shares verify on both GPUs in both
+jackpot modes. Known issue: `--onednn-layout NT` on XeHPG selects an 8×4 catalog kernel (8×4 hash
+tiles) and its mock proof fails verification; the kernel's tile XOR itself verifies in the gemm_xor
+harness, so the mismatch is in how an 8×4 hash tile is proven (also seen on the A380 in PR #36).
 
 ## Debug environment variables
 

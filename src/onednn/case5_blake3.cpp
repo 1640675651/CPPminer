@@ -24,7 +24,8 @@ bool verify_case5_tile_blake3(const std::vector<uint32_t> &tile_xor,
     uint32_t expect[kBlake3DigestWords];
     for (int sid = 0; sid < tile_count; ++sid) {
         for (int w = 0; w < kBlake3JackpotWords; ++w) {
-            msg[w] = tile_xor[static_cast<size_t>(w) * static_cast<size_t>(tile_count) + sid];
+            // tile_xor is tile-major: the 16 folded words of a tile are contiguous.
+            msg[w] = tile_xor[static_cast<size_t>(sid) * kBlake3JackpotWords + static_cast<size_t>(w)];
         }
         blake3_compress64(key8, msg, expect);
         for (int w = 0; w < kBlake3DigestWords; ++w) {

@@ -31,6 +31,8 @@ struct DriverInfo {
     int xorOwnedM = 32;
     int xorOwnedN = 16;
     int unrollK = 32;
+    int milestoneK = 128;
+    int xorLayout = 0; // tile_xor index layout actually compiled (see case5_tile_xor_index)
     int wgM = 4;
     int wgN = 4;
     int wgK = 1;

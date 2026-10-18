@@ -25,6 +25,7 @@ struct CatalogCandidate {
     bool from_catalog = false;
     int unroll_m = 0; // non-catalog candidates: explicit unroll (0 = parser default)
     int unroll_n = 0;
+    bool preferred = false; // built-in measured-best strategy; keeps the problem's real alignment
 };
 
 struct Case5CandidateList {

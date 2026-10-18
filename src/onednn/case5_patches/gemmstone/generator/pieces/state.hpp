@@ -333,6 +333,7 @@ struct GEMMState : public CommonState {
     ngen::Subregister tileXorPanel;                          // ud panel counter (1 after first panel)
     ngen::Subregister spatialId;                            // ud
     ngen::Subregister tileXorLocalId;                       // ud (idM%wgM) + (idN%wgN)*wgM at prologue
+    ngen::Subregister tileXorSlmOff;                        // ud running SLM byte offset (CASE5_XOR_ADDR=inc)
     ngen::Subregister tileXorRow;                           // ud thread tile row (split path)
     ngen::Subregister tileXorCol;                           // ud thread tile col (split path)
     ngen::GRF tileXorFold;                                  // optional scratch if preallocated
@@ -341,6 +342,17 @@ struct GEMMState : public CommonState {
     RegisterLayout tileXorSlmLayout;                        // 1x1 u32 scattered SLM (storeMatrix path)
     std::vector<ngen::GRFRange> tileXorSlmAddrs;
     ngen::FlagRegister flagCase5Xor;                        // KR-period gate (not flagAP)
+    ngen::GRFRange tileXorStoreHdr;                         // fast store: running A64 pointer in uq(0)
+    ngen::GRF tileXorStoreData;                             // fast store: gathered fold dwords
+    ngen::GRF tileXorStoreBase;                             // fast store: running pointer copied into the header per send
+    ngen::Subregister tileXorCountBytes;                    // fast store: tile_count * 4
+    ngen::Subregister tileXorPhase;                         // interleaved: 1 = fold at step end (phase B)
+    int tileXorPhaseMode = 0;                               // 0 all phase A, 1 all phase B, 2 per-thread
+    ngen::GRFRange tileXorPairTmp;                          // interleaved: 2 GRF SIMD16 fold scratch
+    std::vector<ngen::GRFRange> tileXorFoldWide;            // interleaved: 2 GRF (16 lane) accumulator per sub-tile
+    ngen::GRFRange tileXorLineBuf;                          // tile-major store: subGridN lines of tileXorLineBlock dwords (+1 pad GRF)
+    std::vector<ngen::GRFRange> tileXorLineHdr;             // tile-major store: one A64 header per sub-tile line
+    int tileXorLineBlock = 0;                               // tile-major store: milestones per flushed line (8 or 16)
     ngen::Subregister remainders[3];                        // d (todo: w)
     ngen::Subregister remaindersFused[2];                   // w
     ngen::Subregister remaindersWG[2];                      // d (todo: w)

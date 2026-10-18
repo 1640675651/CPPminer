@@ -315,8 +315,23 @@ WalkOrderArgs compute_walk_order_args(const GEMMStrategy &strategy, const Common
 
     if (info.isPersistent()) {
         group_count = std::min(group_count, concurrent_tg);
+        // CASE5_PERSISTENT_GROUPS=<n>: override the number of persistent work groups.
+        if (const char *pg = std::getenv("CASE5_PERSISTENT_GROUPS")) {
+            const int n = std::atoi(pg);
+            if (n > 0) group_count = static_cast<uint32_t>(n);
+        }
         out.has_group_stride = true;
         out.group_stride = group_count;
+    }
+
+    // CASE5_BSLICE / CASE5_BTHRESH: override the boustrophedon slice parameters (tuning).
+    if (out.has_bslice) {
+        if (const char *bs = std::getenv("CASE5_BSLICE")) {
+            if (bs[0]) out.bslice = std::atoi(bs);
+        }
+        if (const char *bt = std::getenv("CASE5_BTHRESH")) {
+            if (bt[0]) out.bthresh = std::atoi(bt);
+        }
     }
 
     return out;

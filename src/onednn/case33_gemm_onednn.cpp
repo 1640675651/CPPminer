@@ -18,6 +18,7 @@
 #include "gemmstone/problem.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -1008,21 +1009,20 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
                     static_cast<size_t>(tr) * static_cast<size_t>(panel_tile_cols) +
                     static_cast<size_t>(tc);
 
+            // tile_xor is tile-major: a tile's words are contiguous (sid * words + w).
             uint32_t msg[cp_jackpot::kJackpotWords];
             if (fused_jackpot_) {
                 for (int w = 0; w < folded_msg_words_; ++w) {
-                    msg[w] =
-                            tile_xor_host_[static_cast<size_t>(w) *
-                                                   static_cast<size_t>(panel_tile_count) +
-                                           spatial_id];
+                    msg[w] = tile_xor_host_[case5_ngen::case5_tile_xor_index(
+                            case5_ngen::kCase5TileXorLayout, w, folded_msg_words_,
+                            static_cast<int>(spatial_id), panel_tile_count)];
                 }
             } else {
                 uint32_t milestone_xor[K_DIM / R_RANK];
                 for (int ms = 0; ms < num_milestones_; ++ms) {
-                    milestone_xor[ms] =
-                            tile_xor_host_[static_cast<size_t>(ms) *
-                                                   static_cast<size_t>(panel_tile_count) +
-                                           spatial_id];
+                    milestone_xor[ms] = tile_xor_host_[case5_ngen::case5_tile_xor_index(
+                            case5_ngen::kCase5TileXorLayout, ms, num_milestones_,
+                            static_cast<int>(spatial_id), panel_tile_count)];
                 }
                 cp_jackpot::fold_milestones(milestone_xor, num_milestones_, msg);
             }
@@ -1063,11 +1063,23 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
     return true;
 }
 
+/* CASE5_PROFILE_SCAN=1: GPU timestamps of every GEMM / jackpot kernel of a pipelined attempt,
+ * summarized once per attempt (busy, idle, overlap). Diagnostic only. */
+static bool profile_scan_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CASE5_PROFILE_SCAN");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
 bool Case33GemmOnednn::ensure_pipeline_(int panel_tile_count) {
     if (!pipe_queue_) {
         cl_int err = CL_SUCCESS;
-        pipe_queue_ = clCreateCommandQueue(ocl_.context, ocl_.device,
-                                           CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err);
+        cl_command_queue_properties props = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+        if (profile_scan_enabled())
+            props |= CL_QUEUE_PROFILING_ENABLE;
+        pipe_queue_ = clCreateCommandQueue(ocl_.context, ocl_.device, props, &err);
         if (!pipe_queue_ || err != CL_SUCCESS) {
             pipe_queue_ = nullptr;
             return false;
@@ -1138,6 +1150,9 @@ int Case33GemmOnednn::scan_pipelined_(int *out_found, int *out_t_rows, int *out_
     uint64_t tiles_scanned = 0;
     int found = 0;
     bool ok = true;
+    const bool profile = profile_scan_enabled();
+    std::vector<cl_event> prof_gemm, prof_jp;
+    const auto host_t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < panels.size() && !found && ok; ++i) {
         if (should_cancel && should_cancel()) {
             ok = false;
@@ -1165,6 +1180,12 @@ int Case33GemmOnednn::scan_pipelined_(int *out_found, int *out_t_rows, int *out_
             ok = false;
             break;
         }
+        if (profile) {
+            clRetainEvent(gemm_ev[s]);
+            clRetainEvent(jp_ev[s]);
+            prof_gemm.push_back(gemm_ev[s]);
+            prof_jp.push_back(jp_ev[s]);
+        }
         clFlush(pipe_queue_);
         if (i >= 1) {
             const int ps = s ^ 1;
@@ -1180,6 +1201,43 @@ int Case33GemmOnednn::scan_pipelined_(int *out_found, int *out_t_rows, int *out_
         }
     }
     clFinish(pipe_queue_);
+    if (profile && !prof_gemm.empty()) {
+        const double host_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - host_t0).count();
+        struct Iv { cl_ulong s, e; int kind; };
+        std::vector<Iv> iv;
+        auto get = [&](cl_event ev, int kind) {
+            cl_ulong s = 0, e = 0;
+            clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
+            clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
+            iv.push_back({s, e, kind});
+        };
+        for (cl_event ev : prof_gemm) get(ev, 0);
+        for (cl_event ev : prof_jp) get(ev, 1);
+        double gemm_ms = 0, jp_ms = 0, gemm_max = 0, gemm_min = 1e30;
+        for (const Iv &v : iv) {
+            const double d = (v.e - v.s) * 1e-6;
+            if (v.kind == 0) { gemm_ms += d; gemm_max = std::max(gemm_max, d); gemm_min = std::min(gemm_min, d); }
+            else jp_ms += d;
+        }
+        std::vector<Iv> sorted = iv;
+        std::sort(sorted.begin(), sorted.end(), [](const Iv &a, const Iv &b) { return a.s < b.s; });
+        cl_ulong span_s = sorted.front().s, span_e = 0, cur_e = sorted.front().s;
+        double busy_ms = 0;
+        for (const Iv &v : sorted) {
+            span_e = std::max(span_e, v.e);
+            if (v.s > cur_e) { busy_ms += (v.e - v.s) * 1e-6; cur_e = v.e; }
+            else if (v.e > cur_e) { busy_ms += (v.e - cur_e) * 1e-6; cur_e = v.e; }
+        }
+        const double span_ms = (span_e - span_s) * 1e-6;
+        std::fprintf(stderr,
+                     "[onednn] profile: panels=%zu host=%.1f ms gpu span=%.1f busy=%.1f idle=%.1f | "
+                     "GEMM sum=%.1f (%.3f..%.3f ms) jackpot sum=%.1f overlap=%.1f ms\n",
+                     prof_gemm.size(), host_s * 1e3, span_ms, busy_ms, span_ms - busy_ms, gemm_ms,
+                     gemm_min, gemm_max, jp_ms, gemm_ms + jp_ms - busy_ms);
+        for (cl_event ev : prof_gemm) clReleaseEvent(ev);
+        for (cl_event ev : prof_jp) clReleaseEvent(ev);
+    }
     if (ok && !found) {
         const int last = static_cast<int>((panels.size() - 1) & 1);
         tiles_scanned += static_cast<uint64_t>(panels.back().tile_count);

@@ -1015,6 +1015,10 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
         if (!gemmFusedPostOpsFinalize(labelLateExit, problem, strategy, state)) return false;
     }
 
+    // Case5 interleaved XMX fold: finish and store the last milestone (C_regs still live).
+    if (problem.case5TileXor && problem.case5TileXorInterleaved)
+        gemmCase5TileXorFinalFlush(problem, strategy, state);
+
     // Case5 SLM-staged tile_xor: flush before any registerOutput marshaling.
     if (problem.case5TileXor && problem.case5TileXorSlm)
         gemmCase5TileXorFlushFromSlm(problem, strategy, state);

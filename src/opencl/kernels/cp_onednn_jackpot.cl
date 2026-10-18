@@ -1,6 +1,7 @@
 /* Device jackpot scan for oneDNN gemmstone milestoned tile_xor output.
- * tile_xor layout (raw milestones): dword_index = ms * tile_count + spatial_id.
- * Case 5.5 wrap-GRF flush: 16 folded msg words per tile, same ms-major layout.
+ * tile_xor is tile-major: the words of one spatial tile are contiguous,
+ * dword_index = spatial_id * words_per_tile + word (raw milestones: words_per_tile =
+ * num_milestones; Case 5.5 wrap-GRF flush: 16 folded msg words per tile).
  * Fold + BLAKE3 match cp_jackpot.hpp / plain_proof host verify. */
 
 #define PP_JACKPOT_WORDS 16
@@ -60,14 +61,15 @@ inline void b3_compress64(__global const uint *key8, const uint *msg16, uint *ou
 }
 
 /* Fold of milestone ms into word ms % 16: msg[w] = rotl(msg[w], 13) ^ xor[ms],
- * read straight from tile_xor (ms-major) with constant word indices. */
+ * read straight from this tile's contiguous milestone row with constant word indices. */
 inline void fold_milestones_glob(__global const uint *tile_xor, int num_milestones,
-                                 int tile_count, int sid, uint out_msg[PP_JACKPOT_WORDS]) {
+                                 int sid, uint out_msg[PP_JACKPOT_WORDS]) {
+    __global const uint *row = tile_xor + (size_t)sid * (size_t)num_milestones;
 #pragma unroll
     for (int w = 0; w < PP_JACKPOT_WORDS; ++w) {
         uint acc = 0u;
         for (int ms = w; ms < num_milestones; ms += PP_JACKPOT_WORDS) {
-            acc = pp_rotl32(acc, PP_LROT) ^ tile_xor[(size_t)ms * (size_t)tile_count + (size_t)sid];
+            acc = pp_rotl32(acc, PP_LROT) ^ row[ms];
         }
         out_msg[w] = acc;
     }
@@ -107,11 +109,10 @@ __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_mile
             return;
         }
         for (int w = 0; w < PP_JACKPOT_WORDS; ++w) {
-            msg[w] = tile_xor[(size_t)w * (size_t)tile_count + (size_t)sid];
+            msg[w] = tile_xor[(size_t)sid * PP_JACKPOT_WORDS + (size_t)w];
         }
     } else {
-        fold_milestones_glob(tile_xor, num_milestones, tile_count, sid, msg);
-
+        fold_milestones_glob(tile_xor, num_milestones, sid, msg);
     }
 
     uint digest[8];
@@ -138,7 +139,8 @@ __kernel void cp_onednn_jackpot_scan(__global const uint *tile_xor, int num_mile
     }
 }
 
-/* GPU BLAKE3 on folded tile_xor panel; digest layout w*tile_count+sid. CPU judges difficulty. */
+/* GPU BLAKE3 on folded tile_xor panel (tile-major, num_words per tile); digest layout
+ * w*tile_count+sid. CPU judges difficulty. */
 __kernel void cp_onednn_blake3_panel(__global const uint *tile_xor, int num_words, int tile_count,
                                        __global const uint *a_key8, __global uint *digest_out) {
     const int sid = get_global_id(0);
@@ -147,7 +149,7 @@ __kernel void cp_onednn_blake3_panel(__global const uint *tile_xor, int num_word
     }
     uint msg[PP_JACKPOT_WORDS];
     for (int w = 0; w < num_words && w < PP_JACKPOT_WORDS; ++w) {
-        msg[w] = tile_xor[(size_t)w * (size_t)tile_count + (size_t)sid];
+        msg[w] = tile_xor[(size_t)sid * (size_t)num_words + (size_t)w];
     }
     for (int w = num_words; w < PP_JACKPOT_WORDS; ++w) {
         msg[w] = 0u;

@@ -1,4 +1,5 @@
 #include "case5_kernel_select.hpp"
+#include "case5_xor_tile.hpp"
 
 #include "gemmstone/kernel_catalog.hpp"
 #include "gemmstone/kernel_evaluator.hpp"
@@ -11,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -40,6 +42,26 @@ constexpr int kMilestoneK = 128;
 
 constexpr char kFallbackGen12LP[] = "sb4 sb8 sb l4 int k32 cab1 wg 4x4 ek";
 constexpr char kFallbackXeHPG[] = "sb4 sb8 sb l4 int k32 cab1 wg 4x4 ek grf256";
+
+// Measured-best XeHPG int8 strategy (kernel.db entry "sS32x2 sB32 ... wg 16x2", unroll 16x64).
+// On an Arc A770 it reaches 197 TOPS at 16384x16384x8192 and 216 TOPS at 32768x16384x4096
+// (GEMM-only), versus 121-145 TOPS for the entries the catalog model ranks first; it also wins
+// at 4096^3 and 8192^3. Requires 64-byte aligned A rows and 4-byte aligned B (entry restriction).
+// CASE5_PREFER=0 disables it and falls back to the catalog ranking.
+// k128 makes the 128-K milestone one loop body (no per-step gate; GEMM speed unchanged). The real
+// fold interleaves at dpas chain boundaries, which exist per row pass only with plain af (xaf
+// chains the whole step and is ~2% faster for pure GEMM, so it stays for 5.1 / no-store runs).
+constexpr char kPreferredXeHPGInt8Xaf[] =
+        "sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
+constexpr char kPreferredXeHPGInt8Af[] =
+        "sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
+constexpr int kPreferredXeHPGUnrollM = 16;
+constexpr int kPreferredXeHPGUnrollN = 64;
+
+bool case5_prefer_measured_default() {
+    const char *v = std::getenv("CASE5_PREFER");
+    return !(v && v[0] == '0');
+}
 
 bool device_has_systolic(cl_device_id device, const Product &product) {
     cl_bitfield caps = 0;
@@ -280,11 +302,22 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
     const auto ranked = select(case5_catalog(), static_cast<int>(setup.match_params.size()),
             setup.match_params.data(), result.eval_params, aux);
 
+    // Tuning override: CASE5_CATALOG_INDEX=<n> forces kernel.db entry n (sweeps).
+    if (const char *idx = std::getenv("CASE5_CATALOG_INDEX")) {
+        const int i = std::atoi(idx);
+        if (idx[0] && i >= 0 && i < case5_catalog().entryCount) {
+            append_catalog_candidate(result.candidates, &case5_catalog().entries[i]);
+            return result;
+        }
+        std::fprintf(stderr, "CASE5_CATALOG_INDEX=%s out of range (0..%d)\n", idx,
+                case5_catalog().entryCount - 1);
+    }
+
     const auto fallbacks = fallback_candidates(hw);
-    result.candidates.reserve(ranked.size() + fallbacks.size() + 1);
+    result.candidates.reserve(ranked.size() + fallbacks.size() + 2);
 
     // Tuning hook: CASE5_STRATEGY="<gemmstone strategy>" with CASE5_UNROLL=MxN is
-    // tried first, as label "custom".
+    // tried first, as label "custom" (CASE5_ALIGN=AxBxC sets its assumed alignment).
     if (const char *s = std::getenv("CASE5_STRATEGY"); s && *s) {
         CatalogCandidate custom;
         custom.label = "custom";
@@ -295,6 +328,26 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         if (const char *u = std::getenv("CASE5_UNROLL"); u && *u)
             std::sscanf(u, "%dx%d", &custom.unroll_m, &custom.unroll_n);
         result.candidates.push_back(std::move(custom));
+    }
+
+    // Measured-best XeHPG strategy first (A770; CASE5_PREFER=0 skips it), then the catalog.
+    if (hw == HW::XeHPG && result.systolic_hw && case5_prefer_measured_default()
+            && problem.Ta == Type::s8 && problem.Tb == Type::s8
+            && problem.A.alignment >= 64 && problem.B.alignment >= 4) {
+        CatalogCandidate c;
+        c.label = "xehpg-preferred";
+        const bool realFold = !problem.case5TileXorNop && !case5_tile_xor_nostore_env()
+                && case5_tile_xor_interleave_enabled();
+        // Real fold: xaf with per-pass chains only in the first/last step of a milestone (default,
+        // CASE5_XOR_XAF=hybrid). CASE5_XOR_XAF=0 uses af everywhere; =1 keeps xaf everywhere and folds
+        // the lower rows right before the next step's chain.
+        const char *xafEnv = std::getenv("CASE5_XOR_XAF");
+        const bool useXaf = !realFold || !(xafEnv && xafEnv[0] == '0');
+        c.strategy = useXaf ? kPreferredXeHPGInt8Xaf : kPreferredXeHPGInt8Af;
+        c.unroll_m = kPreferredXeHPGUnrollM;
+        c.unroll_n = kPreferredXeHPGUnrollN;
+        c.preferred = true;
+        result.candidates.push_back(std::move(c));
     }
 
     // Case 5 filters apply after oneDNN's ordered catalog list (same contract as entries[0..N]).
@@ -355,6 +408,22 @@ bool prepare_case5_strategy(HW hw, const Product &product, GEMMProblem &problem,
             } else if (candidate.seed_gen12_unroll) {
                 strategy.unroll[LoopM] = 32;
                 strategy.unroll[LoopN] = 16;
+            }
+            if (!candidate.from_catalog && !candidate.seed_gen12_unroll && !candidate.preferred) {
+                // Env strategies: assume catalog-like operand alignment (our buffers use padded
+                // leading dimensions that are multiples of 64 bytes). CASE5_ALIGN=AxBxC overrides.
+                int al_a = 64, al_b = 64, al_c = 64;
+                if (const char *al = std::getenv("CASE5_ALIGN")) {
+                    int a = 0, b = 0, c = 0;
+                    if (std::sscanf(al, "%dx%dx%d", &a, &b, &c) == 3 && a > 0 && b > 0 && c > 0) {
+                        al_a = a;
+                        al_b = b;
+                        al_c = c;
+                    }
+                }
+                problem.A.setAlignment(std::max(problem.Ta_ext.paddedSize(), al_a));
+                problem.B.setAlignment(std::max(problem.Tb_ext.paddedSize(), al_b));
+                problem.C.setAlignment(std::max(problem.Tc_ext.paddedSize(), al_c));
             }
             parseStrategy(candidate.strategy.c_str(), hw, problem, strategy);
         }

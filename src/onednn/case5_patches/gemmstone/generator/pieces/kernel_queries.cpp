@@ -20,6 +20,9 @@
 #include "gemmstone/driver_info.hpp"
 #include "hw_utils.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 GEMMSTONE_NAMESPACE_START
 
 using namespace ngen;
@@ -35,12 +38,27 @@ static int case5XorOutputMilestoneCount(const GEMMProblem &problem) {
     return std::max(1, problem.case5XorMaxMilestones / 2);
 }
 
+bool case5WrapAtFlush(const GEMMProblem &problem)
+{
+    static const bool atFlush = [] {
+        const char *v = std::getenv("CASE5_XOR_WRAP_AT");
+        return !(v && v[0] && !std::strcmp(v, "loop"));
+    }();
+    return atFlush && problem.case5TileXorWrap && problem.case5TileXorSlm && !problem.case5TileXorWrapGrf;
+}
+
+int case5XorSlmSlotMs(const GEMMProblem &problem)
+{
+    return case5WrapAtFlush(problem) ? std::max(1, problem.case5XorMaxMilestones)
+                                     : case5XorOutputMilestoneCount(problem);
+}
+
 static size_t case5TileXorSlmBytesPerWG(const GEMMProblem &problem, const GEMMStrategy &strategy)
 {
     if (!problem.case5TileXor || !problem.case5TileXorSlm)
         return 0;
     const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
-    const int maxMs = case5XorOutputMilestoneCount(problem);
+    const int maxMs = case5XorSlmSlotMs(problem);
     const int slotsPerThread = maxMs * nFolds;
     const int wgThreads = strategy.wg[LoopM] * strategy.wg[LoopN];
     return static_cast<size_t>(wgThreads) * static_cast<size_t>(slotsPerThread) * sizeof(uint32_t);

@@ -217,6 +217,8 @@ struct GEMMProblem : public CommonProblem {
     int case5XorSubN = 0;                           // Logical sub-tile width (<= unrollN)
     int case5XorSubGridM = 1;                       // Sub-tiles per thread along M
     int case5XorSubGridN = 1;                       // Sub-tiles per thread along N
+    bool case5TileXorInterleaved = false;           // XMX: fold split across dpas chain boundaries (period 1)
+    int case5XorLayout = 0;                         // tile_xor index: 0 [ms][tile], 1 [thread][ms][sub] (diag), 2 [tile][ms]
 
     // The following data is derived from the postOps and does not need
     //   to be considered for equality/hashing purposes.

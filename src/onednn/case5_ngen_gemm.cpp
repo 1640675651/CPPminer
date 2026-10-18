@@ -1,4 +1,4 @@
-// Case 5: gemmstone int8 GEMM в†’ OpenCL binary "case5_igemm" (Gen12LP or XeHPG).
+// Case 5: gemmstone int8 GEMM -> OpenCL binary "case5_igemm" (Gen12LP or XeHPG).
 
 #include "case5_ngen_gemm.hpp"
 #include "case5_gemm_launch.hpp"
@@ -252,6 +252,25 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
     set_binary_packaging(hw, device);
 
     auto problem = makeProblem(product, xor_nop, fused_jackpot, dims.a_row_major, dims.b_row_major);
+    const bool a_row_major = dims.a_row_major, b_row_major = dims.b_row_major;
+    // Operand alignment from the actual leading dimensions (buffers are page aligned, offsets 0),
+    // as oneDNN does before catalog matching. Without this the catalog entries that require
+    // 64-byte aligned A (e.g. the fastest XeHPG int8 entries) never match.
+    {
+        auto ld_align = [](int64_t ld_bytes) {
+            int al = 64;
+            while (al > 1 && (ld_bytes % al) != 0) {
+                al >>= 1;
+            }
+            return al;
+        };
+        const int64_t lda = dims.lda > 0 ? dims.lda : (a_row_major ? dims.k : dims.m);
+        const int64_t ldb = dims.ldb > 0 ? dims.ldb : (b_row_major ? dims.n : dims.k);
+        const int64_t ldc = dims.ldc > 0 ? dims.ldc : dims.m;
+        problem.A.setAlignment(std::max<int>(problem.Ta_ext.paddedSize(), ld_align(lda * problem.Ta_ext)));
+        problem.B.setAlignment(std::max<int>(problem.Tb_ext.paddedSize(), ld_align(ldb * problem.Tb_ext)));
+        problem.C.setAlignment(std::max<int>(problem.Tc_ext.paddedSize(), ld_align(ldc * problem.Tc_ext)));
+    }
     const auto selection = select_case5_candidates(hw, product, device, problem, dims);
     product.stepping = selection.stepping;
 
@@ -296,6 +315,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
         }
 
         try {
+            const int milestone_k = kMilestoneK;
             const int unroll_k = strategy.unroll[LoopK];
             if (unroll_k <= 0
                     || ((kMilestoneK % unroll_k) != 0 && (unroll_k % kMilestoneK) != 0)
@@ -320,12 +340,24 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             problem.case5XorSubGridM = xsd.subGridM;
             problem.case5XorSubGridN = xsd.subGridN;
             if (dims.k > 0) {
-                problem.case5XorMaxMilestones = std::max(1, dims.k / kMilestoneK);
+                problem.case5XorMaxMilestones = std::max(1, dims.k / milestone_k);
             }
             if (problem.case5TileXorWrap) {
                 problem.case5XorOutputMilestones =
                         std::max(1, problem.case5XorMaxMilestones / 2);
             }
+            // XMX: split the milestone fold across dpas chain boundaries. Needs one milestone per
+            // k-unroll (period 1, no in-panel milestones) and a 1x4 / 1x8 sub-tile grid for the
+            // single-message store; other strategies keep the generic fold.
+            const bool fast_store_grid = xsd.split && xsd.subGridM == 1
+                    && (xsd.subGridN == 4 || xsd.subGridN == 8);
+            problem.case5TileXorInterleaved = case5_tile_xor_interleave_enabled() && hw == HW::XeHPG
+                    && fast_store_grid && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0
+                    && !xor_nop && !problem.case5TileXorWrap && !problem.case5TileXorWrapGrf
+                    && !problem.case5TileXorBlake3 && !problem.case5TileXorSlm;
+            // tile_xor is tile-major ([tile][ms], index sid * num_ms + ms) on every path; the
+            // jackpot kernel reads it that way.
+            problem.case5XorLayout = 2;
 
             InterfaceHandler iface(hw);
             init_case5_gemm_interface(iface, hw, problem, strategy,
@@ -335,6 +367,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             if (info) {
                 *info = toDriverInfo(hw, device, strategy, common_driver, xsd);
                 info->hwName = hw_name(hw);
+                info->milestoneK = milestone_k;
+                info->xorLayout = problem.case5XorLayout;
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {
@@ -348,6 +382,16 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
 
             Generator<hw> gen(product);
             gen.gemm(problem, strategy, iface);
+            // CASE5_DUMP_BINARY=<file>: save the device binary (for `ocloc disasm`).
+            if (const char *dump = std::getenv("CASE5_DUMP_BINARY")) {
+                if (dump[0]) {
+                    auto bin = gen.getBinary(ctx, device);
+                    if (FILE *f = std::fopen(dump, "wb")) {
+                        std::fwrite(bin.data(), 1, bin.size(), f);
+                        std::fclose(f);
+                    }
+                }
+            }
             cl_kernel k = gen.getKernel(ctx, device);
             if (!k) {
                 throw std::runtime_error("getKernel returned null");

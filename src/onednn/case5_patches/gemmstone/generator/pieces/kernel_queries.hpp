@@ -33,6 +33,15 @@ size_t gemmSLMSize(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &
 size_t case5TileXorSlmByteOffset(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
                                  bool computeMax = false);
 
+// Case5.4 with SLM staging: stage every K milestone in SLM and fold slot ms with ms + outputMs
+// at the epilogue flush (default), instead of a load-xor-store in the K loop
+// (CASE5_XOR_WRAP_AT=loop restores that).
+bool case5WrapAtFlush(const GEMMProblem &problem);
+
+// Milestone slots per fold staged in SLM: all K milestones when wrapping at the flush,
+// otherwise the output milestone count.
+int case5XorSlmSlotMs(const GEMMProblem &problem);
+
 // Return amount of per-k SLM needed by a GEMM kernel.
 size_t gemmPerKSLMSize(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy);
 

@@ -322,7 +322,8 @@ function Ensure-OneDnnDeps {
     }
     Push-Location $onednnDir
     try {
-        cmd /c "prepare_onednn_deps.bat"
+        # Full path: cmd does not always start in the PowerShell location (the script cd's to its own dir).
+        cmd /c "`"$prep`""
         if ($LASTEXITCODE -ne 0) { throw "prepare_onednn_deps.bat failed" }
     } finally {
         Pop-Location
