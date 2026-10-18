@@ -275,13 +275,15 @@ void Generator<hw>::case5UpdateTileXorSpatialIdFromIds(const GEMMProblem &proble
             eadd(1, state.tileXorStoreHdr[0].uq(0), state.inputs.tileXor, lc, strategy, state);
             mov(1, state.tileXorCountBytes, uint16_t(subGridN * 4));
         } else if (problem.case5XorLayout == 2) {
-            // [tile][ms]: sub-tile sc of this thread starts at (sid0 + sc) * num_ms * 4 bytes; one
-            // header per sub-tile line, advanced by B*4 bytes at each flush.
-            mulConstant(1, lc, lc, numMs);
+            // [tile][ms]: sub-tile sc of this thread starts at (sid0 + sc) * words * 4 bytes, words =
+            // num_ms (raw milestones) or 16 (folded jackpot message); one header per sub-tile line,
+            // advanced by B*4 bytes at each flush (the folded message is stored once at the end).
+            const int words = problem.case5TileXorFold16 ? 16 : numMs;
+            mulConstant(1, lc, lc, words);
             const int nLines = int(state.tileXorLineHdr.size());
             for (int fi = 0; fi < nLines; fi++) {
                 eadd(1, state.tileXorLineHdr[fi][0].uq(0), state.inputs.tileXor, lc, strategy, state);
-                if (fi + 1 < nLines) add(1, lc, lc, uint32_t(numMs * 4));
+                if (fi + 1 < nLines) add(1, lc, lc, uint32_t(words * 4));
             }
             mov(1, state.tileXorCountBytes, uint16_t(state.tileXorLineBlock * 4));
         } else {
@@ -417,16 +419,29 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         const int grfPerLine = std::max(1, B * 4 / GRF::bytes(hw));
         state.tileXorLineBlock = B;
         state.tileXorLineBuf = state.ra.try_alloc_range(grfPerLine * subGridN + 1, getHint(HintType::LongTerm, strategy));
-        state.tileXorLineHdr.resize(subGridN);
         bool ok = state.tileXorLineBuf.isValid();
-        for (int i = 0; i < subGridN; i++) {
-            state.tileXorLineHdr[i] = state.ra.try_alloc_range(1, getHint(HintType::LongTerm, strategy));
-            ok = ok && state.tileXorLineHdr[i].isValid();
+        // The folded message is stored once, at the end, with an address computed there (in the
+        // dead line buffer); only the raw-milestone store needs per-line headers for the whole loop.
+        if (!problem.case5TileXorFold16) {
+            state.tileXorLineHdr.resize(subGridN);
+            for (int i = 0; i < subGridN; i++) {
+                state.tileXorLineHdr[i] = state.ra.try_alloc_range(1, getHint(HintType::LongTerm, strategy));
+                ok = ok && state.tileXorLineHdr[i].isValid();
+            }
         }
         // The flush test needs a flag (set transiently right before its jmpi); period-1 paths
         // without the interleaved fold do not allocate one otherwise.
         if (ok && !state.flagCase5Xor.isValid())
             state.flagCase5Xor = state.raVFlag.alloc();
+        // Folded message (case5TileXorFold16): one 16-word accumulator per sub-tile, laid out like
+        // the lines.
+        if (ok && problem.case5TileXorFold16) {
+            if (B != 16)
+                throw std::runtime_error("Case5 fold16 needs 16-milestone line blocks (K/128 % 16 == 0)");
+            state.tileXorFoldAcc = state.ra.try_alloc_range(grfPerLine * subGridN, getHint(HintType::LongTerm, strategy));
+            if (!state.tileXorFoldAcc.isValid())
+                throw std::runtime_error("Case5 fold16: insufficient registers for the fold accumulators");
+        }
         if (!ok) {
             state.ra.safeRelease(state.tileXorLineBuf);
             for (auto &h : state.tileXorLineHdr) state.ra.safeRelease(h);
@@ -471,6 +486,12 @@ void Generator<hw>::gemmCase5TileXorIterationInit(const GEMMProblem &problem, co
     const int nFolds = split ? (subGridM * subGridN) : 1;
 
     mov(1, state.tileXorMs, uint16_t(0));
+    // Folded message accumulators start at zero (rotl(0) ^ block0 = block0).
+    if (state.tileXorFoldAcc.isValid()) {
+        const int dw = elementsPerGRF(hw, DataType::ud);
+        for (int g = 0; g < state.tileXorFoldAcc.getLen(); g += 2)
+            mov(2 * dw, state.tileXorFoldAcc[g].ud(), uint16_t(0));
+    }
     // Count mode (CASE5_XOR_GATE=count): panels left until the first milestone store.
     const bool countGate = (problem.case5XorPeriod > 1) && !problem.case5TileXorIncremental && case5GateCount();
     mov(1, state.tileXorPanel, uint16_t(countGate ? problem.case5XorPeriod : 0));
@@ -1589,6 +1610,18 @@ void Generator<hw>::case5TileXorSend(const GEMMProblem &problem, const GEMMStrat
         cmp(1 | ne | state.flagCase5Xor, t, uint16_t(msIncremented ? 0 : (B - 1)));
         state.ra.safeRelease(t);
         jmpi(1 | state.flagCase5Xor, lSkip);
+        if (state.tileXorFoldAcc.isValid()) {
+            // The line holds milestones 16b..16b+15 in slot order, so the protocol fold
+            // msg[w] = rotl(msg[w], 13) ^ x[16b + w] is one rotate and one xor per 16 lanes.
+            for (int fi = 0; fi < subGridN; fi++) {
+                GRF acc = state.tileXorFoldAcc[fi * grfPerLine];
+                GRF line = state.tileXorLineBuf[fi * grfPerLine];
+                rol(16, acc.ud(), acc.ud(), uint16_t(13));
+                xor_(16, acc.ud(), acc.ud(), line.ud());
+            }
+            mark(lSkip);
+            return;
+        }
         const char *cc = std::getenv("CASE5_XOR_STORE_CACHE");
         for (int fi = 0; fi < subGridN; fi++) {
             GRFRange line(state.tileXorLineBuf.getBase() + fi * grfPerLine, grfPerLine);
@@ -1886,24 +1919,43 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
     const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
     const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
     const int nx = strategy.unroll[LoopM];
-    if (nx <= osys) return;                     // single pass: everything was stored in the loop
-    // Phase A threads still owe the lower rows of the last milestone; phase B threads only the send.
-    Label lSkip, lSend;
-    const char *bsend = std::getenv("CASE5_XOR_BSEND");
-    const bool bSendHere = bsend && !std::strcmp(bsend, "here");
-    case5JumpIfPhase(state, true, bSendHere ? lSkip : lSend);
-    for (int sr = 0; sr < subGridM; sr++) {
-        const int rb = std::max(0, osys - sr * subM), re = subM;
-        if (re <= rb) continue;
-        const bool init = (sr * subM >= osys);
-        for (int sc = 0; sc < subGridN; sc++)
-            case5FoldSubtileRows(problem, strategy, state, state.tileXorFolds[sr * subGridN + sc], sr, sc, rb, re,
-                                 init);
+    if (nx > osys) {                            // single pass: everything was folded in the loop
+        // Phase A threads still owe the lower rows of the last milestone; phase B threads only the send.
+        Label lSkip, lSend;
+        const char *bsend = std::getenv("CASE5_XOR_BSEND");
+        const bool bSendHere = bsend && !std::strcmp(bsend, "here");
+        case5JumpIfPhase(state, true, bSendHere ? lSkip : lSend);
+        for (int sr = 0; sr < subGridM; sr++) {
+            const int rb = std::max(0, osys - sr * subM), re = subM;
+            if (re <= rb) continue;
+            const bool init = (sr * subM >= osys);
+            for (int sc = 0; sc < subGridN; sc++)
+                case5FoldSubtileRows(problem, strategy, state, state.tileXorFolds[sr * subGridN + sc], sr, sc, rb,
+                                     re, init);
+        }
+        case5TileXorGather(problem, strategy, state, true, true);
+        mark(lSend);
+        case5TileXorSend(problem, strategy, state, true);
+        mark(lSkip);
     }
-    case5TileXorGather(problem, strategy, state, true, true);
-    mark(lSend);
-    case5TileXorSend(problem, strategy, state, true);
-    mark(lSkip);
+    // Folded message: every block has been folded; write each sub-tile's 16 words as one line at
+    // tile_xor + (sid0 + fi) * 64 bytes. The line buffer is dead now, so its pad GRF holds the header.
+    if (state.tileXorFoldAcc.isValid()) {
+        const int grfPerLine = std::max(1, 16 * 4 / GRF::bytes(hw));
+        GRF hdr = state.tileXorLineBuf[grfPerLine * subGridN];
+        auto lr = hdr.ud(4), lc = hdr.ud(5);
+        mulConstant(1, lr, state.tileXorRow, subGridM);
+        mulConstant(1, lc, state.tileXorCol, subGridN);
+        emad(1, lc, lc, lr, state.inputs.tileCols, strategy, state);
+        shl(1, lc, lc, uint16_t(6));
+        eadd(1, hdr.uq(0), state.inputs.tileXor, lc, strategy, state);
+        for (int fi = 0; fi < subGridN; fi++) {
+            if (fi > 0)
+                eadd(1, hdr.uq(0), hdr.uq(0), uint32_t(64), strategy, state);
+            store(1, block(D32, 16), A64, GRFRange(hdr.getBase(), 1),
+                  GRFRange(state.tileXorFoldAcc.getBase() + fi * grfPerLine, grfPerLine));
+        }
+    }
 }
 
 GEMMSTONE_NAMESPACE_END

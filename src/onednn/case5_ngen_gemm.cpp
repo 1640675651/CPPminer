@@ -358,6 +358,15 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             // tile_xor is tile-major ([tile][ms], index sid * num_ms + ms) on every path; the
             // jackpot kernel reads it that way.
             problem.case5XorLayout = 2;
+            // Interleaved XMX fold: fold the milestones into the 16-word jackpot message in the
+            // kernel (rotl 13 / xor per 16-milestone block) and write it once per tile, so tile_xor
+            // and the jackpot pass move 16 words per tile instead of num_ms. CASE5_XOR_FOLD16=0
+            // keeps the raw milestones.
+            {
+                const char *f16 = std::getenv("CASE5_XOR_FOLD16");
+                problem.case5TileXorFold16 = problem.case5TileXorInterleaved
+                        && problem.case5XorMaxMilestones % 16 == 0 && !(f16 && f16[0] == '0');
+            }
 
             InterfaceHandler iface(hw);
             init_case5_gemm_interface(iface, hw, problem, strategy,
@@ -369,6 +378,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->hwName = hw_name(hw);
                 info->milestoneK = milestone_k;
                 info->xorLayout = problem.case5XorLayout;
+                info->fold16 = problem.case5TileXorFold16;
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {

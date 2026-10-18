@@ -106,8 +106,8 @@ int clamp_row_period_batch(int batch) {
     if (batch < 1) {
         batch = 1;
     }
-    if (batch > CP_ROW_PERIOD_BATCH_MAX) {
-        batch = CP_ROW_PERIOD_BATCH_MAX;
+    if (batch > CP_ONEDNN_PERIOD_BATCH_MAX) {
+        batch = CP_ONEDNN_PERIOD_BATCH_MAX;
     }
     return batch;
 }
@@ -116,8 +116,8 @@ int clamp_col_period_batch(int batch) {
     if (batch < 1) {
         batch = 1;
     }
-    if (batch > CP_PERIOD_BATCH_MAX) {
-        batch = CP_PERIOD_BATCH_MAX;
+    if (batch > CP_ONEDNN_PERIOD_BATCH_MAX) {
+        batch = CP_ONEDNN_PERIOD_BATCH_MAX;
     }
     return batch;
 }
@@ -376,7 +376,7 @@ bool Case33GemmOnednn::ensure_panel_tile_xor_buf_(int panel_tile_count) {
         clReleaseMemObject(tile_xor_buf_);
         tile_xor_buf_ = nullptr;
     }
-    const int tile_xor_words = fused_jackpot_ ? folded_msg_words_ : num_milestones_;
+    const int tile_xor_words = tile_xor_words_();
     const size_t bytes =
             static_cast<size_t>(tile_xor_words) * static_cast<size_t>(panel_tile_count) *
             sizeof(uint32_t);
@@ -539,8 +539,9 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     device_name_ = ocl_.device_name;
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
-    const char *scan_mode =
-            fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+gpuJudge" : "igemm+tileXOR+GPUjackpot";
+    const char *scan_mode = fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+gpuJudge"
+                            : info_.fold16 ? "igemm+tileXOR+fold16+GPUjackpot"
+                                           : "igemm+tileXOR+GPUjackpot";
     char layout_name[8] = {};
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
@@ -548,7 +549,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
                   "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d",
                   info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
-                  info_.subgroupSize, num_milestones_, fused_jackpot_ ? folded_msg_words_ : 0,
+                  info_.subgroupSize, num_milestones_, tile_xor_folded_() ? folded_msg_words_ : 0,
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
@@ -830,7 +831,7 @@ bool Case33GemmOnednn::debug_audit_tile_xor_panel_(int panel_tile_count, int pan
     }
 
     const size_t words =
-            static_cast<size_t>(num_milestones_) * static_cast<size_t>(panel_tile_count);
+            static_cast<size_t>(tile_xor_words_()) * static_cast<size_t>(panel_tile_count);
     tile_xor_host_.resize(words);
     if (!ocl_.read_buffer(tile_xor_buf_, tile_xor_host_.data(), words * sizeof(uint32_t))) {
         std::fprintf(stderr, "[onednn] tile_xor zero audit: GPU readback failed\n");
@@ -838,7 +839,7 @@ bool Case33GemmOnednn::debug_audit_tile_xor_panel_(int panel_tile_count, int pan
     }
 
     const case5_ngen::Case5TileXorZeroAudit audit = case5_ngen::audit_case5_tile_xor_zeros(
-            tile_xor_host_.data(), tile_xor_host_.size(), num_milestones_, panel_tile_count);
+            tile_xor_host_.data(), tile_xor_host_.size(), tile_xor_words_(), panel_tile_count);
     case5_ngen::report_case5_tile_xor_zero_audit(audit, tr_base, tc_base, panel_tile_rows,
                                                  panel_tile_cols, row_batch, col_batch);
     return true;
@@ -883,8 +884,8 @@ bool Case33GemmOnednn::enqueue_jackpot_panel_(cl_command_queue queue, cl_mem til
                                               const cl_event *wait, cl_event *done) {
     const int hash_mr = info_.xorSubM;
     const int hash_nr = info_.xorSubN;
-    const int use_folded_msg = fused_jackpot_ ? 1 : 0;
-    const int jackpot_words = use_folded_msg ? folded_msg_words_ : num_milestones_;
+    const int use_folded_msg = tile_xor_folded_() ? 1 : 0;
+    const int jackpot_words = tile_xor_words_();
     cl_int err = CL_SUCCESS;
     int arg = 0;
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &tile_xor);
@@ -1011,7 +1012,7 @@ bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const
 
             // tile_xor is tile-major: a tile's words are contiguous (sid * words + w).
             uint32_t msg[cp_jackpot::kJackpotWords];
-            if (fused_jackpot_) {
+            if (tile_xor_folded_()) {
                 for (int w = 0; w < folded_msg_words_; ++w) {
                     msg[w] = tile_xor_host_[case5_ngen::case5_tile_xor_index(
                             case5_ngen::kCase5TileXorLayout, w, folded_msg_words_,
@@ -1088,7 +1089,7 @@ bool Case33GemmOnednn::ensure_pipeline_(int panel_tile_count) {
     if (pipe_tile_xor_[0] && pipe_tile_xor_[1] && pipe_tile_xor_cap_ >= panel_tile_count) {
         return true;
     }
-    const size_t bytes = static_cast<size_t>(num_milestones_) *
+    const size_t bytes = static_cast<size_t>(tile_xor_words_()) *
                          static_cast<size_t>(panel_tile_count) * sizeof(uint32_t);
     for (cl_mem &buf : pipe_tile_xor_) {
         if (buf) {

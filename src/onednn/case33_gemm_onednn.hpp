@@ -53,6 +53,10 @@ private:
                             int &out_tile_count) const;
     bool ensure_matrix_bufs_();
     bool ensure_panel_tile_xor_buf_(int panel_tile_count);
+    // tile_xor holds the 16 folded jackpot words per tile (fused path, or the XMX kernel's
+    // in-kernel fold) rather than num_milestones_ raw milestone XORs.
+    bool tile_xor_folded_() const { return fused_jackpot_ || info_.fold16; }
+    int tile_xor_words_() const { return tile_xor_folded_() ? folded_msg_words_ : num_milestones_; }
     bool build_jackpot_kernel_();
     bool ensure_jackpot_bufs_();
     bool upload_a_(const int8_t *a_rowmajor);

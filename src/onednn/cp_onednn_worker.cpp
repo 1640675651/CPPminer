@@ -192,8 +192,8 @@ extern "C" void cp_onednn_worker_set_row_period_batch(int batch) {
     if (batch < 1) {
         batch = 1;
     }
-    if (batch > CP_ROW_PERIOD_BATCH_MAX) {
-        batch = CP_ROW_PERIOD_BATCH_MAX;
+    if (batch > CP_ONEDNN_PERIOD_BATCH_MAX) {
+        batch = CP_ONEDNN_PERIOD_BATCH_MAX;
     }
     g_row_period_batch = batch;
     g_gemm.set_row_period_batch(batch);
@@ -203,8 +203,8 @@ extern "C" void cp_onednn_worker_set_col_period_batch(int batch) {
     if (batch < 1) {
         batch = 1;
     }
-    if (batch > CP_PERIOD_BATCH_MAX) {
-        batch = CP_PERIOD_BATCH_MAX;
+    if (batch > CP_ONEDNN_PERIOD_BATCH_MAX) {
+        batch = CP_ONEDNN_PERIOD_BATCH_MAX;
     }
     g_col_period_batch = batch;
     g_gemm.set_col_period_batch(batch);

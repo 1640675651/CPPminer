@@ -33,6 +33,7 @@ struct DriverInfo {
     int unrollK = 32;
     int milestoneK = 128;
     int xorLayout = 0; // tile_xor index layout actually compiled (see case5_tile_xor_index)
+    bool fold16 = false; // tile_xor holds the 16-word folded jackpot message per tile, not raw milestones
     int wgM = 4;
     int wgN = 4;
     int wgK = 1;
