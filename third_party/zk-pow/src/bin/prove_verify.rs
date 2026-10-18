@@ -1,7 +1,7 @@
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

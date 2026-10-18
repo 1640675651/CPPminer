@@ -4,7 +4,9 @@
 #include "case32_prepack.hpp"
 #include "cp_config.h"
 
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -112,6 +114,34 @@ const char *dot_kind_short(Case32OclDotBackend b, int issue_mode, bool cpm_int) 
     return "clblast cpm";
 }
 
+/* AMD GCN up to gfx8 (no int8 dot instructions at all): ROCm/PAL report "gfx803",
+   the Windows driver and Mesa report the chip name ("Ellesmere", "polaris10", ...). */
+bool amd_gcn_pre_gfx9(const std::string &device_name) {
+    std::string n = device_name;
+    for (char &c : n) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const size_t pos = n.find("gfx");
+    if (pos != std::string::npos && pos + 3 < n.size()) {
+        /* Three digits after "gfx" starting with 6..8: gfx6xx-gfx8xx. */
+        const size_t end = n.find_first_not_of("0123456789abcdef", pos + 3);
+        const size_t ndig = (end == std::string::npos ? n.size() : end) - (pos + 3);
+        const char d = n[pos + 3];
+        return ndig == 3 && d >= '6' && d <= '8';
+    }
+    static const char *const kChips[] = {
+            "polaris", "ellesmere", "baffin", "lexa", "fiji", "tonga", "iceland",
+            "topaz", "carrizo", "stoney", "hawaii", "bonaire", "tahiti", "pitcairn",
+            "capeverde", "cape verde", "oland", "hainan", "kalindi", "mullins", "spectre",
+            "spooky", "kaveri", "kabini", "vegam"};
+    for (const char *chip : kChips) {
+        if (n.find(chip) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Build ordered candidate list. issue_mode==1 (broadcast) is handled by caller. */
 std::vector<Case32OclDotBackend> select_dot_backends(Case32OclDotPolicy policy, bool vendor_amd,
                                                      bool has_khr) {
@@ -187,12 +217,23 @@ void Case33GemmOcl::set_issue_broadcast(int on) {
     issue_mode_ = on ? 1 : 0;
 }
 
-void Case33GemmOcl::set_cpm_int(int on) {
-    use_cpm_int_ = on != 0;
+const char *Case33GemmOcl::cpm_type_name() const {
+    switch (resolved_cpm_type_) {
+    case Case32OclCpmType::Int:
+        return "int";
+    case Case32OclCpmType::Mad24:
+        return "mad24";
+    default:
+        return "float";
+    }
 }
 
 void Case33GemmOcl::set_use_lds(int on) {
     use_lds_ = on != 0;
+}
+
+void Case33GemmOcl::set_double_buffer(int on) {
+    double_buffer_ = on != 0;
 }
 
 Case33GemmOcl::~Case33GemmOcl() {
@@ -255,7 +296,11 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                              backend == Case32OclDotBackend::KhrDpiForce;
         const bool force_ext = backend == Case32OclDotBackend::KhrDpiForce;
         const bool scalar = backend == Case32OclDotBackend::Scalar;
-        const char *label = dot_backend_label(backend, issue_mode_, use_cpm_int_);
+        const bool gcn =
+                scalar && resolved_cpm_type_ == Case32OclCpmType::Mad24 && issue_mode_ != 2;
+        const bool cpm_int = resolved_cpm_type_ == Case32OclCpmType::Int;
+        const char *label = gcn ? "scalar mad24 (no int8 dot)"
+                                : dot_backend_label(backend, issue_mode_, cpm_int);
 
         std::string build_opts = "-cl-std=CL1.2";
         build_opts += " -DMR=" + std::to_string(case32::kMR);
@@ -270,10 +315,31 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         build_opts += " -DCASE32_WI_ROWMAJOR=" +
                       std::to_string(case32::wi_row_major() ? 1 : 0);
         build_opts += use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0";
+        build_opts += double_buffer_ ? " -DCASE32_PIPELINE=1" : " -DCASE32_PIPELINE=0";
+        if (reqd_wg_size_ > 0) {
+            build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+        }
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
-        if (scalar) {
+        if (gcn) {
+            build_opts += " -DCASE32_NO_DPI=1 -DCASE32_GCN_MAD24=1";
+            /* Variant knobs for tuning on hardware: k-loop unroll (1 or 4) and plain
+               a*b+c instead of mad24(). */
+            if (const char *v = std::getenv("CP_OCL_GCN_KUNROLL")) {
+                if (v[0]) {
+                    build_opts += " -DCASE32_GCN_KUNROLL=" + std::to_string(std::atoi(v));
+                }
+            }
+            if (const char *v = std::getenv("CP_OCL_GCN_PLAIN")) {
+                if (v[0] && std::atoi(v) != 0) {
+                    build_opts += " -DCASE32_GCN_PLAIN_MUL=1";
+                }
+            }
+            std::printf("[ocl] GCN kernel options:%s\n",
+                        build_opts.substr(build_opts.find(" -DCASE32_GCN_MAD24")).c_str());
+            std::fflush(stdout);
+        } else if (scalar) {
             build_opts += " -DCASE32_NO_DPI=1";
-            if (use_cpm_int_) {
+            if (cpm_int) {
                 build_opts += " -DCASE32_CPM_INT=1";
             }
             if (issue_mode_ == 2) {
@@ -311,7 +377,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             using_integer_dot_ = use_dot;
             using_asm_dot_ = use_asm;
             using_builtin_dot_ = use_builtin || use_sudot;
-            using_cpm_ = scalar && issue_mode_ != 2;
+            using_cpm_ = scalar && !gcn && issue_mode_ != 2;
+            using_gcn_ = gcn;
+            cpm_type_used_ = scalar && issue_mode_ != 2;
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: OK", status_label);
             return true;
         };
@@ -333,9 +401,13 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                         " -DHASH_NR=" + std::to_string(case32::hash_tile_nr()) +
                         " -DCASE32_COALESCE=1 -DCASE32_WI_ROWMAJOR=" +
                         std::to_string(case32::wi_row_major() ? 1 : 0) +
-                        (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0");
+                        (use_lds_ ? " -DCASE32_USE_LDS=1" : " -DCASE32_USE_LDS=0") +
+                        (double_buffer_ ? " -DCASE32_PIPELINE=1" : " -DCASE32_PIPELINE=0");
                 if (issue_mode_ == 2) {
                     build_opts2 += " -DCASE32_FORCE_PACKED=1";
+                }
+                if (reqd_wg_size_ > 0) {
+                    build_opts2 += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
                 }
                 if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
                     return adopt_kernel(label);
@@ -355,8 +427,20 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
             return false;
         }
 
-        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str())) {
+        /* Auto mode probes the AMD dot builtins first; on GPUs/drivers without them
+           (Polaris, older drivers) the failure is expected, so report one line instead
+           of the compiler log. CP_OCL_BUILD_LOG=1 shows the full log. */
+        const char *show_log = std::getenv("CP_OCL_BUILD_LOG");
+        const bool probe_quiet = (use_sudot || use_builtin || use_asm) &&
+                                 dot_policy_ == Case32OclDotPolicy::Auto &&
+                                 !(show_log && show_log[0] && std::atoi(show_log) != 0);
+        if (!ocl_.safe_build_program_from_file(kernel_cl_path, build_opts.c_str(), probe_quiet)) {
             std::snprintf(dpi_status_, sizeof(dpi_status_), "%s: BUILD FAILED", label);
+            if (probe_quiet) {
+                std::printf("[ocl] %s: not supported by this GPU/driver, trying the next "
+                            "kernel\n", label);
+                std::fflush(stdout);
+            }
             return false;
         }
         return adopt_kernel(label);
@@ -364,6 +448,35 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
 
     const bool vendor_is_amd = ocl_.vendor_name.find("AMD") != std::string::npos ||
                                ocl_.vendor_name.find("Advanced Micro") != std::string::npos;
+
+    /* --ocl-cpm-type auto: GCN gfx6-8 have no int8 dot instructions, so the build falls
+       through to the scalar backend; there use the direct mad24 nest (the float cpm panel
+       spills on gfx803). Only with --ocl-issue auto; broadcast keeps the float panel.
+       CP_OCL_GCN=1/0 overrides the GCN detection. */
+    resolved_cpm_type_ = cpm_type_;
+    if (cpm_type_ == Case32OclCpmType::Auto) {
+        bool gcn_auto = vendor_is_amd && amd_gcn_pre_gfx9(ocl_.device_name);
+        if (const char *g = std::getenv("CP_OCL_GCN")) {
+            if (g[0]) {
+                gcn_auto = std::atoi(g) != 0;
+            }
+        }
+        resolved_cpm_type_ = (gcn_auto && issue_mode_ == 0) ? Case32OclCpmType::Mad24
+                                                            : Case32OclCpmType::Float;
+    } else if (cpm_type_ == Case32OclCpmType::Mad24 && !vendor_is_amd) {
+        std::fprintf(stderr, "[ocl] note: --ocl-cpm-type mad24 is only native on AMD; "
+                             "it may be slower than float or int on this device\n");
+    }
+    cpm_type_used_ = false;
+
+    /* One macro block per work-group whenever the device allows it (run_macro_batch_
+       then launches with local = kMacroWorkItems); tell the compiler the exact size via
+       reqd_work_group_size. Larger-than-device shapes keep the sliced launch and no
+       attribute. */
+    reqd_wg_size_ = 0;
+    if (static_cast<size_t>(case32::kMacroWorkItems) <= ocl_.max_work_group_size) {
+        reqd_wg_size_ = case32::kMacroWorkItems;
+    }
 
     std::vector<Case32OclDotBackend> candidates;
     if (issue_mode_ == 1) {
@@ -490,7 +603,10 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
         return false;
     }
 
-    const char *dot_kind = dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
+    const char *dot_kind =
+            using_gcn_ ? "scalar mad24"
+                       : dot_kind_short(adopted_backend_, issue_mode_,
+                                        resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
@@ -538,7 +654,10 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
         return false;
     }
 
-    const char *dot_kind = dot_kind_short(adopted_backend_, issue_mode_, use_cpm_int_);
+    const char *dot_kind =
+            using_gcn_ ? "scalar mad24"
+                       : dot_kind_short(adopted_backend_, issue_mode_,
+                                        resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
                   "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
@@ -623,7 +742,14 @@ bool Case33GemmOcl::run_macro_batch_(int mb_begin, int batch_count) {
     }
 
     int slice_m = micro_m;
-    if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
+    if (reqd_wg_size_ > 0) {
+        /* Compiled with reqd_work_group_size(kMacroWorkItems): launch exactly that. */
+        if (reqd_wg_size_ != case32::kMacroWorkItems) {
+            std::fprintf(stderr, "[ocl] reqd work-group size %d != macro work-items %d\n",
+                         reqd_wg_size_, case32::kMacroWorkItems);
+            return false;
+        }
+    } else if (case32::kMacroWorkItems > max_wg && micro_n > 0) {
         slice_m = static_cast<int>(max_wg / static_cast<size_t>(micro_n));
         if (slice_m < 1) {
             slice_m = 1;
@@ -724,8 +850,47 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
     uint64_t tiles_scanned = 0;
     int found = 0;
 
-    for (int mb0 = 0; mb0 < macro_blocks_ && !found; mb0 += macro_batch_) {
+    /* Keep two launches in flight. Per batch: enqueue the kernel, enqueue a
+       non-blocking read of found_flag (event), then wait for the previous
+       batch's read and inspect it. The GPU therefore always has the next batch
+       queued while the host checks the last one; the old clFinish + blocking
+       read left it idle for one host round trip per launch. A batch launched
+       after a hit is harmless: the kernel early-outs on found_flag and
+       t_rows/t_cols are latched by the first atomic winner. */
+    cl_event read_ev[2] = {nullptr, nullptr};
+    int found_slot[2] = {0, 0};
+    int batch_in_slot[2] = {0, 0};
+    int slot = 0;
+    int prev_slot = -1;
+    const uint64_t tiles_per_macro = case32::hash_tiles_per_macro();
+
+    auto drain = [&]() {
+        /* found_slot lives on this stack frame: every pending read must land before
+           we return, on all paths. */
+        clFinish(ocl_.queue);
+        for (cl_event &ev : read_ev) {
+            if (ev) {
+                clReleaseEvent(ev);
+                ev = nullptr;
+            }
+        }
+    };
+    auto account = [&](int s) {
+        tiles_scanned += static_cast<uint64_t>(batch_in_slot[s]) * tiles_per_macro;
+        if (out_tiles_scanned) {
+            *out_tiles_scanned = tiles_scanned;
+        }
+        if (on_progress) {
+            on_progress(tiles_scanned);
+        }
+        if (found_slot[s]) {
+            found = 1;
+        }
+    };
+
+    for (int mb0 = 0; mb0 < macro_blocks_; mb0 += macro_batch_) {
         if (should_cancel && should_cancel()) {
+            drain();
             return false;
         }
         int batch_count = macro_batch_;
@@ -733,21 +898,48 @@ bool Case33GemmOcl::scan_for_share(const uint32_t a_key8[8], const uint32_t boun
             batch_count = macro_blocks_ - mb0;
         }
         if (!run_macro_batch_(mb0, batch_count)) {
+            drain();
             return false;
         }
-        clFinish(ocl_.queue);
+        found_slot[slot] = 0;
+        batch_in_slot[slot] = batch_count;
+        const cl_int err = clEnqueueReadBuffer(ocl_.queue, found_buf_, CL_FALSE, 0, sizeof(int),
+                                               &found_slot[slot], 0, nullptr, &read_ev[slot]);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl] clEnqueueReadBuffer(found) failed: %s\n",
+                         OpenClContext::error_string(err).c_str());
+            drain();
+            return false;
+        }
+        clFlush(ocl_.queue);
 
-        if (!ocl_.read_buffer(found_buf_, &found, sizeof(int))) {
+        if (prev_slot >= 0) {
+            if (clWaitForEvents(1, &read_ev[prev_slot]) != CL_SUCCESS) {
+                drain();
+                return false;
+            }
+            clReleaseEvent(read_ev[prev_slot]);
+            read_ev[prev_slot] = nullptr;
+            account(prev_slot);
+            if (found) {
+                break;
+            }
+        }
+        prev_slot = slot;
+        slot ^= 1;
+    }
+
+    if (!found && prev_slot >= 0 && read_ev[prev_slot]) {
+        /* Last batch still in flight. */
+        if (clWaitForEvents(1, &read_ev[prev_slot]) != CL_SUCCESS) {
+            drain();
             return false;
         }
-        tiles_scanned += static_cast<uint64_t>(batch_count) * case32::hash_tiles_per_macro();
-        if (out_tiles_scanned) {
-            *out_tiles_scanned = tiles_scanned;
-        }
-        if (on_progress) {
-            on_progress(tiles_scanned);
-        }
+        clReleaseEvent(read_ev[prev_slot]);
+        read_ev[prev_slot] = nullptr;
+        account(prev_slot);
     }
+    drain();
 
     if (found) {
         int t_rows = -1;

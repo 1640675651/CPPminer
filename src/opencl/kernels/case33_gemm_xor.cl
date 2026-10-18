@@ -16,7 +16,9 @@
 // Issue shape (matches beignet-fix / case36):
 //   !CASE32_PACKED_DOT (scalar / --ocl-issue broadcast): CLBlast GEMMK=0 cpm += aval * bscalar
 //   CASE32_PACKED_DOT (--ocl-issue packed or DPI): per-C case32_dot4
-//   --ocl-cpm-type int (CASE32_CPM_INT): int4 cpm; default float4 mad. CASE32_NO_DPI blocks
+//   --ocl-cpm-type float (default): float4 mad into a cpm panel, flushed to int32 every KR.
+//   --ocl-cpm-type int (CASE32_CPM_INT): int4 mul+add straight into acc (no panel).
+//   --ocl-cpm-type mad24 (CASE32_GCN_MAD24): scalar mad24 straight into acc. CASE32_NO_DPI blocks
 //   auto-enabling KHR DPI when the host requests the scalar cpm nest.
 
 #ifndef MR
@@ -91,6 +93,24 @@
 #endif
 #ifndef CASE32_USE_LDS
 #define CASE32_USE_LDS 0
+#endif
+/* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
+   KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
+   Off by default (--ocl-double-buff on sets -DCASE32_PIPELINE=1): the second register set
+   raises VGPR pressure and can spill or lose occupancy on some devices. */
+#ifndef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+#if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
+#undef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+/* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
+#ifndef SWZ_IM
+#define SWZ_IM 8
+#endif
+#ifndef SWZ_JM
+#define SWZ_JM 4
 #endif
 #ifndef CASE32_CPM_INT
 #define CASE32_CPM_INT 0
@@ -200,10 +220,18 @@ inline bool digest_beats_target(const uint digest[8], __global const uint *bound
 #if defined(CASE32_USE_ASM_DOT) || defined(CASE32_USE_BUILTIN_SDOT4) || \
         defined(CASE32_USE_BUILTIN_SUDOT4) || \
         defined(CASE32_USE_DOT) || defined(CASE32_INT_DOT) || \
-        defined(CASE32_FORCE_PACKED)
+        defined(CASE32_FORCE_PACKED) || defined(CASE32_GCN_MAD24)
 #define CASE32_PACKED_DOT 1
 #else
 #define CASE32_PACKED_DOT 0
+#endif
+/* Separate cpm panel (zeroed and flushed into acc every KR): float broadcast only. The int
+   broadcast nest accumulates straight into acc (int32 wraps identically), saving MR*NR
+   live registers and the per-KR zero/flush. */
+#if !CASE32_PACKED_DOT && !CASE32_CPM_INT
+#define CASE32_CPM_PANEL 1
+#else
+#define CASE32_CPM_PANEL 0
 #endif
 
 inline int case32_dot4(int acc, int a_pack, int b_pack) {
@@ -313,11 +341,132 @@ inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
         }
     }
 }
+
+#if CASE32_CPM_INT
+/* Same broadcast issue as case32_cpm_kgroup, accumulated straight into acc: lane l of
+   cpm[j * CPM_COLVEC + mi] is acc[j * MR + mi * VWM + l]. Keep the int4 CASE32_CPM_MAD form:
+   the AMD compiler turns that chain into v_dot4 on gfx1012 (5500M: 5.1 TMAC/s with
+   --ocl-dot off), while the same math as scalar acc[] += a * b stays at ~1.0 TMAC/s. */
+static inline void case32_cpm_kgroup_direct(__private int *acc, __private const int *a_pack,
+                                            __private const int *b_pack) {
+    char4 ar[MR];
+    char4 br[NR];
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        ar[i] = as_char4(a_pack[i]);
+    }
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        br[j] = as_char4(b_pack[j]);
+    }
+    #pragma unroll
+    for (int k = 0; k < RANK; ++k) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const cpm_vec aval = case32_apm(ar, mi * VWM, k);
+            #pragma unroll
+            for (int j = 0; j < NR; ++j) {
+                const int base = j * MR + mi * VWM;
+                int4 c = (int4)(acc[base + 0], acc[base + 1], acc[base + 2], acc[base + 3]);
+                c = CASE32_CPM_MAD(aval, case32_char_lane(br[j], k), c);
+                acc[base + 0] = c.s0;
+                acc[base + 1] = c.s1;
+                acc[base + 2] = c.s2;
+                acc[base + 3] = c.s3;
+            }
+        }
+    }
+}
+
+/* acc is updated on every MAC here, so every loop over acc must unroll or a rolled
+   dynamic index sends the whole array to scratch (see the GCN note below). */
+#define CASE32_ACC_UNROLL _Pragma("unroll")
+#endif
 #endif
 
-inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
-                                __private const int *a_pack, __private const int *b_pack) {
-#if CASE32_PACKED_DOT
+#if defined(CASE32_GCN_MAD24)
+/* AMD GPUs without int8 dot instructions (GCN gfx8 Polaris/Fiji/Tonga, gfx900 Vega 10,
+   gfx1010 RDNA1). The best they do is one v_mad_i32_i24 per MAC, so accumulate straight
+   into the int32 tile (no float cpm panel: cpm + acc = 2x MR*NR registers spilled to
+   scratch on gfx803 at 8x16) and unpack the int8 operands one k at a time, MR + NR
+   v_bfe_i32 per MR*NR mads (~19% at 8x16), keeping ~MR*NR + 3*(MR+NR) VGPRs live. */
+/* Byte k of a packed int8 quad, sign-extended. With a run-time k (rolled loop) clang's
+   AMDGPU backend emits v_lshrrev + v_bfe_i32 for the portable form; the builtin is a
+   single v_bfe_i32 with a register offset. */
+#if defined(__AMDGCN__) && defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_sbfe)
+#define CASE32_GCN_BYTE(x, k) __builtin_amdgcn_sbfe((x), (uint)(8 * (k)), 8u)
+#endif
+#endif
+#ifndef CASE32_GCN_BYTE
+#define CASE32_GCN_BYTE(x, k) ((int)(char)((x) >> (8 * (k))))
+#endif
+/* One MAC. mad24() is the 24-bit multiply-add, native v_mad_i32_i24 in AMD drivers.
+   The plain form relies on the compiler proving the operands fit in 24 bits: upstream
+   clang does, but the AMD Windows driver for Polaris emitted the quarter-rate 32-bit
+   multiply (313 GMAC/s on an RX 580 vs 1.49 TMAC/s for the float cpm nest).
+   -DCASE32_GCN_PLAIN_MUL selects the plain form (offline clang -nogpulib analysis,
+   where mad24 is an unresolved library call). */
+#if defined(CASE32_GCN_PLAIN_MUL)
+#define CASE32_GCN_MAC(a, b, c) ((c) + (a) * (b))
+#else
+#define CASE32_GCN_MAC(a, b, c) mad24((a), (b), (c))
+#endif
+
+/* The GCN nest updates acc[] on every MAC, so acc[] must live in registers. The AMD
+   Windows driver for Polaris leaves the 128-iteration zero/XOR loops over acc[] rolled;
+   their dynamic index sends the whole array to scratch (CL_KERNEL_PRIVATE_MEM_SIZE
+   576 B = acc 512 + msg 64) and every MAC becomes a scratch read-modify-write: 313
+   GMAC/s on an RX 580 vs 1.49 TMAC/s for the float cpm nest, which only flushes into
+   acc[] once per KR. Unroll those loops on this path. */
+#define CASE32_ACC_UNROLL _Pragma("unroll")
+
+/* static: a plain C99 inline has no external definition; when the AMD Windows driver
+   declines to inline it (mad24 library call), linking fails with "undefined hidden
+   symbol: case32_gcn_kgroup". */
+static inline void case32_gcn_kgroup(__private int *acc, __private const int *a_pack,
+                                     __private const int *b_pack) {
+/* k-loop unroll. RX 580 (AMD Windows driver, 8k, with the register double-buffered
+   k-group loop): rolled 2.17 vs unrolled 2.10 TMAC/s, both with acc[] in registers
+   (full pool size: 1.9 vs 1.38 for the float cpm nest).
+   Upstream clang without __builtin_amdgcn_sbfe prefers 4 (780M forced: 2.32 vs 1.39);
+   CP_OCL_GCN_KUNROLL overrides. */
+#ifndef CASE32_GCN_KUNROLL
+#define CASE32_GCN_KUNROLL 1
+#endif
+    #pragma unroll CASE32_GCN_KUNROLL
+    for (int k = 0; k < RANK; ++k) {
+        int av[MR];
+        int bv[NR];
+        #pragma unroll
+        for (int i = 0; i < MR; ++i) {
+            av[i] = CASE32_GCN_BYTE(a_pack[i], k);
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; ++j) {
+            bv[j] = CASE32_GCN_BYTE(b_pack[j], k);
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; ++j) {
+            #pragma unroll
+            for (int i = 0; i < MR; ++i) {
+                acc[j * MR + i] = CASE32_GCN_MAC(av[i], bv[j], acc[j * MR + i]);
+            }
+        }
+    }
+}
+#endif
+#ifndef CASE32_ACC_UNROLL
+#define CASE32_ACC_UNROLL
+#endif
+
+static inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
+                                       __private const int *a_pack,
+                                       __private const int *b_pack) {
+#if defined(CASE32_GCN_MAD24)
+    (void)cpm;
+    case32_gcn_kgroup(acc, a_pack, b_pack);
+#elif CASE32_PACKED_DOT
     (void)cpm;
     #pragma unroll
     for (int j = 0; j < NR; ++j) {
@@ -328,9 +477,62 @@ inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
             acc[base + i] = case32_dot4(acc[base + i], a_pack[i], b0);
         }
     }
+#elif CASE32_CPM_INT
+    (void)cpm;
+    case32_cpm_kgroup_direct(acc, a_pack, b_pack);
 #else
     (void)acc;
     case32_cpm_kgroup(cpm, a_pack, b_pack);
+#endif
+}
+
+/* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
+   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
+   KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
+   load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
+   dwordx4 even for compilers that do not infer alignment through vload4(char*). */
+#if (MR % 4) == 0 && (NR % 4) == 0 && RANK == 4
+#define CASE32_VEC_LOADS 1
+#else
+#define CASE32_VEC_LOADS 0
+#endif
+
+inline void case32_load_a_pack(__private int *a_pack, __global const char *a_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *a_v = (__global const uint4 *)a_kg;
+    #pragma unroll
+    for (int i = 0; i < MR / 4; ++i) {
+        const uint4 v = a_v[i];
+        a_pack[4 * i + 0] = as_int(v.s0);
+        a_pack[4 * i + 1] = as_int(v.s1);
+        a_pack[4 * i + 2] = as_int(v.s2);
+        a_pack[4 * i + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+    }
+#endif
+}
+
+inline void case32_load_b_pack(__private int *b_pack, __global const char *b_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *b_v = (__global const uint4 *)b_kg;
+    #pragma unroll
+    for (int j = 0; j < NR / 4; ++j) {
+        const uint4 v = b_v[j];
+        b_pack[4 * j + 0] = as_int(v.s0);
+        b_pack[4 * j + 1] = as_int(v.s1);
+        b_pack[4 * j + 2] = as_int(v.s2);
+        b_pack[4 * j + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+    }
 #endif
 }
 
@@ -350,6 +552,10 @@ inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int
 }
 #endif
 
+#ifdef CASE32_REQD_WG
+/* Host passes the exact launch local size when one macro block fits a work-group. */
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
 __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
                                     __global uint *tile_xor, int N, int blocks_k,
                                     int blocks_per_milestone, int num_milestones, int tile_count,
@@ -367,8 +573,28 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 #endif
 
     const int mb = mb_begin + (int)get_group_id(0);
-    const int jm = mb / macro_rows;
-    const int im = mb % macro_rows;
+    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+       walk every im for one jm: each resident work-group streams its own A strip
+       from DRAM and A is never reused from L2 (the whole of A is re-read once per
+       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+       all addressing derive from (im, jm). Falls back to the linear map when the
+       macro grid is not divisible (uniform branch). */
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
 
     const int tr0 = im * MICRO_M;
     const int tc0 = jm * MICRO_N;
@@ -409,15 +635,37 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
         const int tc = hash_tc * HASH_REG_TILES_N + reg_half;
         const int tc_global = tc0 + tc;
         int acc[NR * MR];
+        CASE32_ACC_UNROLL
         for (int i = 0; i < NR * MR; ++i) {
             acc[i] = 0;
         }
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         cpm_vec cpm[CPM_NVEC];
+#endif
+#if CASE32_PIPELINE
+        /* Software pipeline (register double buffer). In the coalesced layout a WI's
+           operands for k-group (kb, kg) sit at a_run + (kb*KGROUPS + kg)*MACRO_KG_STRIP_A
+           (same for B), i.e. the whole K walk is one flat stride, so the prefetch runs
+           across kb boundaries and never drains. Buffer 0 holds the k-group being
+           consumed; the loop is unrolled x2 so buffers alternate without copies. */
+        __global const char *a_run =
+                a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)tr * (size_t)KG_BYTES_A;
+        __global const char *b_run =
+                b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)tc * (size_t)KG_SLICE_B;
+        const int kg_last = blocks_k * KGROUPS - 1;
+        int kg_flat = 0;
+        int a_p0[MR];
+        int b_p0[NR];
+        int a_p1[MR];
+        int b_p1[NR];
+        case32_load_a_pack(a_p0, a_run);
+        case32_load_b_pack(b_p0, b_run);
 #endif
         int ms = 0;
         for (int kb = 0; kb < blocks_k; ++kb) {
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         case32_cpm_zero(cpm);
 #endif
 #if defined(CASE32_COALESCE)
@@ -461,7 +709,7 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                     for (int j = 0; j < NR; ++j) {
                         b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
                     }
-#if CASE32_PACKED_DOT
+#if !CASE32_CPM_PANEL
                     case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
                     case32_accum_kgroup(acc, cpm, a_pack, b_pack);
@@ -469,6 +717,30 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
                 }
             }
             barrier(CLK_LOCAL_MEM_FENCE);
+        }
+#elif CASE32_PIPELINE
+        (void)a_kb_base;
+        (void)b_kb_base;
+        for (int kg = 0; kg < KGROUPS; kg += 2) {
+            /* kg+1 always exists (KGROUPS even); kg+2 may be the next kb's first
+               k-group, clamp at the very end (re-reads the last k-group, harmless). */
+            const int kg_n1 = kg_flat + 1;
+            const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
+            case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
+#else
+            case32_accum_kgroup(acc, cpm, a_p0, b_p0);
+#endif
+            case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
+#else
+            case32_accum_kgroup(acc, cpm, a_p1, b_p1);
+#endif
+            kg_flat += 2;
         }
 #else
         for (int kg = 0; kg < KGROUPS; ++kg) {
@@ -481,16 +753,9 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
             int a_pack[MR];
             int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
-#if CASE32_PACKED_DOT
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
             case32_accum_kgroup(acc, cpm, a_pack, b_pack);
@@ -507,32 +772,26 @@ __kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const c
 
         for (int kg = 0; kg < KGROUPS; ++kg) {
             __global const char *a_kg = a_tile + (size_t)kg * (size_t)KG_BYTES_A;
-            int a_pack[MR];
-            int b_pack[NR];
-            #pragma unroll
-            for (int i = 0; i < MR; ++i) {
-                a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
-            }
-
             __global const char *b_kg =
                     b_tile + (size_t)kg * (size_t)KG_SLICE_B;
-            #pragma unroll
-            for (int j = 0; j < NR; ++j) {
-                b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
-            }
-#if CASE32_PACKED_DOT
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
+#if !CASE32_CPM_PANEL
             case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
 #else
             case32_accum_kgroup(acc, cpm, a_pack, b_pack);
 #endif
         }
 #endif
-#if !CASE32_PACKED_DOT
+#if CASE32_CPM_PANEL
         case32_cpm_flush(acc, cpm);
 #endif
         /* One milestone per KR panel (KR == R_RANK). Cumulative acc across kb. */
         uint x = 0u;
         if (tr_in_slice < micro_m_count) {
+            CASE32_ACC_UNROLL
             for (int i = 0; i < NR * MR; ++i) {
                 x ^= as_uint(acc[i]);
             }

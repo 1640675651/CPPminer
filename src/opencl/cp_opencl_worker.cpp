@@ -15,7 +15,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -46,8 +55,9 @@ static int g_hash_tile_mr = 8;
 static int g_hash_tile_w = 8;
 static int g_issue_mode = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 static int g_dot_policy = 0; /* matches Case32OclDotPolicy */
-static int g_cpm_int = 0;
+static int g_cpm_type = 0; /* Case32OclCpmType */
 static int g_use_lds = 0;
+static int g_double_buffer = 0;
 
 namespace {
 
@@ -125,8 +135,26 @@ static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
     g_zero_b.use_cpu_prep = 0;
     g_zero_b.B_noisy.clear();
 
-    pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
-                               g_zero_b.b_noise_seed);
+    /* The keyed digest of the all-zero B^T on the GPU (~2 ms on an R9700 vs 0.78 s on the
+       CPU per job); CP_OCL_ZERO_B_CHECK=1 compares it with the CPU path. */
+    uint8_t hash_b[32];
+    if (g_gemm.zero_b_digest_gpu(n, K_DIM, job_key, hash_b)) {
+        pearl_b_noise_seed_from_root(job_key, hash_b, n, g_zero_b.salted, g_zero_b.b_noise_seed);
+        const char *chk = getenv("CP_OCL_ZERO_B_CHECK");
+        if (chk && chk[0] && chk[0] != '0') {
+            uint8_t ref[32];
+            pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, ref);
+            const bool same = memcmp(ref, g_zero_b.b_noise_seed, 32) == 0;
+            printf("[ocl] zero-B GPU digest %s the CPU path\n", same ? "matches" : "DIFFERS FROM");
+            fflush(stdout);
+            if (!same) {
+                memcpy(g_zero_b.b_noise_seed, ref, 32);
+            }
+        }
+    } else {
+        pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted,
+                                   g_zero_b.b_noise_seed);
+    }
     if (!g_gemm.prepare_job_gpu(m, n, K_DIM, g_zero_b.b_noise_seed)) {
         g_zero_b.ready = 0;
         fprintf(stderr, "[ocl] prepare_job_gpu failed\n");
@@ -217,6 +245,8 @@ static int zero_b_prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
 
 extern "C" int cp_opencl_worker_handles_matrix_prep(void) { return 1; }
 
+extern "C" int cp_opencl_worker_is_ready(void) { return g_context_ready; }
+
 extern "C" void cp_opencl_worker_set_macro_batch(int batch) {
     if (batch < 1) {
         batch = 1;
@@ -276,12 +306,16 @@ extern "C" void cp_opencl_worker_set_dot_policy(int policy) {
     g_dot_policy = policy;
 }
 
-extern "C" void cp_opencl_worker_set_cpm_int(int on) {
-    g_cpm_int = on ? 1 : 0;
+extern "C" void cp_opencl_worker_set_cpm_type(int type) {
+    g_cpm_type = (type >= 0 && type <= 3) ? type : 0;
 }
 
 extern "C" void cp_opencl_worker_set_use_lds(int on) {
     g_use_lds = on ? 1 : 0;
+}
+
+extern "C" void cp_opencl_worker_set_double_buffer(int on) {
+    g_double_buffer = on ? 1 : 0;
 }
 
 extern "C" void cp_opencl_configure_tile(int device_index, int platform_filter) {
@@ -346,6 +380,43 @@ extern "C" int cp_opencl_worker_list_devices(void) {
     return OpenClContext::list_devices(g_platform_filter);
 }
 
+/* One miner per OpenCL device. Two processes scanning the same GPU only split it and
+   can run a 4 GB card out of memory (easy to do by opening a start script twice). The
+   lock is per session (Windows Local\\ mutex) or per machine (/tmp flock) and goes
+   away with the process. CP_ALLOW_SHARED_GPU=1 skips it. */
+static bool ocl_lock_device(int platform_filter, int device_index) {
+    static bool held = false;
+    const char *allow = std::getenv("CP_ALLOW_SHARED_GPU");
+    if (held || (allow && allow[0] && std::atoi(allow) != 0)) {
+        return true;
+    }
+    const std::string tag = "cppminer-ocl-p" + std::to_string(platform_filter) + "-d" +
+                            std::to_string(device_index);
+#ifdef _WIN32
+    const std::string name = "Local\\" + tag;
+    HANDLE h = CreateMutexA(nullptr, TRUE, name.c_str());
+    if (h && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h);
+        return false;
+    }
+    /* Keep the handle open for the life of the process. */
+    held = true;
+    return true;
+#else
+    const std::string path = "/tmp/" + tag + ".lock";
+    const int fd = open(path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        return true;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return false;
+    }
+    held = true; /* fd stays open, the lock lives as long as the process */
+    return true;
+#endif
+}
+
 extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     if (devices && ndev > 0) {
         g_device_index = devices[0];
@@ -358,12 +429,22 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
         g_device_index = 0;
     }
 
+    if (!ocl_lock_device(g_platform_filter, g_device_index)) {
+        fprintf(stderr,
+                "[ocl] another cppminer is already mining on OpenCL device %d; close it "
+                "first (CP_ALLOW_SHARED_GPU=1 to allow two)\n",
+                g_device_index);
+        g_context_ready = 0;
+        return;
+    }
+
     const std::string kernel_path = cp_ocl_resolve_kernel_path();
     g_gemm.set_macro_batch(g_macro_batch);
     g_gemm.set_issue_mode(g_issue_mode);
     g_gemm.set_dot_policy(static_cast<Case32OclDotPolicy>(g_dot_policy));
-    g_gemm.set_cpm_int(g_cpm_int);
+    g_gemm.set_cpm_type(static_cast<Case32OclCpmType>(g_cpm_type));
     g_gemm.set_use_lds(g_use_lds);
+    g_gemm.set_double_buffer(g_double_buffer);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
@@ -385,20 +466,24 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
                "dot_acc_sat may not beat cpm. Try --backend onednn for Intel GPU perf.\n");
     }
     if (g_issue_mode == 1) {
-        printf("[ocl] issue: broadcast/cpm %s (--ocl-issue broadcast%s)\n",
-               g_cpm_int ? "int" : "float",
-               g_cpm_int ? ", --ocl-cpm-type int" : "");
+        printf("[ocl] issue: broadcast (--ocl-issue broadcast)\n");
     } else if (g_issue_mode == 2) {
         printf("[ocl] issue: packed (--ocl-issue packed)\n");
-        if (g_cpm_int) {
-            fprintf(stderr,
-                    "[ocl] warning: --ocl-cpm-type int ignored without cpm/broadcast issue\n");
-        }
-    } else if (g_cpm_int) {
-        printf("[ocl] cpm tile: int8 lanes, int32 acc (--ocl-cpm-type int)\n");
+    }
+    if (g_gemm.cpm_type_used()) {
+        printf("[ocl] cpm type: %s (%s)\n", g_gemm.cpm_type_name(),
+               g_cpm_type == 0 ? "auto" : "--ocl-cpm-type");
+    } else if (g_cpm_type != 0) {
+        fprintf(stderr,
+                "[ocl] warning: --ocl-cpm-type ignored: %s\n",
+                g_issue_mode == 2 ? "--ocl-issue packed uses per-element dot4"
+                                  : "an int8 dot backend is in use (scalar nest not built)");
     }
     printf("[ocl] LDS staging: %s (--ocl-lds %s)\n", g_use_lds ? "on" : "off",
            g_use_lds ? "on" : "off");
+    printf("[ocl] register double buffer: %s (--ocl-double-buff %s)%s\n",
+           g_double_buffer ? "on" : "off", g_double_buffer ? "on" : "off",
+           g_double_buffer && g_use_lds ? "; not used with --ocl-lds on" : "");
     printf("[ocl] macro batch: %d blocks (%d hash tiles/launch)\n", g_gemm.macro_batch(),
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {

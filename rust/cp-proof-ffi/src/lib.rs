@@ -30,6 +30,17 @@ const CUTLASS_COLS: [usize; 8] = [0, 1, 2, 3, 32, 33, 34, 35];
 
 const CONTIGUOUS_16X16_ROWS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
+/// Hexagon HVX: half of the 4x128 register tile (h*w = 256, the zk-pow maximum).
+const CONTIGUOUS_64_COLS: [usize; 64] = {
+    let mut cols = [0usize; 64];
+    let mut i = 0;
+    while i < 64 {
+        cols[i] = i;
+        i += 1;
+    }
+    cols
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileLayout {
     Scattered = 0,
@@ -38,6 +49,7 @@ enum TileLayout {
     Contiguous8x8 = 3,
     Contiguous4x8 = 4,
     Contiguous16x16 = 5,
+    Contiguous4x64 = 6,
 }
 
 impl TileLayout {
@@ -49,7 +61,8 @@ impl TileLayout {
             3 => Ok(Self::Contiguous8x8),
             4 => Ok(Self::Contiguous4x8),
             5 => Ok(Self::Contiguous16x16),
-            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, 3, 4, or 5)")),
+            6 => Ok(Self::Contiguous4x64),
+            _ => Err(format!("invalid tile_layout {v} (expected 0..=6)")),
         }
     }
 }
@@ -96,6 +109,7 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
             &CONTIGUOUS_16X16_ROWS,
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         ),
+        TileLayout::Contiguous4x64 => (&[0, 1, 2, 3], &CONTIGUOUS_64_COLS),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
     }
 }
@@ -297,7 +311,7 @@ fn write_err(out: Option<&mut [u8]>, msg: &str) {
 /// Build plain_proof base64. Returns 0 on success, -1 on error.
 ///
 /// `tile_layout`: 0 = BzMiner scattered 8x16, 1 = contiguous 8x16, 2 = CUTLASS Case 9 MMA 8x8,
-/// 3 = contiguous 8x8, 4 = contiguous 4x8.
+/// 3 = contiguous 8x8, 4 = contiguous 4x8, 5 = contiguous 16x16, 6 = contiguous 4x64.
 /// `mining_config` must be the 52-byte config used for GPU job_key (must match tile_layout).
 /// `bt` may be null: B^T is then all zeros (zero-B mining), proven without a host copy.
 #[no_mangle]
@@ -863,6 +877,50 @@ mod tests {
         let mut pool_target = [0u8; 32];
         (primitive_types::U256::MAX / factor).to_big_endian(&mut pool_target);
         verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target, 2).expect("verify");
+    }
+
+    #[test]
+    fn contiguous_4x64_build_then_verify() {
+        use zk_pow::api::proof::IncompleteBlockHeader;
+        use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
+
+        // Second 4x64 half of a Hexagon register tile: t_cols = 64 (t_cols + 63 < n).
+        let (m, n, k, rank) = (8, 128, 4096, 128);
+        let (t_rows, t_cols) = (4, 64);
+        let a = test_matrix(m, k, 7);
+        let bt = test_matrix(n, k, 13);
+        let header = [0u8; 76];
+        let config = layout_config(TileLayout::Contiguous4x64, k);
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            Some(&bt),
+            m,
+            n,
+            k,
+            rank,
+            t_rows,
+            t_cols,
+            TileLayout::Contiguous4x64,
+        )
+        .expect("4x64 build");
+
+        let raw = STANDARD.decode(&b64).unwrap();
+        let pp: PlainProof = bincode::deserialize(&raw).unwrap();
+        assert_eq!(pp.a.row_indices, vec![4, 5, 6, 7]);
+        assert_eq!(pp.bt.row_indices, (64..128).collect::<Vec<usize>>());
+
+        // zk-pow accepts h*w = 256 (its maximum); near-max target as above, factor 4*64*32*128.
+        let block_header = IncompleteBlockHeader::from_bytes(&header).unwrap();
+        let zk: ZkPlainProof = ZkPlainProof::deserialize_compat(&raw).unwrap();
+        let factor = primitive_types::U256::from(4u64 * 64 * (4096 / 128) * 128);
+        let mut pool_target = [0u8; 32];
+        (primitive_types::U256::MAX / factor).to_big_endian(&mut pool_target);
+        verify_plain_proof_with_pool_target(&block_header, &zk, &pool_target, 3).expect("verify");
+
+        // Zero B^T (the miner's zero-B path) proves the same as an explicit zero matrix.
+        assert_null_bt_matches(m, n, t_rows, t_cols, TileLayout::Contiguous4x64, &header);
     }
 
     fn test_matrix(rows: usize, k: usize, mul: usize) -> Vec<i8> {

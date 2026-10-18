@@ -27,6 +27,14 @@ enum class Case32OclDotPolicy {
     PinKhr,
 };
 
+/* Scalar (no int8 dot) MAC nest, --ocl-cpm-type. Values match the CLI/C API ints. */
+enum class Case32OclCpmType {
+    Auto = 0,  // mad24 on AMD GCN gfx6-8 with --ocl-issue auto, otherwise Float
+    Float = 1, // float4 mad into a cpm panel, flushed to int32 every KR
+    Int = 2,   // int4 mul+add straight into acc
+    Mad24 = 3, // scalar mad24 straight into acc (fast on AMD only)
+};
+
 struct Case32GemmOcl {
     Case32GemmOcl() = default;
     ~Case32GemmOcl();

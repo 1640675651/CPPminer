@@ -40,11 +40,18 @@ struct Case33GemmOcl {
     void set_issue_mode(int mode);
     /* Legacy: on → broadcast (1), off → auto (0). */
     void set_issue_broadcast(int on);
-    /* Broadcast/cpm element type: 0 = float4 mad (default), 1 = int32. Ignored if packed. */
-    void set_cpm_int(int on);
+    /* Scalar (no int8 dot) MAC nest. Auto resolves at build; ignored with packed issue. */
+    void set_cpm_type(Case32OclCpmType type) { cpm_type_ = type; }
+    /* True when the adopted kernel is the scalar broadcast/mad24 nest. */
+    bool cpm_type_used() const { return cpm_type_used_; }
+    /* Resolved nest: "float", "int", or "mad24". */
+    const char *cpm_type_name() const;
     /* Stage A/B panels in __local (CASE32_USE_LDS). Default off. */
     void set_use_lds(int on);
     bool use_lds() const { return use_lds_; }
+    /* Register double-buffered k-group loop (CASE32_PIPELINE). Default off. */
+    void set_double_buffer(int on);
+    bool double_buffer() const { return double_buffer_; }
 
 
 
@@ -58,6 +65,10 @@ struct Case33GemmOcl {
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                              const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                              int salted, uint8_t a_key_out[32]);
+    /* Keyed digest of the all-zero B^T (n x K) for zero-B jobs, on the GPU. */
+    bool zero_b_digest_gpu(int n, int K, const uint8_t job_key[32], uint8_t out[32]) {
+        return prep_.ready() && prep_.zero_matrix_keyed_hash(n, K, job_key, out);
+    }
     bool read_A_sig(int8_t *h_A_sig);
     int a_witness_subroots() const { return prep_.a_witness_subroots(); }
     bool read_A_witness(const uint32_t *block_idx, int num_blocks, size_t block_bytes,
@@ -149,9 +160,13 @@ private:
 
     int issue_mode_ = 0; /* 0=auto, 1=broadcast/cpm, 2=packed */
 
-    bool use_cpm_int_ = false;
+    Case32OclCpmType cpm_type_ = Case32OclCpmType::Auto;
+    Case32OclCpmType resolved_cpm_type_ = Case32OclCpmType::Float;
+    bool cpm_type_used_ = false;
 
     bool use_lds_ = false;
+    bool double_buffer_ = false;
+    int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;
 
@@ -162,6 +177,8 @@ private:
     bool using_builtin_dot_ = false;
 
     bool using_cpm_ = false;
+
+    bool using_gcn_ = false;
 
 
 

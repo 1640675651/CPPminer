@@ -47,18 +47,28 @@ Asm is opt-in only; it is not part of `auto`.
 
 ### cpm type (`--ocl-cpm-type`)
 
-| Type | Flag | Acc tile |
-|------|------|----------|
-| **float** (default) | `--ocl-cpm-type float` | `float4 mad`, flush to int32 each KR |
-| **int** | `--ocl-cpm-type int` | int8→int32 lanes, `int4` mul+add |
+| Type | Flag | Accumulation |
+|------|------|--------------|
+| **auto** (default) | `--ocl-cpm-type auto` | **mad24** on AMD GCN gfx6-8 with `--ocl-issue auto`, otherwise **float** |
+| **float** | `--ocl-cpm-type float` | `float4 mad` into a cpm panel, flushed to int32 each KR |
+| **int** | `--ocl-cpm-type int` | int8 to int32 lanes, `int4` mul+add straight into the int32 tile (no panel) |
+| **mad24** | `--ocl-cpm-type mad24` | scalar `mad24` straight into the int32 tile (native only on AMD) |
 
-Only applies on the cpm nest (auto scalar fallback or `--ocl-issue broadcast`).
+Only applies when the scalar nest is built (no int8 dot backend, or `--ocl-issue broadcast`);
+otherwise the miner warns that the flag is ignored. `int` and `mad24` update the int32 tile on
+every MAC, so the kernel fully unrolls every loop over it to keep it in registers. Float keeps
+its panel because float is only exact below 2^24, so it must be flushed every KR.
+`CP_OCL_GCN=1/0` overrides the GCN detection used by `auto`.
 
 ### LDS staging (`--ocl-lds`)
 
 Optional `__local` A/B panel staging with work-group barriers (`CASE32_USE_LDS`). Default **off**.
 
 On most GPUs this **regressed** scan throughput: barrier + global→local copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
+
+### Register double buffer (`--ocl-double-buff`)
+
+The coalesced, non-LDS k-group loop can prefetch the next k-group's A/B packs into a second register set while the current one feeds the dot4s (`CASE32_PIPELINE`). Default **off**: it raises VGPR use (Radeon 780M: 206 instead of 180, 4 instead of 5 waves/SIMD) and may spill on devices with fewer registers. Measured gains: about +2.5% on the 780M (gfx1103) and 5.1 -> 5.4 TMAC/s on a Radeon 5500M (gfx1012). Ignored with `--ocl-lds on` or an odd `KGROUPS`.
 
 ## packed
 
