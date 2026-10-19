@@ -250,6 +250,8 @@ protected:
     void gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem, const GEMMStrategy &strategy,
                                        GEMMState &state);
     void gemmCase5ReleaseAccForBlake3(const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorCoopStageArgs(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void case5LoadGlobalDwords(const GEMMStrategy &strategy, GEMMState &state, const ngen::Subregister &base,
                                const ngen::GRF &dst, int count);
     void case5StoreGlobalDword(const GEMMStrategy &strategy, GEMMState &state, const ngen::Subregister &base,

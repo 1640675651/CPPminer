@@ -464,7 +464,9 @@ void init_case5_gemm_interface(InterfaceHandler &iface, HW hw, const GEMMProblem
     }
 
     // Fused Blake3: fold in wrap-GRF; in-kernel judge writes found + per-tile beats.
-    if (!problem.case5TileXorBlake3) {
+    // The cooperative fused jackpot keeps the (unused) tile_xor argument: the interleaved
+    // fast-store path it builds on allocates against it (the host binds a null buffer).
+    if (!problem.case5TileXorBlake3 || problem.case5JackpotCoop) {
         iface.newArgument("tile_xor", ExternalArgumentType::GlobalPtr, c_access);
     }
     iface.newArgument("tile_count", DataType::d);
@@ -639,7 +641,7 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
         err |= CL_INVALID_ARG_VALUE;
     }
 
-    if (!problem.case5TileXorBlake3) {
+    if (!problem.case5TileXorBlake3 || problem.case5JackpotCoop) {
         err |= set_arg(kernel, arg, sizeof(cl_mem), &bufs.tile_xor);
     }
     err |= set_arg(kernel, arg, sizeof(int), &bufs.tile_count);

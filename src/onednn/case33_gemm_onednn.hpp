@@ -44,6 +44,7 @@ struct Case33GemmOnednn {
     const char *device_name() const { return device_name_.c_str(); }
     const char *platform_name() const { return platform_name_.c_str(); }
     int device_index() const { return device_flat_index_; }
+    uint64_t device_global_mem() const; // CL_DEVICE_GLOBAL_MEM_SIZE (0 if unknown)
     const case5_ngen::DriverInfo &driver_info() const { return info_; }
     bool gpu_prep_ready() const { return prep_ready_; }
 
@@ -85,6 +86,8 @@ private:
                                  int *out_t_cols = nullptr);
     bool debug_audit_tile_xor_panel_(int panel_tile_count, int panel_tile_cols, int panel_tile_rows,
                                      int tr_base, int tc_base, int row_batch, int col_batch);
+    bool ensure_coop_audit_buf_(int panel_tile_count);
+    bool coop_audit_panel_(int panel_tile_count, int tr_base, int tc_base);
     bool scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
                                    int panel_tile_rows, int panel_tile_cols, int panel_tile_count,
                                    int tr_base, int tc_base, int *out_found, int *out_t_rows,
@@ -145,6 +148,9 @@ private:
     size_t a_buf_bytes_ = 0;
     size_t b_buf_bytes_ = 0;
     int panel_tile_xor_cap_ = 0;
+    int coop_audit_tiles_ = 0;   // CASE5_COOP_AUDIT: tiles the found buffer's digest/message regions hold
+    std::vector<uint32_t> coop_audit_prev_msg_;   // previous panel's messages (stale-slot diagnosis)
+    int panel_tile_cols_hint_ = 0;
     bool jackpot_ready_ = false;
 
     std::vector<uint32_t> tile_xor_host_;

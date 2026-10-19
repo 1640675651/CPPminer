@@ -330,6 +330,15 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         state.tileXorLocalId = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
     state.tileXorRow = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
     state.tileXorCol = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
+    if (problem.case5JackpotCoop) {
+        // Flat local thread id (lidN * wgM + lidM): names this thread's tiles in the SLM tables of
+        // the cooperative jackpot epilogue (the saved local ids are released before then).
+        // No extra GRF: the 16x64 strategy is at the register limit, so the flat local id lives in the
+        // second dword of the (full) tileXorRow GRF, whose other dwords are never written.
+        state.tileXorLidFlat = GRF(state.tileXorRow.getBase()).ud(1);
+        mul(1, state.tileXorLidFlat, state.lidN, uint16_t(strategy.wg[LoopM]));
+        add(1, state.tileXorLidFlat, state.tileXorLidFlat, state.lidM);
+    }
     if (problem.case5TileXorSlm && (!problem.case5TileXorWrap || case5WrapAtFlush(problem)) && !split
             && case5AddrInc())
         state.tileXorSlmOff = state.ra.try_alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
@@ -1940,7 +1949,9 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
     }
     // Folded message: every block has been folded; write each sub-tile's 16 words as one line at
     // tile_xor + (sid0 + fi) * 64 bytes. The line buffer is dead now, so its pad GRF holds the header.
-    if (state.tileXorFoldAcc.isValid()) {
+    if (state.tileXorFoldAcc.isValid() && problem.case5JackpotCoop) {
+        gemmCase5TileXorJackpotCoop(problem, strategy, state);
+    } else if (state.tileXorFoldAcc.isValid()) {
         const int grfPerLine = std::max(1, 16 * 4 / GRF::bytes(hw));
         GRF hdr = state.tileXorLineBuf[grfPerLine * subGridN];
         auto lr = hdr.ud(4), lc = hdr.ud(5);

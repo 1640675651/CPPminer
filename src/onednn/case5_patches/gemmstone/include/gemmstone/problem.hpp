@@ -208,6 +208,8 @@ struct GEMMProblem : public CommonProblem {
     bool case5TileXorSlm = false;                   // Stage milestone XOR in SLM; flush to global at epilogue
     bool case5TileXorBlake3 = false;                // Case5.6: b3_compress64 on 16 wrap-GRF slots per tile
     bool case5FuseJackpot = false;                  // wrap-GRF fold uses rotl(slot,13)^x (cp_jackpot)
+    bool case5JackpotCoop = false;                  // fused jackpot on the fold16 message: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM
+    bool case5JackpotCoopAudit = false;             // coop: also write every tile's digest and message to the found buffer (host audit)
     int case5XorFoldChunks = 8;                     // Case5.2: column/GRF chunks per milestone panel
     int case5XorMaxMilestones = 1;                  // K / milestone_k (K-loop milestone count)
     int case5XorOutputMilestones = 0;               // Case5.4: global tile_xor rows (0 → max/2 when wrap)

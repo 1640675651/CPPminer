@@ -34,6 +34,8 @@ struct DriverInfo {
     int milestoneK = 128;
     int xorLayout = 0; // tile_xor index layout actually compiled (see case5_tile_xor_index)
     bool fold16 = false; // tile_xor holds the 16-word folded jackpot message per tile, not raw milestones
+    bool jackpotCoop = false; // fused jackpot: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM (no tile_xor traffic)
+    bool jackpotCoopAudit = false; // CASE5_COOP_AUDIT=1: kernel dumps per-tile digests + messages for a host check
     int wgM = 4;
     int wgN = 4;
     int wgK = 1;

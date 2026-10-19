@@ -18,6 +18,10 @@
 #include "alloc_utils.hpp"
 #include "atomic_fusions.hpp"
 #include "cooperative_split.hpp"
+#include <iostream>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdlib>
 #include "gemmstone/generator.hpp"
 #include "gemmstone/problem.hpp"
@@ -418,6 +422,16 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
     if (problem.case5TileXor) {
         gemmCase5TileXorAlloc(problem, strategy, state);
         case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
+        if (problem.case5JackpotCoop)
+            gemmCase5TileXorCoopStageArgs(problem, strategy, state);
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "after tileXorAlloc", state.ra.countAllocedRegisters());
+        if (std::getenv("CASE5_DEBUG_RA")) {
+            auto pr = [](const char *n, const ngen::Subregister &s) { if (s.isValid()) std::fprintf(stderr, "  %s=r%d.%d", n, s.getBase(), s.getOffset()); };
+            pr("tileXor", state.inputs.tileXor); pr("tileCount", state.inputs.tileCount); pr("tileCols", state.inputs.tileCols); pr("xorPeriod", state.inputs.xorPeriod);
+            pr("blake3Out", state.inputs.blake3Out); pr("k0", state.inputs.blake3KeyWords[0]); pr("k7", state.inputs.blake3KeyWords[7]);
+            pr("found", state.inputs.foundFlag); pr("tr", state.inputs.trBase); pr("tc", state.inputs.tcBase); pr("b0", state.inputs.blake3BoundWords[0]); pr("b7", state.inputs.blake3BoundWords[7]);
+            std::fprintf(stderr, "%s", "\n");
+        }
     }
 
     mulConstant(1, state.i0, idM, strategy.unroll[LoopM]);
@@ -966,7 +980,17 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
     auto &remN = state.remainders[LoopN];
 
     // Accumulate C with panel*panel multiply.
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "before accumulateC", state.ra.countAllocedRegisters());
+    if (std::getenv("CASE5_DEBUG_RA") && std::getenv("CASE5_DEBUG_RA")[0] == '2') {
+        std::string map;
+        for (int r = 0; r < state.ra.getRegisterCount(); r++) {
+            if (r && !(r % 32)) map += '\n'; else if (r && !(r % 8)) map += ' ';
+            map += state.ra.isFree(GRF(r)) ? '.' : ((state.ra.isFree(GRF(r).ud(0)) || state.ra.isFree(GRF(r).ud(7))) ? '/' : 'x');
+        }
+        std::fprintf(stderr, "[ra] map (r0 top-left, 32 per row):\n%s\n", map.c_str());
+    }
     if (!gemmAccumulateC(problem, strategy, state)) return false;
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "after accumulateC", state.ra.countAllocedRegisters());
 
     // Final C horizontal reduction for dot product kernels.
     gemmDotReduce(problem, strategy, state);
@@ -1016,6 +1040,7 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
     }
 
     // Case5 interleaved XMX fold: finish and store the last milestone (C_regs still live).
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "before finalFlush", state.ra.countAllocedRegisters());
     if (problem.case5TileXor && problem.case5TileXorInterleaved)
         gemmCase5TileXorFinalFlush(problem, strategy, state);
 

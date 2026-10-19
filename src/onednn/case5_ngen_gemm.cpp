@@ -351,10 +351,32 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             // single-message store; other strategies keep the generic fold.
             const bool fast_store_grid = xsd.split && xsd.subGridM == 1
                     && (xsd.subGridN == 4 || xsd.subGridN == 8);
+            // Cooperative fused jackpot (CASE5_JACKPOT_COOP=0 disables): on the XMX fast-store path
+            // the fold16 message stays in registers and, after one barrier, a quarter of the threads
+            // hash 16 tiles per SIMD16 instruction and judge them in the kernel. It replaces the
+            // per-tile SIMD1 Case 5.6 path (wrap-GRF fold) whenever the strategy qualifies.
+            {
+                const char *coopEnv = std::getenv("CASE5_JACKPOT_COOP");
+                const char *f16 = std::getenv("CASE5_XOR_FOLD16");
+                const bool coop_ok = problem.case5FuseJackpot && !(coopEnv && coopEnv[0] == '0')
+                        && hw == HW::XeHPG && case5_tile_xor_interleave_enabled() && fast_store_grid
+                        && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0 && !xor_nop
+                        && problem.case5XorMaxMilestones % 16 == 0 && !(f16 && f16[0] == '0')
+                        && strategy.wg[LoopM] > 0 && strategy.wg[LoopN] > 0 && !problem.case5TileXorSlm;
+                problem.case5JackpotCoop = coop_ok;
+                {
+                    const char *auditEnv = std::getenv("CASE5_COOP_AUDIT");
+                    problem.case5JackpotCoopAudit = coop_ok && auditEnv && auditEnv[0] == '1';
+                }
+                if (coop_ok) {
+                    problem.case5TileXorWrapGrf = false;
+                    problem.case5TileXorWrap = false;
+                }
+            }
             problem.case5TileXorInterleaved = case5_tile_xor_interleave_enabled() && hw == HW::XeHPG
                     && fast_store_grid && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0
                     && !xor_nop && !problem.case5TileXorWrap && !problem.case5TileXorWrapGrf
-                    && !problem.case5TileXorBlake3 && !problem.case5TileXorSlm;
+                    && (!problem.case5TileXorBlake3 || problem.case5JackpotCoop) && !problem.case5TileXorSlm;
             // tile_xor is tile-major ([tile][ms], index sid * num_ms + ms) on every path; the
             // jackpot kernel reads it that way.
             problem.case5XorLayout = 2;
@@ -379,6 +401,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->milestoneK = milestone_k;
                 info->xorLayout = problem.case5XorLayout;
                 info->fold16 = problem.case5TileXorFold16;
+                info->jackpotCoop = problem.case5JackpotCoop;
+                info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {

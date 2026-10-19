@@ -8,6 +8,8 @@
 
 
 
+#include <cstdio>
+#include <cstdlib>
 #include "alloc_utils.hpp"
 
 #include "hw_utils.hpp"
@@ -772,5 +774,340 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
 
 
+/*******************************************************************************
+ * Cooperative fused jackpot on the fold16 message (XMX fast-store path, case5JackpotCoop).
+ *  1. every thread writes its sub-tiles' 16-word messages, spatial ids and packed (t_rows, t_cols)
+ *     into an SLM region past gemmstone's own;
+ *  2. SLM fence + barrier;
+ *  3. the first ceil(tiles/16) threads each take 16 tiles as SIMD16 lanes: four 4-word vector loads
+ *     return the messages word-major for free, one keyed BLAKE3 compression (the four G chains of a
+ *     half-round interleaved) hashes 16 tiles per instruction, a lexicographic SIMD16 compare against
+ *     the bound gives a lane predicate, and winners store found = 1 and their packed coordinates
+ *     (the per-tile judge's found-buffer contract). With blake3_out bound the digests are stored
+ *     too (harness verification). All other threads exit at once.
+ * Versus the per-tile Case 5.6 judge (one SIMD1 compression per tile per thread) this is 16x fewer
+ * instructions per tile and the dependent chain sits on a quarter of the threads.
+ ******************************************************************************/
+namespace {
+
+// The 7 rounds at execution size esize. v(i)/m(i) give state and message word i as 16-lane
+// regions, tmp(k) the temporary of G chain k. The message schedule is applied statically (round
+// r reads word perm_r[i]); the four independent G functions of a half-round are emitted in lockstep.
+template <typename GeneratorT, typename OpV, typename OpM, typename OpT>
+void emitBlake3RoundsWide(GeneratorT &g, OpV v, OpM m, OpT tmp, int esize) {
+    int perm[16];
+    for (int i = 0; i < 16; i++) perm[i] = i;
+    auto G4 = [&](const int (&a)[4], const int (&b)[4], const int (&c)[4], const int (&d)[4],
+                  const int (&mx)[4], const int (&my)[4]) {
+        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
+        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(mx[k]));
+        for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(d[k]), v(a[k]));
+        for (int k = 0; k < 4; k++) g.ror(esize, v(d[k]), tmp(k), uint16_t(16));
+        for (int k = 0; k < 4; k++) g.add(esize, v(c[k]), v(c[k]), v(d[k]));
+        for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(b[k]), v(c[k]));
+        for (int k = 0; k < 4; k++) g.ror(esize, v(b[k]), tmp(k), uint16_t(12));
+        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
+        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(my[k]));
+        for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(d[k]), v(a[k]));
+        for (int k = 0; k < 4; k++) g.ror(esize, v(d[k]), tmp(k), uint16_t(8));
+        for (int k = 0; k < 4; k++) g.add(esize, v(c[k]), v(c[k]), v(d[k]));
+        for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(b[k]), v(c[k]));
+        for (int k = 0; k < 4; k++) g.ror(esize, v(b[k]), tmp(k), uint16_t(7));
+    };
+    const int ca[4] = {0, 1, 2, 3}, cb[4] = {4, 5, 6, 7}, cc[4] = {8, 9, 10, 11}, cd[4] = {12, 13, 14, 15};
+    const int da[4] = {0, 1, 2, 3}, db[4] = {5, 6, 7, 4}, dc[4] = {10, 11, 8, 9}, dd[4] = {15, 12, 13, 14};
+    for (int round = 0; round < 7; ++round) {
+        const int mx0[4] = {perm[0], perm[2], perm[4], perm[6]},   my0[4] = {perm[1], perm[3], perm[5], perm[7]};
+        const int mx1[4] = {perm[8], perm[10], perm[12], perm[14]}, my1[4] = {perm[9], perm[11], perm[13], perm[15]};
+        G4(ca, cb, cc, cd, mx0, my0);    // columns
+        G4(da, db, dc, dd, mx1, my1);    // diagonals
+        int next[16];
+        for (int i = 0; i < 16; i++) next[i] = perm[kBlake3Perm[i]];
+        for (int i = 0; i < 16; i++) perm[i] = next[i];
+    }
+}
+
+} // namespace
+
+// Cooperative jackpot: the found buffer (bound to the tile_xor argument) also carries the
+// per-panel arguments, so the k loop keeps one pointer register. Byte offsets (host side:
+// case33_gemm_onednn.cpp kJackpotCoopArgsOff): 0 bound[8], 32 found, 40 coords, 64 key[8],
+// 96 tile_cols, 100 tr_base, 104 tc_base, 108 tile_count. One 128-byte block load covers them.
+static constexpr uint32_t kCoopBufLoadBytes = 128;
+static constexpr int kCoopBufKeyDw = 16, kCoopBufTileColsDw = 24, kCoopBufTrDw = 25, kCoopBufTcDw = 26,
+                     kCoopBufTileCountDw = 27;
+// CASE5_COOP_AUDIT: digests at tile_xor + 4096 + sid*32, messages at + 4096 + tile_count*32 + sid*64.
+static constexpr uint32_t kCoopAuditOff = 4096;
+
+template <HW hw>
+void Generator<hw>::gemmCase5TileXorCoopStageArgs(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                                  GEMMState &state)
+{
+    // The 16x64 preferred strategy is at the register limit: release the jackpot's argument
+    // registers (key, bound, found pointer, tile bases, tile_cols, ...) before the k loop. The
+    // epilogue reloads their values from the found buffer through the tile_xor pointer.
+    if (!problem.case5JackpotCoop || !state.tileXorLidFlat.isValid()) return;
+    auto &in = state.inputs;
+    if (std::getenv("CASE5_DEBUG_RA"))
+        std::fprintf(stderr, "[coop] wg %dx%d activeThreads=%d slmA=%zu slmB=%zu slmBuffers=%d unrollKSLM=%d\n",
+                     strategy.wg[LoopM], strategy.wg[LoopN], strategy.activeThreads,
+                     size_t(strategy.slmABufSize(problem)), size_t(strategy.slmBBufSize(problem)),
+                     strategy.slmBuffers, strategy.unrollKSLM);
+    if (!in.tileXor.isValid()) stub("cooperative jackpot needs the tile_xor argument (found buffer)");
+    state.tileXorCoopJudge = in.foundFlag.isValid() && in.trBase.isValid() && in.tcBase.isValid();
+    state.tileXorCoopDigestOut = in.blake3Out.isValid();      // harness digest-out mode keeps its pointer
+    for (int i = 0; i < kBlake3DigestWords; i++) {
+        state.ra.safeRelease(in.blake3KeyWords[i]);
+        state.ra.safeRelease(in.blake3BoundWords[i]);
+    }
+    state.ra.safeRelease(in.foundFlag);
+    state.ra.safeRelease(in.trBase);
+    state.ra.safeRelease(in.tcBase);
+    state.ra.safeRelease(in.tileCols);
+    state.ra.safeRelease(in.tileCount);
+    state.ra.safeRelease(in.xorPeriod);
+}
+
+template <HW hw>
+void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                                 GEMMState &state)
+{
+    if (!problem.case5JackpotCoop || !state.tileXorFoldAcc.isValid() || !state.tileXorLidFlat.isValid())
+        return;
+    if (hw < HW::XeHPG) stub("cooperative jackpot needs LSC messages");
+    const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
+    const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
+    const int tilesPerThread = subGridM * subGridN;
+    const int nTiles = case5JackpotCoopTiles(problem, strategy);
+    // Lanes per hashing thread (tiles per SIMD instruction). 8: twice as many threads share the
+    // work group's hashing tail and SIMD8 int ops issue in one cycle (CASE5_COOP_LANES=16 for A/B).
+    const char *lanesEnv = std::getenv("CASE5_COOP_LANES");
+    const int L = (lanesEnv && std::atoi(lanesEnv) == 16) ? 16 : 8;
+    const int nHash = (nTiles + L - 1) / L;
+    const int hashMr = (problem.case5XorSubM > 0) ? problem.case5XorSubM : strategy.unroll[LoopM];
+    const int hashNr = (problem.case5XorSubN > 0) ? problem.case5XorSubN : strategy.unroll[LoopN];
+    const int dpg = grfDwords(hw);
+    const uint32_t blake3BlockLen = 64, blake3Flags = 0x1Bu;   // CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
+    if (subGridM != 1 || tilesPerThread > dpg || (nTiles % 2) != 0 || nTiles <= 0)
+        stub("cooperative jackpot: unsupported sub-tile grid");
+    const uint32_t slmBase = 0;                   // the k loop's SLM buffers are dead after the barrier below
+    const uint32_t msgBase = slmBase;
+    const uint32_t sidBase = msgBase + uint32_t(nTiles) * 64;
+    const uint32_t coordBase = sidBase + uint32_t(nTiles) * 4;      // nTiles even: 8-byte aligned
+    // CASE5_COOP_SKIP (timing only; no shares): 1 = no epilogue at all, 2 = no hashing, 4 = no stores.
+    const char *skipEnv = std::getenv("CASE5_COOP_SKIP");
+    const int coopSkip = skipEnv ? std::atoi(skipEnv) : 0;
+    if (coopSkip & 1) return;
+    const bool judge = state.tileXorCoopJudge && !(coopSkip & 4);   // captured before the arguments were released
+    const bool audit = problem.case5JackpotCoopAudit;
+    const bool digestOut = (state.tileXorCoopDigestOut || audit) && !(coopSkip & 4);
+
+    // The accumulators and operand registers are dead after the k loop: release them first so the
+    // scratch below (and the hashing threads' 90 GRFs) can be allocated in a full register file.
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "coop entry", state.ra.countAllocedRegisters());
+    gemmCase5ReleaseAccForBlake3(strategy, state);
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "coop after release", state.ra.countAllocedRegisters());
+
+    // ---- 1. this thread's tiles -> SLM ----
+    GRF hdr = state.ra.alloc(), tIdx = state.ra.alloc(), sidG = state.ra.alloc();
+    GRFRange coordG = state.ra.alloc_range(std::max(1, (2 * tilesPerThread + dpg - 1) / dpg));
+    // Reload the jackpot arguments parked in SLM by gemmCase5TileXorCoopStageArgs (this thread's
+    // own stores, long complete): key, bound, found pointer, tile bases, tile_cols.
+    GRFRange args = state.ra.alloc_range(int(kCoopBufLoadBytes) / GRF::bytes(hw));
+    GRFRange hdrQ = state.ra.alloc_range(1);
+    auto ARG = [&](int i) { return args[i / dpg].ud(i % dpg); };
+    const auto trBase = ARG(kCoopBufTrDw), tcBase = ARG(kCoopBufTcDw), tileCols = ARG(kCoopBufTileColsDw);
+    const auto foundFlag = state.inputs.tileXor, blake3Out = state.inputs.blake3Out;
+    emov(1, hdrQ[0].uq(0), state.inputs.tileXor, strategy, state);
+    load(1, args, block(D32, int(kCoopBufLoadBytes) / 4), A64, hdrQ);
+    // Every thread's last operand loads completed before its final dpas, so after this barrier
+    // the k loop's SLM buffers can hold the tile tables.
+    useTempAndR0(state, [&](GRF temp, GRF r0_info) { slmBarrier(temp, r0_info, strategy); });
+    mulConstant(1, tIdx.ud(0), state.tileXorLidFlat, tilesPerThread);        // this thread's first tile
+    for (int fi = 0; fi < tilesPerThread; fi++) {
+        mulConstant(1, hdr.ud(0), tIdx.ud(0), 64);
+        add(1, hdr.ud(0), hdr.ud(0), uint32_t(msgBase + fi * 64));
+        store(1, block(D32, 16), SLM, hdr, GRFRange(state.tileXorFoldAcc.getBase() + fi * 2, 2));
+    }
+    {
+        GRF lr = state.ra.alloc(), lc = state.ra.alloc();
+        for (int fi = 0; fi < tilesPerThread; fi++) {
+            const int sr = fi / subGridN, sc = fi % subGridN;
+            mulConstant(1, lr.ud(0), state.tileXorRow, subGridM);
+            add(1, lr.ud(0), lr.ud(0), uint16_t(sr));
+            mulConstant(1, lc.ud(0), state.tileXorCol, subGridN);
+            add(1, lc.ud(0), lc.ud(0), uint16_t(sc));
+            emad(1, sidG.ud(fi), lc.ud(0), lr.ud(0), tileCols, strategy, state);  // spatial id
+            if (judge) {
+                add(1, lr.ud(0), lr.ud(0), trBase);
+                add(1, lc.ud(0), lc.ud(0), tcBase);
+            }
+            mulConstant(1, coordG[(2 * fi) / dpg].ud((2 * fi) % dpg), lr.ud(0), hashMr);          // t_rows
+            mulConstant(1, coordG[(2 * fi + 1) / dpg].ud((2 * fi + 1) % dpg), lc.ud(0), hashNr);  // t_cols
+        }
+        state.ra.safeRelease(lc);
+        state.ra.safeRelease(lr);
+    }
+    if (audit) {
+        // The owner thread also writes each tile's message (from its own registers) so the host
+        // can recompute the digest: tile_xor + 4096 + tile_count*32 + sid*64.
+        GRFRange ahdr = state.ra.alloc_range(1);
+        GRF aoff = state.ra.alloc();
+        shl(1, aoff.ud(0), ARG(kCoopBufTileCountDw), uint16_t(5));
+        add(1, aoff.ud(0), aoff.ud(0), uint32_t(kCoopAuditOff));
+        for (int fi = 0; fi < tilesPerThread; fi++) {
+            shl(1, aoff.ud(1), sidG.ud(fi), uint16_t(6));
+            add(1, aoff.ud(1), aoff.ud(1), aoff.ud(0));
+            eadd(1, ahdr[0].uq(0), state.inputs.tileXor, aoff.ud(1), strategy, state);
+            store(1, block(D32, 16), A64, ahdr, GRFRange(state.tileXorFoldAcc.getBase() + fi * 2, 2));
+        }
+        state.ra.safeRelease(aoff);
+        state.ra.safeRelease(ahdr);
+    }
+    mulConstant(1, hdr.ud(0), tIdx.ud(0), 4);
+    add(1, hdr.ud(0), hdr.ud(0), uint32_t(sidBase));
+    store(1, block(D32, tilesPerThread), SLM, hdr, sidG);
+    mulConstant(1, hdr.ud(0), tIdx.ud(0), 8);
+    add(1, hdr.ud(0), hdr.ud(0), uint32_t(coordBase));
+    store(1, block(D32, 2 * tilesPerThread), SLM, hdr, coordG);
+    state.ra.safeRelease(coordG);
+    state.ra.safeRelease(sidG);
+    state.ra.safeRelease(tIdx);
+
+    // ---- 2. every message visible to the work group ----
+    useTempAndR0(state, [&](GRF temp, GRF r0_info) {
+        slmfence(temp, r0_info);
+        fencewait();
+        slmBarrier(temp, r0_info, strategy);
+    });
+
+    // ---- 3. hashing threads: lane l of thread t handles tile L t + l ----
+    Label lEnd;
+    cmp(1 | ge | f0[0], null.ud(), state.tileXorLidFlat, uint32_t((coopSkip & 2) ? 0 : nHash));
+    jmpi(1 | f0[0], lEnd);
+    const int gpl = std::max(1, L / dpg);                 // GRFs per L-lane dword vector
+    const int halves = (L + 7) / 8;                       // SIMD8 pieces of the 64-bit address math
+
+    state.ra.safeRelease(state.tileXorLineBuf);
+    // Audit mode: the A64 message stores above still read the fold accumulators (only the SLM
+    // stores are fenced), so keep those registers out of the hashing allocations.
+    if (!audit) state.ra.safeRelease(state.tileXorFoldAcc);
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "coop before hash allocs", state.ra.countAllocedRegisters());
+
+    GRFRange v = state.ra.try_alloc_range(16 * gpl), m = state.ra.try_alloc_range(16 * gpl), tmp = state.ra.try_alloc_range(4 * gpl);
+    GRFRange laneIdx = state.ra.try_alloc_range(gpl), hdr16 = state.ra.try_alloc_range(gpl), sid16 = state.ra.try_alloc_range(gpl);
+    GRFRange coord16 = state.ra.try_alloc_range(2 * gpl), hdr64 = state.ra.try_alloc_range(2 * halves), ones = state.ra.try_alloc_range(gpl);
+    GRF scal = state.ra.try_alloc();
+    if (!v.isValid() || !m.isValid() || !tmp.isValid() || !laneIdx.isValid() || !hdr16.isValid() || !sid16.isValid()
+            || !coord16.isValid() || !hdr64.isValid() || !ones.isValid() || !scal.isValid())
+        stub("cooperative jackpot: insufficient registers");
+    auto V = [&](int i) { return v[gpl * i].ud(); };
+    auto Mw = [&](int w) { return m[gpl * w].ud(); };
+    auto T = [&](int k) { return tmp[gpl * k].ud(); };
+
+    mov(8, scal.uw(0)(1), Immediate::uv(0, 1, 2, 3, 4, 5, 6, 7));
+    mov(8, scal.uw(8)(1), Immediate::uv(8, 9, 10, 11, 12, 13, 14, 15));
+    mov(L, laneIdx[0].ud(), scal.uw(0)(1));                               // lane index (dwords)
+    mulConstant(1, hdr.ud(0), state.tileXorLidFlat, L);
+    add(L, laneIdx[0].ud(), laneIdx[0].ud(), hdr.ud(0));                 // tile index per lane
+    cmp(L | lt | f1[0], null.ud(), laneIdx[0].ud(), uint32_t(nTiles));   // lanes past the last tile hash garbage
+    mov(1, scal.uw(0), f1[0]);                                            // valid-lane mask
+    if (L < 16) and_(1, scal.uw(0), scal.uw(0), uint16_t((1u << L) - 1));
+    // messages: four 4-word vector loads land word-major (word w of all L tiles in m[gpl*w ..])
+    shl(L, hdr16[0].ud(), laneIdx[0].ud(), uint16_t(6));
+    add(L, hdr16[0].ud(), hdr16[0].ud(), uint32_t(msgBase));
+    for (int k = 0; k < 4; k++) {
+        load(L, m[4 * gpl * k], scattered(D32, 4), SLM, hdr16[0]);
+        if (k < 3) add(L, hdr16[0].ud(), hdr16[0].ud(), uint32_t(16));
+    }
+    shl(L, hdr16[0].ud(), laneIdx[0].ud(), uint16_t(2));
+    add(L, hdr16[0].ud(), hdr16[0].ud(), uint32_t(sidBase));
+    load(L, sid16[0], D32, SLM, hdr16[0]);                                // spatial ids
+    shl(L, hdr16[0].ud(), laneIdx[0].ud(), uint16_t(3));
+    add(L, hdr16[0].ud(), hdr16[0].ud(), uint32_t(coordBase));
+    load(L, coord16[0], D64, SLM, hdr16[0]);                              // packed (t_rows, t_cols)
+    if (audit) {
+        // Third audit copy: the message as loaded by the hashing lane, at
+        // tile_xor + 4096 + tile_count*96 + sid*64 + 4w.
+        mulConstant(1, hdr.ud(1), ARG(kCoopBufTileCountDw), 96);
+        add(1, hdr.ud(1), hdr.ud(1), uint32_t(kCoopAuditOff));
+        shl(L, hdr16[0].ud(), sid16[0].ud(), uint16_t(6));
+        add(L, hdr16[0].ud(), hdr16[0].ud(), hdr.ud(1));
+        for (int h = 0; h < halves; h++)
+            eadd(8, hdr64[2 * h].uq(), state.inputs.tileXor, hdr16[h].ud(), strategy, state);
+        mov(1, f1[0], scal.uw(0));
+        for (int w = 0; w < kBlake3MsgWords; w++) {
+            if (w)
+                for (int h = 0; h < halves; h++)
+                    eadd(8, hdr64[2 * h].uq(), hdr64[2 * h].uq(), uint32_t(4), strategy, state);
+            store(L | f1[0], scattered_dword(), A64, hdr64[0], m[gpl * w]);
+        }
+    }
+
+    // keyed BLAKE3, 16 tiles per instruction: v[0..7] key, v[8..11] IV, counter 0, block length, flags
+    for (int i = 0; i < kBlake3DigestWords; i++) mov(L, V(i), ARG(kCoopBufKeyDw + i));
+    for (int i = 0; i < 4; i++) mov(L, V(8 + i), uint32_t(kBlake3IV[i]));
+    mov(L, V(12), uint32_t(0));
+    mov(L, V(13), uint32_t(0));
+    mov(L, V(14), blake3BlockLen);
+    mov(L, V(15), blake3Flags);
+    emitBlake3RoundsWide(*this, V, Mw, T, L);
+    for (int i = 0; i < kBlake3DigestWords; i++) xor_(L, V(i), V(i), V(8 + i));    // digest in V(0..7)
+
+    if (digestOut) {
+        // blake3_out + sid*32 + 4w (audit: tile_xor + 4096 + sid*32), SIMD8 halves for the 64-bit math
+        const auto outBase = audit ? state.inputs.tileXor : blake3Out;
+        shl(L, hdr16[0].ud(), sid16[0].ud(), uint16_t(5));
+        if (audit) add(L, hdr16[0].ud(), hdr16[0].ud(), uint32_t(kCoopAuditOff));
+        for (int h = 0; h < halves; h++)
+            eadd(8, hdr64[2 * h].uq(), outBase, hdr16[h].ud(), strategy, state);
+        mov(1, f1[0], scal.uw(0));
+        for (int w = 0; w < kBlake3DigestWords; w++) {
+            if (w)
+                for (int h = 0; h < halves; h++)
+                    eadd(8, hdr64[2 * h].uq(), hdr64[2 * h].uq(), uint32_t(4), strategy, state);
+            store(L | f1[0], scattered_dword(), A64, hdr64[0], v[gpl * w]);
+        }
+    }
+    if (judge) {
+        // beats = digest < bound lexicographically from word 7 down, equal counts as a hit:
+        // res_w = lt_w | (eq_w & res_{w-1}), res_{-1} = valid lanes
+        mov(1, scal.uw(1), scal.uw(0));
+        for (int w = 0; w < kBlake3DigestWords; w++) {
+            cmp(L | lt | f1[0], null.ud(), V(w), ARG(w));               // bound words at +0
+            cmp(L | eq | f1[1], null.ud(), V(w), ARG(w));
+            mov(1, scal.uw(2), f1[0]);
+            mov(1, scal.uw(3), f1[1]);
+            and_(1, scal.uw(3), scal.uw(3), scal.uw(1));
+            or_(1, scal.uw(1), scal.uw(2), scal.uw(3));
+        }
+        and_(1, scal.uw(1), scal.uw(1), scal.uw(0));
+        mov(1, f0[1], scal.uw(1));
+        mov(L, ones[0].ud(), uint32_t(1));
+        for (int h = 0; h < halves; h++)
+            eadd(8, hdr64[2 * h].uq(), foundFlag, uint32_t(kJackpotFoundFlagOff), strategy, state);
+        store(L | f0[1], scattered_dword(), A64, hdr64[0], ones[0]);          // found = 1 (any winner)
+        for (int h = 0; h < halves; h++)
+            eadd(8, hdr64[2 * h].uq(), foundFlag, uint32_t(kJackpotFoundCoordsOff), strategy, state);
+        store(L | f0[1], scattered_qword(), A64, hdr64[0], coord16[0]);      // one winner's (t_rows, t_cols)
+    }
+    mark(lEnd);
+
+    state.ra.safeRelease(scal);
+    state.ra.safeRelease(ones);
+    state.ra.safeRelease(hdr64);
+    state.ra.safeRelease(coord16);
+    state.ra.safeRelease(sid16);
+    state.ra.safeRelease(hdr16);
+    state.ra.safeRelease(laneIdx);
+    state.ra.safeRelease(tmp);
+    state.ra.safeRelease(m);
+    state.ra.safeRelease(v);
+    state.ra.safeRelease(args);
+    state.ra.safeRelease(hdrQ);
+    state.ra.safeRelease(hdr);
+}
+
 GEMMSTONE_NAMESPACE_END
+
 

@@ -38,7 +38,16 @@ bool pipeline_enabled() {
 constexpr size_t kJackpotFoundFlagOffFused = 8u * sizeof(uint32_t);
 constexpr size_t kJackpotFoundCoordsOff =
         (kJackpotFoundFlagOffFused + sizeof(uint32_t) + 7u) & ~size_t(7u);
-constexpr size_t kJackpotFoundBufBytes = kJackpotFoundCoordsOff + sizeof(uint64_t);
+// Cooperative fused kernel: the found buffer is also bound to its tile_xor argument and carries
+// the per-panel arguments at +64 (key[8], tile_cols, tr_base, tc_base, tile_count; see
+// gemmstone case5_blake3.cxx kCoopBuf*). The kernel loads the first 128 bytes.
+constexpr size_t kJackpotCoopArgsOff = 64;
+constexpr size_t kJackpotCoopArgWords = 12;
+constexpr size_t kJackpotFoundBufBytes = 128;
+// CASE5_COOP_AUDIT=1: the kernel also writes per-tile digests (+4096, 32 B each) and the owner
+// thread's messages (+4096 + tiles*32, 64 B each); the host recomputes every digest.
+constexpr size_t kJackpotCoopAuditOff = 4096;
+static_assert(kJackpotFoundCoordsOff + sizeof(uint64_t) <= kJackpotCoopArgsOff, "found buffer layout");
 
 // Fused gemmstone kernel packs bound[+0] found[+32] coords[+40] in one buffer.
 // Non-fused cp_onednn_jackpot_scan uses found_flag at buffer base (offset 0).
@@ -365,6 +374,15 @@ bool Case33GemmOnednn::ensure_matrix_bufs_() {
     return true;
 }
 
+uint64_t Case33GemmOnednn::device_global_mem() const {
+    cl_ulong bytes = 0;
+    if (!ocl_.device ||
+        clGetDeviceInfo(ocl_.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(bytes), &bytes, nullptr) != CL_SUCCESS) {
+        return 0;
+    }
+    return static_cast<uint64_t>(bytes);
+}
+
 bool Case33GemmOnednn::ensure_panel_tile_xor_buf_(int panel_tile_count) {
     if (panel_tile_count <= 0) {
         return false;
@@ -539,18 +557,19 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     device_name_ = ocl_.device_name;
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
-    const char *scan_mode = fused_jackpot_ ? "igemm+wrapGRF+case56Blake3+gpuJudge"
+    const char *scan_mode = fused_jackpot_ ? (info_.jackpotCoop ? "igemm+fold16+coopSIMD16Blake3+gpuJudge"
+                                                                : "igemm+wrapGRF+case56Blake3+gpuJudge")
                             : info_.fold16 ? "igemm+tileXOR+fold16+GPUjackpot"
                                            : "igemm+tileXOR+GPUjackpot";
     char layout_name[8] = {};
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
-                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d",
+                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d",
                   info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, tile_xor_folded_() ? folded_msg_words_ : 0,
-                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_);
+                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, info_.slm);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
@@ -775,6 +794,27 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
         bufs.found_flag = found_buf_;
         bufs.tr_base = tr_base;
         bufs.tc_base = tc_base;
+        if (info_.jackpotCoop) {
+            // The kernel keeps only the tile_xor pointer: bind the found buffer to it and stage
+            // this panel's arguments there (in-order queue: visible to this panel's kernel).
+            uint32_t args[kJackpotCoopArgWords] = {};
+            std::memcpy(args, scan_jackpot_key_, 8 * sizeof(uint32_t));
+            args[8] = static_cast<uint32_t>(panel_tile_cols);
+            args[9] = static_cast<uint32_t>(tr_base);
+            args[10] = static_cast<uint32_t>(tc_base);
+            args[11] = static_cast<uint32_t>(panel_tile_count);
+            if (!ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff)) {
+                return false;
+            }
+            if (info_.jackpotCoopAudit) {   // sentinel: an unwritten digest stays all-ones
+                std::vector<uint32_t> fill(static_cast<size_t>(panel_tile_count) * 8, 0xFFFFFFFFu);
+                if (!ocl_.write_buffer(found_buf_, fill.data(), fill.size() * sizeof(uint32_t),
+                                       kJackpotCoopAuditOff)) {
+                    return false;
+                }
+            }
+            bufs.tile_xor = found_buf_;
+        }
     }
 
     gemmstone::GEMMProblem problem;
@@ -788,6 +828,7 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
     problem.case5TileXorNop = false;
     problem.case5FuseJackpot = fused_jackpot_;
     problem.case5TileXorBlake3 = fused_jackpot_;
+    problem.case5JackpotCoop = fused_jackpot_ && info_.jackpotCoop;   // coop keeps the tile_xor argument
     problem.A.layout = a_row_major_ ? gemmstone::MatrixLayout::T : gemmstone::MatrixLayout::N;
     problem.B.layout = b_row_major_ ? gemmstone::MatrixLayout::T : gemmstone::MatrixLayout::N;
     problem.C.layout = gemmstone::MatrixLayout::N;
@@ -951,6 +992,12 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
                                jackpot_found_flag_off(/*fused=*/true))) {
             return false;
         }
+        if (info_.jackpotCoopAudit) {
+            panel_tile_cols_hint_ = panel_tile_cols;
+            if (!coop_audit_panel_(panel_tile_count, tr_base, tc_base)) {
+                return false;
+            }
+        }
         if (out_found) {
             *out_found = found ? 1 : 0;
         }
@@ -984,6 +1031,150 @@ bool Case33GemmOnednn::run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t
         }
     }
     return true;
+}
+
+bool Case33GemmOnednn::ensure_coop_audit_buf_(int panel_tile_count) {
+    if (coop_audit_tiles_ >= panel_tile_count) {
+        return found_buf_ != nullptr;
+    }
+    if (found_buf_) {
+        clReleaseMemObject(found_buf_);
+        found_buf_ = nullptr;
+    }
+    const size_t bytes = kJackpotCoopAuditOff + static_cast<size_t>(panel_tile_count) * (32 + 64 + 64);
+    found_buf_ = ocl_.alloc_buffer(bytes, CL_MEM_READ_WRITE);
+    if (!found_buf_) {
+        std::fprintf(stderr, "[coop audit] failed to allocate %zu bytes\n", bytes);
+        return false;
+    }
+    coop_audit_tiles_ = panel_tile_count;
+    // The bound words at +0 were written at scan start: restore them in the new buffer.
+    return ocl_.write_buffer(found_buf_, scan_jackpot_bound_, sizeof(scan_jackpot_bound_), 0);
+}
+
+bool Case33GemmOnednn::coop_audit_panel_(int panel_tile_count, int tr_base, int tc_base) {
+    const size_t n = static_cast<size_t>(panel_tile_count);
+    std::vector<uint32_t> dig(n * 8), msg(n * 16), hmsg(n * 16);
+    if (!ocl_.read_buffer(found_buf_, dig.data(), dig.size() * sizeof(uint32_t), kJackpotCoopAuditOff) ||
+        !ocl_.read_buffer(found_buf_, msg.data(), msg.size() * sizeof(uint32_t),
+                          kJackpotCoopAuditOff + n * 32) ||
+        !ocl_.read_buffer(found_buf_, hmsg.data(), hmsg.size() * sizeof(uint32_t),
+                          kJackpotCoopAuditOff + n * 96)) {
+        return false;
+    }
+    int found = 0;
+    if (!ocl_.read_buffer(found_buf_, &found, sizeof(found), jackpot_found_flag_off(true))) {
+        return false;
+    }
+    size_t mismatch = 0, unwritten = 0, winners = 0, first_bad = n, xfer_bad = 0, hash_bad = 0;
+    uint32_t snap_msg[16] = {}, snap_hmsg[16] = {}, snap_dig[8] = {}, snap_ref[8] = {};
+    auto count = [&]() {
+        mismatch = unwritten = winners = xfer_bad = hash_bad = 0;
+        first_bad = n;
+        for (size_t t = 0; t < n; ++t) {
+            uint32_t ref[8];
+            cp_jackpot::b3_compress64(scan_jackpot_key_, &msg[t * 16], ref);
+            const bool xb = std::memcmp(&msg[t * 16], &hmsg[t * 16], 64) != 0;   // owner copy != hasher copy
+            if (xb) ++xfer_bad;
+            {
+                uint32_t hh[8];
+                cp_jackpot::b3_compress64(scan_jackpot_key_, &hmsg[t * 16], hh);
+                if (std::memcmp(hh, &dig[t * 8], 32) != 0) ++hash_bad;         // digest != BLAKE3(hasher copy)
+            }
+            if (cp_jackpot::digest_beats_target(ref, scan_jackpot_bound_)) {
+                ++winners;
+            }
+            bool blank = true;
+            for (int w = 0; w < 8; ++w) {
+                blank = blank && dig[t * 8 + w] == 0xFFFFFFFFu;
+            }
+            const bool mm = !blank && std::memcmp(ref, &dig[t * 8], 32) != 0;
+            if (blank) ++unwritten;
+            if (mm) ++mismatch;
+            if ((blank || mm || xb) && first_bad == n) {
+                first_bad = t;
+                std::memcpy(snap_msg, &msg[t * 16], 64);
+                std::memcpy(snap_hmsg, &hmsg[t * 16], 64);
+                std::memcpy(snap_dig, &dig[t * 8], 32);
+                std::memcpy(snap_ref, ref, 32);
+            }
+        }
+    };
+    count();
+    if (mismatch || unwritten || xfer_bad || hash_bad) {
+        // Pass 2: same host data again. Pass 3: re-read the device buffer. If either clears the
+        // problem, the kernel output was fine and the host readback was not yet complete.
+        const size_t m1 = mismatch, x1 = xfer_bad, h1 = hash_bad, u1 = unwritten, t1 = first_bad;
+        count();
+        std::fprintf(stderr, "[coop audit] pass1 mismatch=%zu xfer_bad=%zu hash_bad=%zu unwritten=%zu first=%zu | "
+                             "pass2 mismatch=%zu xfer_bad=%zu hash_bad=%zu unwritten=%zu first=%zu\n",
+                     m1, x1, h1, u1, t1, mismatch, xfer_bad, hash_bad, unwritten, first_bad);
+        std::fprintf(stderr, "[coop audit] pass1 snapshot of tile %zu: owner %08x %08x .. %08x %08x | hasher %08x %08x .. %08x %08x | "
+                             "H(owner) %08x.. gpu %08x..\n", t1, snap_msg[0], snap_msg[1], snap_msg[14], snap_msg[15],
+                     snap_hmsg[0], snap_hmsg[1], snap_hmsg[14], snap_hmsg[15], snap_ref[0], snap_dig[0]);
+        if (t1 < n) {
+            std::fprintf(stderr, "[coop audit] now       of tile %zu: owner %08x %08x .. %08x %08x | hasher %08x %08x .. %08x %08x\n",
+                         t1, msg[t1 * 16], msg[t1 * 16 + 1], msg[t1 * 16 + 14], msg[t1 * 16 + 15],
+                         hmsg[t1 * 16], hmsg[t1 * 16 + 1], hmsg[t1 * 16 + 14], hmsg[t1 * 16 + 15]);
+        }
+        clFinish(ocl_.queue);
+        if (ocl_.read_buffer(found_buf_, dig.data(), dig.size() * sizeof(uint32_t), kJackpotCoopAuditOff) &&
+            ocl_.read_buffer(found_buf_, msg.data(), msg.size() * sizeof(uint32_t), kJackpotCoopAuditOff + n * 32) &&
+            ocl_.read_buffer(found_buf_, hmsg.data(), hmsg.size() * sizeof(uint32_t), kJackpotCoopAuditOff + n * 96)) {
+            count();
+            std::fprintf(stderr, "[coop audit] pass3 (re-read) mismatch=%zu xfer_bad=%zu hash_bad=%zu unwritten=%zu first=%zu\n",
+                         mismatch, xfer_bad, hash_bad, unwritten, first_bad);
+        }
+    }
+    const bool ok = mismatch == 0 && unwritten == 0 && xfer_bad == 0 && hash_bad == 0
+            && ((winners > 0) == (found != 0));
+    std::fprintf(stderr,
+                 "[coop audit] panel tr=%d tc=%d tiles=%d mismatch=%zu unwritten=%zu xfer_bad=%zu hash_bad=%zu winners=%zu found=%d%s\n",
+                 tr_base, tc_base, panel_tile_count, mismatch, unwritten, xfer_bad, hash_bad, winners, found,
+                 ok ? "" : "  FAIL");
+    if (!ok && first_bad < n) {
+        const size_t t = first_bad;
+        std::fprintf(stderr, "[coop audit] first bad tile sid=%zu msg[0]=%08x gpu=%08x..%08x\n", t,
+                     msg[t * 16], dig[t * 8], dig[t * 8 + 7]);
+        // Position: panel tile (row, col); work group = 16 tile rows x (2 threads x 4 sub-tiles) cols.
+        const int cols = panel_tile_cols_hint_ > 0 ? panel_tile_cols_hint_ : 1;
+        const size_t tr = t / cols, tc = t % cols;
+        const int lidM = int(tr % 16), lidN = int((tc % 8) / 4), fi = int(tc % 4);
+        const int lidFlat = lidN * 16 + lidM, tileInWg = lidFlat * 4 + fi;
+        std::fprintf(stderr, "[coop audit]   tile (%zu,%zu) wg (%zu,%zu) lidFlat=%d fi=%d tileInWg=%d "
+                             "(hash thread %d lane %d at 8 lanes, %d/%d at 16)\n",
+                     tr, tc, tr / 16, tc / 8, lidFlat, fi, tileInWg, tileInWg / 8, tileInWg % 8,
+                     tileInWg / 16, tileInWg % 16);
+        const bool stale = coop_audit_prev_msg_.size() == msg.size() &&
+                std::memcmp(&coop_audit_prev_msg_[t * 16], &msg[t * 16], 64) == 0;
+        std::fprintf(stderr, "[coop audit]   audit message slot %s the previous panel's\n",
+                     stale ? "UNCHANGED since (stale copy: owner's audit store missed)" : "differs from");
+        size_t match = n;
+        for (size_t u = 0; u < n && match == n; ++u) {
+            uint32_t h[8];
+            cp_jackpot::b3_compress64(scan_jackpot_key_, &msg[u * 16], h);
+            if (std::memcmp(h, &dig[t * 8], 32) == 0) match = u;
+        }
+        if (match < n)
+            std::fprintf(stderr, "[coop audit]   GPU digest = BLAKE3 of tile %zu's message (mapping/slot error)\n", match);
+        else
+            std::fprintf(stderr, "[coop audit]   GPU digest matches no tile's message (corrupted message or digest)\n");
+        bool zero = true;
+        for (int w = 0; w < 16; ++w) zero = zero && msg[t * 16 + w] == 0;
+        if (zero) std::fprintf(stderr, "[coop audit]   audit message is all zero\n");
+        std::fprintf(stderr, "[coop audit]   owner copy : %08x %08x %08x %08x %08x %08x %08x %08x ...\n",
+                     msg[t * 16], msg[t * 16 + 1], msg[t * 16 + 2], msg[t * 16 + 3], msg[t * 16 + 4],
+                     msg[t * 16 + 5], msg[t * 16 + 6], msg[t * 16 + 7]);
+        std::fprintf(stderr, "[coop audit]   hasher copy: %08x %08x %08x %08x %08x %08x %08x %08x ...\n",
+                     hmsg[t * 16], hmsg[t * 16 + 1], hmsg[t * 16 + 2], hmsg[t * 16 + 3], hmsg[t * 16 + 4],
+                     hmsg[t * 16 + 5], hmsg[t * 16 + 6], hmsg[t * 16 + 7]);
+        uint32_t hh[8];
+        cp_jackpot::b3_compress64(scan_jackpot_key_, &hmsg[t * 16], hh);
+        std::fprintf(stderr, "[coop audit]   digest %s BLAKE3(hasher copy)\n",
+                     std::memcmp(hh, &dig[t * 8], 32) == 0 ? "==" : "!=");
+    }
+    coop_audit_prev_msg_.swap(msg);
+    return ok;
 }
 
 bool Case33GemmOnednn::scan_tile_xor_panel_host_(const uint32_t a_key8[8], const uint32_t bound[8],
@@ -1368,6 +1559,9 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
 
             if (fused_jackpot_) {
                 if (!ensure_jackpot_bufs_()) {
+                    return false;
+                }
+                if (info_.jackpotCoopAudit && !ensure_coop_audit_buf_(panel_tile_count)) {
                     return false;
                 }
             } else if (!ensure_panel_tile_xor_buf_(panel_tile_count)) {

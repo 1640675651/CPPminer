@@ -92,8 +92,38 @@ size_t gemmSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strate
         slmSize = std::max<size_t>(slmSize, 8);
 
     slmSize += case5TileXorSlmBytesPerWG(problem, strategy);
+    // Cooperative jackpot tables live in the k loop's (then dead) SLM buffers: above 16 KB the
+    // A770 loses a quarter of its throughput, so they only ever grow the allocation when needed.
+    if (problem.case5JackpotCoop)
+        slmSize = std::max(slmSize, case5JackpotCoopSlmBytes(problem, strategy));
+    // CASE5_SLM_PAD=<bytes> (timing experiments only): pad or shrink the SLM allocation.
+    if (const char *pad = std::getenv("CASE5_SLM_PAD"); pad && pad[0]) {
+        const long long p = std::atoll(pad);
+        slmSize = size_t(std::max<long long>(0, static_cast<long long>(slmSize) + p));
+    }
 
     return slmSize;
+}
+
+int case5JackpotCoopTiles(const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
+    const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
+    return strategy.wg[LoopM] * strategy.wg[LoopN] * subGridM * subGridN;
+}
+
+size_t case5JackpotCoopSlmBytes(const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    if (!problem.case5JackpotCoop) return 0;
+    const int tiles = std::max(0, case5JackpotCoopTiles(problem, strategy));
+    return size_t(tiles) * (64 + 4 + 8);          // per tile: message, spatial id, packed (t_rows, t_cols)
+}
+
+size_t case5JackpotCoopSlmByteOffset(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy, bool computeMax)
+{
+    GEMMProblem base = problem;
+    base.case5JackpotCoop = false;
+    return (gemmSLMSize(hw, base, strategy, computeMax) + 63) & ~size_t(63);
 }
 
 size_t gemmPerKSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy)

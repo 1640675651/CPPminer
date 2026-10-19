@@ -33,6 +33,14 @@ size_t gemmSLMSize(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &
 size_t case5TileXorSlmByteOffset(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
                                  bool computeMax = false);
 
+// Cooperative fused jackpot (case5JackpotCoop): tiles per work group, bytes of the SLM region that
+// holds every tile's 16-word message, spatial id and packed (t_rows, t_cols), and its byte offset
+// (after everything else gemmstone and the Case5 staging use, 64-byte aligned).
+int case5JackpotCoopTiles(const GEMMProblem &problem, const GEMMStrategy &strategy);
+size_t case5JackpotCoopSlmBytes(const GEMMProblem &problem, const GEMMStrategy &strategy);
+size_t case5JackpotCoopSlmByteOffset(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                     bool computeMax = false);
+
 // Case5.4 with SLM staging: stage every K milestone in SLM and fold slot ms with ms + outputMs
 // at the epilogue flush (default), instead of a load-xor-store in the K loop
 // (CASE5_XOR_WRAP_AT=loop restores that).

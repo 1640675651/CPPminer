@@ -297,10 +297,15 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     configure_hash_tile_from_kernel();
     const auto &di = g_gemm.driver_info();
     if (di.strategy.systolic) {
+        // 4096x4096-tile panels (4 per 131072^2 attempt) need two 1 GiB tile_xor buffers with the
+        // folded message; use them only on cards with >= 12 GiB (A770 16 GB: +0.8% over 2048).
+        const uint64_t mem = g_gemm.device_global_mem();
+        const int batch = (di.fold16 && mem >= (12ull << 30)) ? CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM
+                                                              : CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT;
         if (g_row_batch_auto)
-            cp_onednn_worker_set_row_period_batch(CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT);
+            cp_onednn_worker_set_row_period_batch(batch);
         if (g_col_batch_auto)
-            cp_onednn_worker_set_col_period_batch(CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT);
+            cp_onednn_worker_set_col_period_batch(batch);
     }
     printf("[onednn] device[%d]: %s\n", g_gemm.device_index(), g_gemm.device_name());
     printf("[onednn] platform: %s\n", g_gemm.platform_name());

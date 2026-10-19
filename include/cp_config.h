@@ -57,8 +57,11 @@
  * (fewer kernel tails), and 16 panels per attempt need fewer host syncs than 64. On the
  * A380, 1024x1024 measured fastest of the sizes up to 1024 (PR #36). */
 #define CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT 2048
+/* Cards with >= 12 GiB: 4096x4096-tile panels (65536^2 GEMM, 4 per attempt), +0.8% on the A770
+ * (fewer kernel boundaries; idle 2.2 -> 0.4 ms per attempt). */
+#define CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM 4096
 /* oneDNN panel batch limit (hash tiles per dimension); larger than the generic launch window. */
-#define CP_ONEDNN_PERIOD_BATCH_MAX 2048
+#define CP_ONEDNN_PERIOD_BATCH_MAX 4096
 
 /* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
 #define CP_MACRO_BATCH_DEFAULT 1024 // one full row of 131072 cols
