@@ -90,6 +90,7 @@ private:
     bool noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, int K, int out_lda, int is_b,
                                 int has_signal);
     /* Work-group row-major path; false when unavailable so the caller falls back. */
+    bool uniform_rows_check_(int rows, int is_b);
     bool noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
                                    int is_b, int has_signal);
     bool noisy_matrix_rowmajor_check_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
@@ -122,6 +123,8 @@ private:
     cl_kernel k_noisy_rowmajor_ = nullptr;
     cl_kernel k_uniform_rows_ = nullptr;      // optional: work-group row-major noise path
     cl_kernel k_noisy_rowmajor_wg_ = nullptr; // optional, with k_uniform_rows_
+    cl_kernel k_noisy_rowmajor_sg_ = nullptr; // optional: 32-lane sub-group shuffle variant (preferred)
+    cl_kernel k_uniform_rows_b3_ = nullptr;   // optional: register BLAKE3 uniform rows (preferred)
     cl_kernel k_noisy_a_colmajor_ = nullptr;
     cl_kernel k_noisy_colmajor_ = nullptr;
     cl_kernel k_noisy_b_rowmajor_ = nullptr;
