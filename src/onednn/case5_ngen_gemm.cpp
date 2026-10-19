@@ -365,6 +365,12 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                         && strategy.wg[LoopM] > 0 && strategy.wg[LoopN] > 0 && !problem.case5TileXorSlm;
                 problem.case5JackpotCoop = coop_ok;
                 {
+                    // Default: every thread hashes its own tiles (SIMD-N, no SLM). CASE5_COOP_OWN=0:
+                    // SLM transpose, 8 tiles per hashing thread.
+                    const char *ownEnv = std::getenv("CASE5_COOP_OWN");
+                    problem.case5JackpotCoopSlm = coop_ok && ownEnv && ownEnv[0] == '0';
+                }
+                {
                     const char *auditEnv = std::getenv("CASE5_COOP_AUDIT");
                     problem.case5JackpotCoopAudit = coop_ok && auditEnv && auditEnv[0] == '1';
                 }
@@ -403,6 +409,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->fold16 = problem.case5TileXorFold16;
                 info->jackpotCoop = problem.case5JackpotCoop;
                 info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
+                info->jackpotCoopSlm = problem.case5JackpotCoopSlm;
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {

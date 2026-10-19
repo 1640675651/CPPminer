@@ -94,7 +94,7 @@ size_t gemmSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strate
     slmSize += case5TileXorSlmBytesPerWG(problem, strategy);
     // Cooperative jackpot tables live in the k loop's (then dead) SLM buffers: above 16 KB the
     // A770 loses a quarter of its throughput, so they only ever grow the allocation when needed.
-    if (problem.case5JackpotCoop)
+    if (problem.case5JackpotCoop && problem.case5JackpotCoopSlm)
         slmSize = std::max(slmSize, case5JackpotCoopSlmBytes(problem, strategy));
     // CASE5_SLM_PAD=<bytes> (timing experiments only): pad or shrink the SLM allocation.
     if (const char *pad = std::getenv("CASE5_SLM_PAD"); pad && pad[0]) {

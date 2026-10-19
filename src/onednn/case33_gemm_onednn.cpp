@@ -557,7 +557,8 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     device_name_ = ocl_.device_name;
     platform_name_ = ocl_.platform_name;
     device_flat_index_ = ocl_.device_flat_index;
-    const char *scan_mode = fused_jackpot_ ? (info_.jackpotCoop ? "igemm+fold16+coopSIMD16Blake3+gpuJudge"
+    const char *scan_mode = fused_jackpot_ ? (info_.jackpotCoop ? (info_.jackpotCoopSlm ? "igemm+fold16+slmSIMD8Blake3+gpuJudge"
+                                                                                        : "igemm+fold16+ownTileBlake3+gpuJudge")
                                                                 : "igemm+wrapGRF+case56Blake3+gpuJudge")
                             : info_.fold16 ? "igemm+tileXOR+fold16+GPUjackpot"
                                            : "igemm+tileXOR+GPUjackpot";

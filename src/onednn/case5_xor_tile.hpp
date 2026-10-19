@@ -205,7 +205,10 @@ inline void case5_halve_xor_subtile_dims_both(int unrollM, int unrollN, XorSubti
     while (d.subM > 16) {
         d.subM /= 2;
     }
-    while (d.subN > 16) {
+    // CASE5_XOR_SUBN_MAX=8 (experiment): narrower logical tiles, e.g. 16x8 (8 per 16x64 thread block).
+    int capN = 16;
+    if (const char *c = std::getenv("CASE5_XOR_SUBN_MAX"); c && std::atoi(c) > 0) capN = std::atoi(c);
+    while (d.subN > capN) {
         d.subN /= 2;
     }
     d.subGridM = unrollM / d.subM;

@@ -794,20 +794,29 @@ namespace {
 // regions, tmp(k) the temporary of G chain k. The message schedule is applied statically (round
 // r reads word perm_r[i]); the four independent G functions of a half-round are emitted in lockstep.
 template <typename GeneratorT, typename OpV, typename OpM, typename OpT>
-void emitBlake3RoundsWide(GeneratorT &g, OpV v, OpM m, OpT tmp, int esize) {
+void emitBlake3RoundsWide(GeneratorT &g, OpV v, OpM m, OpT tmp, int esize, bool useAdd3) {
     int perm[16];
     for (int i = 0; i < 16; i++) perm[i] = i;
     auto G4 = [&](const int (&a)[4], const int (&b)[4], const int (&c)[4], const int (&d)[4],
                   const int (&mx)[4], const int (&my)[4]) {
-        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
-        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(mx[k]));
+        // a = a + b + m: one 3-input add on XeHP+ (12 instead of 14 instructions per G)
+        if (useAdd3) {
+            for (int k = 0; k < 4; k++) g.add3(esize, v(a[k]), v(a[k]), v(b[k]), m(mx[k]));
+        } else {
+            for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
+            for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(mx[k]));
+        }
         for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(d[k]), v(a[k]));
         for (int k = 0; k < 4; k++) g.ror(esize, v(d[k]), tmp(k), uint16_t(16));
         for (int k = 0; k < 4; k++) g.add(esize, v(c[k]), v(c[k]), v(d[k]));
         for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(b[k]), v(c[k]));
         for (int k = 0; k < 4; k++) g.ror(esize, v(b[k]), tmp(k), uint16_t(12));
-        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
-        for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(my[k]));
+        if (useAdd3) {
+            for (int k = 0; k < 4; k++) g.add3(esize, v(a[k]), v(a[k]), v(b[k]), m(my[k]));
+        } else {
+            for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), v(b[k]));
+            for (int k = 0; k < 4; k++) g.add(esize, v(a[k]), v(a[k]), m(my[k]));
+        }
         for (int k = 0; k < 4; k++) g.xor_(esize, tmp(k), v(d[k]), v(a[k]));
         for (int k = 0; k < 4; k++) g.ror(esize, v(d[k]), tmp(k), uint16_t(8));
         for (int k = 0; k < 4; k++) g.add(esize, v(c[k]), v(c[k]), v(d[k]));
@@ -907,6 +916,157 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
         if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "coop entry", state.ra.countAllocedRegisters());
     gemmCase5ReleaseAccForBlake3(strategy, state);
         if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "coop after release", state.ra.countAllocedRegisters());
+
+    // Default: every thread hashes its own N = tilesPerThread tiles, one SIMD lane per sub-tile,
+    // straight from the fold registers: a register transpose instead of SLM tables, no barriers.
+    // The busiest thread runs one N-lane hash, like a hashing thread of the SLM variant
+    // (problem.case5JackpotCoopSlm, CASE5_COOP_OWN=0), which measured the same speed at N = 4.
+    if (!problem.case5JackpotCoopSlm) {
+        const int N = tilesPerThread;
+        if (subGridM != 1 || N < 1 || N > 8 || (N & (N - 1)) || dpg != 8)
+            stub("own-tile jackpot: needs a 1 x N sub-tile grid, N a power of two <= 8, and 32-byte GRFs");
+        // With the hash skipped this kernel never completed on the A770 (cause not found); refuse
+        // to build it rather than hang the GPU. Timing knob only.
+        if (coopSkip & 2) stub("own-tile jackpot: CASE5_COOP_SKIP=2 hangs, not supported");
+        const int wpg = 8 / N;                                  // message words per GRF in the packed transpose
+        GRF hdr = state.ra.alloc(), sidG = state.ra.alloc();
+        GRFRange coordG = state.ra.alloc_range(2);              // SIMD8 qword payload (lanes 0..N-1 used)
+        GRFRange args = state.ra.alloc_range(int(kCoopBufLoadBytes) / GRF::bytes(hw));
+        GRFRange hdrQ = state.ra.alloc_range(1);
+        auto ARG = [&](int i) { return args[i / dpg].ud(i % dpg); };
+        const auto trBase = ARG(kCoopBufTrDw), tcBase = ARG(kCoopBufTcDw), tileCols = ARG(kCoopBufTileColsDw);
+        const auto foundFlag = state.inputs.tileXor, blake3Out = state.inputs.blake3Out;
+        emov(1, hdrQ[0].uq(0), state.inputs.tileXor, strategy, state);
+        load(1, args, block(D32, int(kCoopBufLoadBytes) / 4), A64, hdrQ);
+        {
+            GRF lr = state.ra.alloc(), lc = state.ra.alloc();
+            for (int fi = 0; fi < N; fi++) {
+                mulConstant(1, lr.ud(0), state.tileXorRow, subGridM);
+                mulConstant(1, lc.ud(0), state.tileXorCol, subGridN);
+                add(1, lc.ud(0), lc.ud(0), uint16_t(fi));
+                emad(1, sidG.ud(fi), lc.ud(0), lr.ud(0), tileCols, strategy, state);  // spatial id
+                if (judge) {
+                    add(1, lr.ud(0), lr.ud(0), trBase);
+                    add(1, lc.ud(0), lc.ud(0), tcBase);
+                }
+                mulConstant(1, coordG[(2 * fi) / dpg].ud((2 * fi) % dpg), lr.ud(0), hashMr);          // t_rows
+                mulConstant(1, coordG[(2 * fi + 1) / dpg].ud((2 * fi + 1) % dpg), lc.ud(0), hashNr);  // t_cols
+            }
+            state.ra.safeRelease(lc);
+            state.ra.safeRelease(lr);
+        }
+        if (audit) {
+            // owner copy of each message: tile_xor + 4096 + tile_count*32 + sid*64
+            GRFRange ahdr = state.ra.alloc_range(1);
+            GRF aoff = state.ra.alloc();
+            shl(1, aoff.ud(0), ARG(kCoopBufTileCountDw), uint16_t(5));
+            add(1, aoff.ud(0), aoff.ud(0), uint32_t(kCoopAuditOff));
+            for (int fi = 0; fi < N; fi++) {
+                shl(1, aoff.ud(1), sidG.ud(fi), uint16_t(6));
+                add(1, aoff.ud(1), aoff.ud(1), aoff.ud(0));
+                eadd(1, ahdr[0].uq(0), state.inputs.tileXor, aoff.ud(1), strategy, state);
+                store(1, block(D32, 16), A64, ahdr, GRFRange(state.tileXorFoldAcc.getBase() + fi * 2, 2));
+            }
+            state.ra.safeRelease(aoff);
+            state.ra.safeRelease(ahdr);
+        }
+        {
+            GRFRange v = state.ra.alloc_range(16), P = state.ra.alloc_range(16 / wpg), tmp = state.ra.alloc_range(4);
+            GRFRange hdr64 = state.ra.alloc_range(2), ones = state.ra.alloc_range(1);
+            GRFRange A;
+            if (wpg > 1) A = state.ra.alloc_range(16);
+            GRF scal = state.ra.alloc(), dtmp = state.ra.alloc(), hdrS = state.ra.alloc();
+            auto V = [&](int i) { return v[i].ud(); };
+            // Word w of the N tiles: N lanes at the start of a GRF. The transpose packs wpg words per
+            // GRF (P); words not at a GRF start are copied to A[w], because add3 with an operand that
+            // starts mid-register computed wrong sums (two-source ops on it were fine).
+            auto Mw = [&](int w) { return (w % wpg) ? A[w].ud(0)(1) : P[w / wpg].ud(0)(1); };
+            auto T = [&](int k) { return tmp[k].ud(); };
+            // transpose: tile fi's word w (fold GRF 2 fi + w/8, dword w%8) -> P[w/wpg] dword (w%wpg)*N + fi;
+            // one mov per (tile, wpg consecutive words): 2 N^2 movs
+            const int dstStride = (wpg > 1) ? N : 1;
+            for (int fi = 0; fi < N; fi++)
+                for (int w = 0; w < kBlake3MsgWords; w += wpg)
+                    mov(wpg, P[w / wpg].ud(fi)(dstStride),
+                        GRF(state.tileXorFoldAcc.getBase() + 2 * fi + w / 8).ud(w % 8)(1));
+            for (int w = 0; w < kBlake3MsgWords; w++)
+                if (w % wpg) mov(N, A[w].ud(), P[w / wpg].ud((w % wpg) * N)(1));
+            mov(1, scal.uw(0), uint16_t((1u << N) - 1));                      // valid lanes
+            if (audit) {
+                // hasher copy: tile_xor + 4096 + tile_count*96 + sid*64 + 4w (stores stay SIMD8, masked)
+                mulConstant(1, hdr.ud(1), ARG(kCoopBufTileCountDw), 96);
+                add(1, hdr.ud(1), hdr.ud(1), uint32_t(kCoopAuditOff));
+                shl(8, hdrS.ud(), sidG.ud(), uint16_t(6));
+                add(8, hdrS.ud(), hdrS.ud(), hdr.ud(1));
+                eadd(8, hdr64[0].uq(), state.inputs.tileXor, hdrS.ud(), strategy, state);
+                mov(1, f1[0], scal.uw(0));
+                for (int w = 0; w < kBlake3MsgWords; w++) {
+                    if (w) eadd(8, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
+                    mov(N, dtmp.ud(), Mw(w));
+                    store(8 | f1[0], scattered_dword(), A64, hdr64[0], dtmp);
+                }
+            }
+            for (int i = 0; i < kBlake3DigestWords; i++) mov(N, V(i), ARG(kCoopBufKeyDw + i));
+            for (int i = 0; i < 4; i++) mov(N, V(8 + i), uint32_t(kBlake3IV[i]));
+            mov(N, V(12), uint32_t(0));
+            mov(N, V(13), uint32_t(0));
+            mov(N, V(14), blake3BlockLen);
+            mov(N, V(15), blake3Flags);
+            {
+                const char *a3 = std::getenv("CASE5_COOP_ADD3");
+                const bool useAdd3 = hw >= HW::XeHP && !(a3 && a3[0] == '0');
+                emitBlake3RoundsWide(*this, V, Mw, T, N, useAdd3);
+            }
+            for (int i = 0; i < kBlake3DigestWords; i++) xor_(N, V(i), V(i), V(8 + i));   // digest in V(0..7)
+            if (digestOut) {
+                const auto outBase = audit ? state.inputs.tileXor : blake3Out;
+                shl(8, hdrS.ud(), sidG.ud(), uint16_t(5));
+                if (audit) add(8, hdrS.ud(), hdrS.ud(), uint32_t(kCoopAuditOff));
+                eadd(8, hdr64[0].uq(), outBase, hdrS.ud(), strategy, state);
+                mov(1, f1[0], scal.uw(0));
+                for (int w = 0; w < kBlake3DigestWords; w++) {
+                    if (w) eadd(8, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
+                    store(8 | f1[0], scattered_dword(), A64, hdr64[0], v[w]);
+                }
+            }
+            if (judge) {
+                // beats = digest < bound lexicographically from word 7 down, equal counts as a hit
+                mov(1, scal.uw(1), scal.uw(0));
+                for (int w = 0; w < kBlake3DigestWords; w++) {
+                    cmp(N | lt | f1[0], null.ud(), V(w), ARG(w));
+                    cmp(N | eq | f1[1], null.ud(), V(w), ARG(w));
+                    mov(1, scal.uw(2), f1[0]);
+                    mov(1, scal.uw(3), f1[1]);
+                    and_(1, scal.uw(3), scal.uw(3), scal.uw(1));
+                    or_(1, scal.uw(1), scal.uw(2), scal.uw(3));
+                }
+                and_(1, scal.uw(1), scal.uw(1), scal.uw(0));
+                mov(1, f0[1], scal.uw(1));
+                mov(8, ones[0].ud(), uint32_t(1));
+                eadd(8, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundFlagOff), strategy, state);
+                store(8 | f0[1], scattered_dword(), A64, hdr64[0], ones[0]);      // found = 1 (any winner)
+                eadd(8, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundCoordsOff), strategy, state);
+                store(8 | f0[1], scattered_qword(), A64, hdr64[0], coordG[0]);    // one winner's (t_rows, t_cols)
+            }
+            state.ra.safeRelease(hdrS);
+            state.ra.safeRelease(dtmp);
+            state.ra.safeRelease(scal);
+            if (wpg > 1) state.ra.safeRelease(A);
+            state.ra.safeRelease(ones);
+            state.ra.safeRelease(hdr64);
+            state.ra.safeRelease(tmp);
+            state.ra.safeRelease(P);
+            state.ra.safeRelease(v);
+        }
+        state.ra.safeRelease(state.tileXorLineBuf);
+        state.ra.safeRelease(state.tileXorFoldAcc);
+        state.ra.safeRelease(hdrQ);
+        state.ra.safeRelease(args);
+        state.ra.safeRelease(coordG);
+        state.ra.safeRelease(sidG);
+        state.ra.safeRelease(hdr);
+        return;
+    }
 
     // ---- 1. this thread's tiles -> SLM ----
     GRF hdr = state.ra.alloc(), tIdx = state.ra.alloc(), sidG = state.ra.alloc();
@@ -1051,7 +1211,11 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
     mov(L, V(13), uint32_t(0));
     mov(L, V(14), blake3BlockLen);
     mov(L, V(15), blake3Flags);
-    emitBlake3RoundsWide(*this, V, Mw, T, L);
+    {
+        const char *a3 = std::getenv("CASE5_COOP_ADD3");          // 0: two adds (A/B timing)
+        const bool useAdd3 = hw >= HW::XeHP && !(a3 && a3[0] == '0');
+        emitBlake3RoundsWide(*this, V, Mw, T, L, useAdd3);
+    }
     for (int i = 0; i < kBlake3DigestWords; i++) xor_(L, V(i), V(i), V(8 + i));    // digest in V(0..7)
 
     if (digestOut) {
