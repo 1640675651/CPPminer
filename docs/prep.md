@@ -233,8 +233,9 @@ seed write). The first derivation in a process is compared with the host formula
 host on a mismatch; `CP_OCL_PREP_CHECK=1` also checks the GPU row against the host formula every nonce.
 
 A770, fused scan, steady state per attempt: host-to-device writes 23 (4,628 B) -> 19 (308 B), reads 5 -> 4,
-prep 5.3 -> 5.0 ms. What remains per attempt: the bound (32 B) and the found-buffer resets and tile
-arguments per panel.
+prep 5.3 -> 5.0 ms. The bound (pool target) is likewise written only when it changes, which takes the
+steady state to 13 writes (196 B): per panel the cleared found flag and hit coordinates and 16 B of
+tile arguments, plus one flag clear at scan start.
 
 ### Verification
 

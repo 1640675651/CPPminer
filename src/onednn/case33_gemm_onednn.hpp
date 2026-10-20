@@ -121,6 +121,13 @@ private:
     bool scan_key_dev_ = false;        // this scan's key is prep_.a_key_buffer() (device only)
     bool scan_key_host_valid_ = false; // scan_jackpot_key_ holds it
     bool ensure_host_scan_key_();      // fetch the device key for host-side users
+    // The bound changes with the pool target (per job), not per attempt: device copies are rewritten
+    // only when the value differs from what was last written (or the buffer was reallocated).
+    uint32_t bound_buf_val_[8] = {};
+    bool bound_buf_valid_ = false;
+    uint32_t found_bound_val_[8] = {};
+    bool found_bound_valid_ = false;
+    bool stage_found_bound_();         // fused: scan_jackpot_bound_ -> found_buf_[0..31] if stale
     uint32_t scan_jackpot_bound_[8] = {};
     int xor_period_ = 1;
     int row_period_batch_ = CP_ONEDNN_PERIOD_BATCH_DEFAULT;

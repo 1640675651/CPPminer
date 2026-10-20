@@ -464,9 +464,11 @@ bool Case33GemmOnednn::ensure_jackpot_bufs_() {
     }
     if (!bound_buf_) {
         bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_WRITE);
+        bound_buf_valid_ = false;
     }
     if (!found_buf_) {
         found_buf_ = ocl_.alloc_buffer(kJackpotFoundBufBytes, CL_MEM_READ_WRITE);
+        found_bound_valid_ = false;
     }
     if (!out_rows_buf_) {
         out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
@@ -763,7 +765,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         if (!found_buf_ || !bound_buf_) {
             return false;
         }
-        if (!ocl_.write_buffer(found_buf_, scan_jackpot_bound_, 8u * sizeof(uint32_t), 0)) {
+        if (!stage_found_bound_()) {   // normally already current (written once per job)
             return false;
         }
         const int zero = 0;
@@ -1116,13 +1118,27 @@ bool Case33GemmOnednn::ensure_coop_audit_buf_(int panel_tile_count) {
     }
     const size_t bytes = kJackpotCoopAuditOff + static_cast<size_t>(panel_tile_count) * (32 + 64 + 64);
     found_buf_ = ocl_.alloc_buffer(bytes, CL_MEM_READ_WRITE);
+    found_bound_valid_ = false;
     if (!found_buf_) {
         std::fprintf(stderr, "[coop audit] failed to allocate %zu bytes\n", bytes);
         return false;
     }
     coop_audit_tiles_ = panel_tile_count;
-    // The bound words at +0 were written at scan start: restore them in the new buffer.
-    return ocl_.write_buffer(found_buf_, scan_jackpot_bound_, sizeof(scan_jackpot_bound_), 0);
+    // The bound words at +0 were written into the old buffer: restore them in the new one.
+    return stage_found_bound_();
+}
+
+bool Case33GemmOnednn::stage_found_bound_() {
+    if (found_bound_valid_ && std::memcmp(found_bound_val_, scan_jackpot_bound_, sizeof(found_bound_val_)) == 0) {
+        return true;
+    }
+    found_bound_valid_ = false;
+    if (!ocl_.write_buffer(found_buf_, scan_jackpot_bound_, sizeof(scan_jackpot_bound_), 0)) {
+        return false;
+    }
+    std::memcpy(found_bound_val_, scan_jackpot_bound_, sizeof(found_bound_val_));
+    found_bound_valid_ = true;
+    return true;
 }
 
 bool Case33GemmOnednn::ensure_host_scan_key_() {
@@ -1596,11 +1612,17 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
     }
     std::memcpy(scan_jackpot_bound_, bound, sizeof(scan_jackpot_bound_));
 
-    if (!ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
-        return false;
+    // The bound follows the pool target: write the device copies only when it changed.
+    if (!bound_buf_valid_ || std::memcmp(bound_buf_val_, bound, sizeof(bound_buf_val_)) != 0) {
+        bound_buf_valid_ = false;
+        if (!ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
+            return false;
+        }
+        std::memcpy(bound_buf_val_, bound, sizeof(bound_buf_val_));
+        bound_buf_valid_ = true;
     }
     if (fused_jackpot_) {
-        if (!ocl_.write_buffer(found_buf_, bound, 8 * sizeof(uint32_t), 0)) {
+        if (!stage_found_bound_()) {   // found_buf_[0..31] holds the bound in fused mode
             return false;
         }
         if (info_.jackpotCoop) {   // the cooperative kernel reads its key from the found buffer
