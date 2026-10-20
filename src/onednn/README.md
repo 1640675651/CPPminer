@@ -132,6 +132,32 @@ $env:CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT = "1.0"
 | `CASE5_DEBUG_SELECT` | off | `1` — log each catalog candidate tried during JIT kernel build. |
 | `CASE5_DEBUG_RANK` | off | `1` — print gemmstone's own catalog ranking for the problem (top 15, model score = predicted time, lower ranks first), before the miner reorders candidates. |
 
+### Host/device transfers (scan stalls)
+
+On the Arc A770 (Windows driver), `clEnqueueWriteBuffer` occasionally sleeps about 70 s (40-100 s seen)
+waiting on a GPU fence in `D3DKMTWaitForSynchronizationObjectFromCpu` (stack captured during a stall),
+while the CPU and GPU sit idle; then it returns normally with correct data. The scan shows `0 MAC/s` or
+a frozen percentage with a falling rate until it returns, which can coincide with the next pool job.
+The fused scan makes about 25 small transfers per attempt (per-panel arguments into the found buffer,
+the found-flag read, prep seeds and the row update), so it hit this about once per 325 attempts. Every
+variant that still called the transfer API stalled sooner or later: read-only or read-write buffers,
+staging through an `ALLOC_HOST_PTR` buffer, non-blocking writes followed by `clFinish`.
+
+`OpenClContext::write_buffer` / `read_buffer` therefore move transfers of up to 64 KB on Intel discrete
+GPUs without a transfer call: the bytes go through a 64 KB host USM block
+(`cl_intel_unified_shared_memory`) and a one-line copy kernel, completed with `clFinish`. Result: 0
+stalls in 2000 fused attempts (about 6 expected before), prep 6.0 to 5.3 ms, scan unchanged. A kernel
+must not write a `CL_MEM_READ_ONLY` buffer or read a `CL_MEM_WRITE_ONLY` one, so the small buffers the
+host writes or reads (`a_key_buf_`, `bound_buf_`, the prep's `d_job_key_` and `d_noise_seed_`, the
+OpenCL backend's hit coordinates) are now `CL_MEM_READ_WRITE`. Other read-only or write-only buffers
+and larger transfers (such as the witness read after a hit) still use the transfer calls.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CP_OCL_XFER_STAGE` | on for Intel discrete GPUs | `0` — transfer calls for everything (the stalling path); `1` — the kernel path on any device with USM. Shared with the OpenCL backend. |
+| `CP_OCL_XFER_WATCH` | off | `<ms>` — log every transfer slower than `<ms>` with its path, size, offset, the buffer's size and flags (`[ocl] SLOW write 32 B @0 (buffer 32 B, flags 0x4): host 70.2 s`), and GPU timestamps when `CP_OCL_QUEUE_PROFILING=1`. |
+| `CP_ONEDNN_PANEL_WATCH` | off | `<ms>` — log GEMM panels slower than `<ms>`, split into host enqueue time (including the per-panel argument writes) and queue wait, with the kernel's GPU timestamps when `CP_OCL_QUEUE_PROFILING=1`. |
+
 ### Kernel JIT (advanced)
 
 | Variable | Default | Effect |

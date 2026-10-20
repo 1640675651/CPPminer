@@ -704,19 +704,20 @@ bool Case33GemmOcl::prepare_attempt_a(const int8_t *a_rowmajor) {
 
 bool Case33GemmOcl::ensure_jackpot_bufs_() {
     if (!a_key_buf_) {
-        a_key_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+        // Host-written every attempt: READ_WRITE, not READ_ONLY (see OpenClContext::write_buffer).
+        a_key_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_WRITE);
     }
     if (!bound_buf_) {
-        bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+        bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_WRITE);
     }
     if (!found_buf_) {
         found_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
     }
     if (!out_rows_buf_) {
-        out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+        out_rows_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
     }
     if (!out_cols_buf_) {
-        out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_WRITE_ONLY);
+        out_cols_buf_ = ocl_.alloc_buffer(sizeof(int), CL_MEM_READ_WRITE);
     }
     return a_key_buf_ && bound_buf_ && found_buf_ && out_rows_buf_ && out_cols_buf_;
 }

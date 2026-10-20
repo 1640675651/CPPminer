@@ -410,10 +410,11 @@ bool Case33OclPrep::init(OpenClContext *ocl, const std::string &kernel_dir, bool
         return false;
     }
     if (!d_job_key_) {
-        d_job_key_ = ocl_->alloc_buffer(32, CL_MEM_READ_ONLY);
+        // Host-written every attempt: READ_WRITE, not READ_ONLY (see OpenClContext::write_buffer).
+        d_job_key_ = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
     }
     if (!d_noise_seed_) {
-        d_noise_seed_ = ocl_->alloc_buffer(32, CL_MEM_READ_ONLY);
+        d_noise_seed_ = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
     }
     if (!d_pairs_) {
         d_pairs_ = ocl_->alloc_buffer(static_cast<size_t>(K_DIM) * 2u * sizeof(uint32_t),
@@ -1724,7 +1725,7 @@ bool Case33OclPrep::align_run_get_random_hash(int index, const uint8_t seed[32],
     if (!ocl_->write_buffer(d_noise_seed_, seed, 32)) {
         return false;
     }
-    cl_mem d_out = ocl_->alloc_buffer(32, CL_MEM_WRITE_ONLY);
+    cl_mem d_out = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
     if (!d_out) {
         return false;
     }

@@ -459,10 +459,11 @@ bool Case33GemmOnednn::build_jackpot_kernel_() {
 
 bool Case33GemmOnednn::ensure_jackpot_bufs_() {
     if (!a_key_buf_) {
-        a_key_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+        // Host-written every attempt: READ_WRITE, not READ_ONLY (see OpenClContext::write_buffer).
+        a_key_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_WRITE);
     }
     if (!bound_buf_) {
-        bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_ONLY);
+        bound_buf_ = ocl_.alloc_buffer(8 * sizeof(uint32_t), CL_MEM_READ_WRITE);
     }
     if (!found_buf_) {
         found_buf_ = ocl_.alloc_buffer(kJackpotFoundBufBytes, CL_MEM_READ_WRITE);
@@ -779,18 +780,51 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         return false;
     }
 
+    // CP_ONEDNN_PANEL_WATCH=<ms> (debug): report panels slower than <ms> with their event timestamps
+    // (queued -> submit -> start -> end; GPU times need CP_OCL_QUEUE_PROFILING=1).
+    static const double watch_ms = [] {
+        const char *v = std::getenv("CP_ONEDNN_PANEL_WATCH");
+        return (v && v[0]) ? std::atof(v) : 0.0;
+    }();
+    cl_event watch_ev = nullptr;
+    const double watch_t0 = cp_now_sec();
     if (!enqueue_gemm_panel_(ocl_.queue, fused_jackpot_ ? nullptr : tile_xor_buf_, m_panel, n_panel,
                              offset_a_rows, offset_b_cols, panel_tile_count, panel_tile_cols,
-                             tr_base, tc_base, 0, nullptr, nullptr)) {
+                             tr_base, tc_base, 0, nullptr, watch_ms > 0 ? &watch_ev : nullptr)) {
         return false;
     }
+    const double watch_t1 = cp_now_sec();
     if (finish_queue) {
         const cl_int err = clFinish(ocl_.queue);
         if (err != CL_SUCCESS) {
             std::fprintf(stderr, "[onednn] clFinish failed (%d): %s\n", err,
                          OpenClContext::error_string(err).c_str());
+            if (watch_ev) clReleaseEvent(watch_ev);
             return false;
         }
+    }
+    if (watch_ev) {
+        const double watch_t2 = cp_now_sec();
+        if ((watch_t2 - watch_t0) * 1e3 > watch_ms) {
+            cl_ulong q = 0, sb = 0, st = 0, en = 0;
+            cl_int status = 0;
+            clGetEventInfo(watch_ev, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(status), &status, nullptr);
+            const bool prof =
+                    clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_QUEUED, sizeof(q), &q, nullptr) == CL_SUCCESS &&
+                    clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_SUBMIT, sizeof(sb), &sb, nullptr) == CL_SUCCESS &&
+                    clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr) == CL_SUCCESS &&
+                    clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr) == CL_SUCCESS;
+            std::fprintf(stderr,
+                         "[onednn] SLOW panel tr=%d tc=%d: host enqueue %.3f s, wait %.3f s, status %d",
+                         tr_base, tc_base, watch_t1 - watch_t0, watch_t2 - watch_t1, status);
+            if (prof)
+                std::fprintf(stderr, "; gpu queued->submit %.3f s, submit->start %.3f s, start->end %.3f s\n",
+                             double(sb - q) * 1e-9, double(st - sb) * 1e-9, double(en - st) * 1e-9);
+            else
+                std::fprintf(stderr, " (no profiling: set CP_OCL_QUEUE_PROFILING=1)\n");
+            std::fflush(stderr);
+        }
+        clReleaseEvent(watch_ev);
     }
 
     (void)out_found;

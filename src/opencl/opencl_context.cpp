@@ -1,6 +1,7 @@
 #include "opencl_context.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -161,6 +162,7 @@ int candidate_rank(const OclDeviceInfo &d) {
 } // namespace
 
 OpenClContext::~OpenClContext() {
+    release_xfer_();
     if (program) {
         clReleaseProgram(program);
         program = nullptr;
@@ -520,23 +522,213 @@ cl_kernel OpenClContext::create_kernel(const char *name) const {
     return kernel;
 }
 
-bool OpenClContext::write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset) const {
-    const cl_int err =
-            clEnqueueWriteBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-        log_cl_error("clEnqueueWriteBuffer", err);
+static constexpr size_t kXferStageBytes = 64 * 1024;
+
+// cl_intel_unified_shared_memory entry points (declared here: the bundled CL headers may predate it).
+typedef cl_bitfield cp_cl_mem_properties_intel;
+typedef void *(CL_API_CALL *cp_clHostMemAllocINTEL_fn)(cl_context, const cp_cl_mem_properties_intel *,
+                                                       size_t, cl_uint, cl_int *);
+typedef cl_int(CL_API_CALL *cp_clMemBlockingFreeINTEL_fn)(cl_context, void *);
+typedef cl_int(CL_API_CALL *cp_clSetKernelArgMemPointerINTEL_fn)(cl_kernel, cl_uint, const void *);
+
+static const char *kXferSrc = R"CLC(
+__kernel void cp_xfer_copy(__global const uchar *src, ulong soff, __global uchar *dst, ulong doff,
+                           uint n) {
+    const uint i = get_global_id(0);
+    if (i < n) dst[doff + i] = src[soff + i];
+}
+)CLC";
+
+bool OpenClContext::init_xfer_kernels_() const {
+    size_t ext_len = 0;
+    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_len) != CL_SUCCESS || !ext_len) {
+        return false;
+    }
+    std::string ext(ext_len, '\0');
+    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_len, &ext[0], nullptr) != CL_SUCCESS ||
+        ext.find("cl_intel_unified_shared_memory") == std::string::npos) {
+        return false;
+    }
+    auto alloc_fn = reinterpret_cast<cp_clHostMemAllocINTEL_fn>(
+            clGetExtensionFunctionAddressForPlatform(platform, "clHostMemAllocINTEL"));
+    usm_free_fn_ = clGetExtensionFunctionAddressForPlatform(platform, "clMemBlockingFreeINTEL");
+    usm_arg_fn_ = clGetExtensionFunctionAddressForPlatform(platform, "clSetKernelArgMemPointerINTEL");
+    if (!alloc_fn || !usm_free_fn_ || !usm_arg_fn_) {
+        return false;
+    }
+    cl_int err = CL_SUCCESS;
+    xfer_host_ = alloc_fn(context, nullptr, kXferStageBytes, 0, &err);
+    if (!xfer_host_ || err != CL_SUCCESS) {
+        xfer_host_ = nullptr;
+        return false;
+    }
+    xfer_prog_ = clCreateProgramWithSource(context, 1, &kXferSrc, nullptr, &err);
+    if (!xfer_prog_ || err != CL_SUCCESS ||
+        clBuildProgram(xfer_prog_, 1, &device, "", nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    xfer_up_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
+    if (!xfer_up_ || err != CL_SUCCESS) return false;
+    xfer_down_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
+    if (!xfer_down_ || err != CL_SUCCESS) return false;
+    auto set_ptr = reinterpret_cast<cp_clSetKernelArgMemPointerINTEL_fn>(usm_arg_fn_);
+    return set_ptr(xfer_up_, 0, xfer_host_) == CL_SUCCESS &&
+           set_ptr(xfer_down_, 2, xfer_host_) == CL_SUCCESS;
+}
+
+void OpenClContext::release_xfer_() const {
+    if (xfer_up_) clReleaseKernel(xfer_up_);
+    if (xfer_down_) clReleaseKernel(xfer_down_);
+    if (xfer_prog_) clReleaseProgram(xfer_prog_);
+    xfer_up_ = xfer_down_ = nullptr;
+    xfer_prog_ = nullptr;
+    if (xfer_host_ && usm_free_fn_ && context) {
+        reinterpret_cast<cp_clMemBlockingFreeINTEL_fn>(usm_free_fn_)(context, xfer_host_);
+    }
+    xfer_host_ = nullptr;
+}
+
+bool OpenClContext::stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const {
+    if (bytes == 0 || bytes > kXferStageBytes || !context || !queue || !buf) {
+        return false;
+    }
+    if (xfer_stage_on_ < 0) {
+        std::lock_guard<std::mutex> lock(*xfer_mu_);
+        if (xfer_stage_on_ < 0) {
+            const char *v = std::getenv("CP_OCL_XFER_STAGE");
+            const bool intel = vendor_name.find("Intel") != std::string::npos ||
+                               platform_name.find("Intel") != std::string::npos;
+            bool on = (v && v[0]) ? v[0] != '0' : (discrete_gpu && intel);
+            if (on && !init_xfer_kernels_()) {
+                std::fprintf(stderr, "[ocl] small-transfer kernel path unavailable; using transfer calls\n");
+                release_xfer_();
+                on = false;
+            }
+            xfer_stage_on_ = on ? 1 : 0;
+        }
+    }
+    if (xfer_stage_on_ != 1) {
+        return false;
+    }
+    // A kernel must not write a CL_MEM_READ_ONLY buffer nor read a CL_MEM_WRITE_ONLY one: use the
+    // transfer call for those.
+    cl_mem_flags flags = 0;
+    if (clGetMemObjectInfo(buf, CL_MEM_FLAGS, sizeof(flags), &flags, nullptr) != CL_SUCCESS ||
+        (flags & (device_write ? CL_MEM_READ_ONLY : CL_MEM_WRITE_ONLY))) {
         return false;
     }
     return true;
 }
 
-bool OpenClContext::read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset) const {
-    const cl_int err =
-            clEnqueueReadBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr, nullptr);
+// One copy kernel launch (64-wide work-groups), completed with clFinish.
+static cl_int xfer_launch(cl_command_queue queue, cl_kernel k, size_t bytes, cl_event *ev) {
+    const size_t lws = 64, gws = (bytes + lws - 1) / lws * lws;
+    cl_int err = clEnqueueNDRangeKernel(queue, k, 1, nullptr, &gws, &lws, 0, nullptr, ev);
+    if (err == CL_SUCCESS) err = clFinish(queue);
+    return err;
+}
+
+// CP_OCL_XFER_WATCH=<ms> (debug): report transfers slower than <ms> with the buffer's size and flags
+// and the event timestamps (queued -> submit -> start -> end; GPU times need CP_OCL_QUEUE_PROFILING=1).
+static double xfer_watch_ms() {
+    static const double ms = [] {
+        const char *v = std::getenv("CP_OCL_XFER_WATCH");
+        return (v && v[0]) ? std::atof(v) : 0.0;
+    }();
+    return ms;
+}
+
+static void xfer_watch_report(const char *op, cl_mem buf, cl_event ev, size_t bytes, size_t offset,
+                              std::chrono::steady_clock::time_point t0) {
+    const double sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (sec * 1e3 > xfer_watch_ms()) {
+        cl_ulong q = 0, sb = 0, st = 0, en = 0;
+        const bool prof =
+                ev &&
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_QUEUED, sizeof(q), &q, nullptr) == CL_SUCCESS &&
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_SUBMIT, sizeof(sb), &sb, nullptr) == CL_SUCCESS &&
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr) == CL_SUCCESS &&
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr) == CL_SUCCESS;
+        size_t buf_size = 0;
+        cl_mem_flags buf_flags = 0;
+        clGetMemObjectInfo(buf, CL_MEM_SIZE, sizeof(buf_size), &buf_size, nullptr);
+        clGetMemObjectInfo(buf, CL_MEM_FLAGS, sizeof(buf_flags), &buf_flags, nullptr);
+        std::fprintf(stderr, "[ocl] SLOW %s %zu B @%zu (buffer %zu B, flags 0x%llx): host %.3f s", op,
+                     bytes, offset, buf_size, static_cast<unsigned long long>(buf_flags), sec);
+        if (prof)
+            std::fprintf(stderr, "; gpu queued->submit %.3f s, submit->start %.3f s, start->end %.3f s\n",
+                         double(sb - q) * 1e-9, double(st - sb) * 1e-9, double(en - st) * 1e-9);
+        else
+            std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+    if (ev) clReleaseEvent(ev);
+}
+
+bool OpenClContext::write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset) const {
+    const bool watch = xfer_watch_ms() > 0;
+    cl_event ev = nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (stage_small_xfer_(buf, bytes, /*device_write=*/true)) {
+        std::lock_guard<std::mutex> lock(*xfer_mu_);
+        std::memcpy(xfer_host_, host, bytes);
+        const cl_ulong soff = 0, doff = offset;
+        const cl_uint n = static_cast<cl_uint>(bytes);
+        cl_int err = clSetKernelArg(xfer_up_, 1, sizeof(soff), &soff);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_up_, 2, sizeof(cl_mem), &buf);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_up_, 3, sizeof(doff), &doff);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_up_, 4, sizeof(n), &n);
+        if (err == CL_SUCCESS) err = xfer_launch(queue, xfer_up_, bytes, watch ? &ev : nullptr);
+        if (err != CL_SUCCESS) {
+            log_cl_error("kernel write", err);
+            if (ev) clReleaseEvent(ev);
+            return false;
+        }
+        if (watch) xfer_watch_report("write(kernel)", buf, ev, bytes, offset, t0);
+        return true;
+    }
+    const cl_int err = clEnqueueWriteBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr,
+                                            watch ? &ev : nullptr);
     if (err != CL_SUCCESS) {
-        log_cl_error("clEnqueueReadBuffer", err);
+        log_cl_error("clEnqueueWriteBuffer", err);
+        if (ev) clReleaseEvent(ev);
         return false;
     }
+    if (watch) xfer_watch_report("write", buf, ev, bytes, offset, t0);
+    return true;
+}
+
+bool OpenClContext::read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset) const {
+    const bool watch = xfer_watch_ms() > 0;
+    cl_event ev = nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (stage_small_xfer_(buf, bytes, /*device_write=*/false)) {
+        std::lock_guard<std::mutex> lock(*xfer_mu_);
+        const cl_ulong soff = offset, doff = 0;
+        const cl_uint n = static_cast<cl_uint>(bytes);
+        cl_int err = clSetKernelArg(xfer_down_, 0, sizeof(cl_mem), &buf);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_down_, 1, sizeof(soff), &soff);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_down_, 3, sizeof(doff), &doff);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_down_, 4, sizeof(n), &n);
+        if (err == CL_SUCCESS) err = xfer_launch(queue, xfer_down_, bytes, watch ? &ev : nullptr);
+        if (err != CL_SUCCESS) {
+            log_cl_error("kernel read", err);
+            if (ev) clReleaseEvent(ev);
+            return false;
+        }
+        std::memcpy(host, xfer_host_, bytes);
+        if (watch) xfer_watch_report("read(kernel)", buf, ev, bytes, offset, t0);
+        return true;
+    }
+    const cl_int err = clEnqueueReadBuffer(queue, buf, CL_TRUE, offset, bytes, host, 0, nullptr,
+                                           watch ? &ev : nullptr);
+    if (err != CL_SUCCESS) {
+        log_cl_error("clEnqueueReadBuffer", err);
+        if (ev) clReleaseEvent(ev);
+        return false;
+    }
+    if (watch) xfer_watch_report("read", buf, ev, bytes, offset, t0);
     return true;
 }
 

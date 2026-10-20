@@ -10,6 +10,8 @@
 #endif
 
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -77,6 +79,13 @@ struct OpenClContext {
 
     cl_kernel create_kernel(const char *name) const;
 
+    /* Transfers that are complete on return. On the Arc A770 (Windows) clEnqueueWriteBuffer /
+       clEnqueueReadBuffer occasionally wait ~70 s on a GPU fence inside the driver
+       (D3DKMTWaitForSynchronizationObjectFromCpu; CPU and GPU idle, then they return normally). On
+       Intel discrete GPUs transfers of <= 64 KB into / out of read-write buffers therefore use no
+       transfer call: the bytes pass through a host USM block (cl_intel_unified_shared_memory) and a
+       one-line copy kernel, completed with clFinish. CP_OCL_XFER_STAGE=0 restores the transfer calls,
+       =1 forces the kernel path on any USM device; CP_OCL_XFER_WATCH=<ms> logs slow transfers. */
     bool write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset = 0) const;
     bool read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset = 0) const;
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
@@ -85,6 +94,17 @@ struct OpenClContext {
 
 private:
     static void dump_program_binary_(cl_program prog);
+    bool stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const;
+    bool init_xfer_kernels_() const;
+    void release_xfer_() const;
+    mutable int xfer_stage_on_ = -1;        /* -1 = not decided yet */
+    mutable void *xfer_host_ = nullptr;     /* host USM block (64 KB) */
+    mutable cl_program xfer_prog_ = nullptr;
+    mutable cl_kernel xfer_up_ = nullptr;   /* host USM -> cl_mem */
+    mutable cl_kernel xfer_down_ = nullptr; /* cl_mem -> host USM */
+    mutable void *usm_free_fn_ = nullptr;
+    mutable void *usm_arg_fn_ = nullptr;
+    std::shared_ptr<std::mutex> xfer_mu_ = std::make_shared<std::mutex>();
 };
 
 std::string read_text_file(const char *path);
