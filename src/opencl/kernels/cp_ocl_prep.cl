@@ -397,109 +397,68 @@ __kernel void ocl_noisy_matrix_rowmajor_wg(__global char *out, __global const uc
     }
 }
 
-#pragma OPENCL EXTENSION cl_intel_subgroups : enable
-#ifndef NSG_SG
-#define NSG_SG 32 /* sub-group width: 32 (table = 1 dword per lane) or 16 (2 dwords per lane) */
-#endif
 #ifndef NSG_KPL
-#define NSG_KPL 4 /* consecutive k per lane per unit: 4, 16 or 64 (4: 128 contiguous bytes per instruction) */
+#define NSG_KPL 4 /* consecutive k per work item per unit: 4 or 16 */
 #endif
 #ifndef NSG_UNROLL
 #define NSG_UNROLL 8 /* units whose signal loads are issued before the first store */
 #endif
 #ifndef NSG_DIAG
-#define NSG_DIAG 0 /* 1: timing diagnostic only, copies the signal without lookups (wrong output) */
+#define NSG_DIAG 0 /* timing diagnostics only (wrong output): 1 = copy, 2 = synthetic pair indices */
 #endif
-#ifndef NSG_SLM_TABLE
-#define NSG_SLM_TABLE 1 /* 1: row table in local memory, lookups are byte gathers; 0: sub-group shuffles */
-#endif
-#define NSG_SUBGROUPS (256 / NSG_SG)
-#define NSG_UNIT (NSG_SG * NSG_KPL)
+#define NSG_LANES 32                     /* work items per row */
+#define NSG_ROWS_PER_WG (256 / NSG_LANES) /* 8 rows per 256-item work group */
+#define NSG_UNIT (NSG_LANES * NSG_KPL)
 #define NSG_STEP (NSG_UNIT * NSG_UNROLL)
+#define NSG_LOOKUP(p) ((int)(char)et[(p)])
 
-/* Same result as ocl_noisy_matrix_rowmajor_wg, one sub-group per row (NSG_SUBGROUPS rows per work
- * group). Measured on the A770 (131072 x 4096, CP_OCL_PREP_TIMING): the memory pattern decides the
- * time, not the lookups. 16 bytes per lane per access copies 1 GB in 5.5 ms; 4 bytes per lane
- * (128 contiguous bytes per instruction) with 8 units in flight copies it in 2.7 ms. With the row's
- * 128 uniform bytes in local memory and byte-gather lookups the full kernel takes 3.0 ms (sub-group
- * shuffle lookups, NSG_SLM_TABLE=0, cost 3 ms more). Needs rank == 128 and K % NSG_STEP == 0
- * (1024 at the defaults). */
-#if NSG_SG == 32
-#define NSG_TABLE_DECL(tbl, lane) const uint e0 = (tbl)[lane];
-static inline int ocl_noise_lookup_sg(uint e0, uint p) {
-    const uint v = intel_sub_group_shuffle(e0, p >> 2);
-    return (int)(char)(uchar)(v >> ((p & 3u) << 3));
-}
-#define NSG_LOOKUP(p) ocl_noise_lookup_sg(e0, (p))
-#else
-#define NSG_TABLE_DECL(tbl, lane) \
-    const uint e0 = (tbl)[lane];  \
-    const uint e1 = (tbl)[(lane) + 16];
-static inline int ocl_noise_lookup_sg16(uint e0, uint e1, uint p) {
-    const uint idx = (p >> 2) & 15u;
-    const uint v0 = intel_sub_group_shuffle(e0, idx);
-    const uint v1 = intel_sub_group_shuffle(e1, idx);
-    const uint v = (p & 64u) ? v1 : v0;
-    return (int)(char)(uchar)(v >> ((p & 3u) << 3));
-}
-#define NSG_LOOKUP(p) ocl_noise_lookup_sg16(e0, e1, (p))
-#endif
-
-__kernel __attribute__((intel_reqd_sub_group_size(NSG_SG)))
-__attribute__((reqd_work_group_size(256, 1, 1))) void
+/* Same result as ocl_noisy_matrix_rowmajor_wg; plain OpenCL 1.2, no vendor extensions. 32 work
+ * items per row, 8 rows per work group, the rows' 128 uniform bytes in local memory. Each work item
+ * handles 4 consecutive k per unit, so 32 neighbouring items cover 128 contiguous bytes, and 8 units'
+ * loads are issued before their stores. Measured on the A770 (131072 x 4096): the memory pattern
+ * decides the time. 16 bytes per item per access copies 1 GB in 5.5 ms, 4 bytes per item with 8 units
+ * in flight in 2.7 ms; the full kernel takes 3.0 ms. (A sub-group-shuffle variant of the lookups
+ * cost 3 ms more and was removed.) Needs rank == 128 and K % NSG_STEP == 0 (1024 by default). */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
 ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
                              __global const uint *pairs, int rows, int K, int has_signal,
                              __global const char *signal, int out_lda) {
-    const int sg = (int)get_sub_group_id();
-    const int lane = (int)get_sub_group_local_id();
-    const int row = min((int)get_group_id(0) * NSG_SUBGROUPS + sg, rows - 1);
-    const int valid = ((int)get_group_id(0) * NSG_SUBGROUPS + sg < rows) && out_lda >= K;
-    const __global uint *tbl = (const __global uint *)(el_rows + (size_t)row * 128);
-#if NSG_SLM_TABLE
-    __local uchar tblslm[NSG_SUBGROUPS * 128];
-    {
-        __local uint *t32 = (__local uint *)tblslm + sg * 32;
-        for (int i = lane; i < 32; i += NSG_SG) {
-            t32[i] = tbl[i];
-        }
-    }
+    __local uint tbl32[NSG_ROWS_PER_WG * 32];
+    const int lid = (int)get_local_id(0);
+    const int rsub = lid / NSG_LANES;
+    const int lane = lid % NSG_LANES;
+    const int row_raw = (int)get_group_id(0) * NSG_ROWS_PER_WG + rsub;
+    const int valid = row_raw < rows && out_lda >= K;
+    const int row = min(row_raw, rows - 1);
+    /* 32 items x 4 bytes = the row's 128 uniform bytes */
+    tbl32[rsub * 32 + lane] = ((const __global uint *)(el_rows + (size_t)row * 128))[lane];
     barrier(CLK_LOCAL_MEM_FENCE);
-    const __local uchar *et = tblslm + sg * 128;
-#undef NSG_LOOKUP
-#define NSG_LOOKUP(p) ((int)(char)et[(p)])
-#else
-    NSG_TABLE_DECL(tbl, lane)
-#endif
     if (!valid) {
-        return; /* uniform across the sub-group; after the barrier */
+        return; /* after the barrier */
     }
+    const __local uchar *et = (const __local uchar *)(tbl32 + rsub * 32);
     __global char *dst = out + (size_t)row * (size_t)out_lda;
     __global const char *src = signal + (size_t)row * (size_t)K;
 
     for (int kb = 0; kb < K; kb += NSG_STEP) {
 #if NSG_KPL == 4
         uchar4 sv[NSG_UNROLL];
-#pragma unroll
         for (int u = 0; u < NSG_UNROLL; ++u) {
             const int k0 = kb + u * NSG_UNIT + lane * 4;
             sv[u] = has_signal ? vload4(0, (__global const uchar *)src + k0) : (uchar4)(0);
         }
-#pragma unroll
         for (int u = 0; u < NSG_UNROLL; ++u) {
             const int k0 = kb + u * NSG_UNIT + lane * 4;
             uchar4 o = sv[u];
 #if NSG_DIAG == 2
-            /* timing diagnostic: shuffles with synthetic pair indices, no pair loads (wrong output) */
             const uint4 pa = (uint4)((uint)(k0 * 7 + lane) & 127u, (uint)(k0 * 11 + lane) & 127u,
                                      (uint)(k0 * 13 + lane) & 127u, (uint)(k0 * 17 + lane) & 127u);
             const uint4 pb = pa ^ (uint4)(33u, 65u, 97u, 5u);
-            o.s0 = (uchar)((int)(char)sv[u].s0 + NSG_LOOKUP(pa.x) - NSG_LOOKUP(pa.y));
-            o.s1 = (uchar)((int)(char)sv[u].s1 + NSG_LOOKUP(pa.z) - NSG_LOOKUP(pa.w));
-            o.s2 = (uchar)((int)(char)sv[u].s2 + NSG_LOOKUP(pb.x) - NSG_LOOKUP(pb.y));
-            o.s3 = (uchar)((int)(char)sv[u].s3 + NSG_LOOKUP(pb.z) - NSG_LOOKUP(pb.w));
-#elif !NSG_DIAG
+#elif NSG_DIAG == 0
             const uint4 pa = *(const __global uint4 *)(pairs + (size_t)k0 * 2);
             const uint4 pb = *(const __global uint4 *)(pairs + (size_t)k0 * 2 + 4);
+#endif
+#if NSG_DIAG != 1
             o.s0 = (uchar)((int)(char)sv[u].s0 + NSG_LOOKUP(pa.x) - NSG_LOOKUP(pa.y));
             o.s1 = (uchar)((int)(char)sv[u].s1 + NSG_LOOKUP(pa.z) - NSG_LOOKUP(pa.w));
             o.s2 = (uchar)((int)(char)sv[u].s2 + NSG_LOOKUP(pb.x) - NSG_LOOKUP(pb.y));
@@ -507,45 +466,34 @@ ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
 #endif
             vstore4(o, 0, (__global uchar *)dst + k0);
         }
-#else
-        /* NSG_KPL = 16 or 64: NSG_KPL/16 vectors of 16 per lane per unit */
-#define NSG_V16 (NSG_KPL / 16)
-        uchar16 sv[NSG_UNROLL * NSG_V16];
-#pragma unroll
+#elif NSG_KPL == 16
+        uchar16 sv[NSG_UNROLL];
         for (int u = 0; u < NSG_UNROLL; ++u) {
-#pragma unroll
-            for (int c = 0; c < NSG_V16; ++c) {
-                const int k0 = kb + u * NSG_UNIT + lane * NSG_KPL + c * 16;
-                sv[u * NSG_V16 + c] =
-                        has_signal ? vload16(0, (__global const uchar *)src + k0) : (uchar16)(0);
-            }
+            const int k0 = kb + u * NSG_UNIT + lane * 16;
+            sv[u] = has_signal ? vload16(0, (__global const uchar *)src + k0) : (uchar16)(0);
         }
-#pragma unroll
         for (int u = 0; u < NSG_UNROLL; ++u) {
-#pragma unroll
-            for (int c = 0; c < NSG_V16; ++c) {
-                const int k0 = kb + u * NSG_UNIT + lane * NSG_KPL + c * 16;
-                uchar16 o = sv[u * NSG_V16 + c];
-#if !NSG_DIAG
-                uchar s[16];
-                uchar r[16];
-                vstore16(o, 0, s);
-                const __global uint4 *pp = (const __global uint4 *)(pairs + (size_t)k0 * 2);
-#pragma unroll
-                for (int q = 0; q < 8; ++q) {
-                    const uint4 pq = pp[q]; /* pairs of k0+2q (x,y) and k0+2q+1 (z,w) */
-                    r[2 * q] = (uchar)((int)(char)s[2 * q] + NSG_LOOKUP(pq.x) - NSG_LOOKUP(pq.y));
-                    r[2 * q + 1] =
-                            (uchar)((int)(char)s[2 * q + 1] + NSG_LOOKUP(pq.z) - NSG_LOOKUP(pq.w));
-                }
-                o = vload16(0, r);
+            const int k0 = kb + u * NSG_UNIT + lane * 16;
+            uchar16 o = sv[u];
+#if NSG_DIAG != 1
+            uchar sb[16];
+            uchar r[16];
+            vstore16(o, 0, sb);
+            const __global uint4 *pp = (const __global uint4 *)(pairs + (size_t)k0 * 2);
+            for (int q = 0; q < 8; ++q) {
+                const uint4 pq = pp[q]; /* pairs of k0+2q (x,y) and k0+2q+1 (z,w) */
+                r[2 * q] = (uchar)((int)(char)sb[2 * q] + NSG_LOOKUP(pq.x) - NSG_LOOKUP(pq.y));
+                r[2 * q + 1] = (uchar)((int)(char)sb[2 * q + 1] + NSG_LOOKUP(pq.z) - NSG_LOOKUP(pq.w));
+            }
+            o = vload16(0, r);
 #endif
-                vstore16(o, 0, (__global uchar *)dst + k0);
-            }
+            vstore16(o, 0, (__global uchar *)dst + k0);
         }
+#else
+#error "NSG_KPL must be 4 or 16"
 #endif
     }
-    for (int l = K + lane; l < out_lda; l += NSG_SG) {
+    for (int l = K + lane; l < out_lda; l += NSG_LANES) {
         dst[l] = 0;
     }
 }

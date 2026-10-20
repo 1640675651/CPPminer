@@ -686,7 +686,7 @@ bool Case33OclPrep::noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int row
         }
         clFinish(ocl_->queue);
         if (prep_timing_enabled()) {
-            std::printf("[ocl-prep]   uniform rows %.1fms, noise (sub-group kernel) %.1fms\n",
+            std::printf("[ocl-prep]   uniform rows %.1fms, noise (coalesced kernel) %.1fms\n",
                         (t1 - t0) * 1e3, (cp_now_sec() - t1) * 1e3);
         }
         if (prep_check_enabled()) {

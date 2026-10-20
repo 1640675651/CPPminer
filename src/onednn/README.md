@@ -72,6 +72,8 @@ harness, so the mismatch is in how an 8×4 hash tile is proven (also seen on the
 
 ## Matrix preparation (per attempt)
 
+See [docs/prep.md](../../docs/prep.md) for the full write-up, including PR #27.
+
 Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB). The random signal A_sig is generated
 in full once (`ocl_gen_random_matrix16`) and hashed in full once; every later nonce replaces one random
 row (the values the full generator would give that row for the nonce's seed, written from the host) and
@@ -92,7 +94,9 @@ the simple per-row kernels with `CP_OCL_PREP_CHECK=1`; `CP_OCL_PREP_TIMING=1` pr
 `CP_OCL_PREP_DEFS="-DNSG_KPL=16 -DNSG_UNROLL=1 -DNSG_SLM_TABLE=0 -DNSG_DIAG=1"` passes build options
 to the prep kernels for experiments (the `NSG_*` defines select the noise kernel's decomposition;
 `NSG_DIAG` variants produce wrong output and are for timing only). The OpenCL backend shares
-the generation, hash and uniform-rows steps but has its own prepack noise kernel.
+the signal update, commitment and uniform-rows steps but has its own prepack noise kernel (A770 via
+OpenCL: prep 11 -> 4 ms of a 1.06 s attempt at 65536^2). The sub-group noise kernel is compiled only
+where `cl_intel_subgroups` exists; other devices (the GTX 1070's OpenCL) keep the work-group kernel.
 
 ## Debug environment variables
 
