@@ -595,17 +595,19 @@ bool Case33GemmOnednn::upload_a_(const int8_t *a_rowmajor) {
     const size_t raw_bytes = static_cast<size_t>(M_) * static_cast<size_t>(K_);
     const size_t bytes = static_cast<size_t>(lda_) *
                          static_cast<size_t>(a_row_major_ ? M_ : K_);
-    if (a_row_major_ && info_.aPackRows == 16) {
-        // gemmstone packed columns: panel p of 16 rows at p * 16 * lda, element (m, k) at
-        // (k / 4) * 64 + (m % 16) * 4 + k % 4 inside it.
+    if (a_row_major_ && info_.aPackRows > 0) {
+        // gemmstone packed columns: panel p of P rows at p * P * lda, element (m, k) at
+        // (k / c) * P * c + (m % P) * c + k % c inside it (P = aPackRows, c = crosspack).
+        const size_t P = static_cast<size_t>(info_.aPackRows);
+        const size_t c = static_cast<size_t>(info_.aPackCp > 0 ? info_.aPackCp : 4);
         a_host_.assign(bytes, 0);
         for (int m = 0; m < M_; ++m) {
             const int8_t *row = a_rowmajor + static_cast<size_t>(m) * static_cast<size_t>(K_);
             int8_t *panel = reinterpret_cast<int8_t *>(a_host_.data()) +
-                            static_cast<size_t>(m / 16) * 16u * static_cast<size_t>(lda_);
+                            (static_cast<size_t>(m) / P) * P * static_cast<size_t>(lda_);
             for (int k = 0; k < K_; ++k) {
-                panel[static_cast<size_t>(k / 4) * 64u + static_cast<size_t>(m % 16) * 4u +
-                      static_cast<size_t>(k % 4)] = row[k];
+                panel[(static_cast<size_t>(k) / c) * P * c + (static_cast<size_t>(m) % P) * c +
+                      static_cast<size_t>(k) % c] = row[k];
             }
         }
         return ocl_.write_buffer(a_buf_, a_host_.data(), bytes);
@@ -630,17 +632,19 @@ bool Case33GemmOnednn::upload_b_(const int8_t *b_bt_rowmajor) {
     const size_t bytes = static_cast<size_t>(ldb_) *
                          static_cast<size_t>(b_row_major_ ? K_ : N_);
     b_host_.resize(bytes);
-    if (!b_row_major_ && info_.bPackCols == 64 && info_.bPackCp == 32) {
-        // gemmstone packed rows: panel p of 64 columns at p * 64 * ldb, element (k, n) at
-        // (k / 32) * 2048 + (n % 64) * 32 + k % 32 inside it. b_bt_rowmajor is B^T (column n = row n).
+    if (!b_row_major_ && info_.bPackCols > 0) {
+        // gemmstone packed rows: panel p of Q columns at p * Q * ldb, element (k, n) at
+        // (k / c) * Q * c + (n % Q) * c + k % c inside it. b_bt_rowmajor is B^T (column n = row n).
+        const size_t Q = static_cast<size_t>(info_.bPackCols);
+        const size_t c = static_cast<size_t>(info_.bPackCp > 0 ? info_.bPackCp : 1);
         std::fill(b_host_.begin(), b_host_.end(), 0);
         for (int n = 0; n < N_; ++n) {
             const int8_t *col = b_bt_rowmajor + static_cast<size_t>(n) * static_cast<size_t>(K_);
             int8_t *panel = reinterpret_cast<int8_t *>(b_host_.data()) +
-                            static_cast<size_t>(n / 64) * 64u * static_cast<size_t>(ldb_);
+                            (static_cast<size_t>(n) / Q) * Q * static_cast<size_t>(ldb_);
             for (int k = 0; k < K_; ++k) {
-                panel[static_cast<size_t>(k / 32) * 2048u + static_cast<size_t>(n % 64) * 32u +
-                      static_cast<size_t>(k % 32)] = col[k];
+                panel[(static_cast<size_t>(k) / c) * Q * c + (static_cast<size_t>(n) % Q) * c +
+                      static_cast<size_t>(k) % c] = col[k];
             }
         }
     } else if (b_row_major_) {
@@ -703,6 +707,12 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
         return false;
     }
     if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
+        return false;
+    }
+    // The prep writes packed A as 16-row panels with 4 k per dword (ocl_noisy_matrix_a_packed16) only.
+    if (info_.aPackRows > 0 && (info_.aPackRows != 16 || info_.aPackCp != 4)) {
+        std::fprintf(stderr, "[onednn] packed A %d rows x crosspack %d is not supported by the GPU prep\n",
+                     info_.aPackRows, info_.aPackCp);
         return false;
     }
     prep_.set_a_pack_rows(info_.aPackRows);

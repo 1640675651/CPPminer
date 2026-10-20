@@ -31,6 +31,10 @@ A380 it had never selected a systolic kernel:
   XeHPG; it is matched by strategy string and unroll, because the catalog
   repeats the string with a 16x16 unroll (`catalog-343`). Dropping `af`
   (atomic FMA) from its strategy adds 1.06% (ABAB at 131072²).
+  (Removed from the catalog layer on 2026-10-20: the catalog now runs in gemmstone's own order, and
+  XeHPG cards get the measured family kernel first. This A380 result is kept as a commented candidate
+  for the per-device override table in `src/onednn/case5_kernel_select.cpp`; it has not been compared
+  with the family kernel on an A380.)
 - **Panels.** Systolic kernels default to 1024x1024 hash tiles per panel
   (16384² GEMM per launch) unless `--batch-size`/`--row-period-batch` are
   given. `--batch-size 1024` was previously mistaken for the default and

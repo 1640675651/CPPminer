@@ -37,7 +37,8 @@ struct DriverInfo {
     bool jackpotCoop = false; // fused jackpot: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM (no tile_xor traffic)
     int bPackCols = 0;          // B in gemmstone packed rows: panels of this many columns (0 = plain)
     int bPackCp = 0;            // ... with this many consecutive k per column (crosspack)
-    int aPackRows = 0;          // A in gemmstone packed columns: panels of this many rows, 4 k per dword (0 = plain)
+    int aPackRows = 0;          // A in gemmstone packed columns: panels of this many rows (0 = plain)
+    int aPackCp = 0;            // ... with this many consecutive k per group (crosspack)
     bool jackpotCoopSlm = false; // coop jackpot via SLM transpose (CASE5_COOP_OWN=0); default: own-tile SIMD-N
     bool jackpotCoopAudit = false; // CASE5_COOP_AUDIT=1: kernel dumps per-tile digests + messages for a host check
     int wgM = 4;

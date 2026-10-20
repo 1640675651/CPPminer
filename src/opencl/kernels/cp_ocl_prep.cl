@@ -561,22 +561,29 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
  * at (k / 32) * 2048 + (n % 64) * 32 + k % 32 inside it. Input: column-major B (column n at n * ldb),
  * as written by ocl_noisy_matrix_colmajor. One work item per 32-byte chunk; neighbouring items write
  * neighbouring chunks of a panel. Plain OpenCL 1.2. */
-__kernel void ocl_repack_b_packed64x32(__global uint *out, __global const uint *in, int n, int K,
-                                       int ldb) {
+__kernel void ocl_repack_b_packed(__global uint *out, __global const uint *in, int n, int K, int ldb,
+                                  int Q, int cp) {
+    /* Column-major B (column c at c * ldb) -> gemmstone packed rows: panels of Q columns at
+       p * Q * ldb, element (k, c) at (k / cp) * Q * cp + (c % Q) * cp + k % cp inside the panel.
+       One work item per (panel, k group, column): cp bytes (cp % 4 == 0), consecutive work items write
+       consecutive columns. */
     const size_t id = get_global_id(0);
-    const int kchunks = K / 32;
+    const int kchunks = K / cp;
     const size_t total = (size_t)n * (size_t)kchunks;
     if (id >= total) {
         return;
     }
-    const int nn = (int)(id % 64);
-    const size_t rest = id / 64;
+    const int nn = (int)(id % (size_t)Q);
+    const size_t rest = id / (size_t)Q;
     const int kb = (int)(rest % (size_t)kchunks);
     const int p = (int)(rest / (size_t)kchunks);
-    const int col = p * 64 + nn;
-    const size_t src = ((size_t)col * (size_t)ldb + (size_t)kb * 32) / 4;
-    const size_t dst = ((size_t)p * 64 * (size_t)ldb + (size_t)kb * 2048 + (size_t)nn * 32) / 4;
-    vstore8(vload8(0, in + src), 0, out + dst);
+    const int col = p * Q + nn;
+    const size_t src = ((size_t)col * (size_t)ldb + (size_t)kb * (size_t)cp) / 4;
+    const size_t dst = ((size_t)p * (size_t)Q * (size_t)ldb + (size_t)kb * (size_t)Q * (size_t)cp +
+                        (size_t)nn * (size_t)cp) / 4;
+    for (int w = 0; w < cp / 4; w++) {
+        out[dst + w] = in[src + w];
+    }
 }
 
 /* A column-major (gemmstone layout N): row-parallel like rowmajor; write out[k*lda+row]. */

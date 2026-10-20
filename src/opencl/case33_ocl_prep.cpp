@@ -292,7 +292,7 @@ bool Case33OclPrep::create_kernels_() {
     k_noisy_rowmajor_sg_ = mk("ocl_noisy_matrix_rowmajor_sg");
     k_uniform_rows_b3_ = mk("ocl_uniform_rows_b3");
     k_noisy_a_packed_ = mk("ocl_noisy_matrix_a_packed16");
-    k_repack_b_packed_ = mk("ocl_repack_b_packed64x32");
+    k_repack_b_packed_ = mk("ocl_repack_b_packed");
     k_noisy_a_colmajor_ = mk("ocl_noisy_matrix_a_colmajor");
     k_noisy_colmajor_ = mk("ocl_noisy_matrix_colmajor");
     k_noisy_b_rowmajor_ = mk("ocl_noisy_matrix_b_rowmajor");
@@ -1545,19 +1545,22 @@ bool Case33OclPrep::prepare_job_b_colmajor(cl_mem b_buf, const uint8_t b_noise_s
     if (!ocl_->write_buffer(d_noise_seed_, b_noise_seed, 32)) {
         return false;
     }
-    if (b_pack_cols_ == 64 && b_pack_cp_ == 32) {
+    if (b_pack_cols_ > 0) {   // no fallback: the GEMM kernel was built for this layout
         return prepare_job_b_packed_(b_buf, n, K, ldb);
     }
     return noisy_matrix_colmajor_(b_buf, n, K, ldb, 1);
 }
 
 /* Per-job noisy B in gemmstone's packed-rows layout: the column-major noise kernel writes into scratch,
-   ocl_repack_b_packed64x32 moves it into 64-column panels with 32 k per column. Once per job, so the
-   extra pass does not matter; the scratch is released afterwards. No fallback: the GEMM kernel was
-   built for this layout. */
+   ocl_repack_b_packed moves it into panels of b_pack_cols_ columns with b_pack_cp_ k per column (A770:
+   64 x 32, UHD 770: 32 x 4). Once per job, so the extra pass does not matter; the scratch is released
+   afterwards. No fallback: the GEMM kernel was built for this layout. */
 bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
-    if (!k_repack_b_packed_ || n % 64 != 0 || K % 32 != 0 || ldb < K || ldb % 4 != 0) {
-        std::fprintf(stderr, "[ocl-prep] packed B: unsupported shape (n %d, K %d, ldb %d)\n", n, K, ldb);
+    const int Q = b_pack_cols_, cp = b_pack_cp_;
+    if (!k_repack_b_packed_ || Q <= 0 || cp <= 0 || cp % 4 != 0 || n % Q != 0 || K % cp != 0 || ldb < K ||
+        ldb % 4 != 0) {
+        std::fprintf(stderr, "[ocl-prep] packed B: unsupported shape (n %d, K %d, ldb %d, %d x %d)\n", n, K,
+                     ldb, Q, cp);
         return false;
     }
     const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
@@ -1571,18 +1574,20 @@ bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
     err |= clSetKernelArg(k_repack_b_packed_, 2, sizeof(int), &n);
     err |= clSetKernelArg(k_repack_b_packed_, 3, sizeof(int), &K);
     err |= clSetKernelArg(k_repack_b_packed_, 4, sizeof(int), &ldb);
+    err |= clSetKernelArg(k_repack_b_packed_, 5, sizeof(int), &Q);
+    err |= clSetKernelArg(k_repack_b_packed_, 6, sizeof(int), &cp);
     const size_t l = 256;
-    const size_t total = static_cast<size_t>(n) * static_cast<size_t>(K / 32);
+    const size_t total = static_cast<size_t>(n) * static_cast<size_t>(K / cp);
     const size_t g = (total + l - 1) / l * l;
     if (err != CL_SUCCESS ||
         clEnqueueNDRangeKernel(ocl_->queue, k_repack_b_packed_, 1, nullptr, &g, &l, 0, nullptr, nullptr) !=
                 CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl-prep] ocl_repack_b_packed64x32 launch failed\n");
+        std::fprintf(stderr, "[ocl-prep] ocl_repack_b_packed launch failed\n");
         return false;
     }
     clFinish(ocl_->queue);
     if (prep_timing_enabled()) {
-        std::printf("[ocl-prep] B packed (64 x 32) per job: %.1fms\n", (cp_now_sec() - t0) * 1e3);
+        std::printf("[ocl-prep] B packed (%d x %d) per job: %.1fms\n", Q, cp, (cp_now_sec() - t0) * 1e3);
     }
     bool ok = true;
     if (prep_check_enabled()) {
@@ -1593,11 +1598,13 @@ bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
         }
         size_t bad = 0;
         for (int c = 0; c < n; ++c) {
-            const int8_t *pan = packed.data() + static_cast<size_t>(c / 64) * 64u * static_cast<size_t>(ldb);
+            const int8_t *pan = packed.data() + static_cast<size_t>(c / Q) * static_cast<size_t>(Q) *
+                                                        static_cast<size_t>(ldb);
             const int8_t *col = ref.data() + static_cast<size_t>(c) * static_cast<size_t>(ldb);
             for (int k = 0; k < K; ++k) {
-                if (pan[static_cast<size_t>(k / 32) * 2048u + static_cast<size_t>(c % 64) * 32u +
-                        static_cast<size_t>(k % 32)] != col[k]) {
+                if (pan[static_cast<size_t>(k / cp) * static_cast<size_t>(Q * cp) +
+                        static_cast<size_t>(c % Q) * static_cast<size_t>(cp) + static_cast<size_t>(k % cp)] !=
+                    col[k]) {
                     ++bad;
                 }
             }

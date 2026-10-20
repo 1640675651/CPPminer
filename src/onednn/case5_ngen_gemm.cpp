@@ -368,23 +368,26 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                     if (std::sscanf(v, "%d,%d", &a, &b) == 2) { r = uint16_t(a); c = uint16_t(b); }
                 }
             };
+            // Packing comes with the candidate (family / device kernels, case5_kernel_select.cpp): panels
+            // of the strategy's unroll, crosspack from the candidate. CASE5_A_PACKED=1 / CASE5_B_PACKED=1
+            // force it onto every candidate (timing experiments, CASE5_*_CP / CASE5_*_TILE).
             const bool forceA = case5_a_packed_env() == 1;
-            if (((candidate.pack_a && strategy.unroll[LoopM] == 16) || forceA) && hw == HW::XeHPG
+            if ((candidate.pack_a || forceA)
                     && problem.A.layout == MatrixLayout::T && problem.Ta == Type::s8) {
                 problem.A.layout = MatrixLayout::Pc;
                 problem.A.packSize = strategy.unroll[LoopM];
-                problem.A.crosspack = uint8_t(forceA ? envInt("CASE5_A_CP", 4) : 4);
+                problem.A.crosspack = uint8_t(forceA ? envInt("CASE5_A_CP", 4) : candidate.pack_a_cp);
                 problem.A.tileR = problem.A.tileC = 0;
                 if (forceA) envTile("CASE5_A_TILE", problem.A.tileR, problem.A.tileC);
                 problem.A.panelLength = 0;
                 problem.A.setAlignment(problem.A.defaultAlignment(problem.Ta_ext));
             }
             const bool forceB = case5_b_packed_env() == 1;
-            if (((candidate.pack_b && strategy.unroll[LoopN] == 64) || forceB) && hw == HW::XeHPG
+            if ((candidate.pack_b || forceB)
                     && problem.B.layout == MatrixLayout::N && problem.Tb == Type::s8) {
                 problem.B.layout = MatrixLayout::Pr;
                 problem.B.packSize = strategy.unroll[LoopN];
-                problem.B.crosspack = uint8_t(forceB ? envInt("CASE5_B_CP", 32) : 32);
+                problem.B.crosspack = uint8_t(forceB ? envInt("CASE5_B_CP", 32) : candidate.pack_b_cp);
                 problem.B.tileR = problem.B.tileC = 0;
                 if (forceB) envTile("CASE5_B_TILE", problem.B.tileR, problem.B.tileC);
                 problem.B.panelLength = 0;
@@ -455,6 +458,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
                 info->jackpotCoopSlm = problem.case5JackpotCoopSlm;
                 info->aPackRows = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.packSize) : 0;
+                info->aPackCp = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.crosspack) : 0;
                 info->bPackCols = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.packSize) : 0;
                 info->bPackCp = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.crosspack) : 0;
                 info->strategyNameOwned = candidate.label;

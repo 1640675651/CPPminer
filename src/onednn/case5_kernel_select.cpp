@@ -66,6 +66,80 @@ constexpr char kPreferredXeHPGInt8AfPackedA[] =
 constexpr int kPreferredXeHPGUnrollM = 16;
 constexpr int kPreferredXeHPGUnrollN = 64;
 
+// ---- Kernel selection layers ------------------------------------------------------------------
+// 1. per-device overrides (measured exceptions to the family default; empty for now)
+// 2. per-family defaults (gemmstone HW family: the measured-best strategy on a representative device)
+// 3. gemmstone's catalog ranking, then generic fallbacks
+// gemmstone's own selector cannot choose these: its catalog has no packed int8 entries, and for the
+// miner's layout it matches a single entry per family (Gen12LP: entry 30 only).
+//
+// A family kernel names a tile (unroll), the strategies for plain and packed A, and the packing it
+// wants: A in panels of unroll_m rows (the prep writes 16-row panels, 4 k per dword), B in panels of
+// unroll_n columns with pack_b_cp consecutive k per column (written once per job). A combination
+// whose strategy is nullptr does not build and is skipped (the catalog takes over).
+struct FamilyKernel {
+    HW hw;
+    const char *label;
+    const char *measured_on;     // documentation
+    bool needs_systolic;
+    int unroll_m, unroll_n;
+    const char *plain;           // A row-major (not packed)
+    const char *plain_alt;       // XMX real fold with CASE5_XOR_XAF=0 (af instead of xaf); nullptr = plain
+    const char *packed;          // A packed
+    const char *packed_alt;
+    int pack_a_cp;               // 0 = never pack A
+    int pack_a_max_k;            // pack A only while K <= this (0 = any K)
+    int pack_b_cp;               // 0 = never pack B
+    int min_align_a, min_align_b;
+};
+
+// UHD 770 (Gen12LP, 32 EUs): gemm_xor pure GEMM 8192^2 x 4096 (note.md 2026-10-20): 177.8 ms = 97.4% of
+// the dp4a peak, against 192.6 ms (89.9%) for catalog entry 30 plain; verified with packed A and B.
+// Builds only with packed operands (plain runs out of registers), so plain = nullptr.
+constexpr char kGen12LPInt8Packed[] = "sb16 sb16 sb l4 nse k16 cab1 wg 4x4";
+
+const FamilyKernel kFamilyKernels[] = {
+    {HW::XeHPG, "xehpg-preferred", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
+     kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
+     kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4},
+    {HW::Gen12LP, "gen12lp-preferred", "UHD 770", false, 16, 32,
+     nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1},
+};
+
+const FamilyKernel *family_kernel(HW hw) {
+    for (const auto &f : kFamilyKernels)
+        if (f.hw == hw) return &f;
+    return nullptr;
+}
+
+#ifndef CL_DEVICE_ID_INTEL
+#define CL_DEVICE_ID_INTEL 0x4251
+#endif
+
+// Per-device overrides: {PCI device id, kernel}. Placeholder: no measured exception yet.
+// Candidate, not enabled: Arc A380 (8086:56a5). PR #36 measured catalog entry 333 ("sB64 sB32 aB wg 8x4
+// cab4 ks64 dw vav bo bk0 sm sn grf256 sys pab l4 sr", 16x32, `af` dropped: +1.06%) at 15.0 TMAC/s against
+// 9.7 for the catalog's top pick, before the XeHPG family kernel existed; it has not been compared with
+// the family kernel on an A380.
+struct DeviceOverride {
+    uint32_t pci_device_id;
+    FamilyKernel kernel;
+};
+const std::vector<DeviceOverride> &device_overrides() {
+    static const std::vector<DeviceOverride> kOverrides = {};
+    return kOverrides;
+}
+
+const FamilyKernel *device_override(cl_device_id device, HW hw) {
+    const auto &overrides = device_overrides();
+    if (overrides.empty() || !device) return nullptr;
+    cl_uint id = 0;
+    if (clGetDeviceInfo(device, CL_DEVICE_ID_INTEL, sizeof(id), &id, nullptr) != CL_SUCCESS) return nullptr;
+    for (const auto &o : overrides)
+        if (o.pci_device_id == id && o.kernel.hw == hw) return &o.kernel;
+    return nullptr;
+}
+
 bool case5_prefer_measured_default() {
     const char *v = std::getenv("CASE5_PREFER");
     return !(v && v[0] == '0');
@@ -249,35 +323,6 @@ std::vector<CatalogCandidate> fallback_candidates(HW hw) {
     return out;
 }
 
-// Arc A380 (XeHPG, s8 TN, 131072^2 with milestone XOR): this 8x4-workgroup
-// 16x32 systolic kernel scanned at 15.0 TMAC/s vs 9.7 for oneDNN's top pick.
-// The catalog repeats the strategy string with other unrolls, so match both.
-// `tuned` replaces the catalog string: dropping `af` (atomic FMA) measured
-// +1.06% at 131072^2 in an ABAB comparison.
-struct PreferredKernel {
-    int unroll_m, unroll_n;
-    const char *strategy;
-    const char *tuned;
-};
-
-const PreferredKernel *preferred_entry(HW hw, const Entry &entry) {
-    static const PreferredKernel kXeHPG[] = {
-            {16, 32, "sB64 sB32 aB wg 8x4 cab4 ks64 af dw vav bo bk0 sm sn grf256 sys pab l4 sr",
-             "sB64 sB32 aB wg 8x4 cab4 ks64 dw vav bo bk0 sm sn grf256 sys pab l4 sr"},
-    };
-    if (hw != HW::XeHPG) {
-        return nullptr;
-    }
-    for (const auto &p : kXeHPG) {
-        if (entry.driverInfo.unroll[LoopM] == p.unroll_m
-                && entry.driverInfo.unroll[LoopN] == p.unroll_n
-                && std::string(entry.strategy) == p.strategy) {
-            return &p;
-        }
-    }
-    return nullptr;
-}
-
 void append_catalog_candidate(std::vector<CatalogCandidate> &out, const Entry *entry) {
     if (!entry) {
         return;
@@ -351,55 +396,55 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         result.candidates.push_back(std::move(custom));
     }
 
-    // Measured-best XeHPG strategy first (A770; CASE5_PREFER=0 skips it), then the catalog.
-    if (hw == HW::XeHPG && result.systolic_hw && case5_prefer_measured_default()
+    // Measured kernels first (device override, else the family default; CASE5_PREFER=0 skips both),
+    // then the catalog.
+    const FamilyKernel *fk = device_override(device, hw);
+    if (!fk) fk = family_kernel(hw);
+    if (fk && case5_prefer_measured_default() && (!fk->needs_systolic || result.systolic_hw)
             && problem.Ta == Type::s8 && problem.Tb == Type::s8
-            && problem.A.alignment >= 64 && problem.B.alignment >= 4) {
+            && problem.A.alignment >= fk->min_align_a && problem.B.alignment >= fk->min_align_b) {
         CatalogCandidate c;
-        c.label = "xehpg-preferred";
+        c.label = fk->label;
         const bool realFold = !problem.case5TileXorNop && !case5_tile_xor_nostore_env()
                 && case5_tile_xor_interleave_enabled();
-        // Real fold: xaf with per-pass chains only in the first/last step of a milestone (default,
-        // CASE5_XOR_XAF=hybrid). CASE5_XOR_XAF=0 uses af everywhere; =1 keeps xaf everywhere and folds
-        // the lower rows right before the next step's chain.
+        // XMX real fold: xaf with per-pass chains only in the first/last step of a milestone (default,
+        // CASE5_XOR_XAF=hybrid). CASE5_XOR_XAF=0 uses the af strategy everywhere.
         const char *xafEnv = std::getenv("CASE5_XOR_XAF");
-        const bool useXaf = !realFold || !(xafEnv && xafEnv[0] == '0');
-        // Packed A is single-buffered: at K > 4096 (A panels beyond the 16 MB L2) its block loads cannot
-        // hide the misses and the double-buffered gathers win (A770 pure GEMM, 16384^2: K=8192 194.6 plain
-        // vs 176.0 packed A; K=16384 157.4 vs 175.6, but B-only packing gives 203.7 / 169.7). Default:
-        // A and B packed up to K = 4096 (231-234 vs 209-211 TOPS), B only above. The miner uses K = 4096.
-        c.pack_a = case5_a_packed_env() == 1
-                || (case5_a_packed_env() != 0 && dims.k > 0 && dims.k <= 4096
-                    && problem.A.layout == gemmstone::MatrixLayout::T);
-        // Packed B keeps the strategy (B is block-loaded either way); it saves energy per byte
-        // (one contiguous 128-byte piece per thread and k step), +3.8% per mining attempt.
-        c.pack_b = case5_b_packed_env() != 0 && problem.B.layout == gemmstone::MatrixLayout::N;
-        if (c.pack_a)
-            c.strategy = useXaf ? kPreferredXeHPGInt8XafPackedA : kPreferredXeHPGInt8AfPackedA;
-        else
-            c.strategy = useXaf ? kPreferredXeHPGInt8Xaf : kPreferredXeHPGInt8Af;
-        c.unroll_m = kPreferredXeHPGUnrollM;
-        c.unroll_n = kPreferredXeHPGUnrollN;
-        c.preferred = true;
-        result.candidates.push_back(std::move(c));
+        const bool useAlt = realFold && xafEnv && xafEnv[0] == '0';
+        // Packed A on XeHPG is single-buffered: at K > 4096 (A panels beyond the 16 MB L2) its block loads
+        // cannot hide the misses and the double-buffered gathers win (A770 pure GEMM, 16384^2: K=8192 194.6
+        // plain vs 176.0 packed A; K=16384 157.4 vs 175.6, but B-only packing gives 203.7 / 169.7), hence
+        // pack_a_max_k. The miner uses K = 4096.
+        c.pack_a = problem.A.layout == gemmstone::MatrixLayout::T && fk->pack_a_cp > 0
+                && (case5_a_packed_env() == 1
+                    || (case5_a_packed_env() != 0 && dims.k > 0
+                        && (fk->pack_a_max_k == 0 || dims.k <= fk->pack_a_max_k)));
+        // Packed B: one contiguous piece per thread and k step (A770: +3.8% per mining attempt, saves
+        // energy under the power cap; UHD 770: part of the 97.4% kernel). Written once per job.
+        c.pack_b = case5_b_packed_env() != 0 && fk->pack_b_cp > 0
+                && problem.B.layout == gemmstone::MatrixLayout::N;
+        c.pack_a_cp = fk->pack_a_cp;
+        c.pack_b_cp = fk->pack_b_cp;
+        const char *s = c.pack_a ? (useAlt && fk->packed_alt ? fk->packed_alt : fk->packed)
+                                 : (useAlt && fk->plain_alt ? fk->plain_alt : fk->plain);
+        // Gen12LP's kernel needs both operands packed; anything else falls through to the catalog.
+        const bool usable = s && (fk->hw != HW::Gen12LP || (c.pack_a && c.pack_b));
+        if (usable) {
+            c.strategy = s;
+            c.unroll_m = fk->unroll_m;
+            c.unroll_n = fk->unroll_n;
+            c.preferred = true;
+            result.candidates.push_back(std::move(c));
+        }
     }
 
-    // Case 5 filters apply after oneDNN's ordered catalog list (same contract as entries[0..N]).
-    // Strategies measured fastest with the milestone XOR are moved to the front:
-    // oneDNN's model ranks plain GEMM, not GEMM + per-milestone fold.
-    std::vector<const Entry *> preferred, rest;
+    // Catalog layer: oneDNN's ordered catalog list as is (same contract as entries[0..N]), minus the
+    // entries Case 5 cannot use. Measured choices belong in the device / family layers above.
     for (const Entry *entry : ranked) {
-        if (!entry || !entry_case5_compatible(*entry)) {
-            continue;
+        if (entry && entry_case5_compatible(*entry)) {
+            append_catalog_candidate(result.candidates, entry);
         }
-        (preferred_entry(hw, *entry) ? preferred : rest).push_back(entry);
     }
-    for (const Entry *entry : preferred) {
-        append_catalog_candidate(result.candidates, entry);
-        result.candidates.back().strategy = preferred_entry(hw, *entry)->tuned;
-    }
-    for (const Entry *entry : rest)
-        append_catalog_candidate(result.candidates, entry);
 
     for (auto &fallback : fallbacks) {
         result.candidates.push_back(std::move(fallback));
