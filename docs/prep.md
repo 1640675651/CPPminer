@@ -162,12 +162,60 @@ commitment every nonce and compares roots; `CP_OCL_PREP_ROWPOKE=0` restores full
 Other GPUs gain the same way: the OpenCL backend on the A770 at 65536^2 went from 11 to 4 ms of prep per
 attempt, and on the GTX 1070 at 32768^2 from 9.1 to 2.4 ms.
 
+### 4. Noisy A written in the systolic (packed) layout
+
+The preferred kernel used to gather A: every load message was 8 lanes reading one dword (4 consecutive
+k) from 8 different rows, which assembles the VNNI operand format in flight but costs 16 small
+messages per thread and k step, double-buffered (`sS32x2`) to hide their latency. Since the prep writes
+all of A every nonce anyway, it can write A directly in gemmstone's packed-columns layout
+(`MatrixLayout::Pc`: 16-row panels, 4 consecutive k per dword) at no extra cost, and the kernel then
+block-loads A single-buffered (`sB32`). A timing-only switch that declared A packed without changing the
+data measured it first (0.638 vs 0.688 s per attempt); without the packing the same block strategy does
+not fit the register file, and single-buffered gathers are slower (0.733 s).
+
+`ocl_noisy_matrix_a_packed16` writes the packed layout: one 256-item work group per 16-row panel, the
+signal tile staged through local memory with coalesced loads, item w = 16 g + r producing the dword of
+row r and k group g so each unit's stores are 1 KB contiguous. Panel p starts at p x 16 x lda bytes
+(gemmstone offsets a panel by i0 x lda), element (m, k) at (k / 4) x 64 + (m % 16) x 4 + k % 4 inside it.
+The host path that uploads a CPU-built A packs the same way. It takes 4.4 ms against 2.9 ms for the
+row-major kernel (more units in flight: 4.0 ms; not worth the local memory).
+
+| A770, 131072^2 x 4096, per attempt | Row-major A | Packed A |
+|---|---:|---:|
+| Scan, fused jackpot | 0.689 s | 0.642 s |
+| Wall, fused jackpot | 0.694 s | 0.648 s |
+| Wall, separate jackpot | 0.708 s | 0.664 s |
+| End-to-end, fused | 101.4 TMAC/s | 108.5 TMAC/s |
+
+`CASE5_A_PACKED=0` restores row-major A; the UHD 770 (catalog kernel) and the OpenCL backend are not
+affected.
+
+### 5. Per-job noisy B in the packed layout
+
+B is built once per job (zero-B: pure noise), so its layout costs nothing per attempt. With A packed, a
+B packed as gemmstone packed rows (`MatrixLayout::Pr`: 64-column panels, 32 consecutive k per column)
+lets each thread fetch its share of a B slice as one contiguous 128-byte piece instead of four 32-byte
+pieces from four columns, and gemmstone uses a linear copy split. The strategy string is unchanged; the
+saving is energy per byte, which the 210 W cap turns into clock (about +90 MHz). The prep writes the
+column-major noisy B into scratch with the existing kernel and `ocl_repack_b_packed64x32` moves it into
+the panels: 16.6 ms per job. `CP_OCL_PREP_CHECK=1` compares every byte through the index map.
+
+| A770, 131072^2 x 4096, per attempt | Packed A | Packed A and B |
+|---|---:|---:|
+| Wall, fused jackpot | 0.648 s | 0.627 s |
+| Scan, separate jackpot | 0.661 s | 0.631 s |
+| Pure GEMM, 98304^2 x 4096 | 224.5 TOPS | 233-235 TOPS |
+
+`CASE5_B_PACKED=0` restores column-major B. Why not zero-A instead: the noise seeds are chained
+(`b_noise_seed = H(job_key, root(B))`, `a_noise_seed = H(b_noise_seed, root(A))`), so with a per-nonce B
+both noisy matrices would change every nonce.
+
 ### Verification
 
 Every change was checked the same way:
 
-- `CP_OCL_PREP_CHECK=1` byte comparison against the reference kernels (noisy A and B, uniform rows)
-  and full-versus-incremental commitment roots;
+- `CP_OCL_PREP_CHECK=1` byte comparison against the reference kernels (noisy A and B, uniform rows,
+  packed A through its index map) and full-versus-incremental commitment roots;
 - mock shares built and zk-verified (`--mock --verify`) on the A770 (both jackpot modes), the UHD 770
   and, for the OpenCL backend, the A770 and GTX 1070.
 
@@ -197,8 +245,15 @@ Every change was checked the same way:
 
 ## What is left
 
-On the A770 the remaining 4 ms is mostly the noise rebuild at its bandwidth floor plus small launches.
+On the A770 the remaining 5-6 ms is mostly the packed noise kernel (4.4 ms, against a 2.7 ms copy floor)
+plus small launches.
 Overlapping prep with the previous nonce's scan on a second queue with a double-buffered A could hide
-part of it (the GEMM is power-capped, so mainly the memory-bound parts). Separately, gemmstone repacks B
-for the systolic array inside every k step although B changes only per job; prepacking B once per job
-into gemmstone's packed layout could take a little off the GEMM itself.
+part of it (the GEMM is power-capped, so mainly the memory-bound parts).
+
+Prepacking B once per job into the systolic (VNNI) layout was tried and dropped (2026-10-19). The
+disassembled k loop of the preferred kernel shows that B is never repacked in registers: each thread's
+32-byte transposed block loads from global memory land in four registers that are stored to SLM
+unchanged as one 128-byte block, and the systolic arrangement comes from the addressing alone. A
+prepacked B could at most replace four 32-byte loads with one 128-byte load per thread and k step, and
+gemmstone's packed-B path (`MatrixLayout::Pr`, panel width = unrollN, crosspack 4) runs out of registers
+for the 16x64 strategy and for every catalog fallback, even with single-buffered A.

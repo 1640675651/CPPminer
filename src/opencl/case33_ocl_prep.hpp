@@ -12,6 +12,12 @@ struct Case33OclPrep {
 
     bool init(OpenClContext *ocl, const std::string &kernel_dir, bool fused_prepack = true);
     bool ensure_buffers(int m, int n, int k);
+    /* 16: write the noisy A in gemmstone's packed layout (16-row panels, 4 k per dword) instead of
+       row-major (oneDNN XeHPG kernel with packed A); 0: row-major. */
+    void set_a_pack_rows(int rows) { a_pack_rows_ = rows; }
+    /* 64, 32: write the per-job noisy B in gemmstone's packed-rows layout (64-column panels, 32 k per
+       column) instead of column-major (oneDNN XeHPG kernel with packed B); 0, 0: column-major. */
+    void set_b_pack(int cols, int crosspack) { b_pack_cols_ = cols; b_pack_cp_ = crosspack; }
     bool ensure_noisy_scratch(size_t bytes);
 
     bool prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K, int blocks_k,
@@ -97,6 +103,8 @@ private:
                                 int has_signal);
     /* Work-group row-major path; false when unavailable so the caller falls back. */
     bool uniform_rows_check_(int rows, int is_b);
+    bool noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, int K, int out_lda);
+    bool prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb);
     bool noisy_matrix_rowmajor_wg_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
                                    int is_b, int has_signal);
     bool noisy_matrix_rowmajor_check_(cl_mem out, cl_mem signal, int rows, int K, int out_lda,
@@ -131,6 +139,11 @@ private:
     cl_kernel k_noisy_rowmajor_wg_ = nullptr; // optional, with k_uniform_rows_
     cl_kernel k_noisy_rowmajor_sg_ = nullptr; // optional: 32-lane sub-group shuffle variant (preferred)
     cl_kernel k_uniform_rows_b3_ = nullptr;   // optional: register BLAKE3 uniform rows (preferred)
+    cl_kernel k_noisy_a_packed_ = nullptr;    // noisy A in gemmstone's packed layout (16-row panels)
+    int a_pack_rows_ = 0;
+    cl_kernel k_repack_b_packed_ = nullptr;   // column-major B -> gemmstone packed rows (64 x crosspack 32)
+    int b_pack_cols_ = 0;
+    int b_pack_cp_ = 0;
     cl_kernel k_noisy_a_colmajor_ = nullptr;
     cl_kernel k_noisy_colmajor_ = nullptr;
     cl_kernel k_noisy_b_rowmajor_ = nullptr;

@@ -58,14 +58,14 @@ Default panel batching: `--row-period-batch 256 --batch-size 256` (256×256 hash
 | XOR | Milestone K=128: `xor_period = 128/unrollK`, or every 128 k inside the panel when unrollK > 128; gemmstone `case5_tile_xor` hook |
 | XMX fold | For one milestone per k-unroll and a 1×4/1×8 sub-tile grid (the preferred strategy): the fold is split at dpas chain boundaries (upper rows after pass 0 of the milestone's last step, lower rows after pass 0 of the next step), SIMD16 column pairs with 3-input `bfn` xor into 16-lane accumulators, one packed reduction, and per-pass dpas chains only in the first/last step of a milestone (`xaf` elsewhere). `CASE5_XOR_INTERLEAVE=0` restores the end-of-step fold. |
 | tile_xor | **Tile-major**: the milestone words of spatial tile `sid` are contiguous at `sid * num_ms` (folded 16-word messages likewise at `sid * 16`). On XMX the kernel buffers 16 milestones per sub-tile and folds each block into the 16-word jackpot message (`rotl 13`, xor), writing it once per tile at `sid * 16`; the jackpot kernel then only hashes (`CASE5_XOR_FOLD16=0` writes the raw milestones instead). Elsewhere one dword per milestone. |
-| Layout | Host A/B (Pearl) → device gemmstone layouts via GPU/CPU prep. Default **TN** (A row, B col). Also `TT`, `NT`, `NN` via `--onednn-layout` or `CASE5_GEMM_LAYOUT`. |
+| Layout | Host A/B (Pearl) → device gemmstone layouts via GPU/CPU prep. Default **TN** (A row, B col). Also `TT`, `NT`, `NN` via `--onednn-layout` or `CASE5_GEMM_LAYOUT`. On XeHPG with the built-in strategy A is written in gemmstone's **packed** layout (16-row panels, 4 consecutive k per dword: the systolic operand layout) so the kernel block-loads it instead of gathering it (`CASE5_A_PACKED=0` keeps row-major A). B is likewise written once per job in gemmstone's packed-rows layout (64-column panels, 32 consecutive k per column), +4% per attempt (`CASE5_B_PACKED=0` keeps column-major B). Above K = 4096 only B is packed (single-buffered packed-A loads lose there). |
 | Jackpot | GPU `cp_onednn_jackpot_scan` after GEMM (`tile_xor` buffer, tile-major) or fused in-kernel (`--fused-jackpot`). On XeHPG with the built-in strategy the fused path hashes **in the GEMM kernel**: the folded 16-word messages stay in registers and, after the k loop, every thread hashes its own N sub-tiles (N = 4 for the 16x64 strategy) as N SIMD lanes with keyed BLAKE3, after a register transpose; it judges them against the bound in the kernel and stores only a found flag and one winner's coordinates. No SLM, no barriers. The jackpot's key, bound and panel offsets travel in the found buffer (bound to the kernel's `tile_xor` argument) because the 16x64 strategy has no spare registers for them. Other strategies keep the older per-tile SIMD1 fused path. |
 | HW | Gen12LP or XeHPG only (`case5_ngen::is_supported_device`) |
 
 Arc A770, mock scan at 131072², sustained, per attempt (GEMM + folded message + device jackpot):
 **100.5 TMAC/s** with the built-in strategy and 4096×4096 panels (was 95 with raw milestones and
 1024×1024 panels); 75 TMAC/s with `CASE5_PREFER=0` (the A380-tuned catalog-333 kernel, older
-measurement); `--fused-jackpot` **102-103 TMAC/s** with the in-kernel jackpot (0.685-0.688 s per attempt vs 0.700-0.707 separate; the older per-tile fused path was 66-80). UHD 770 (catalog-30): 1.35 TMAC/s. Mock shares verify on both GPUs in both
+measurement); `--fused-jackpot` **108.5 TMAC/s** end-to-end with packed A and the in-kernel jackpot (0.648 s per attempt, scan 109.5 TMAC/s; 0.694 s with row-major A, 0.664 s with packed A and the separate jackpot; the older per-tile fused path was 66-80). UHD 770 (catalog-30): 1.35 TMAC/s. Mock shares verify on both GPUs in both
 jackpot modes. Known issue: `--onednn-layout NT` on XeHPG selects an 8×4 catalog kernel (8×4 hash
 tiles) and its mock proof fails verification; the kernel's tile XOR itself verifies in the gemm_xor
 harness, so the mismatch is in how an 8×4 hash tile is proven (also seen on the A380 in PR #36).
@@ -130,6 +130,7 @@ $env:CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT = "1.0"
 |----------|---------|--------|
 | `CASE5_DEBUG_LAUNCH` | off | `1` — log walk-order args passed to the kernel (`group_count_m/n`, boustrophedon slice, etc.) on each `bind_case5_kernel_args`. |
 | `CASE5_DEBUG_SELECT` | off | `1` — log each catalog candidate tried during JIT kernel build. |
+| `CASE5_DEBUG_RANK` | off | `1` — print gemmstone's own catalog ranking for the problem (top 15, model score = predicted time, lower ranks first), before the miner reorders candidates. |
 
 ### Kernel JIT (advanced)
 
@@ -140,6 +141,8 @@ $env:CASE5_DEBUG_TILE_XOR_ZERO_WARN_PCT = "1.0"
 | `CASE5_XOR_SLM_DEBUG_SPATIAL` | off | Set to any value — extra stderr from spatial-id store path inside generated kernel. |
 | `CASE5_JACKPOT_COOP` | on | `0` — `--fused-jackpot` uses the older per-tile SIMD1 fused path (wrap-GRF fold + Case 5.6 BLAKE3) instead of the in-kernel SIMD-N epilogue. |
 | `CASE5_COOP_AUDIT` | off | `1` — the cooperative kernel also writes every tile's digest and message into the found buffer and the host recomputes every digest after each panel (`[coop audit] ... mismatch=0 unwritten=0`); use small panels (`--row-period-batch 512 --batch-size 512`). |
+| `CASE5_A_PACKED` | on (XeHPG preferred kernel) | `0` — row-major A with gathered A loads (about 7% slower); `1` — force packed A onto every candidate, panel = unroll M (timing experiments: the prep only writes 16-row panels), with `CASE5_A_CP=<crosspack>` (default 4) and `CASE5_A_TILE=r,c`. |
+| `CASE5_B_PACKED` | on (XeHPG preferred kernel) | `0` — column-major B (about 4% slower); `1` — force packed B onto every candidate (panel = unroll N) with `CASE5_B_CP=<crosspack>` (default 32) and `CASE5_B_TILE=r,c` (timing experiments: the prep only writes 64-column panels with crosspack 32). |
 | `CASE5_COOP_OWN` | on | `0` — SLM variant of the fused epilogue: every thread parks its messages in the k loop's dead SLM, one barrier, and 16 threads hash 8 tiles each as SIMD8 (`CASE5_COOP_LANES=16`: 8 threads, SIMD16). Same speed as the default; kept for comparison. The default (own tiles) cannot be combined with `CASE5_COOP_SKIP=2`. |
 | `CASE5_COOP_ADD3` | on | `0` — the cooperative BLAKE3 computes `a + b + m` with two `add`s instead of one `add3` (A/B timing; no measurable difference). |
 | `CASE5_COOP_SKIP` | `0` | Timing only (no shares): bit 1 skips the whole cooperative epilogue, bit 2 the hashing, bit 4 the stores. |

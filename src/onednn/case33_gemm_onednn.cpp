@@ -566,11 +566,12 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
-                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d",
+                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d apack=%d bpack=%dx%d",
                   info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, tile_xor_folded_() ? folded_msg_words_ : 0,
-                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, info_.slm);
+                  tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, info_.slm, info_.aPackRows,
+                  info_.bPackCols, info_.bPackCp);
     context_ready_ = true;
     prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
     if (!prep_ready_) {
@@ -591,6 +592,21 @@ bool Case33GemmOnednn::upload_a_(const int8_t *a_rowmajor) {
     const size_t raw_bytes = static_cast<size_t>(M_) * static_cast<size_t>(K_);
     const size_t bytes = static_cast<size_t>(lda_) *
                          static_cast<size_t>(a_row_major_ ? M_ : K_);
+    if (a_row_major_ && info_.aPackRows == 16) {
+        // gemmstone packed columns: panel p of 16 rows at p * 16 * lda, element (m, k) at
+        // (k / 4) * 64 + (m % 16) * 4 + k % 4 inside it.
+        a_host_.assign(bytes, 0);
+        for (int m = 0; m < M_; ++m) {
+            const int8_t *row = a_rowmajor + static_cast<size_t>(m) * static_cast<size_t>(K_);
+            int8_t *panel = reinterpret_cast<int8_t *>(a_host_.data()) +
+                            static_cast<size_t>(m / 16) * 16u * static_cast<size_t>(lda_);
+            for (int k = 0; k < K_; ++k) {
+                panel[static_cast<size_t>(k / 4) * 64u + static_cast<size_t>(m % 16) * 4u +
+                      static_cast<size_t>(k % 4)] = row[k];
+            }
+        }
+        return ocl_.write_buffer(a_buf_, a_host_.data(), bytes);
+    }
     if (a_row_major_ && lda_ == K_) {
         a_host_.assign(a_rowmajor, a_rowmajor + raw_bytes);
         return ocl_.write_buffer(a_buf_, a_rowmajor, bytes);
@@ -611,7 +627,20 @@ bool Case33GemmOnednn::upload_b_(const int8_t *b_bt_rowmajor) {
     const size_t bytes = static_cast<size_t>(ldb_) *
                          static_cast<size_t>(b_row_major_ ? K_ : N_);
     b_host_.resize(bytes);
-    if (b_row_major_) {
+    if (!b_row_major_ && info_.bPackCols == 64 && info_.bPackCp == 32) {
+        // gemmstone packed rows: panel p of 64 columns at p * 64 * ldb, element (k, n) at
+        // (k / 32) * 2048 + (n % 64) * 32 + k % 32 inside it. b_bt_rowmajor is B^T (column n = row n).
+        std::fill(b_host_.begin(), b_host_.end(), 0);
+        for (int n = 0; n < N_; ++n) {
+            const int8_t *col = b_bt_rowmajor + static_cast<size_t>(n) * static_cast<size_t>(K_);
+            int8_t *panel = reinterpret_cast<int8_t *>(b_host_.data()) +
+                            static_cast<size_t>(n / 64) * 64u * static_cast<size_t>(ldb_);
+            for (int k = 0; k < K_; ++k) {
+                panel[static_cast<size_t>(k / 32) * 2048u + static_cast<size_t>(n % 64) * 32u +
+                      static_cast<size_t>(k % 32)] = col[k];
+            }
+        }
+    } else if (b_row_major_) {
         pack_b_rowmajor_from_bt(b_bt_rowmajor, K_, N_, ldb_, b_host_.data());
     } else {
         pack_b_colmajor(b_bt_rowmajor, K_, N_, ldb_, b_host_.data());
@@ -648,6 +677,7 @@ bool Case33GemmOnednn::prepare_job_gpu(int M, int N, int K, const uint8_t b_nois
     if (!ensure_matrix_bufs_()) {
         return false;
     }
+    prep_.set_b_pack(info_.bPackCols, info_.bPackCp);
     if (!prep_.prepare_job_b_gpu(b_buf_, b_noise_seed, N_, K_, ldb_, b_row_major_)) {
         return false;
     }
@@ -672,6 +702,7 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
     if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
         return false;
     }
+    prep_.set_a_pack_rows(info_.aPackRows);
     return prep_.prepare_attempt_a_gpu(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
                                        lda_, a_row_major_, salted, a_key_out);
 }

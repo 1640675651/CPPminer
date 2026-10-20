@@ -291,7 +291,11 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
 
     std::string last_err;
     std::vector<std::string> rejected;
+    const auto case5BaseA = problem.A;   // packed A/B are per candidate; restore them for the next one
+    const auto case5BaseB = problem.B;
     for (const auto &candidate : candidates) {
+        problem.A = case5BaseA;
+        problem.B = case5BaseB;
         if (case5_debug_select()) {
             std::fprintf(stderr, "Case5 trying %s\n", candidate.label.c_str());
             std::fflush(stderr);
@@ -345,6 +349,46 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             if (problem.case5TileXorWrap) {
                 problem.case5XorOutputMilestones =
                         std::max(1, problem.case5XorMaxMilestones / 2);
+            }
+            // Packed A: gemmstone packed columns (16-row panels = unrollM, 4 consecutive k per dword,
+            // the systolic layout), written by the GPU prep (ocl_noisy_matrix_a_packed16) or packed on
+            // the host. Default for the XeHPG preferred kernel; CASE5_A_PACKED=1 forces it everywhere.
+            // Timing experiments (prep only writes 16-row packed A; other shapes compute on wrong data):
+            // CASE5_A_PACKED=1 packs A for any candidate (panel = unrollM), CASE5_A_CP=<crosspack>
+            // (default 4), CASE5_A_TILE=r,c; CASE5_B_PACKED=1 packs B (panel = unrollN),
+            // CASE5_B_CP=<crosspack> (default 32), CASE5_B_TILE=r,c.
+            auto envInt = [](const char *name, int dflt) {
+                const char *v = std::getenv(name);
+                return (v && v[0]) ? std::atoi(v) : dflt;
+            };
+            auto envTile = [](const char *name, uint16_t &r, uint16_t &c) {
+                r = c = 0;
+                if (const char *v = std::getenv(name); v && v[0]) {
+                    int a = 0, b = 0;
+                    if (std::sscanf(v, "%d,%d", &a, &b) == 2) { r = uint16_t(a); c = uint16_t(b); }
+                }
+            };
+            const bool forceA = case5_a_packed_env() == 1;
+            if (((candidate.pack_a && strategy.unroll[LoopM] == 16) || forceA) && hw == HW::XeHPG
+                    && problem.A.layout == MatrixLayout::T && problem.Ta == Type::s8) {
+                problem.A.layout = MatrixLayout::Pc;
+                problem.A.packSize = strategy.unroll[LoopM];
+                problem.A.crosspack = uint8_t(forceA ? envInt("CASE5_A_CP", 4) : 4);
+                problem.A.tileR = problem.A.tileC = 0;
+                if (forceA) envTile("CASE5_A_TILE", problem.A.tileR, problem.A.tileC);
+                problem.A.panelLength = 0;
+                problem.A.setAlignment(problem.A.defaultAlignment(problem.Ta_ext));
+            }
+            const bool forceB = case5_b_packed_env() == 1;
+            if (((candidate.pack_b && strategy.unroll[LoopN] == 64) || forceB) && hw == HW::XeHPG
+                    && problem.B.layout == MatrixLayout::N && problem.Tb == Type::s8) {
+                problem.B.layout = MatrixLayout::Pr;
+                problem.B.packSize = strategy.unroll[LoopN];
+                problem.B.crosspack = uint8_t(forceB ? envInt("CASE5_B_CP", 32) : 32);
+                problem.B.tileR = problem.B.tileC = 0;
+                if (forceB) envTile("CASE5_B_TILE", problem.B.tileR, problem.B.tileC);
+                problem.B.panelLength = 0;
+                problem.B.setAlignment(problem.B.defaultAlignment(problem.Tb_ext));
             }
             // XMX: split the milestone fold across dpas chain boundaries. Needs one milestone per
             // k-unroll (period 1, no in-panel milestones) and a 1x4 / 1x8 sub-tile grid for the
@@ -410,6 +454,9 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->jackpotCoop = problem.case5JackpotCoop;
                 info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
                 info->jackpotCoopSlm = problem.case5JackpotCoopSlm;
+                info->aPackRows = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.packSize) : 0;
+                info->bPackCols = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.packSize) : 0;
+                info->bPackCp = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.crosspack) : 0;
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {

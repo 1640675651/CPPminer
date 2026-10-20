@@ -55,6 +55,14 @@ constexpr char kPreferredXeHPGInt8Xaf[] =
         "sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr char kPreferredXeHPGInt8Af[] =
         "sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
+// Packed A (the default on XeHPG, see case5_a_packed_env): A arrives in 16-row panels with 4 consecutive
+// k per dword, so it is block-loaded (sB32) instead of gathered (sS32x2); the gathers needed two buffers
+// to hide their latency, block loads need one, and the scan is ~7% faster (0.638 vs 0.688 s per
+// 131072^2 attempt on the A770).
+constexpr char kPreferredXeHPGInt8XafPackedA[] =
+        "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
+constexpr char kPreferredXeHPGInt8AfPackedA[] =
+        "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr int kPreferredXeHPGUnrollM = 16;
 constexpr int kPreferredXeHPGUnrollN = 64;
 
@@ -301,6 +309,19 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
     EvaluateAuxOutput aux;
     const auto ranked = select(case5_catalog(), static_cast<int>(setup.match_params.size()),
             setup.match_params.data(), result.eval_params, aux);
+    // CASE5_DEBUG_RANK=1: print gemmstone's own ranking (model score = predicted time, lower is better).
+    if (const char *dr = std::getenv("CASE5_DEBUG_RANK"); dr && dr[0] == '1') {
+        int shown = 0;
+        for (const Entry *e : ranked) {
+            if (!e || shown >= 15) break;
+            EvaluateAuxOutput a2;
+            const double score = evaluate(*e, result.eval_params, a2);
+            std::fprintf(stderr, "[rank %2d] catalog-%d score=%.4g :: %s\n", shown + 1,
+                         int(e - case5_catalog().entries), score, static_cast<const char *>(e->strategy));
+            ++shown;
+        }
+        std::fprintf(stderr, "[rank] %zu entries matched\n", ranked.size());
+    }
 
     // Tuning override: CASE5_CATALOG_INDEX=<n> forces kernel.db entry n (sweeps).
     if (const char *idx = std::getenv("CASE5_CATALOG_INDEX")) {
@@ -343,7 +364,20 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         // the lower rows right before the next step's chain.
         const char *xafEnv = std::getenv("CASE5_XOR_XAF");
         const bool useXaf = !realFold || !(xafEnv && xafEnv[0] == '0');
-        c.strategy = useXaf ? kPreferredXeHPGInt8Xaf : kPreferredXeHPGInt8Af;
+        // Packed A is single-buffered: at K > 4096 (A panels beyond the 16 MB L2) its block loads cannot
+        // hide the misses and the double-buffered gathers win (A770 pure GEMM, 16384^2: K=8192 194.6 plain
+        // vs 176.0 packed A; K=16384 157.4 vs 175.6, but B-only packing gives 203.7 / 169.7). Default:
+        // A and B packed up to K = 4096 (231-234 vs 209-211 TOPS), B only above. The miner uses K = 4096.
+        c.pack_a = case5_a_packed_env() == 1
+                || (case5_a_packed_env() != 0 && dims.k > 0 && dims.k <= 4096
+                    && problem.A.layout == gemmstone::MatrixLayout::T);
+        // Packed B keeps the strategy (B is block-loaded either way); it saves energy per byte
+        // (one contiguous 128-byte piece per thread and k step), +3.8% per mining attempt.
+        c.pack_b = case5_b_packed_env() != 0 && problem.B.layout == gemmstone::MatrixLayout::N;
+        if (c.pack_a)
+            c.strategy = useXaf ? kPreferredXeHPGInt8XafPackedA : kPreferredXeHPGInt8AfPackedA;
+        else
+            c.strategy = useXaf ? kPreferredXeHPGInt8Xaf : kPreferredXeHPGInt8Af;
         c.unroll_m = kPreferredXeHPGUnrollM;
         c.unroll_n = kPreferredXeHPGUnrollN;
         c.preferred = true;

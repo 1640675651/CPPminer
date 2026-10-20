@@ -23,6 +23,7 @@
 - Reduce xor overhead by overlapping xor with dpas
 - In-register 16 XOR slot folding, reducing global memory writeout
 - SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
+- Prepack A and B for better hashrate
 
 ## v0.5
 ### New features

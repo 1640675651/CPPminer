@@ -498,6 +498,87 @@ ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
     }
 }
 
+#ifndef NPA_UNROLL
+#define NPA_UNROLL 4 /* 64-k units per loop iteration (K % (64 * NPA_UNROLL) == 0) */
+#endif
+/* Noisy A in gemmstone's packed-columns layout for the XeHPG kernel (MatrixLayout::Pc, 16-row
+ * panels, crosspack 4): panel p (rows 16p..16p+15) starts at p * panel_stride_dw dwords and element
+ * (m, k) sits at byte (k / 4) * 64 + (m % 16) * 4 + k % 4, i.e. dword (k / 4) * 16 + m % 16 holds
+ * k..k+3 of row m. One 256-item work group per panel. Per unit of 64 k the signal tile (16 rows x
+ * 64 bytes) is loaded with 16 items per row (coalesced) into local memory, and item w = 16 g + r
+ * produces the dword of row r, k-group g, so the group's stores are 1 KB contiguous. Same bytes as
+ * ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them). Plain OpenCL 1.2. */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
+ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
+                            __global const uint *pairs, int rows, int K,
+                            __global const char *signal, int panel_stride_dw) {
+    __local uint sig[NPA_UNROLL * 16 * 17]; /* 17: no bank conflicts on the transposed read */
+    __local uint el32[16 * 33];             /* 33: row stride against bank conflicts */
+    __local uchar p0[NPA_UNROLL * 64];
+    __local uchar p1[NPA_UNROLL * 64];
+    const int w = (int)get_local_id(0);
+    const int panel = (int)get_group_id(0);
+    const int row0 = panel * 16;
+    if (row0 >= rows) {
+        return; /* uniform across the work group */
+    }
+    for (int j = w; j < 512; j += 256) {
+        el32[(j >> 5) * 33 + (j & 31)] = el_rows[(size_t)row0 * 32 + (size_t)j];
+    }
+    const __local uchar *el = (const __local uchar *)el32;
+    __global uint *dst = out + (size_t)panel * (size_t)panel_stride_dw;
+    const int r = w & 15;  /* compute and store: row in panel */
+    const int g = w >> 4;  /* compute and store: k group of 4 inside a 64-k unit */
+    const int lr = w >> 4; /* load: row in panel */
+    const int ld = w & 15; /* load: dword inside the row's 64 bytes */
+    const __local uchar *e = el + r * 132;
+    for (int kb = 0; kb < K; kb += 64 * NPA_UNROLL) {
+        barrier(CLK_LOCAL_MEM_FENCE); /* the previous iteration's readers are done */
+        for (int u = 0; u < NPA_UNROLL; ++u) {
+            sig[(u * 16 + lr) * 17 + ld] = *(const __global uint *)(
+                    signal + (size_t)(row0 + lr) * (size_t)K + (size_t)(kb + u * 64 + ld * 4));
+        }
+        for (int i = w; i < 64 * NPA_UNROLL; i += 256) {
+            p0[i] = (uchar)pairs[(size_t)(kb + i) * 2];
+            p1[i] = (uchar)pairs[(size_t)(kb + i) * 2 + 1];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int u = 0; u < NPA_UNROLL; ++u) {
+            const uint sv = sig[(u * 16 + r) * 17 + g];
+            const int kl = u * 64 + g * 4;
+            uint o = 0;
+            for (int b = 0; b < 4; ++b) {
+                const uint v = (sv >> (8 * b)) + (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
+                o |= (v & 0xffu) << (8 * b);
+            }
+            dst[(size_t)((kb >> 2) + u * 16) * 16 + (size_t)w] = o;
+        }
+    }
+}
+
+/* Per-job B for the oneDNN XeHPG kernel in gemmstone's packed-rows layout (MatrixLayout::Pr, 64-column
+ * panels, crosspack 32): panel p (columns 64p..64p+63) starts at byte p * 64 * ldb, element (k, n) sits
+ * at (k / 32) * 2048 + (n % 64) * 32 + k % 32 inside it. Input: column-major B (column n at n * ldb),
+ * as written by ocl_noisy_matrix_colmajor. One work item per 32-byte chunk; neighbouring items write
+ * neighbouring chunks of a panel. Plain OpenCL 1.2. */
+__kernel void ocl_repack_b_packed64x32(__global uint *out, __global const uint *in, int n, int K,
+                                       int ldb) {
+    const size_t id = get_global_id(0);
+    const int kchunks = K / 32;
+    const size_t total = (size_t)n * (size_t)kchunks;
+    if (id >= total) {
+        return;
+    }
+    const int nn = (int)(id % 64);
+    const size_t rest = id / 64;
+    const int kb = (int)(rest % (size_t)kchunks);
+    const int p = (int)(rest / (size_t)kchunks);
+    const int col = p * 64 + nn;
+    const size_t src = ((size_t)col * (size_t)ldb + (size_t)kb * 32) / 4;
+    const size_t dst = ((size_t)p * 64 * (size_t)ldb + (size_t)kb * 2048 + (size_t)nn * 32) / 4;
+    vstore8(vload8(0, in + src), 0, out + dst);
+}
+
 /* A column-major (gemmstone layout N): row-parallel like rowmajor; write out[k*lda+row]. */
 __kernel void ocl_noisy_matrix_a_colmajor(__global char *out, __global const uchar *noise_seed,
                                          __global const uint *pairs, int rows, int K, int rank,
