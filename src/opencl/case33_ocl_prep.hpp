@@ -87,6 +87,12 @@ private:
     bool merkle_finish_root_(int num_subroots);
     bool build_perm_pairs_(int is_b, int K);
     bool gen_random_a_(uint64_t rng_seed, int total); /* signal A into d_A_sig_ */
+    /* Per-nonce signal: full generation + hash the first time (and on dimension/job changes),
+       afterwards one random full row and an incremental commitment (one 256-chunk group). */
+    bool update_signal_a_(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32], int m,
+                          int K, uint8_t hash_a[32], double *t_after_gen);
+    bool rehash_signal_a_group_(size_t raw_len, size_t pad_len, const uint8_t job_key[32], int group,
+                                uint8_t out[32]);
     bool noisy_matrix_rowmajor_(cl_mem out, cl_mem signal, int rows, int K, int out_lda, int is_b,
                                 int has_signal);
     /* Work-group row-major path; false when unavailable so the caller falls back. */
@@ -141,6 +147,10 @@ private:
     int a_num_subroots_ = 0;
     uint8_t a_root_[32] = {};
     bool a_witness_valid_ = false;
+    bool a_sig_init_ = false;     // d_A_sig_ holds a fully generated signal (row updates build on it)
+    int a_sig_m_ = 0;
+    int a_sig_k_ = 0;
+    uint8_t a_hash_key_[32] = {}; // job key the stored subroots were hashed with
     cl_mem d_noisy_scratch_ = nullptr;
     size_t noisy_scratch_cap_ = 0;
     cl_mem d_el_rows_ = nullptr; // rows x R_RANK uniform noise for the work-group path

@@ -3,16 +3,26 @@
 ## v0.6 (tentative)
 ### New features
 - Experimental hexagon backend for qualcomm devices
-- AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
-- ARM i8mm kernel
+- OneDNN backend now supports Xe-HPG GPU with XMX cores with tuned performance
+- AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected) (thanks @danifest751)
+- ARM i8mm kernel (thanks @danifest751)
 
 ### Fix & Enhancements
-- NEON DotProd and basic NEON kernel rewrite, reduce instruction count and improve speed
-- OpenCL `--ocl-cpm-type auto|float|int|mad24`: `mad24` is now an explicit choice (auto keeps it on AMD GCN gfx6-8); `int` accumulates straight into the int32 tile instead of a separate panel
+- NEON DotProd and basic NEON kernel rewrite, reduce instruction count and improve speed (thanks @danifest751)
+- OpenCL mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8) (joint effort with @danifest751) 
+- OpenCL `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
+- Faster noisy matrix preparation (joint effort with @danifest751)
+- Light random A matrix generation on GPU, only fill one random row and hash incrementally (OpenCL, OneDNN done, others TODO)
 
 ### Pearl Hexagon
 - Self-guided loop on the DSP, negligible kernel launch overhead
 - Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
+
+### Pearl OneDNN
+- Rewrite gemmstone strategy selection logic for GPUs with XMX core
+- Reduce xor overhead by overlapping xor with dpas
+- In-register 16 XOR slot folding, reducing global memory writeout
+- SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
 
 ## v0.5
 ### New features

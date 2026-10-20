@@ -41,6 +41,23 @@ bool prep_wg_enabled() {
     return on;
 }
 
+/* CP_OCL_PREP_ROWPOKE=0: regenerate and rehash the whole signal matrix every nonce instead of
+   updating one random row and its Merkle group. */
+bool prep_rowpoke_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CP_OCL_PREP_ROWPOKE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+static inline uint64_t prep_splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
 /* CP_OCL_PREP_UROWS_B3=0 keeps the byte-array uniform-rows kernel (ocl_uniform_rows). */
 bool prep_urows_b3_enabled() {
     static const bool on = [] {
@@ -418,6 +435,7 @@ bool Case33OclPrep::ensure_buffers(int m, int n, int k) {
             clReleaseMemObject(d_A_sig_);
         }
         d_A_sig_ = ocl_->alloc_buffer(szA, CL_MEM_READ_WRITE);
+        a_sig_init_ = false;
         m_cap_ = m;
     }
     if (merkle_need > merkle_cap_) {
@@ -960,6 +978,129 @@ bool Case33OclPrep::zero_matrix_keyed_hash(int n, int K, const uint8_t job_key[3
     return matrix_keyed_hash_(d_A_sig_, 0, pad, job_key, out, nullptr, nullptr);
 }
 
+bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
+                                     const uint8_t job_key[32], int m, int K, uint8_t hash_a[32],
+                                     double *t_after_gen) {
+    const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
+    const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
+    const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
+    const bool incremental = prep_rowpoke_enabled() && a_sig_init_ && a_sig_m_ == m && a_sig_k_ == K &&
+            m > 0 && K > 0 && (K % 1024) == 0 && pad_a == raw_a;
+    if (!incremental) {
+        /* First attempt (or new dimensions): the full random signal and its full commitment. */
+        if (!gen_random_a_(rng_seed, m * K)) {
+            return false;
+        }
+        if (t_after_gen) {
+            *t_after_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
+        }
+        if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+            return false;
+        }
+        a_sig_init_ = true;
+        a_sig_m_ = m;
+        a_sig_k_ = K;
+        memcpy(a_hash_key_, job_key, 32);
+        return true;
+    }
+
+    /* One random full row, with the values the full generator (ocl_gen_random_matrix, tag 0)
+       would give those positions; the rest of the signal keeps earlier nonces' rows. */
+    const uint32_t row = static_cast<uint32_t>(prep_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) %
+                                               static_cast<uint64_t>(m));
+    std::vector<int8_t> rowbuf(static_cast<size_t>(K));
+    for (int j = 0; j < K; ++j) {
+        const uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(K) + static_cast<uint64_t>(j);
+        uint64_t sv = rng_seed ^ (idx * 0x9E3779B97F4A7C15ULL);
+        sv = prep_splitmix64(sv);
+        rowbuf[static_cast<size_t>(j)] = static_cast<int8_t>(static_cast<int>((sv >> 32) % 128u) - 64);
+    }
+    if (!ocl_->write_buffer(d_A_sig_, rowbuf.data(), rowbuf.size(),
+                            static_cast<size_t>(row) * static_cast<size_t>(K))) {
+        return false;
+    }
+    if (t_after_gen) {
+        *t_after_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    }
+
+    if (!a_witness_valid_ || memcmp(a_hash_key_, job_key, 32) != 0) {
+        /* New job key: every subroot changes, so hash the whole (persisting) signal once. */
+        if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+            return false;
+        }
+        memcpy(a_hash_key_, job_key, 32);
+    } else {
+        const int group = static_cast<int>((static_cast<size_t>(row) * static_cast<size_t>(K) / 1024) / 256);
+        if (!rehash_signal_a_group_(raw_a, pad_a, job_key, group, hash_a)) {
+            return false;
+        }
+    }
+    if (prep_check_enabled()) {
+        /* Recompute the whole commitment and compare roots (also refreshes the stored subroots). */
+        uint8_t full[32];
+        if (!hash_signal_a_(raw_a, pad_a, job_key, full)) {
+            return false;
+        }
+        const bool same = memcmp(full, hash_a, 32) == 0;
+        std::printf("[ocl-prep] incremental commitment check (row %u): %s\n", row,
+                    same ? "identical" : "MISMATCH");
+        std::fflush(stdout);
+        if (!same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Case33OclPrep::rehash_signal_a_group_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
+                                           int group, uint8_t out[32]) {
+    const int num_chunks = static_cast<int>(pad_len / 1024);
+    const int num_subroots = (num_chunks + 255) / 256;
+    if (num_chunks <= 0 || group < 0 || group >= num_subroots || !d_a_subroots_ || !d_merkle_roots_) {
+        return false;
+    }
+    if (!ocl_->write_buffer(d_job_key_, job_key, 32)) {
+        return false;
+    }
+    cl_ulong raw_len_ul = static_cast<cl_ulong>(raw_len);
+    cl_ulong pad_len_ul = static_cast<cl_ulong>(pad_len);
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 0, sizeof(cl_mem), &d_A_sig_);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 1, sizeof(cl_ulong), &raw_len_ul);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 2, sizeof(cl_ulong), &pad_len_ul);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 3, sizeof(cl_mem), &d_job_key_);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 4, sizeof(cl_mem), &d_a_subroots_);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 5, sizeof(int), &num_chunks);
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 6, sizeof(int), &group);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    const size_t g = 256, l = 256;
+    err = clEnqueueNDRangeKernel(ocl_->queue, k_keyed_chunk_roots_, 1, nullptr, &g, &l, 0, nullptr,
+                                 nullptr);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    /* The reduction works in place: run it on a copy of the stored subroots. */
+    err = clEnqueueCopyBuffer(ocl_->queue, d_a_subroots_, d_merkle_roots_, 0, 0,
+                              static_cast<size_t>(num_subroots) * 32, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    a_witness_valid_ = false;
+    if (!merkle_finish_root_(num_subroots)) {
+        return false;
+    }
+    clFinish(ocl_->queue);
+    if (!ocl_->read_buffer(d_merkle_roots_, out, 32)) {
+        return false;
+    }
+    memcpy(a_root_, out, 32);
+    a_num_subroots_ = num_subroots;
+    a_witness_valid_ = true;
+    return true;
+}
+
 bool Case33OclPrep::hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
                                    uint8_t out[32]) {
     a_witness_valid_ = false;
@@ -1009,6 +1150,8 @@ bool Case33OclPrep::matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_
     err |= clSetKernelArg(k_keyed_chunk_roots_, 3, sizeof(cl_mem), &d_job_key_);
     err |= clSetKernelArg(k_keyed_chunk_roots_, 4, sizeof(cl_mem), &d_merkle_roots_);
     err |= clSetKernelArg(k_keyed_chunk_roots_, 5, sizeof(int), &num_chunks);
+    const int group_base0 = 0;
+    err |= clSetKernelArg(k_keyed_chunk_roots_, 6, sizeof(int), &group_base0);
     if (err != CL_SUCCESS) {
         return false;
     }
@@ -1114,14 +1257,8 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
         return false;
     }
 
-    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
-        return false;
-    }
-
-    const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
-    const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, nullptr)) {
         return false;
     }
 
@@ -1147,15 +1284,9 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
     }
     const double t_start = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
-    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
-        return false;
-    }
-    const double t_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
-
-    const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
-    const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+    double t_gen = 0.0;
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, &t_gen)) {
         return false;
     }
     const double t_hash = prep_timing_enabled() ? cp_now_sec() : 0.0;
@@ -1228,14 +1359,8 @@ bool Case33OclPrep::prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, 
         return false;
     }
 
-    if (!gen_random_a_(pearl_seed_to_u64(ab_seed, ab_seed_len), m * K)) {
-        return false;
-    }
-
-    const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
-    const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     uint8_t hash_a[32];
-    if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, nullptr)) {
         return false;
     }
 

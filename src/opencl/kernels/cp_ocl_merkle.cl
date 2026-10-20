@@ -159,13 +159,15 @@ inline void d_mt_store_root_words(__local uint* smem, int smem_cols, __global uc
     d_b3_store32_g(roots_out + (size_t)root_index * D_B3_OUT + (size_t)tid * 4, w);
 }
 
+/* group_base: first 256-chunk group this launch covers (0 for the full matrix; the incremental
+ * per-nonce update launches one group). The last-group logic uses the matrix size, not the grid. */
 __kernel void ocl_keyed_chunk_roots(__global const uchar* mat, ulong raw_len, ulong pad_len,
                                     __global const uchar* job_key, __global uchar* roots_out,
-                                    int num_chunks) {
+                                    int num_chunks, int group_base) {
     __local uint smem_leaves[CP_MT_CV_WORDS * CP_MT_THREADS];
     const int tid = get_local_id(0);
-    const int bid = get_group_id(0);
-    const int num_grid_blocks = get_num_groups(0);
+    const int bid = group_base + (int)get_group_id(0);
+    const int num_grid_blocks = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
     const int is_last_block = (bid == num_grid_blocks - 1);
     const int global_chunk = bid * CP_MT_THREADS + tid;
 

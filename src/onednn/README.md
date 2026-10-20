@@ -72,14 +72,21 @@ harness, so the mismatch is in how an 8×4 hash tile is proven (also seen on the
 
 ## Matrix preparation (per attempt)
 
-Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB): random A_sig (`ocl_gen_random_matrix16`),
-its BLAKE3 Merkle commitment, 128 uniform noise bytes per row (`ocl_uniform_rows_b3`: one keyed
+Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB). The random signal A_sig is generated
+in full once (`ocl_gen_random_matrix16`) and hashed in full once; every later nonce replaces one random
+row (the values the full generator would give that row for the nonce's seed, written from the host) and
+updates the BLAKE3 Merkle commitment incrementally: the row's 256-chunk group is rehashed by one work
+group of the same kernel and the stored subroots are reduced again (`CP_OCL_PREP_ROWPOKE=0` restores the
+full regeneration; a new job key triggers one full rehash since the hash is keyed). Then 128 uniform
+noise bytes per row (`ocl_uniform_rows_b3`: one keyed
 single-block BLAKE3 per 32-byte block, words in registers) and the noisy matrix
 (`ocl_noisy_matrix_rowmajor_sg`: one 32-lane sub-group per row, 4 consecutive k per lane so an
 instruction touches 128 contiguous bytes, 8 units in flight, the row's noise bytes in local memory).
-A770 per attempt: generation 4.3 ms, hash 2.8 ms, uniform rows 0.3 ms (was 8.7 with the byte-array
-hash), noise 3.0 ms (was 6.1: the 16-byte-per-lane access pattern alone cost 5.5 ms as a plain copy);
-prep 11 ms of a 0.698 s attempt, so end-to-end is 100.8 TMAC/s against 102.5 scan-only. Both new kernels are checked byte for byte against
+A770 per attempt: row update 0.2 ms (was 4.3 for the full generation), commitment 0.7 ms (was 2.8),
+uniform rows 0.3 ms (was 8.7 with the byte-array hash), noise 3.0 ms (was 6.1: the 16-byte-per-lane
+access pattern alone cost 5.5 ms as a plain copy); prep 4 ms (was 22) of a 0.694 s attempt, so
+end-to-end is 101.4 TMAC/s against about 102 scan-only. `CP_OCL_PREP_CHECK=1` also recomputes the full
+commitment every nonce and compares roots. Both new kernels are checked byte for byte against
 the simple per-row kernels with `CP_OCL_PREP_CHECK=1`; `CP_OCL_PREP_TIMING=1` prints the split;
 `CP_OCL_PREP_UROWS_B3=0` / `CP_OCL_PREP_SG=0` restore the previous kernels;
 `CP_OCL_PREP_DEFS="-DNSG_KPL=16 -DNSG_UNROLL=1 -DNSG_SLM_TABLE=0 -DNSG_DIAG=1"` passes build options
