@@ -118,6 +118,9 @@ private:
     bool a_row_major_ = true;
     bool b_row_major_ = false;
     uint32_t scan_jackpot_key_[8] = {};
+    bool scan_key_dev_ = false;        // this scan's key is prep_.a_key_buffer() (device only)
+    bool scan_key_host_valid_ = false; // scan_jackpot_key_ holds it
+    bool ensure_host_scan_key_();      // fetch the device key for host-side users
     uint32_t scan_jackpot_bound_[8] = {};
     int xor_period_ = 1;
     int row_period_batch_ = CP_ONEDNN_PERIOD_BATCH_DEFAULT;

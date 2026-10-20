@@ -697,7 +697,7 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
                                            const uint8_t job_key[32],
                                            const uint8_t b_noise_seed[32], int salted,
                                            uint8_t a_key_out[32]) {
-    if (!available_ || !ab_seed || !job_key || !b_noise_seed || !a_key_out || !prep_ready_) {
+    if (!available_ || !ab_seed || !job_key || !b_noise_seed || !prep_ready_) {   // a_key_out optional
         return false;
     }
     if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
@@ -855,6 +855,9 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
     bufs.tile_cols = panel_tile_cols;
     bufs.xor_period = xor_period_;
     if (fused_jackpot_) {
+        if (!info_.jackpotCoop && !ensure_host_scan_key_()) {   // key passed as kernel arguments
+            return false;
+        }
         std::memcpy(bufs.blake3_key_words, scan_jackpot_key_, sizeof(bufs.blake3_key_words));
         std::memcpy(bufs.blake3_bound_words, scan_jackpot_bound_, sizeof(bufs.blake3_bound_words));
         bufs.found_flag = found_buf_;
@@ -862,15 +865,18 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
         bufs.tc_base = tc_base;
         if (info_.jackpotCoop) {
             // The kernel keeps only the tile_xor pointer: bind the found buffer to it and stage
-            // this panel's arguments there (in-order queue: visible to this panel's kernel).
-            uint32_t args[kJackpotCoopArgWords] = {};
-            std::memcpy(args, scan_jackpot_key_, 8 * sizeof(uint32_t));
-            args[8] = static_cast<uint32_t>(panel_tile_cols);
-            args[9] = static_cast<uint32_t>(tr_base);
-            args[10] = static_cast<uint32_t>(tc_base);
-            args[11] = static_cast<uint32_t>(panel_tile_count);
-            if (!ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff)) {
+            // this panel's tile arguments there (in-order queue: visible to this panel's kernel).
+            // The key words before them were filled once at scan start (scan_for_share).
+            uint32_t args[4] = {static_cast<uint32_t>(panel_tile_cols), static_cast<uint32_t>(tr_base),
+                                static_cast<uint32_t>(tc_base), static_cast<uint32_t>(panel_tile_count)};
+            if (!ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff + 32)) {
                 return false;
+            }
+            if (info_.jackpotCoopAudit) {   // the audit may have reallocated the found buffer: restage the key
+                if (!ensure_host_scan_key_() ||
+                    !ocl_.write_buffer(found_buf_, scan_jackpot_key_, 32, kJackpotCoopArgsOff)) {
+                    return false;
+                }
             }
             if (info_.jackpotCoopAudit) {   // sentinel: an unwritten digest stays all-ones
                 std::vector<uint32_t> fill(static_cast<size_t>(panel_tile_count) * 8, 0xFFFFFFFFu);
@@ -1004,7 +1010,8 @@ bool Case33GemmOnednn::enqueue_jackpot_panel_(cl_command_queue queue, cl_mem til
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_mr);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &hash_nr);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(int), &use_folded_msg);
-    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &a_key_buf_);
+    cl_mem key_buf = scan_key_dev_ ? prep_.a_key_buffer() : a_key_buf_;
+    err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &key_buf);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &bound_buf_);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &found_buf_);
     err |= clSetKernelArg(jackpot_kernel_, arg++, sizeof(cl_mem), &out_rows_buf_);
@@ -1118,7 +1125,22 @@ bool Case33GemmOnednn::ensure_coop_audit_buf_(int panel_tile_count) {
     return ocl_.write_buffer(found_buf_, scan_jackpot_bound_, sizeof(scan_jackpot_bound_), 0);
 }
 
+bool Case33GemmOnednn::ensure_host_scan_key_() {
+    if (scan_key_host_valid_) {
+        return true;
+    }
+    if (!scan_key_dev_ || !prep_.a_key_buffer() ||
+        !ocl_.read_buffer(prep_.a_key_buffer(), scan_jackpot_key_, sizeof(scan_jackpot_key_))) {
+        return false;
+    }
+    scan_key_host_valid_ = true;
+    return true;
+}
+
 bool Case33GemmOnednn::coop_audit_panel_(int panel_tile_count, int tr_base, int tc_base) {
+    if (!ensure_host_scan_key_()) {
+        return false;
+    }
     const size_t n = static_cast<size_t>(panel_tile_count);
     std::vector<uint32_t> dig(n * 8), msg(n * 16), hmsg(n * 16);
     if (!ocl_.read_buffer(found_buf_, dig.data(), dig.size() * sizeof(uint32_t), kJackpotCoopAuditOff) ||
@@ -1534,7 +1556,7 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
                                       uint64_t *out_tiles_scanned,
                                       const std::function<bool()> &should_cancel,
                                       const std::function<void(uint64_t)> &on_progress) {
-    if (!available_ || !a_key8 || !bound) {
+    if (!available_ || !bound) {   // a_key8 == nullptr: key on the device (see below)
         return false;
     }
     if (!jackpot_ready_) {
@@ -1557,16 +1579,37 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
         *out_tiles_scanned = 0;
     }
 
-    std::memcpy(scan_jackpot_key_, a_key8, sizeof(scan_jackpot_key_));
+    // a_key8 == nullptr: the key is the A noise seed the GPU prep left in prep_.a_key_buffer();
+    // kernels read it there and host-side users fetch it on demand (ensure_host_scan_key_).
+    scan_key_dev_ = (a_key8 == nullptr);
+    scan_key_host_valid_ = !scan_key_dev_;
+    if (scan_key_dev_) {
+        if (!prep_ready_ || !prep_.a_key_buffer()) {
+            return false;
+        }
+        clFinish(ocl_.queue);   // prep's seed kernel is complete before other queues read the key
+    } else {
+        std::memcpy(scan_jackpot_key_, a_key8, sizeof(scan_jackpot_key_));
+        if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t))) {
+            return false;
+        }
+    }
     std::memcpy(scan_jackpot_bound_, bound, sizeof(scan_jackpot_bound_));
 
-    if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t)) ||
-        !ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
+    if (!ocl_.write_buffer(bound_buf_, bound, 8 * sizeof(uint32_t))) {
         return false;
     }
     if (fused_jackpot_) {
         if (!ocl_.write_buffer(found_buf_, bound, 8 * sizeof(uint32_t), 0)) {
             return false;
+        }
+        if (info_.jackpotCoop) {   // the cooperative kernel reads its key from the found buffer
+            const bool ok = scan_key_dev_
+                    ? ocl_.copy_buffer(prep_.a_key_buffer(), 0, found_buf_, kJackpotCoopArgsOff, 32)
+                    : ocl_.write_buffer(found_buf_, a_key8, 32, kJackpotCoopArgsOff);
+            if (!ok) {
+                return false;
+            }
         }
     }
     const int zero = 0;

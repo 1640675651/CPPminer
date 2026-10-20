@@ -67,6 +67,9 @@ struct Case33OclPrep {
                         uint8_t root_out[32]) const;
 
     cl_mem noisy_scratch_buffer() const { return d_noisy_scratch_; }
+    /* 32 bytes on the device: the last attempt's A noise seed, which is also the scan's jackpot key.
+       The prepare_attempt_* functions accept a_key_out == nullptr and then leave the key only here. */
+    cl_mem a_key_buffer() const { return d_a_key_; }
 
     /* OpenCL --align-test helpers (GPU vs CPU reference). */
     bool align_gen_random(cl_mem dst, uint64_t rng_seed, int matrix_tag, int total_elems);
@@ -91,6 +94,10 @@ private:
     bool hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
                         uint8_t out[32]);
     bool merkle_finish_root_(int num_subroots);
+    /* A's noise seed from the root in d_merkle_roots_ into d_noise_seed_ / d_a_key_ (and the root
+       into d_a_root_), on the GPU; a_key_out (optional) receives a host copy. */
+    bool derive_a_noise_seed_(const uint8_t b_noise_seed[32], int m, int salted, uint8_t *a_key_out);
+    bool set_job_key_(const uint8_t job_key[32]); /* writes d_job_key_ only when it changes */
     bool build_perm_pairs_(int is_b, int K);
     bool gen_random_a_(uint64_t rng_seed, int total); /* signal A into d_A_sig_ */
     /* Per-nonce signal: full generation + hash the first time (and on dimension/job changes),
@@ -150,10 +157,16 @@ private:
     cl_kernel k_pad_row_tails_ = nullptr;
     cl_kernel k_pad_col_tails_ = nullptr;
     cl_kernel k_test_random_hash_ = nullptr;
+    cl_kernel k_a_noise_seed_ = nullptr;      // optional: A noise seed on the device (host fallback)
+    int seed_mode_ = -1;                      // -1 = not verified yet, 1 = device, 0 = host
 
     cl_mem d_A_sig_ = nullptr;
     cl_mem d_job_key_ = nullptr;
     cl_mem d_noise_seed_ = nullptr;
+    cl_mem d_a_key_ = nullptr;   // the last attempt's A noise seed (jackpot key)
+    cl_mem d_a_root_ = nullptr;  // the last attempt's signal-A root (share witness)
+    uint8_t dev_job_key_[32] = {};
+    bool dev_job_key_valid_ = false;
     cl_mem d_pairs_ = nullptr;
     cl_mem d_merkle_roots_ = nullptr;
     cl_mem d_a_subroots_ = nullptr;

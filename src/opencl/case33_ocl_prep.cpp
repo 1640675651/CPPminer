@@ -151,6 +151,14 @@ Case33OclPrep::~Case33OclPrep() {
         clReleaseMemObject(d_noise_seed_);
         d_noise_seed_ = nullptr;
     }
+    if (d_a_key_) {
+        clReleaseMemObject(d_a_key_);
+        d_a_key_ = nullptr;
+    }
+    if (d_a_root_) {
+        clReleaseMemObject(d_a_root_);
+        d_a_root_ = nullptr;
+    }
     if (d_pairs_) {
         clReleaseMemObject(d_pairs_);
         d_pairs_ = nullptr;
@@ -291,6 +299,7 @@ bool Case33OclPrep::create_kernels_() {
     k_pad_row_tails_ = mk("ocl_pad_rowmajor_row_tails");
     k_pad_col_tails_ = mk("ocl_pad_colmajor_col_tails");
     k_test_random_hash_ = mk("ocl_test_get_random_hash");
+    k_a_noise_seed_ = mk("ocl_a_noise_seed");
 
     const bool core = k_gen_random_ && k_build_pairs_ && k_keyed_chunk_roots_ &&
                       k_compute_blake_mt_ && k_reduce_roots_ && k_noisy_rowmajor_ &&
@@ -394,6 +403,10 @@ void Case33OclPrep::release_kernels_() {
         clReleaseKernel(k_test_random_hash_);
         k_test_random_hash_ = nullptr;
     }
+    if (k_a_noise_seed_) {
+        clReleaseKernel(k_a_noise_seed_);
+        k_a_noise_seed_ = nullptr;
+    }
 }
 
 bool Case33OclPrep::init(OpenClContext *ocl, const std::string &kernel_dir, bool fused_prepack) {
@@ -416,11 +429,17 @@ bool Case33OclPrep::init(OpenClContext *ocl, const std::string &kernel_dir, bool
     if (!d_noise_seed_) {
         d_noise_seed_ = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
     }
+    if (!d_a_key_) {
+        d_a_key_ = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
+    }
+    if (!d_a_root_) {
+        d_a_root_ = ocl_->alloc_buffer(32, CL_MEM_READ_WRITE);
+    }
     if (!d_pairs_) {
         d_pairs_ = ocl_->alloc_buffer(static_cast<size_t>(K_DIM) * 2u * sizeof(uint32_t),
                                       CL_MEM_READ_ONLY);
     }
-    if (!d_job_key_ || !d_noise_seed_ || !d_pairs_) {
+    if (!d_job_key_ || !d_noise_seed_ || !d_pairs_ || !d_a_key_ || !d_a_root_) {
         return false;
     }
     ready_ = true;
@@ -1026,6 +1045,77 @@ bool Case33OclPrep::noisy_matrix_b_rowmajor_(cl_mem out, int K, int N, int ldb) 
     return true;
 }
 
+bool Case33OclPrep::set_job_key_(const uint8_t job_key[32]) {
+    if (dev_job_key_valid_ && memcmp(dev_job_key_, job_key, 32) == 0) {
+        return true;
+    }
+    dev_job_key_valid_ = false;
+    if (!ocl_->write_buffer(d_job_key_, job_key, 32)) {
+        return false;
+    }
+    memcpy(dev_job_key_, job_key, 32);
+    dev_job_key_valid_ = true;
+    return true;
+}
+
+bool Case33OclPrep::derive_a_noise_seed_(const uint8_t b_noise_seed[32], int m, int salted,
+                                         uint8_t *a_key_out) {
+    if (seed_mode_ != 0 && k_a_noise_seed_ && d_a_key_ && d_a_root_ && d_merkle_roots_) {
+        cl_uint8 bw;
+        memcpy(&bw, b_noise_seed, 32);
+        const cl_uint mu = static_cast<cl_uint>(m);
+        const cl_int s = salted ? 1 : 0;
+        cl_int err = clSetKernelArg(k_a_noise_seed_, 0, sizeof(cl_mem), &d_merkle_roots_);
+        err |= clSetKernelArg(k_a_noise_seed_, 1, sizeof(cl_uint), &mu);
+        err |= clSetKernelArg(k_a_noise_seed_, 2, sizeof(cl_int), &s);
+        err |= clSetKernelArg(k_a_noise_seed_, 3, sizeof(cl_uint8), &bw);
+        err |= clSetKernelArg(k_a_noise_seed_, 4, sizeof(cl_mem), &d_noise_seed_);
+        err |= clSetKernelArg(k_a_noise_seed_, 5, sizeof(cl_mem), &d_a_key_);
+        err |= clSetKernelArg(k_a_noise_seed_, 6, sizeof(cl_mem), &d_a_root_);
+        const size_t g = 1, l = 1;
+        if (err == CL_SUCCESS)
+            err = clEnqueueNDRangeKernel(ocl_->queue, k_a_noise_seed_, 1, nullptr, &g, &l, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl-prep] noise seed kernel failed (%d); deriving it on the host\n", err);
+            seed_mode_ = 0;
+        } else if (seed_mode_ < 0 || prep_check_enabled()) {
+            /* First use (and CP_OCL_PREP_CHECK): compare with the host derivation once. */
+            uint8_t root[32], dev[32], host[32];
+            if (!ocl_->read_buffer(d_a_root_, root, 32) || !ocl_->read_buffer(d_a_key_, dev, 32)) {
+                return false;
+            }
+            pearl_a_noise_seed_from_hash(b_noise_seed, root, static_cast<uint32_t>(m), salted, host);
+            const bool same = memcmp(dev, host, 32) == 0;
+            if (!same || prep_check_enabled()) {
+                std::printf("[ocl-prep] device A noise seed check: %s\n",
+                            same ? "identical" : "MISMATCH, deriving it on the host from now on");
+                std::fflush(stdout);
+            }
+            if (same) {
+                seed_mode_ = 1;
+                if (a_key_out) memcpy(a_key_out, dev, 32);
+                return true;
+            }
+            seed_mode_ = 0;
+        } else {
+            return !a_key_out || ocl_->read_buffer(d_a_key_, a_key_out, 32);
+        }
+    }
+    /* Host derivation: root from the device, seed back to the device. */
+    uint8_t root[32], seed[32];
+    if (!ocl_->read_buffer(d_merkle_roots_, root, 32)) {
+        return false;
+    }
+    pearl_a_noise_seed_from_hash(b_noise_seed, root, static_cast<uint32_t>(m), salted, seed);
+    if (!ocl_->write_buffer(d_noise_seed_, seed, 32) ||
+        (d_a_key_ && !ocl_->write_buffer(d_a_key_, seed, 32)) ||
+        (d_a_root_ && !ocl_->write_buffer(d_a_root_, root, 32))) {
+        return false;
+    }
+    if (a_key_out) memcpy(a_key_out, seed, 32);
+    return true;
+}
+
 bool Case33OclPrep::merkle_finish_root_(int num_subroots) {
     cl_int err = CL_SUCCESS;
     const int num_mt_blocks = (num_subroots + 255) / 256;
@@ -1090,6 +1180,7 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
     const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
     const bool incremental = prep_rowpoke_enabled() && a_sig_init_ && a_sig_m_ == m && a_sig_k_ == K &&
             m > 0 && K > 0 && (K % 1024) == 0 && pad_a == raw_a;
+    uint8_t root_local[32];
     if (!incremental) {
         /* First attempt (or new dimensions): the full random signal and its full commitment. */
         if (!gen_random_a_(rng_seed, m * K)) {
@@ -1098,7 +1189,7 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
         if (t_after_gen) {
             *t_after_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
         }
-        if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+        if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a ? hash_a : root_local)) {
             return false;
         }
         a_sig_init_ = true;
@@ -1108,34 +1199,65 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
         return true;
     }
 
-    /* One random full row, with the values the full generator (ocl_gen_random_matrix, tag 0)
-       would give those positions; the rest of the signal keeps earlier nonces' rows. */
+    /* One random full row, generated on the GPU by the full generator (ocl_gen_random_matrix, tag 0)
+       over just that row (global work offset); the rest of the signal keeps earlier nonces' rows. */
     const uint32_t row = static_cast<uint32_t>(prep_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) %
                                                static_cast<uint64_t>(m));
-    std::vector<int8_t> rowbuf(static_cast<size_t>(K));
-    for (int j = 0; j < K; ++j) {
-        const uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(K) + static_cast<uint64_t>(j);
-        uint64_t sv = rng_seed ^ (idx * 0x9E3779B97F4A7C15ULL);
-        sv = prep_splitmix64(sv);
-        rowbuf[static_cast<size_t>(j)] = static_cast<int8_t>(static_cast<int>((sv >> 32) % 128u) - 64);
+    {
+        const bool wide = k_gen_random16_ && (K % 16) == 0;
+        cl_kernel k = wide ? k_gen_random16_ : k_gen_random_;
+        const cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
+        const int tag = 0;
+        const int total = m * K;
+        cl_int err = clSetKernelArg(k, 0, sizeof(cl_ulong), &rng_ul);
+        err |= clSetKernelArg(k, 1, sizeof(int), &tag);
+        err |= clSetKernelArg(k, 2, sizeof(int), &total);
+        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_A_sig_);
+        const size_t per = wide ? 16 : 1;
+        const size_t off = static_cast<size_t>(row) * static_cast<size_t>(K) / per;
+        const size_t g = static_cast<size_t>(K) / per;
+        const size_t l = (g % 256 == 0) ? 256 : ((g % 64 == 0) ? 64 : 1);
+        if (err == CL_SUCCESS)
+            err = clEnqueueNDRangeKernel(ocl_->queue, k, 1, &off, &g, &l, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::fprintf(stderr, "[ocl-prep] row generation launch failed (%d)\n", err);
+            return false;
+        }
     }
-    if (!ocl_->write_buffer(d_A_sig_, rowbuf.data(), rowbuf.size(),
-                            static_cast<size_t>(row) * static_cast<size_t>(K))) {
-        return false;
+    if (prep_check_enabled()) {
+        /* Compare the GPU row with the host formula the CPU worker uses. */
+        std::vector<int8_t> got(static_cast<size_t>(K));
+        if (!ocl_->read_buffer(d_A_sig_, got.data(), got.size(),
+                               static_cast<size_t>(row) * static_cast<size_t>(K))) {
+            return false;
+        }
+        int bad = 0;
+        for (int j = 0; j < K; ++j) {
+            const uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(K) + static_cast<uint64_t>(j);
+            const uint64_t sv = prep_splitmix64(rng_seed ^ (idx * 0x9E3779B97F4A7C15ULL));
+            bad += got[static_cast<size_t>(j)] != static_cast<int8_t>(static_cast<int>((sv >> 32) % 128u) - 64);
+        }
+        std::printf("[ocl-prep] GPU row %u check: %s\n", row, bad ? "MISMATCH" : "identical");
+        std::fflush(stdout);
+        if (bad) {
+            return false;
+        }
     }
     if (t_after_gen) {
         *t_after_gen = prep_timing_enabled() ? cp_now_sec() : 0.0;
     }
 
+    /* The root stays on the device (d_merkle_roots_[0..31]) unless hash_a asks for a copy. */
+    uint8_t *root_out = hash_a ? hash_a : (prep_check_enabled() ? root_local : nullptr);
     if (!a_witness_valid_ || memcmp(a_hash_key_, job_key, 32) != 0) {
         /* New job key: every subroot changes, so hash the whole (persisting) signal once. */
-        if (!hash_signal_a_(raw_a, pad_a, job_key, hash_a)) {
+        if (!hash_signal_a_(raw_a, pad_a, job_key, root_out ? root_out : root_local)) {
             return false;
         }
         memcpy(a_hash_key_, job_key, 32);
     } else {
         const int group = static_cast<int>((static_cast<size_t>(row) * static_cast<size_t>(K) / 1024) / 256);
-        if (!rehash_signal_a_group_(raw_a, pad_a, job_key, group, hash_a)) {
+        if (!rehash_signal_a_group_(raw_a, pad_a, job_key, group, root_out)) {
             return false;
         }
     }
@@ -1145,7 +1267,7 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
         if (!hash_signal_a_(raw_a, pad_a, job_key, full)) {
             return false;
         }
-        const bool same = memcmp(full, hash_a, 32) == 0;
+        const bool same = memcmp(full, root_out, 32) == 0;
         std::printf("[ocl-prep] incremental commitment check (row %u): %s\n", row,
                     same ? "identical" : "MISMATCH");
         std::fflush(stdout);
@@ -1163,7 +1285,7 @@ bool Case33OclPrep::rehash_signal_a_group_(size_t raw_len, size_t pad_len, const
     if (num_chunks <= 0 || group < 0 || group >= num_subroots || !d_a_subroots_ || !d_merkle_roots_) {
         return false;
     }
-    if (!ocl_->write_buffer(d_job_key_, job_key, 32)) {
+    if (!set_job_key_(job_key)) {
         return false;
     }
     cl_ulong raw_len_ul = static_cast<cl_ulong>(raw_len);
@@ -1185,21 +1307,21 @@ bool Case33OclPrep::rehash_signal_a_group_(size_t raw_len, size_t pad_len, const
     if (err != CL_SUCCESS) {
         return false;
     }
-    /* The reduction works in place: run it on a copy of the stored subroots. */
-    err = clEnqueueCopyBuffer(ocl_->queue, d_a_subroots_, d_merkle_roots_, 0, 0,
-                              static_cast<size_t>(num_subroots) * 32, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
+    /* The reduction works in place: run it on a copy of the stored subroots (a copy kernel on the
+       compute queue, not a copy-engine transfer). */
+    if (!ocl_->copy_buffer(d_a_subroots_, 0, d_merkle_roots_, 0, static_cast<size_t>(num_subroots) * 32)) {
         return false;
     }
     a_witness_valid_ = false;
     if (!merkle_finish_root_(num_subroots)) {
         return false;
     }
-    clFinish(ocl_->queue);
-    if (!ocl_->read_buffer(d_merkle_roots_, out, 32)) {
-        return false;
+    if (out) {   /* the root stays in d_merkle_roots_[0..31]; copy it out only on request */
+        if (!ocl_->read_buffer(d_merkle_roots_, out, 32)) {
+            return false;
+        }
+        memcpy(a_root_, out, 32);
     }
-    memcpy(a_root_, out, 32);
     a_num_subroots_ = num_subroots;
     a_witness_valid_ = true;
     return true;
@@ -1237,10 +1359,11 @@ bool Case33OclPrep::matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_
             memset(tmp.data() + raw_len, 0, pad_len - raw_len);
         }
         pearl_keyed_matrix_digest(tmp.data(), pad_len, job_key, out);
-        return true;
+        /* keep the device root consistent with the multi-chunk path (A's noise seed reads it there) */
+        return !d_merkle_roots_ || ocl_->write_buffer(d_merkle_roots_, out, 32);
     }
 
-    if (!ocl_->write_buffer(d_job_key_, job_key, 32)) {
+    if (!set_job_key_(job_key)) {
         return false;
     }
 
@@ -1268,9 +1391,7 @@ bool Case33OclPrep::matrix_keyed_hash_(cl_mem d_mat, size_t raw_len, size_t pad_
         return false;
     }
     if (subroots_out) {
-        err = clEnqueueCopyBuffer(ocl_->queue, d_merkle_roots_, subroots_out, 0, 0,
-                                  static_cast<size_t>(num_subroots) * 32, 0, nullptr, nullptr);
-        if (err != CL_SUCCESS) {
+        if (!ocl_->copy_buffer(d_merkle_roots_, 0, subroots_out, 0, static_cast<size_t>(num_subroots) * 32)) {
             return false;
         }
         if (num_subroots_out) {
@@ -1354,22 +1475,18 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
                                       const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                                       int m, int K, int blocks_k, int macro_rows, int salted,
                                       uint8_t a_key_out[32]) {
-    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed || !a_key_out) {
+    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed) {
         return false;
     }
     if (!ensure_buffers(m, 1, K)) {
         return false;
     }
 
-    uint8_t hash_a[32];
-    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, nullptr)) {
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, nullptr, nullptr)) {
         return false;
     }
 
-    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), salted,
-                                 a_key_out);
-
-    if (!ocl_->write_buffer(d_noise_seed_, a_key_out, 32)) {
+    if (!derive_a_noise_seed_(b_noise_seed, m, salted, a_key_out)) {
         return false;
     }
 
@@ -1380,7 +1497,7 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
                                                int ab_seed_len, const uint8_t job_key[32],
                                                const uint8_t b_noise_seed[32], int m, int K,
                                                int out_lda, int salted, uint8_t a_key_out[32]) {
-    if (!ready_ || !a_noisy_out || !ab_seed || !job_key || !b_noise_seed || !a_key_out) {
+    if (!ready_ || !a_noisy_out || !ab_seed || !job_key || !b_noise_seed) {
         return false;
     }
     if (!ensure_buffers(m, 1, K)) {
@@ -1388,17 +1505,13 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
     }
     const double t_start = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
-    uint8_t hash_a[32];
     double t_gen = 0.0;
-    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, &t_gen)) {
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, nullptr, &t_gen)) {
         return false;
     }
     const double t_hash = prep_timing_enabled() ? cp_now_sec() : 0.0;
 
-    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), salted,
-                                 a_key_out);
-
-    if (!ocl_->write_buffer(d_noise_seed_, a_key_out, 32)) {
+    if (!derive_a_noise_seed_(b_noise_seed, m, salted, a_key_out)) {
         return false;
     }
 
@@ -1521,22 +1634,18 @@ bool Case33OclPrep::prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, 
         return prepare_attempt_a_rowmajor(a_buf, ab_seed, ab_seed_len, job_key, b_noise_seed, m, K,
                                           lda, salted, a_key_out);
     }
-    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed || !a_key_out) {
+    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed) {
         return false;
     }
     if (!ensure_buffers(m, 1, K)) {
         return false;
     }
 
-    uint8_t hash_a[32];
-    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, hash_a, nullptr)) {
+    if (!update_signal_a_(ab_seed, ab_seed_len, job_key, m, K, nullptr, nullptr)) {
         return false;
     }
 
-    pearl_a_noise_seed_from_hash(b_noise_seed, hash_a, static_cast<uint32_t>(m), salted,
-                                 a_key_out);
-
-    if (!ocl_->write_buffer(d_noise_seed_, a_key_out, 32)) {
+    if (!derive_a_noise_seed_(b_noise_seed, m, salted, a_key_out)) {
         return false;
     }
 
@@ -1683,7 +1792,13 @@ bool Case33OclPrep::read_A_witness(size_t sz_a, const uint32_t *block_idx, int n
             return false;
         }
     }
-    memcpy(root_out, a_root_, 32);
+    if (d_a_root_) {   /* written by derive_a_noise_seed_ for the attempt being proven */
+        if (!ocl_->read_buffer(d_a_root_, root_out, 32)) {
+            return false;
+        }
+    } else {
+        memcpy(root_out, a_root_, 32);
+    }
     return true;
 }
 

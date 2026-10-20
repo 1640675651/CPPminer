@@ -571,6 +571,8 @@ bool OpenClContext::init_xfer_kernels_() const {
     if (!xfer_up_ || err != CL_SUCCESS) return false;
     xfer_down_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
     if (!xfer_down_ || err != CL_SUCCESS) return false;
+    xfer_dd_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
+    if (!xfer_dd_ || err != CL_SUCCESS) return false;
     auto set_ptr = reinterpret_cast<cp_clSetKernelArgMemPointerINTEL_fn>(usm_arg_fn_);
     return set_ptr(xfer_up_, 0, xfer_host_) == CL_SUCCESS &&
            set_ptr(xfer_down_, 2, xfer_host_) == CL_SUCCESS;
@@ -579,6 +581,8 @@ bool OpenClContext::init_xfer_kernels_() const {
 void OpenClContext::release_xfer_() const {
     if (xfer_up_) clReleaseKernel(xfer_up_);
     if (xfer_down_) clReleaseKernel(xfer_down_);
+    if (xfer_dd_) clReleaseKernel(xfer_dd_);
+    xfer_dd_ = nullptr;
     if (xfer_prog_) clReleaseProgram(xfer_prog_);
     xfer_up_ = xfer_down_ = nullptr;
     xfer_prog_ = nullptr;
@@ -590,6 +594,23 @@ void OpenClContext::release_xfer_() const {
 
 bool OpenClContext::stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const {
     if (bytes == 0 || bytes > kXferStageBytes || !context || !queue || !buf) {
+        return false;
+    }
+    if (!xfer_kernels_on_()) {
+        return false;
+    }
+    // A kernel must not write a CL_MEM_READ_ONLY buffer nor read a CL_MEM_WRITE_ONLY one: use the
+    // transfer call for those.
+    cl_mem_flags flags = 0;
+    if (clGetMemObjectInfo(buf, CL_MEM_FLAGS, sizeof(flags), &flags, nullptr) != CL_SUCCESS ||
+        (flags & (device_write ? CL_MEM_READ_ONLY : CL_MEM_WRITE_ONLY))) {
+        return false;
+    }
+    return true;
+}
+
+bool OpenClContext::xfer_kernels_on_() const {
+    if (!context || !queue) {
         return false;
     }
     if (xfer_stage_on_ < 0) {
@@ -607,14 +628,44 @@ bool OpenClContext::stage_small_xfer_(cl_mem buf, size_t bytes, bool device_writ
             xfer_stage_on_ = on ? 1 : 0;
         }
     }
-    if (xfer_stage_on_ != 1) {
-        return false;
+    return xfer_stage_on_ == 1;
+}
+
+bool OpenClContext::copy_buffer(cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset,
+                                size_t bytes) const {
+    if (bytes == 0) {
+        return true;
     }
-    // A kernel must not write a CL_MEM_READ_ONLY buffer nor read a CL_MEM_WRITE_ONLY one: use the
-    // transfer call for those.
-    cl_mem_flags flags = 0;
-    if (clGetMemObjectInfo(buf, CL_MEM_FLAGS, sizeof(flags), &flags, nullptr) != CL_SUCCESS ||
-        (flags & (device_write ? CL_MEM_READ_ONLY : CL_MEM_WRITE_ONLY))) {
+    bool kernel_path = bytes <= (size_t(16) << 20) && xfer_kernels_on_();
+    if (kernel_path) {
+        cl_mem_flags sf = 0, df = 0;
+        kernel_path = clGetMemObjectInfo(src, CL_MEM_FLAGS, sizeof(sf), &sf, nullptr) == CL_SUCCESS &&
+                      clGetMemObjectInfo(dst, CL_MEM_FLAGS, sizeof(df), &df, nullptr) == CL_SUCCESS &&
+                      !(sf & CL_MEM_WRITE_ONLY) && !(df & CL_MEM_READ_ONLY);
+    }
+    if (!kernel_path) {
+        const cl_int err = clEnqueueCopyBuffer(queue, src, dst, src_offset, dst_offset, bytes, 0,
+                                               nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            log_cl_error("clEnqueueCopyBuffer", err);
+            return false;
+        }
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(*xfer_mu_);
+    const cl_ulong soff = src_offset, doff = dst_offset;
+    const cl_uint n = static_cast<cl_uint>(bytes);
+    cl_int err = clSetKernelArg(xfer_dd_, 0, sizeof(cl_mem), &src);
+    if (err == CL_SUCCESS) err = clSetKernelArg(xfer_dd_, 1, sizeof(soff), &soff);
+    if (err == CL_SUCCESS) err = clSetKernelArg(xfer_dd_, 2, sizeof(cl_mem), &dst);
+    if (err == CL_SUCCESS) err = clSetKernelArg(xfer_dd_, 3, sizeof(doff), &doff);
+    if (err == CL_SUCCESS) err = clSetKernelArg(xfer_dd_, 4, sizeof(n), &n);
+    if (err == CL_SUCCESS) {
+        const size_t lws = 64, gws = (bytes + lws - 1) / lws * lws;
+        err = clEnqueueNDRangeKernel(queue, xfer_dd_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
+    }
+    if (err != CL_SUCCESS) {
+        log_cl_error("kernel copy", err);
         return false;
     }
     return true;

@@ -381,14 +381,17 @@ extern "C" int cp_onednn_worker_mine_attempt(
 
     uint8_t a_key_local[32];
     const uint8_t *scan_key = a_key;
+    bool key_on_device = false;
 
     if (!scan_key) {
         if (!h_A_sig && !g_gemm.gpu_prep_ready()) {
             fprintf(stderr, "[onednn] mine_attempt requires h_Ap_global\n");
             return -2;
         }
-        const int prep_rc =
-                zero_b_prepare_attempt(ab_seed, ab_seed_len, job_key, m, n, h_A_sig, a_key_local);
+        /* GPU prep leaves the key (A's noise seed) on the device for the scan: no host copy. */
+        key_on_device = g_gemm.gpu_prep_ready();
+        const int prep_rc = zero_b_prepare_attempt(ab_seed, ab_seed_len, job_key, m, n, h_A_sig,
+                                                   key_on_device ? nullptr : a_key_local);
         if (prep_rc != 0) {
             return cp_job_should_cancel() ? -1 : 0;
         }
@@ -404,7 +407,9 @@ extern "C" int cp_onednn_worker_mine_attempt(
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
     uint32_t a_key8[8];
-    memcpy(a_key8, scan_key, 32);
+    if (!key_on_device) {
+        memcpy(a_key8, scan_key, 32);
+    }
 
     const int row_parts = cp_pp_num_row_parts(m, 1);
     const int col_parts = cp_pp_num_col_parts(n, 1);
@@ -479,7 +484,7 @@ extern "C" int cp_onednn_worker_mine_attempt(
     uint64_t tiles_scanned = 0;
 
     const bool ok = g_gemm.scan_for_share(
-            a_key8, bound, &found, &hit_rows, &hit_cols, &tiles_scanned,
+            key_on_device ? nullptr : a_key8, bound, &found, &hit_rows, &hit_cols, &tiles_scanned,
             []() -> bool { return cp_job_should_cancel() != 0; },
             [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); });
 

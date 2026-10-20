@@ -88,6 +88,10 @@ struct OpenClContext {
        =1 forces the kernel path on any USM device; CP_OCL_XFER_WATCH=<ms> logs slow transfers. */
     bool write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset = 0) const;
     bool read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset = 0) const;
+    /* Device-to-device copy, enqueued (not waited for) on `queue` like clEnqueueCopyBuffer. With the
+       small-transfer kernel path active it runs as a copy kernel on the compute engine, so no copy
+       engine wait is involved; otherwise (or above 16 MB) it is clEnqueueCopyBuffer. */
+    bool copy_buffer(cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t bytes) const;
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
@@ -95,6 +99,7 @@ struct OpenClContext {
 private:
     static void dump_program_binary_(cl_program prog);
     bool stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const;
+    bool xfer_kernels_on_() const;
     bool init_xfer_kernels_() const;
     void release_xfer_() const;
     mutable int xfer_stage_on_ = -1;        /* -1 = not decided yet */
@@ -102,6 +107,7 @@ private:
     mutable cl_program xfer_prog_ = nullptr;
     mutable cl_kernel xfer_up_ = nullptr;   /* host USM -> cl_mem */
     mutable cl_kernel xfer_down_ = nullptr; /* cl_mem -> host USM */
+    mutable cl_kernel xfer_dd_ = nullptr;   /* cl_mem -> cl_mem */
     mutable void *usm_free_fn_ = nullptr;
     mutable void *usm_arg_fn_ = nullptr;
     std::shared_ptr<std::mutex> xfer_mu_ = std::make_shared<std::mutex>();

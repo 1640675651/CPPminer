@@ -668,3 +668,55 @@ __kernel void ocl_test_get_random_hash(int index, __global const uchar *seed, in
         out[i] = digest[i];
     }
 }
+
+/* A's noise seed on the device (mirrors pearl_a_noise_seed_from_hash in cp_noise.c):
+     root_a = Merkle root of the signal A (32 bytes at root[0..31]);
+     salted: root_a = BLAKE3_keyed(SALT_A, root_a || le32(m) || zeros), a 64-byte message;
+     a_seed = BLAKE3(b_noise_seed || root_a), a 64-byte message.
+   Writes a_seed to seed_out (the noise kernels' seed) and key_out (the scan's jackpot key), and copies
+   the root to root_out (the share witness root). One work item. */
+constant uint CP_SEED_SALT_A_W[8] = {
+    0x6C404982u, 0x1615EDA0u, 0x92F61696u, 0xF876F0FCu, 0x2ADBDB92u, 0x52B82370u, 0x1977D4F0u, 0x7B0190C3u
+};
+
+__kernel void ocl_a_noise_seed(__global const uchar *root, uint m, int salted, uint8 b_seed,
+                               __global uchar *seed_out, __global uchar *key_out,
+                               __global uchar *root_out) {
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    const uint flags = D_B3_CHUNK_START | D_B3_CHUNK_END | D_B3_ROOT;
+    uint r[8];
+    for (int i = 0; i < 8; i++) {
+        r[i] = d_b3_load32_g(root + 4 * i);
+        d_b3_store32_g(root_out + 4 * i, r[i]);
+    }
+    uint msg[16];
+    if (salted) {
+        uint cv[8];
+        for (int i = 0; i < 8; i++) {
+            cv[i] = CP_SEED_SALT_A_W[i];
+            msg[i] = r[i];
+        }
+        msg[8] = m;
+        for (int i = 9; i < 16; i++) {
+            msg[i] = 0u;
+        }
+        d_b3_compress_words(cv, msg, 64u, 0ul, flags | D_B3_KEYED);
+        for (int i = 0; i < 8; i++) {
+            r[i] = cv[i];
+        }
+    }
+    const uint bw[8] = {b_seed.s0, b_seed.s1, b_seed.s2, b_seed.s3, b_seed.s4, b_seed.s5, b_seed.s6, b_seed.s7};
+    uint cv[8];
+    for (int i = 0; i < 8; i++) {
+        cv[i] = D_B3_IV[i];
+        msg[i] = bw[i];
+        msg[8 + i] = r[i];
+    }
+    d_b3_compress_words(cv, msg, 64u, 0ul, flags);
+    for (int i = 0; i < 8; i++) {
+        d_b3_store32_g(seed_out + 4 * i, cv[i]);
+        d_b3_store32_g(key_out + 4 * i, cv[i]);
+    }
+}

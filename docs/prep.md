@@ -18,7 +18,7 @@ from the keyed digest of the zero matrix.
 Per nonce:
 
 ```
-signal A_sig  ->  keyed BLAKE3 Merkle root  ->  host: noise seed = f(root)  ->  uniform rows  ->  noisy A
+signal A_sig  ->  keyed BLAKE3 Merkle root  ->  noise seed = f(root)  ->  uniform rows  ->  noisy A
 ```
 
 | Step | What it is |
@@ -154,8 +154,10 @@ one random value per column into a zero matrix. For the GPU a full random row is
   buffer the witness path keeps); the stored subroots are copied and reduced to the new root.
 
 A_sig is generated and hashed in full on the first attempt, after a dimension change, and on a new job
-key (the hash is keyed). Afterwards the host derives the row from the nonce's seed, computes its 4,096
-values with the full generator's formula for those positions, and writes 4 KiB. Signal 4.3 -> 0.2 ms,
+key (the hash is keyed). Afterwards the host derives the row index from the nonce's seed and the full
+generator kernel runs over just that row (global work offset row * K / 16, K / 16 work items), so the
+values are the ones the full generation would give. (Until 2026-10-20 the host computed the row and
+wrote 4 KiB; see section 6.) Signal 4.3 -> 0.2 ms,
 commitment 2.8 -> 0.7 ms (mostly launch and sync latency). `CP_OCL_PREP_CHECK=1` also recomputes the full
 commitment every nonce and compares roots; `CP_OCL_PREP_ROWPOKE=0` restores full regeneration.
 
@@ -209,6 +211,30 @@ the panels: 16.6 ms per job. `CP_OCL_PREP_CHECK=1` compares every byte through t
 `CASE5_B_PACKED=0` restores column-major B. Why not zero-A instead: the noise seeds are chained
 (`b_noise_seed = H(job_key, root(B))`, `a_noise_seed = H(b_noise_seed, root(A))`), so with a per-nonce B
 both noisy matrices would change every nonce.
+
+### 6. No host round trips in the per-nonce prep (2026-10-20)
+
+Per attempt the host used to write the row (4 KiB), the job key and A's noise seed, read the Merkle root
+back to derive that seed, and write the seed again as the scan's jackpot key. Now:
+
+| Step | Before | Now |
+|---|---|---|
+| Changed row | host computes, 4 KiB write | generator kernel over the row |
+| Job key | written every attempt | written when it changes (once per job) |
+| Subroot copy before the reduction | `clEnqueueCopyBuffer` (copy engine) | copy kernel (`OpenClContext::copy_buffer`) |
+| A noise seed | root read, host BLAKE3, seed write | `ocl_a_noise_seed` (cert-v3 binding + BLAKE3) on the device |
+| Jackpot key for the scan (oneDNN) | host writes, 48 B per panel in the fused kernel's arguments | device copy once per attempt; 16 B of tile arguments per panel |
+| Witness root | kept on the host after every attempt | read from the device when a share is proven |
+
+The oneDNN worker passes no key buffer to the prep and a null key to the scan; kernels read the key on
+the device and host-side users (the per-tile fused kernel on Gen12, the coop audit) fetch it on demand.
+The OpenCL backend still asks for a host copy of the key (one 32-byte read instead of a root read and a
+seed write). The first derivation in a process is compared with the host formula and falls back to the
+host on a mismatch; `CP_OCL_PREP_CHECK=1` also checks the GPU row against the host formula every nonce.
+
+A770, fused scan, steady state per attempt: host-to-device writes 23 (4,628 B) -> 19 (308 B), reads 5 -> 4,
+prep 5.3 -> 5.0 ms. What remains per attempt: the bound (32 B) and the found-buffer resets and tile
+arguments per panel.
 
 ### Verification
 
