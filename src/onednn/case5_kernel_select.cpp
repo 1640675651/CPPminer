@@ -70,8 +70,11 @@ constexpr int kPreferredXeHPGUnrollN = 64;
 // 1. per-device overrides (measured exceptions to the family default; empty for now)
 // 2. per-family defaults (gemmstone HW family: the measured-best strategy on a representative device)
 // 3. gemmstone's catalog ranking, then generic fallbacks
-// gemmstone's own selector cannot choose these: its catalog has no packed int8 entries, and for the
-// miner's layout it matches a single entry per family (Gen12LP: entry 30 only).
+// gemmstone's own selector does not choose these: the miner asks it for plain TN (A row-major, B
+// column-major), where it matches a single Gen12LP entry (30). The catalog's few packed int8 entries are
+// only matched when the problem itself is packed: Gen12LP 24 (A and B crosspack 4, 16x32; the Gen12LP
+// family kernel below uses its strategy) and XeHPG 287 / 289 (A in a tiled packed layout,
+// "A4#8,32", which the prep does not write).
 //
 // A family kernel names a tile (unroll), the strategies for plain and packed A, and the packing it
 // wants: A in panels of unroll_m rows (the prep writes 16-row panels, 4 k per dword), B in panels of
@@ -93,16 +96,20 @@ struct FamilyKernel {
     int min_align_a, min_align_b;
 };
 
-// UHD 770 (Gen12LP, 32 EUs): gemm_xor pure GEMM 8192^2 x 4096 (note.md 2026-10-20): 177.8 ms = 97.4% of
-// the dp4a peak, against 192.6 ms (89.9%) for catalog entry 30 plain; verified with packed A and B.
-// Builds only with packed operands (plain runs out of registers), so plain = nullptr.
-constexpr char kGen12LPInt8Packed[] = "sb16 sb16 sb l4 nse k16 cab1 wg 4x4";
+// UHD 770 (Gen12LP, 32 EUs): kernel.db entry 24, gemmstone's catalog kernel for packed int8 (A and B
+// crosspack 4, 16x32), used with the packing it was written for. gemm_xor 8192^2 x 4096 with A and B packed:
+// pure GEMM 177.5 ms = 98.0% of the measured dp4a peak (3.16 TOPS); with the real tile XOR 186.8 ms
+// separate / 190.4 ms fused, 0.5% ahead of the hand strategy "sb16 sb16 sb l4 nse k16 cab1 wg 4x4" it
+// replaces (187.7 / 191.3 ms); catalog entry 30 plain: 192.6 ms pure (89.9%). The selector never offers
+// entry 24 for the miner's plain TN problem; the string is used rather than the index, which can change
+// between oneDNN versions.
+constexpr char kGen12LPInt8Packed[] = "ab16x2 ab8x2 ab int bm8192";
 
 const FamilyKernel kFamilyKernels[] = {
-    {HW::XeHPG, "xehpg-preferred", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
+    {HW::XeHPG, "xehpg-family", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
      kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
      kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4},
-    {HW::Gen12LP, "gen12lp-preferred", "UHD 770", false, 16, 32,
+    {HW::Gen12LP, "gen12lp-family", "UHD 770", false, 16, 32,
      nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1},
 };
 
@@ -433,6 +440,17 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
             c.strategy = s;
             c.unroll_m = fk->unroll_m;
             c.unroll_n = fk->unroll_n;
+            // Name the catalog entry the strategy is, when one matches exactly (same hardware, tile and
+            // string). Looked up rather than stored: entry numbers change between oneDNN versions.
+            const char hwTag = setup.match_params.empty() ? 0 : setup.match_params[0].selector.hw;
+            for (int i = 0; i < case5_catalog().entryCount; ++i) {
+                const Entry &e = case5_catalog().entries[i];
+                if (e.selector.hw == hwTag && e.driverInfo.unroll[LoopM] == c.unroll_m
+                        && e.driverInfo.unroll[LoopN] == c.unroll_n && std::strcmp(e.strategy, s) == 0) {
+                    c.label += " (catalog-" + std::to_string(i) + ")";
+                    break;
+                }
+            }
             c.preferred = true;
             result.candidates.push_back(std::move(c));
         }

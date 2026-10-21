@@ -238,8 +238,12 @@ void emitBlake3Compress64(GeneratorT &g, GEMMState &state, const GRF &keyGrf, co
 
 
 
-template <HW hw>
+namespace {
+template <typename GeneratorT, typename OpV, typename OpM, typename OpT>
+void emitBlake3RoundsWide(GeneratorT &g, OpV v, OpM m, OpT tmp, int esize, bool useAdd3);
+} // namespace
 
+template <HW hw>
 void Generator<hw>::gemmCase5ReleaseAccForBlake3(const GEMMStrategy &strategy, GEMMState &state) {
 
     (void)strategy;
@@ -335,16 +339,121 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
 
     for (auto &g : state.tileXorWrapGrf) {
-
         if (g.isValid()) {
-
             state.ra.claim(g);
-
         }
-
     }
 
+    // SIMD-N judge (default for a 1 x N sub-tile grid, N = 2..8 a power of two): the thread's N logical
+    // tiles are hashed together, one tile per lane, in a single N-wide keyed BLAKE3 compression
+    // (emitBlake3RoundsWide), instead of N one-lane compressions. Messages are transposed from the
+    // wrap-GRF slots (tile fi, word w -> lane fi of message register w). The digest compare is
+    // branchless, in GRF masks (Gen12LP: a jmpi right after a cmp can read a stale flag, see
+    // src/onednn/case5_gen12_jackpot_cmp.md), and only winning lanes touch the found buffer, through
+    // predicated atomics. CASE5_JACKPOT_SIMDN=0 restores the per-tile judge below.
+    {
+        const char *simdEnv = std::getenv("CASE5_JACKPOT_SIMDN");
+        const int N = subGridN;
+        const int dpg = grfDwords(hw);
+        if (!(simdEnv && simdEnv[0] == '0') && subGridM == 1 && N >= 2 && N <= 8 && N <= dpg
+                && (N & (N - 1)) == 0 && state.inputs.tileCols.isValid()) {
+            gemmCase5ReleaseAccForBlake3(strategy, state);
 
+            GRF lrG = state.ra.alloc(), lcG = state.ra.alloc(), sidG = state.ra.alloc();
+            for (int fi = 0; fi < N; fi++) {
+                mov(1, lrG.ud(fi), state.tileXorRow);
+                mulConstant(1, lcG.ud(fi), state.tileXorCol, N);
+                add(1, lcG.ud(fi), lcG.ud(fi), uint16_t(fi));
+                emad(1, sidG.ud(fi), lcG.ud(fi), lrG.ud(fi), state.inputs.tileCols, strategy, state);
+            }
+
+            GRFRange m = state.ra.alloc_range(kBlake3MsgWords), v = state.ra.alloc_range(16);
+            GRFRange t = state.ra.alloc_range(4);
+            // Wrap slot w of tile fi: tileXorWrapGrf[fi * 2 + w / dpg] dword w % dpg (2 GRFs per tile).
+            for (int fi = 0; fi < N; fi++)
+                for (int w = 0; w < kBlake3MsgWords; w++)
+                    mov(1, m[w].ud(fi), state.tileXorWrapGrf[fi * 2 + w / dpg].ud(w % dpg));
+
+            auto V = [&](int i) { return v[i].ud(); };
+            auto Mw = [&](int w) { return m[w].ud(); };
+            auto T = [&](int k) { return t[k].ud(); };
+            for (int i = 0; i < kBlake3DigestWords; ++i) {
+                if (state.inputs.blake3KeyWords[i].isValid()) {
+                    mov(N, V(i), state.inputs.blake3KeyWords[i]);
+                } else {
+                    mov(N, V(i), uint32_t(0xA5A5A5A5u ^ static_cast<uint32_t>(i * 0x9E3779B9u)));
+                }
+            }
+            for (int i = 0; i < 4; i++) mov(N, V(8 + i), uint32_t(kBlake3IV[i]));
+            mov(N, V(12), uint32_t(0));
+            mov(N, V(13), uint32_t(0));
+            mov(N, V(14), uint32_t(64));      // block length
+            mov(N, V(15), uint32_t(0x1Bu));   // CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
+            emitBlake3RoundsWide(*this, V, Mw, T, N, /*useAdd3=*/false);
+            for (int i = 0; i < kBlake3DigestWords; i++) xor_(N, V(i), V(i), V(8 + i));   // digest in V(0..7)
+            state.ra.safeRelease(m);
+
+            // beat = digest <= bound, lexicographic from word 7 down (digest_beats_target), as
+            // all-ones / zero lane masks.
+            GRF beat = state.ra.alloc(), resolved = state.ra.alloc(), ltM = state.ra.alloc();
+            GRF gtM = state.ra.alloc(), decM = state.ra.alloc(), bnd = state.ra.alloc();
+            mov(8, beat.ud(), uint32_t(0));
+            mov(8, resolved.ud(), uint32_t(0));
+            for (int w = kBlake3DigestWords - 1; w >= 0; --w) {
+                if (state.inputs.blake3BoundWords[w].isValid()) {
+                    mov(1, bnd.ud(0), state.inputs.blake3BoundWords[w]);
+                } else {
+                    mov(1, bnd.ud(0), uint32_t(0));
+                }
+                cmp(N | lt, ltM.ud(), V(w), bnd.ud(0));
+                cmp(N | gt, gtM.ud(), V(w), bnd.ud(0));
+                or_(N, decM.ud(), ltM.ud(), gtM.ud());          // decided at this word
+                not_(N, T(0), resolved.ud());
+                and_(N, T(0), T(0), decM.ud());                 // ... and not before
+                and_(N, T(1), T(0), ltM.ud());
+                or_(N, beat.ud(), beat.ud(), T(1));
+                or_(N, resolved.ud(), resolved.ud(), decM.ud());
+            }
+            not_(N, T(0), resolved.ud());                       // all words equal => beat
+            or_(N, beat.ud(), beat.ud(), T(0));
+            if (state.inputs.tileCount.isValid()) {             // tiles past the panel never win
+                cmp(N | lt, ltM.ud(), sidG.ud(), state.inputs.tileCount);
+                and_(N, beat.ud(), beat.ud(), ltM.ud());
+            }
+
+            // Winners: found = 1 and their packed (t_rows, t_cols), one predicated atomic each.
+            auto hdrF = state.ra.alloc_range(1), hdrC = state.ra.alloc_range(1);
+            GRF one = state.ra.alloc(), coords = state.ra.alloc();
+            eadd(1, hdrF[0].uq(0), state.inputs.foundFlag, kJackpotFoundFlagOff, strategy, state);
+            eadd(1, hdrC[0].uq(0), state.inputs.foundFlag, kJackpotFoundCoordsOff, strategy, state);
+            mov(1, one.ud(0), uint32_t(1));
+            for (int fi = 0; fi < N; fi++) {
+                add(1, T(2), lrG.ud(fi), state.inputs.trBase);
+                mulConstant(1, coords.ud(0), t[2].ud(0), hashMr);
+                add(1, T(3), lcG.ud(fi), state.inputs.tcBase);
+                mulConstant(1, coords.ud(1), t[3].ud(0), hashNr);
+                cmp(1 | ne | f0[0], null.ud(), beat.ud(fi), uint32_t(0));
+                atomic(AtomicOp::mov, 1 | f0[0], scattered_dword(), A64, hdrF[0], one);
+                atomic(AtomicOp::mov, 1 | f0[0], scattered_qword(), A64, hdrC[0], coords);
+            }
+            state.ra.safeRelease(coords);
+            state.ra.safeRelease(one);
+            state.ra.safeRelease(hdrC);
+            state.ra.safeRelease(hdrF);
+            state.ra.safeRelease(bnd);
+            state.ra.safeRelease(decM);
+            state.ra.safeRelease(gtM);
+            state.ra.safeRelease(ltM);
+            state.ra.safeRelease(resolved);
+            state.ra.safeRelease(beat);
+            state.ra.safeRelease(t);
+            state.ra.safeRelease(v);
+            state.ra.safeRelease(sidG);
+            state.ra.safeRelease(lcG);
+            state.ra.safeRelease(lrG);
+            return;
+        }
+    }
 
     auto stageWrapMsg = [&](int fi, GRF stagedMsg[2]) {
 

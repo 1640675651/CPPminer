@@ -118,6 +118,9 @@ Inspect `[onednn] gpu digest vs bound per-word GPU vs CPU compare` lines in stde
 `cp_jackpot::digest_beats_target(digest, bound)` is true on the GPU-written digest. False GPU
 claims are logged and suppressed.
 
+The SIMD-N judge (2026-10-20, `CASE5_JACKPOT_SIMDN`, default) keeps this rule: its N-lane compare is
+branchless in GRF lane masks, and only the found-buffer atomics are predicated (no `jmpi`).
+
 ## Fix (branchless compare, 2026-08-30)
 
 Gen12LP `jmpi` after `cmp` is unreliable even when compare masks are materialized in GRF
