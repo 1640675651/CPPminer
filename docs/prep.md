@@ -198,9 +198,15 @@ B is built once per job (zero-B: pure noise), so its layout costs nothing per at
 B packed as gemmstone packed rows (`MatrixLayout::Pr`: 64-column panels, 32 consecutive k per column)
 lets each thread fetch its share of a B slice as one contiguous 128-byte piece instead of four 32-byte
 pieces from four columns, and gemmstone uses a linear copy split. The strategy string is unchanged; the
-saving is energy per byte, which the 210 W cap turns into clock (about +90 MHz). The prep writes the
-column-major noisy B into scratch with the existing kernel and `ocl_repack_b_packed64x32` moves it into
-the panels: 16.6 ms per job. `CP_OCL_PREP_CHECK=1` compares every byte through the index map.
+saving is energy per byte, which the 210 W cap turns into clock (about +90 MHz).
+`ocl_noisy_matrix_b_packed` writes the noisy B straight into the panels (any panel width up to 64 and
+crosspack dividing 64; A770 64 x 32, UHD 770 32 x 4): one work group per panel keeps the panel's uniform
+rows in local memory, and within each 64-k unit the panel's output is contiguous, so stores coalesce.
+Until 2026-10-20 the prep wrote column-major B into a 512 MiB scratch and repacked it (A770 18-20 ms,
+UHD 770 270-400 ms per job, scratch included); the fused kernel takes 8 ms and 263-283 ms and needs no
+scratch, so the oneDNN prep holds the same three large buffers as the OpenCL worker (signal A, packed
+noisy A, packed noisy B). `CP_OCL_PREP_CHECK=1` builds the column-major reference in scratch and
+compares every byte through the index map.
 
 | A770, 131072^2 x 4096, per attempt | Packed A | Packed A and B |
 |---|---:|---:|

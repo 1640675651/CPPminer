@@ -561,28 +561,55 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
  * at (k / 32) * 2048 + (n % 64) * 32 + k % 32 inside it. Input: column-major B (column n at n * ldb),
  * as written by ocl_noisy_matrix_colmajor. One work item per 32-byte chunk; neighbouring items write
  * neighbouring chunks of a panel. Plain OpenCL 1.2. */
-__kernel void ocl_repack_b_packed(__global uint *out, __global const uint *in, int n, int K, int ldb,
-                                  int Q, int cp) {
-    /* Column-major B (column c at c * ldb) -> gemmstone packed rows: panels of Q columns at
-       p * Q * ldb, element (k, c) at (k / cp) * Q * cp + (c % Q) * cp + k % cp inside the panel.
-       One work item per (panel, k group, column): cp bytes (cp % 4 == 0), consecutive work items write
-       consecutive columns. */
-    const size_t id = get_global_id(0);
-    const int kchunks = K / cp;
-    const size_t total = (size_t)n * (size_t)kchunks;
-    if (id >= total) {
-        return;
+/* Noisy B (no signal) written straight into gemmstone's packed-rows layout: panels of Q columns at
+ * p * panel_stride_dw, element (k, c) at (k / cp) * Q * cp + (c % Q) * cp + k % cp inside the panel
+ * (Q <= NPB_QMAX, cp % 4 == 0, 64 % cp == 0, K % 64 == 0). Same bytes as ocl_noisy_matrix_colmajor
+ * followed by a repack, without the column-major copy. One work group of 256 per panel: the panel's
+ * uniform rows stay in local memory; inside a 64-k unit the panel's 16 * Q output dwords are contiguous,
+ * so consecutive work items write consecutive dwords. */
+#ifndef NPB_QMAX
+#define NPB_QMAX 64
+#endif
+__kernel void ocl_noisy_matrix_b_packed(__global uint *out, __global const uint *el_rows,
+                                        __global const uint *pairs, int cols, int K, int Q, int cp,
+                                        int panel_stride_dw) {
+    __local uint el32[NPB_QMAX * 33]; /* 33: row stride against bank conflicts */
+    __local uchar p0[64];
+    __local uchar p1[64];
+    const int w = (int)get_local_id(0);
+    const int panel = (int)get_group_id(0);
+    const int col0 = panel * Q;
+    if (col0 >= cols) {
+        return; /* uniform across the work group */
     }
-    const int nn = (int)(id % (size_t)Q);
-    const size_t rest = id / (size_t)Q;
-    const int kb = (int)(rest % (size_t)kchunks);
-    const int p = (int)(rest / (size_t)kchunks);
-    const int col = p * Q + nn;
-    const size_t src = ((size_t)col * (size_t)ldb + (size_t)kb * (size_t)cp) / 4;
-    const size_t dst = ((size_t)p * (size_t)Q * (size_t)ldb + (size_t)kb * (size_t)Q * (size_t)cp +
-                        (size_t)nn * (size_t)cp) / 4;
-    for (int w = 0; w < cp / 4; w++) {
-        out[dst + w] = in[src + w];
+    for (int j = w; j < Q * 32; j += 256) {
+        el32[(j >> 5) * 33 + (j & 31)] = el_rows[(size_t)col0 * 32 + (size_t)j];
+    }
+    const __local uchar *el = (const __local uchar *)el32;
+    __global uint *dst = out + (size_t)panel * (size_t)panel_stride_dw;
+    const int cpd = cp >> 2;    /* dwords per column in a k block of cp */
+    const int blk_dw = Q * cpd; /* dwords per k block */
+    for (int kb = 0; kb < K; kb += 64) {
+        barrier(CLK_LOCAL_MEM_FENCE); /* the previous iteration's readers are done */
+        if (w < 64) {
+            p0[w] = (uchar)pairs[(size_t)(kb + w) * 2];
+            p1[w] = (uchar)pairs[(size_t)(kb + w) * 2 + 1];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global uint *unit = dst + (size_t)kb * (size_t)Q / 4;
+        for (int j = w; j < 16 * Q; j += 256) {
+            const int blk = j / blk_dw;
+            const int d = j - blk * blk_dw;
+            const int c = d / cpd;
+            const int kl = blk * cp + (d - c * cpd) * 4;
+            const __local uchar *e = el + c * 132;
+            uint o = 0;
+            for (int b = 0; b < 4; ++b) {
+                const uint v = (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
+                o |= (v & 0xffu) << (8 * b);
+            }
+            unit[j] = o;
+        }
     }
 }
 

@@ -292,7 +292,7 @@ bool Case33OclPrep::create_kernels_() {
     k_noisy_rowmajor_sg_ = mk("ocl_noisy_matrix_rowmajor_sg");
     k_uniform_rows_b3_ = mk("ocl_uniform_rows_b3");
     k_noisy_a_packed_ = mk("ocl_noisy_matrix_a_packed16");
-    k_repack_b_packed_ = mk("ocl_repack_b_packed");
+    k_noisy_b_packed_ = mk("ocl_noisy_matrix_b_packed");
     k_noisy_a_colmajor_ = mk("ocl_noisy_matrix_a_colmajor");
     k_noisy_colmajor_ = mk("ocl_noisy_matrix_colmajor");
     k_noisy_b_rowmajor_ = mk("ocl_noisy_matrix_b_rowmajor");
@@ -371,9 +371,9 @@ void Case33OclPrep::release_kernels_() {
         clReleaseKernel(k_noisy_a_packed_);
         k_noisy_a_packed_ = nullptr;
     }
-    if (k_repack_b_packed_) {
-        clReleaseKernel(k_repack_b_packed_);
-        k_repack_b_packed_ = nullptr;
+    if (k_noisy_b_packed_) {
+        clReleaseKernel(k_noisy_b_packed_);
+        k_noisy_b_packed_ = nullptr;
     }
     if (k_noisy_rowmajor_wg_) {
         clReleaseKernel(k_noisy_rowmajor_wg_);
@@ -1551,72 +1551,76 @@ bool Case33OclPrep::prepare_job_b_colmajor(cl_mem b_buf, const uint8_t b_noise_s
     return noisy_matrix_colmajor_(b_buf, n, K, ldb, 1);
 }
 
-/* Per-job noisy B in gemmstone's packed-rows layout: the column-major noise kernel writes into scratch,
-   ocl_repack_b_packed moves it into panels of b_pack_cols_ columns with b_pack_cp_ k per column (A770:
-   64 x 32, UHD 770: 32 x 4). Once per job, so the extra pass does not matter; the scratch is released
-   afterwards. No fallback: the GEMM kernel was built for this layout. */
+/* Per-job noisy B in gemmstone's packed-rows layout, written directly by ocl_noisy_matrix_b_packed:
+   panels of b_pack_cols_ columns with b_pack_cp_ k per column (A770: 64 x 32, UHD 770: 32 x 4). No
+   column-major scratch, so the job needs only the packed B buffer (CP_OCL_PREP_CHECK builds a
+   column-major reference in scratch and compares). No fallback: the GEMM kernel was built for this
+   layout. */
 bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
     const int Q = b_pack_cols_, cp = b_pack_cp_;
-    if (!k_repack_b_packed_ || Q <= 0 || cp <= 0 || cp % 4 != 0 || n % Q != 0 || K % cp != 0 || ldb < K ||
-        ldb % 4 != 0) {
+    if (!k_noisy_b_packed_ || Q <= 0 || Q > 64 || cp <= 0 || cp % 4 != 0 || 64 % cp != 0 || n % Q != 0 ||
+        K % 64 != 0 || ldb < K || ldb % 4 != 0 || R_RANK != 128) {
         std::fprintf(stderr, "[ocl-prep] packed B: unsupported shape (n %d, K %d, ldb %d, %d x %d)\n", n, K,
                      ldb, Q, cp);
         return false;
     }
     const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    if (!build_perm_pairs_(1, K) || !uniform_rows_(n, 1)) {
+        return false;
+    }
+    const int panel_stride_dw = Q * (ldb / 4);
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k_noisy_b_packed_, 0, sizeof(cl_mem), &b_buf);
+    err |= clSetKernelArg(k_noisy_b_packed_, 1, sizeof(cl_mem), &d_el_rows_);
+    err |= clSetKernelArg(k_noisy_b_packed_, 2, sizeof(cl_mem), &d_pairs_);
+    err |= clSetKernelArg(k_noisy_b_packed_, 3, sizeof(int), &n);
+    err |= clSetKernelArg(k_noisy_b_packed_, 4, sizeof(int), &K);
+    err |= clSetKernelArg(k_noisy_b_packed_, 5, sizeof(int), &Q);
+    err |= clSetKernelArg(k_noisy_b_packed_, 6, sizeof(int), &cp);
+    err |= clSetKernelArg(k_noisy_b_packed_, 7, sizeof(int), &panel_stride_dw);
+    const size_t l = 256;
+    const size_t g = static_cast<size_t>(n / Q) * l;
+    if (err != CL_SUCCESS ||
+        clEnqueueNDRangeKernel(ocl_->queue, k_noisy_b_packed_, 1, nullptr, &g, &l, 0, nullptr, nullptr) !=
+                CL_SUCCESS) {
+        std::fprintf(stderr, "[ocl-prep] ocl_noisy_matrix_b_packed launch failed\n");
+        return false;
+    }
+    if (prep_timing_enabled()) {
+        clFinish(ocl_->queue);
+        std::printf("[ocl-prep] B packed (%d x %d) per job: %.1fms\n", Q, cp, (cp_now_sec() - t0) * 1e3);
+    }
+    if (!prep_check_enabled()) {
+        return true;
+    }
     const size_t bytes = static_cast<size_t>(n) * static_cast<size_t>(ldb);
     if (!ensure_noisy_scratch(bytes) || !noisy_matrix_colmajor_(d_noisy_scratch_, n, K, ldb, 1)) {
         return false;
     }
-    cl_int err = CL_SUCCESS;
-    err |= clSetKernelArg(k_repack_b_packed_, 0, sizeof(cl_mem), &b_buf);
-    err |= clSetKernelArg(k_repack_b_packed_, 1, sizeof(cl_mem), &d_noisy_scratch_);
-    err |= clSetKernelArg(k_repack_b_packed_, 2, sizeof(int), &n);
-    err |= clSetKernelArg(k_repack_b_packed_, 3, sizeof(int), &K);
-    err |= clSetKernelArg(k_repack_b_packed_, 4, sizeof(int), &ldb);
-    err |= clSetKernelArg(k_repack_b_packed_, 5, sizeof(int), &Q);
-    err |= clSetKernelArg(k_repack_b_packed_, 6, sizeof(int), &cp);
-    const size_t l = 256;
-    const size_t total = static_cast<size_t>(n) * static_cast<size_t>(K / cp);
-    const size_t g = (total + l - 1) / l * l;
-    if (err != CL_SUCCESS ||
-        clEnqueueNDRangeKernel(ocl_->queue, k_repack_b_packed_, 1, nullptr, &g, &l, 0, nullptr, nullptr) !=
-                CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl-prep] ocl_repack_b_packed launch failed\n");
+    std::vector<int8_t> packed(bytes), ref(bytes);
+    if (!ocl_->read_buffer(b_buf, packed.data(), bytes) ||
+        !ocl_->read_buffer(d_noisy_scratch_, ref.data(), bytes)) {
         return false;
     }
-    clFinish(ocl_->queue);
-    if (prep_timing_enabled()) {
-        std::printf("[ocl-prep] B packed (%d x %d) per job: %.1fms\n", Q, cp, (cp_now_sec() - t0) * 1e3);
-    }
-    bool ok = true;
-    if (prep_check_enabled()) {
-        std::vector<int8_t> packed(bytes), ref(bytes);
-        if (!ocl_->read_buffer(b_buf, packed.data(), bytes) ||
-            !ocl_->read_buffer(d_noisy_scratch_, ref.data(), bytes)) {
-            return false;
-        }
-        size_t bad = 0;
-        for (int c = 0; c < n; ++c) {
-            const int8_t *pan = packed.data() + static_cast<size_t>(c / Q) * static_cast<size_t>(Q) *
-                                                        static_cast<size_t>(ldb);
-            const int8_t *col = ref.data() + static_cast<size_t>(c) * static_cast<size_t>(ldb);
-            for (int k = 0; k < K; ++k) {
-                if (pan[static_cast<size_t>(k / cp) * static_cast<size_t>(Q * cp) +
-                        static_cast<size_t>(c % Q) * static_cast<size_t>(cp) + static_cast<size_t>(k % cp)] !=
-                    col[k]) {
-                    ++bad;
-                }
+    size_t bad = 0;
+    for (int c = 0; c < n; ++c) {
+        const int8_t *pan = packed.data() + static_cast<size_t>(c / Q) * static_cast<size_t>(Q) *
+                                                    static_cast<size_t>(ldb);
+        const int8_t *col = ref.data() + static_cast<size_t>(c) * static_cast<size_t>(ldb);
+        for (int k = 0; k < K; ++k) {
+            if (pan[static_cast<size_t>(k / cp) * static_cast<size_t>(Q * cp) +
+                    static_cast<size_t>(c % Q) * static_cast<size_t>(cp) + static_cast<size_t>(k % cp)] !=
+                col[k]) {
+                ++bad;
             }
         }
-        std::printf("[ocl-prep] packed B check (%dx%d): %s\n", K, n, bad == 0 ? "identical" : "MISMATCH");
-        std::fflush(stdout);
-        ok = bad == 0;
     }
-    clReleaseMemObject(d_noisy_scratch_);   /* 512 MB at production size; reallocated on demand */
+    std::printf("[ocl-prep] packed B check (%dx%d): %s\n", K, n, bad == 0 ? "identical" : "MISMATCH");
+    std::fflush(stdout);
+    clReleaseMemObject(d_noisy_scratch_);   /* 512 MB at production size; check mode only */
     d_noisy_scratch_ = nullptr;
     noisy_scratch_cap_ = 0;
-    return ok;
+    return bad == 0;
 }
 
 bool Case33OclPrep::prepare_job_b_gpu(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K,

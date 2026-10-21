@@ -148,7 +148,7 @@ private:
     cl_kernel k_uniform_rows_b3_ = nullptr;   // optional: register BLAKE3 uniform rows (preferred)
     cl_kernel k_noisy_a_packed_ = nullptr;    // noisy A in gemmstone's packed layout (16-row panels)
     int a_pack_rows_ = 0;
-    cl_kernel k_repack_b_packed_ = nullptr;   // column-major B -> gemmstone packed rows (64 x crosspack 32)
+    cl_kernel k_noisy_b_packed_ = nullptr;    // noisy B straight into gemmstone packed rows (Q x crosspack)
     int b_pack_cols_ = 0;
     int b_pack_cp_ = 0;
     cl_kernel k_noisy_a_colmajor_ = nullptr;
