@@ -344,8 +344,8 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
         }
     }
 
-    // SIMD-N judge (default for a 1 x N sub-tile grid, N = 2..8 a power of two): the thread's N logical
-    // tiles are hashed together, one tile per lane, in a single N-wide keyed BLAKE3 compression
+    // SIMD-N judge (default for N = subGridM x subGridN logical tiles per thread, N = 2..8 a power of
+    // two; lane fi = sr * subGridN + sc): the thread's N logical tiles are hashed together, one tile per lane, in a single N-wide keyed BLAKE3 compression
     // (emitBlake3RoundsWide), instead of N one-lane compressions. Messages are transposed from the
     // wrap-GRF slots (tile fi, word w -> lane fi of message register w). The digest compare is
     // branchless, in GRF masks (Gen12LP: a jmpi right after a cmp can read a stale flag, see
@@ -353,17 +353,19 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
     // predicated atomics. CASE5_JACKPOT_SIMDN=0 restores the per-tile judge below.
     {
         const char *simdEnv = std::getenv("CASE5_JACKPOT_SIMDN");
-        const int N = subGridN;
+        const int N = subGridM * subGridN;
         const int dpg = grfDwords(hw);
-        if (!(simdEnv && simdEnv[0] == '0') && subGridM == 1 && N >= 2 && N <= 8 && N <= dpg
+        if (!(simdEnv && simdEnv[0] == '0') && N >= 2 && N <= 8 && N <= dpg
                 && (N & (N - 1)) == 0 && state.inputs.tileCols.isValid()) {
             gemmCase5ReleaseAccForBlake3(strategy, state);
 
             GRF lrG = state.ra.alloc(), lcG = state.ra.alloc(), sidG = state.ra.alloc();
             for (int fi = 0; fi < N; fi++) {
-                mov(1, lrG.ud(fi), state.tileXorRow);
-                mulConstant(1, lcG.ud(fi), state.tileXorCol, N);
-                add(1, lcG.ud(fi), lcG.ud(fi), uint16_t(fi));
+                const int sr = fi / subGridN, sc = fi % subGridN;   // same tile order as the per-tile judge
+                mulConstant(1, lrG.ud(fi), state.tileXorRow, subGridM);
+                if (sr) add(1, lrG.ud(fi), lrG.ud(fi), uint16_t(sr));
+                mulConstant(1, lcG.ud(fi), state.tileXorCol, subGridN);
+                if (sc) add(1, lcG.ud(fi), lcG.ud(fi), uint16_t(sc));
                 emad(1, sidG.ud(fi), lcG.ud(fi), lrG.ud(fi), state.inputs.tileCols, strategy, state);
             }
 

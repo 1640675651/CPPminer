@@ -709,8 +709,8 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
     if (!ensure_matrix_bufs_() || !prep_.ensure_buffers(M_, N_, K_)) {
         return false;
     }
-    // The prep writes packed A as 16-row panels with 4 k per dword (ocl_noisy_matrix_a_packed16) only.
-    if (info_.aPackRows > 0 && (info_.aPackRows != 16 || info_.aPackCp != 4)) {
+    // The prep writes packed A in panels of up to 64 rows with 4 k per dword (case33_ocl_prep.cpp).
+    if (info_.aPackRows > 0 && (info_.aPackRows > 64 || info_.aPackCp != 4)) {
         std::fprintf(stderr, "[onednn] packed A %d rows x crosspack %d is not supported by the GPU prep\n",
                      info_.aPackRows, info_.aPackCp);
         return false;

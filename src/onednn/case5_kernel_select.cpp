@@ -84,7 +84,7 @@ struct FamilyKernel {
     HW hw;
     const char *label;
     const char *measured_on;     // documentation
-    bool needs_systolic;
+    bool systolic;               // XMX (dpas) devices only; false: devices without it (dp4a)
     int unroll_m, unroll_n;
     const char *plain;           // A row-major (not packed)
     const char *plain_alt;       // XMX real fold with CASE5_XOR_XAF=0 (af instead of xaf); nullptr = plain
@@ -105,17 +105,29 @@ struct FamilyKernel {
 // between oneDNN versions.
 constexpr char kGen12LPInt8Packed[] = "ab16x2 ab8x2 ab int bm8192";
 
+// Xe-LPG (Meteor Lake iGPU, 64 EUs at 1.9 GHz): gemmstone calls it XeHPG, but it has no XMX, so it gets
+// its own entry. kernel.db entry 329 (XeHPG without XMX, native NT, 32x32, k16) with A and B packed
+// (32-row / 32-column panels, crosspack 4): 7.4 TOPS pure GEMM at 8192^2 x 4096 in tools/sweep_device.sh,
+// about 95% of the dp4a peak (64 x 32 MAC x 1.9 GHz = 7.78 TOPS), ahead of the best plain NT kernel;
+// tile XOR verified against the CPU (CASE5_FORCE_VERIFY=1, 1024^2 x 4096). Two 16x16 hash tiles per
+// direction (2x2 grid per thread).
+constexpr char kXeLPGInt8Packed[] = "aB16 aB16 aB wg 4x4 cab4 ks16 nse bo sr bk0 grf256 l4";
+
 const FamilyKernel kFamilyKernels[] = {
     {HW::XeHPG, "xehpg-family", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
      kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
      kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4},
     {HW::Gen12LP, "gen12lp-family", "UHD 770", false, 16, 32,
      nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1},
+    {HW::XeHPG, "xelpg-family", "Xe-LPG 64 EU", false, 32, 32,
+     nullptr, nullptr, kXeLPGInt8Packed, nullptr, 4, 0, 4, 1, 1},
 };
 
-const FamilyKernel *family_kernel(HW hw) {
+// Keyed by gemmstone's HW family and XMX: Xe-HPG (Arc) and Xe-LPG (Meteor Lake) are both HW::XeHPG,
+// and only the dpas capability tells their int8 paths apart.
+const FamilyKernel *family_kernel(HW hw, bool systolic) {
     for (const auto &f : kFamilyKernels)
-        if (f.hw == hw) return &f;
+        if (f.hw == hw && f.systolic == systolic) return &f;
     return nullptr;
 }
 
@@ -143,7 +155,7 @@ const FamilyKernel *device_override(cl_device_id device, HW hw) {
     cl_uint id = 0;
     if (clGetDeviceInfo(device, CL_DEVICE_ID_INTEL, sizeof(id), &id, nullptr) != CL_SUCCESS) return nullptr;
     for (const auto &o : overrides)
-        if (o.pci_device_id == id && o.kernel.hw == hw) return &o.kernel;
+        if (o.pci_device_id == id && o.kernel.hw == hw) return &o.kernel;   // a device knows its XMX
     return nullptr;
 }
 
@@ -406,8 +418,8 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
     // Measured kernels first (device override, else the family default; CASE5_PREFER=0 skips both),
     // then the catalog.
     const FamilyKernel *fk = device_override(device, hw);
-    if (!fk) fk = family_kernel(hw);
-    if (fk && case5_prefer_measured_default() && (!fk->needs_systolic || result.systolic_hw)
+    if (!fk) fk = family_kernel(hw, result.systolic_hw);
+    if (fk && case5_prefer_measured_default() && (!fk->systolic || result.systolic_hw)
             && problem.Ta == Type::s8 && problem.Tb == Type::s8
             && problem.A.alignment >= fk->min_align_a && problem.B.alignment >= fk->min_align_b) {
         CatalogCandidate c;
@@ -434,8 +446,9 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         c.pack_b_cp = fk->pack_b_cp;
         const char *s = c.pack_a ? (useAlt && fk->packed_alt ? fk->packed_alt : fk->packed)
                                  : (useAlt && fk->plain_alt ? fk->plain_alt : fk->plain);
-        // Gen12LP's kernel needs both operands packed; anything else falls through to the catalog.
-        const bool usable = s && (fk->hw != HW::Gen12LP || (c.pack_a && c.pack_b));
+        // Kernels without a plain-A strategy (the dp4a ones) were measured with both operands packed;
+        // anything else falls through to the catalog.
+        const bool usable = s && (fk->plain || (c.pack_a && c.pack_b));
         if (usable) {
             c.strategy = s;
             c.unroll_m = fk->unroll_m;

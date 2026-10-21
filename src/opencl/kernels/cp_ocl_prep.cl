@@ -498,6 +498,62 @@ ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
     }
 }
 
+/* Noisy A in packed columns for any panel height P (P <= NPAG_PMAX, crosspack 4): panel p (rows
+ * P p .. P p + P - 1) starts at p * panel_stride_dw dwords and dword (k / 4) * P + m % P holds
+ * k..k+3 of row m. Same scheme as ocl_noisy_matrix_a_packed16 below, which stays for P = 16: one
+ * 256-item work group per panel, the panel's uniform rows in local memory, per 64-k unit the P x 64-byte
+ * signal tile loaded coalesced into local memory, and the unit's P * 16 output dwords written
+ * contiguously. Same bytes as ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them). */
+#ifndef NPAG_PMAX
+#define NPAG_PMAX 64
+#endif
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
+ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __global const uint *pairs,
+                          int rows, int K, __global const char *signal, int P, int panel_stride_dw) {
+    __local uint sig[NPAG_PMAX * 17];  /* 17: no bank conflicts on the transposed read */
+    __local uint el32[NPAG_PMAX * 33]; /* 33: row stride against bank conflicts */
+    __local uchar p0[64];
+    __local uchar p1[64];
+    const int w = (int)get_local_id(0);
+    const int panel = (int)get_group_id(0);
+    const int row0 = panel * P;
+    if (row0 >= rows) {
+        return; /* uniform across the work group */
+    }
+    for (int j = w; j < P * 32; j += 256) {
+        el32[(j >> 5) * 33 + (j & 31)] = el_rows[(size_t)row0 * 32 + (size_t)j];
+    }
+    const __local uchar *el = (const __local uchar *)el32;
+    __global uint *dst = out + (size_t)panel * (size_t)panel_stride_dw;
+    for (int kb = 0; kb < K; kb += 64) {
+        barrier(CLK_LOCAL_MEM_FENCE); /* the previous iteration's readers are done */
+        for (int i = w; i < P * 16; i += 256) {
+            const int lr = i >> 4, ld = i & 15; /* row, dword inside the row's 64 bytes */
+            sig[lr * 17 + ld] = *(const __global uint *)(signal + (size_t)(row0 + lr) * (size_t)K +
+                                                         (size_t)(kb + ld * 4));
+        }
+        if (w < 64) {
+            p0[w] = (uchar)pairs[(size_t)(kb + w) * 2];
+            p1[w] = (uchar)pairs[(size_t)(kb + w) * 2 + 1];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global uint *unit = dst + (size_t)kb * (size_t)P / 4;
+        for (int j = w; j < P * 16; j += 256) {
+            const int g = j / P;     /* k group of 4 inside the unit */
+            const int r = j - g * P; /* row in the panel */
+            const uint sv = sig[r * 17 + g];
+            const __local uchar *e = el + r * 132;
+            const int kl = g * 4;
+            uint o = 0;
+            for (int b = 0; b < 4; ++b) {
+                const uint v = (sv >> (8 * b)) + (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
+                o |= (v & 0xffu) << (8 * b);
+            }
+            unit[j] = o;
+        }
+    }
+}
+
 #ifndef NPA_UNROLL
 #define NPA_UNROLL 4 /* 64-k units per loop iteration (K % (64 * NPA_UNROLL) == 0) */
 #endif

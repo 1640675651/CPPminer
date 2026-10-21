@@ -292,6 +292,7 @@ bool Case33OclPrep::create_kernels_() {
     k_noisy_rowmajor_sg_ = mk("ocl_noisy_matrix_rowmajor_sg");
     k_uniform_rows_b3_ = mk("ocl_uniform_rows_b3");
     k_noisy_a_packed_ = mk("ocl_noisy_matrix_a_packed16");
+    k_noisy_a_packed_any_ = mk("ocl_noisy_matrix_a_packed");
     k_noisy_b_packed_ = mk("ocl_noisy_matrix_b_packed");
     k_noisy_a_colmajor_ = mk("ocl_noisy_matrix_a_colmajor");
     k_noisy_colmajor_ = mk("ocl_noisy_matrix_colmajor");
@@ -370,6 +371,10 @@ void Case33OclPrep::release_kernels_() {
     if (k_noisy_a_packed_) {
         clReleaseKernel(k_noisy_a_packed_);
         k_noisy_a_packed_ = nullptr;
+    }
+    if (k_noisy_a_packed_any_) {
+        clReleaseKernel(k_noisy_a_packed_any_);
+        k_noisy_a_packed_any_ = nullptr;
     }
     if (k_noisy_b_packed_) {
         clReleaseKernel(k_noisy_b_packed_);
@@ -645,14 +650,18 @@ bool Case33OclPrep::uniform_rows_(int rows, int is_b) {
                                   nullptr) == CL_SUCCESS;
 }
 
-/* Noisy A in gemmstone's packed layout (see ocl_noisy_matrix_a_packed16). There is no fallback: the
-   GEMM kernel was built for this layout, so a failure fails the attempt. */
+/* Noisy A in gemmstone's packed layout, panels of a_pack_rows_ rows with 4 k per dword
+   (ocl_noisy_matrix_a_packed16 for 16 rows, ocl_noisy_matrix_a_packed for other heights up to 64). There
+   is no fallback: the GEMM kernel was built for this layout, so a failure fails the attempt. */
 bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, int K, int out_lda) {
-    const int unit = 64 * 4; /* NPA_UNROLL default */
-    if (!ready_ || !out || !signal || !k_noisy_a_packed_ || rows <= 0 || rows % 16 != 0 ||
+    const int P = a_pack_rows_;
+    const bool p16 = P == 16;
+    const int unit = p16 ? 64 * 4 : 64; /* NPA_UNROLL default for the 16-row kernel */
+    cl_kernel kern = p16 ? k_noisy_a_packed_ : k_noisy_a_packed_any_;
+    if (!ready_ || !out || !signal || !kern || P <= 0 || P > 64 || rows <= 0 || rows % P != 0 ||
         K % unit != 0 || out_lda < K || out_lda % 4 != 0 || R_RANK != 128) {
-        std::fprintf(stderr, "[ocl-prep] packed A: unsupported shape (rows %d, K %d, lda %d)\n", rows,
-                     K, out_lda);
+        std::fprintf(stderr, "[ocl-prep] packed A: unsupported shape (rows %d, K %d, lda %d, panel %d)\n",
+                     rows, K, out_lda, P);
         return false;
     }
     if (!build_perm_pairs_(0, K)) {
@@ -666,21 +675,24 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
         clFinish(ocl_->queue);
     }
     const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
-    const int panel_stride_dw = 16 * out_lda / 4;
+    const int panel_stride_dw = P * (out_lda / 4);
     cl_int err = CL_SUCCESS;
-    err |= clSetKernelArg(k_noisy_a_packed_, 0, sizeof(cl_mem), &out);
-    err |= clSetKernelArg(k_noisy_a_packed_, 1, sizeof(cl_mem), &d_el_rows_);
-    err |= clSetKernelArg(k_noisy_a_packed_, 2, sizeof(cl_mem), &d_pairs_);
-    err |= clSetKernelArg(k_noisy_a_packed_, 3, sizeof(int), &rows);
-    err |= clSetKernelArg(k_noisy_a_packed_, 4, sizeof(int), &K);
-    err |= clSetKernelArg(k_noisy_a_packed_, 5, sizeof(cl_mem), &signal);
-    err |= clSetKernelArg(k_noisy_a_packed_, 6, sizeof(int), &panel_stride_dw);
+    int arg = 0;
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_mem), &out);
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_mem), &d_el_rows_);
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_mem), &d_pairs_);
+    err |= clSetKernelArg(kern, arg++, sizeof(int), &rows);
+    err |= clSetKernelArg(kern, arg++, sizeof(int), &K);
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_mem), &signal);
+    if (!p16) {
+        err |= clSetKernelArg(kern, arg++, sizeof(int), &P);
+    }
+    err |= clSetKernelArg(kern, arg++, sizeof(int), &panel_stride_dw);
     const size_t l = 256;
-    const size_t g = static_cast<size_t>(rows / 16) * l;
+    const size_t g = static_cast<size_t>(rows / P) * l;
     if (err != CL_SUCCESS ||
-        clEnqueueNDRangeKernel(ocl_->queue, k_noisy_a_packed_, 1, nullptr, &g, &l, 0, nullptr,
-                               nullptr) != CL_SUCCESS) {
-        std::fprintf(stderr, "[ocl-prep] noisy_matrix_a_packed16 launch failed\n");
+        clEnqueueNDRangeKernel(ocl_->queue, kern, 1, nullptr, &g, &l, 0, nullptr, nullptr) != CL_SUCCESS) {
+        std::fprintf(stderr, "[ocl-prep] packed A (%d-row panels) launch failed\n", P);
         return false;
     }
     clFinish(ocl_->queue);
@@ -724,16 +736,18 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
     }
     size_t bad = 0;
     for (int m = 0; m < rows; ++m) {
-        const int8_t *pan = packed.data() + static_cast<size_t>(m / 16) * 16u * static_cast<size_t>(out_lda);
+        const int8_t *pan = packed.data() + static_cast<size_t>(m / P) * static_cast<size_t>(P) *
+                                                    static_cast<size_t>(out_lda);
         const int8_t *rr = ref.data() + static_cast<size_t>(m) * static_cast<size_t>(out_lda);
         for (int k = 0; k < K; ++k) {
-            if (pan[static_cast<size_t>(k / 4) * 64u + static_cast<size_t>(m % 16) * 4u +
+            if (pan[static_cast<size_t>(k / 4) * static_cast<size_t>(4 * P) + static_cast<size_t>(m % P) * 4u +
                     static_cast<size_t>(k % 4)] != rr[k]) {
                 ++bad;
             }
         }
     }
-    std::printf("[ocl-prep] packed A noise check (%dx%d): %s\n", rows, K, bad == 0 ? "identical" : "MISMATCH");
+    std::printf("[ocl-prep] packed A noise check (%dx%d, %d-row panels): %s\n", rows, K, P,
+                bad == 0 ? "identical" : "MISMATCH");
     std::fflush(stdout);
     return bad == 0;
 }
@@ -1515,7 +1529,7 @@ bool Case33OclPrep::prepare_attempt_a_rowmajor(cl_mem a_noisy_out, const uint8_t
         return false;
     }
 
-    const bool ok = (a_pack_rows_ == 16) ? noisy_matrix_a_packed_(a_noisy_out, d_A_sig_, m, K, out_lda)
+    const bool ok = (a_pack_rows_ > 0) ? noisy_matrix_a_packed_(a_noisy_out, d_A_sig_, m, K, out_lda)
                                          : noisy_matrix_rowmajor_(a_noisy_out, d_A_sig_, m, K, out_lda, 0, 1);
     if (prep_timing_enabled()) {
         clFinish(ocl_->queue);
