@@ -733,6 +733,16 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
     (void)cert_version;
 }
 
+extern "C" int cp_contiguous_tile_layout_for_shape(int mr, int w)
+{
+    if(mr == 4 && w == 8) return CP_TILE_LAYOUT_CONTIGUOUS_4x8;
+    if(mr == 4 && w == 64) return CP_TILE_LAYOUT_CONTIGUOUS_4x64;
+    if(mr == 8 && w == 8) return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
+    if(mr == 8 && w == 16) return CP_TILE_LAYOUT_CONTIGUOUS;
+    if(mr == 16 && w == 16) return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
+    return -1;
+}
+
 extern "C" int cp_worker_default_tile_layout(void)
 {
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
@@ -741,13 +751,9 @@ extern "C" int cp_worker_default_tile_layout(void)
         return CP_TILE_LAYOUT_CONTIGUOUS_4x64;
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN) {
-        if(cp_onednn_hash_tile_mr() == 16 && cp_onednn_hash_tile_w() == 16)
-            return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
-        if(cp_onednn_hash_tile_mr() == 4 && cp_onednn_hash_tile_w() == 8)
-            return CP_TILE_LAYOUT_CONTIGUOUS_4x8;
-        if(cp_onednn_hash_tile_w() == 8)
-            return CP_TILE_LAYOUT_CONTIGUOUS_8x8;
-        return CP_TILE_LAYOUT_CONTIGUOUS;
+        /* The kernel selection only accepts provable hash tiles (cp_onednn_worker.cpp). */
+        const int layout = cp_contiguous_tile_layout_for_shape(cp_onednn_hash_tile_mr(), cp_onednn_hash_tile_w());
+        return layout >= 0 ? layout : CP_TILE_LAYOUT_CONTIGUOUS;
     }
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL

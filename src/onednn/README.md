@@ -66,9 +66,13 @@ Arc A770, mock scan at 131072², sustained, per attempt (GEMM + folded message +
 **100.5 TMAC/s** with the built-in strategy and 4096×4096 panels (was 95 with raw milestones and
 1024×1024 panels); 67 TMAC/s with `CASE5_PREFER=0` (gemmstone's own top pick, catalog-354, 32x16; separate
 jackpot); `--fused-jackpot` **108.5 TMAC/s** end-to-end with packed A and the in-kernel jackpot (0.648 s per attempt, scan 109.5 TMAC/s; 0.694 s with row-major A, 0.664 s with packed A and the separate jackpot; the older per-tile fused path was 66-80). UHD 770 (catalog-30): 1.35 TMAC/s. Mock shares verify on both GPUs in both
-jackpot modes. Known issue: `--onednn-layout NT` on XeHPG selects an 8×4 catalog kernel (8×4 hash
-tiles) and its mock proof fails verification; the kernel's tile XOR itself verifies in the gemm_xor
-harness, so the mismatch is in how an 8×4 hash tile is proven (also seen on the A380 in PR #36).
+jackpot modes. Proofs exist only for contiguous 4×8, 4×64, 8×8, 8×16 and 16×16 hash tiles
+(`cp_contiguous_tile_layout_for_shape`), so kernel selection skips candidates whose hash tile is
+anything else (`case5_ngen::set_hash_tile_filter`; `CASE5_DEBUG_SELECT=1` shows "has no proof layout").
+Before this guard, `--onednn-layout NT` on XeHPG picked catalog-323 (8×4 tiles), whose shares could not
+be proven (the proof side silently assumed 8×16); NT now runs catalog-330 (16×16 tiles, about 1.0 s per
+attempt instead of 17.5) and NN catalog-292 (1.5 s instead of 3.1), and both verify. Non-TN layouts
+remain diagnostics: only TN gets the family kernels.
 
 ## Matrix preparation (per attempt)
 

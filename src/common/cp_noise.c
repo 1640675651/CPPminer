@@ -115,6 +115,11 @@ void pearl_set_contiguous_tile_width(int w){
 }
 
 void pearl_set_contiguous_tile_shape(int mr, int w){
+    const int supported = (mr == 4 && (w == 8 || w == 64)) || (mr == 8 && (w == 8 || w == 16)) ||
+                          (mr == 16 && w == 16);
+    if(!supported)
+        fprintf(stderr, "[proof] contiguous %dx%d hash tiles have no proof layout; proofs will not "
+                        "verify (supported: 4x8, 4x64, 8x8, 8x16, 16x16)\n", mr, w);
     if(mr == 4)
         g_pearl_contiguous_tile_mr = 4;
     else if(mr == 16)

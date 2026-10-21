@@ -207,6 +207,8 @@ DriverInfo toDriverInfo(HW hw, cl_device_id device, const GEMMStrategy &strategy
     return out;
 }
 
+HashTileFilter g_hash_tile_filter = nullptr;
+
 void log_candidate_rejection(const CatalogCandidate &candidate, const std::string &reason,
                              std::vector<std::string> *rejected) {
     std::string line = candidate.label;
@@ -339,6 +341,10 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             }
             const auto xsd =
                     compute_xor_subtile_dims(strategy.unroll[LoopM], strategy.unroll[LoopN]);
+            if (g_hash_tile_filter && !g_hash_tile_filter(xsd.subM, xsd.subN)) {
+                throw std::runtime_error("Case5 hash tile " + std::to_string(xsd.subM) + "x"
+                        + std::to_string(xsd.subN) + " has no proof layout (hash-tile filter)");
+            }
             problem.case5XorSubM = xsd.subM;
             problem.case5XorSubN = xsd.subN;
             problem.case5XorSubGridM = xsd.subGridM;
@@ -505,6 +511,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
     return nullptr;
 }
 } // namespace
+
+void set_hash_tile_filter(HashTileFilter filter) { g_hash_tile_filter = filter; }
 
 bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) {
     const Product product = detect_product(ctx, device);

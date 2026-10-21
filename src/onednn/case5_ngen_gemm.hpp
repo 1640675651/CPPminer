@@ -83,6 +83,11 @@ inline int pad_ld_int8(int inner) {
 // Gen12LP/XeLP and XeHPG (Core Ultra MTL/ARL). Xe2/LNL not supported yet.
 bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err = nullptr);
 
+// Optional filter on a candidate's logical hash tile (sub_m x sub_n): a candidate it rejects is skipped
+// like one that fails to build. The miner installs one that accepts only provable tile shapes.
+using HashTileFilter = bool (*)(int sub_m, int sub_n);
+void set_hash_tile_filter(HashTileFilter filter);
+
 struct BuildParams {
     int m = 4096;
     int n = 4096;

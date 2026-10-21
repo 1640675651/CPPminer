@@ -10,6 +10,7 @@
 #include "cp_share_witness.h"
 #include "cp_state.h"
 #include "cp_util.h"
+#include "cp_worker.h"
 #include "onednn_intel_devices.hpp"
 #include "opencl_context.hpp"
 
@@ -177,6 +178,12 @@ static int zero_b_prepare_attempt(const uint8_t *ab_seed, int ab_seed_len, const
     return zero_b_prepare_attempt_host(ab_seed, ab_seed_len, job_key, m, n, h_A_sig, a_key_out);
 }
 
+/* Only hash tiles the proof path can express (cp_contiguous_tile_layout_for_shape); others would mine
+   shares that never verify (e.g. the 8x4 tile of catalog-323 under --onednn-layout NT on XeHPG). */
+static bool hash_tile_provable(int sub_m, int sub_n) {
+    return cp_contiguous_tile_layout_for_shape(sub_m, sub_n) >= 0;
+}
+
 static void configure_hash_tile_from_kernel(void) {
     const auto &di = g_gemm.driver_info();
     cp_pp_set_hash_tile(di.xorSubM, di.xorSubN);
@@ -287,12 +294,19 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     g_gemm.set_col_period_batch(g_col_period_batch);
     g_gemm.set_fused_jackpot(g_fused_jackpot != 0);
     resolve_gemm_layout();
+    case5_ngen::set_hash_tile_filter(&hash_tile_provable);
     if (!g_gemm.init_context(g_device_index, g_platform_filter)) {
         fprintf(stderr, "[onednn] init failed (device=%d)\n", g_device_index);
         g_context_ready = 0;
         return;
     }
 
+    if (!hash_tile_provable(g_gemm.driver_info().xorSubM, g_gemm.driver_info().xorSubN)) {
+        fprintf(stderr, "[onednn] selected kernel has a %dx%d hash tile, which proofs cannot express\n",
+                g_gemm.driver_info().xorSubM, g_gemm.driver_info().xorSubN);
+        g_context_ready = 0;
+        return;
+    }
     g_context_ready = 1;
     configure_hash_tile_from_kernel();
     const auto &di = g_gemm.driver_info();

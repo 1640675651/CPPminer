@@ -132,6 +132,9 @@ void cp_worker_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_
 
 /* Default tile layout for proof build (matches CP_TILE_LAYOUT_* in cp_proof.h). */
 int cp_worker_default_tile_layout(void);
+/* CP_TILE_LAYOUT_* for a contiguous mr x w hash tile, or -1 when the proof path has no layout for it
+   (supported: 4x8, 4x64, 8x8, 8x16, 16x16; see pearl_active_mining_config in cp_noise.c). */
+int cp_contiguous_tile_layout_for_shape(int mr, int w);
 /* Layout proofs are built with: default, or CUTLASS when --cutlass-fused. */
 int cp_worker_proof_tile_layout(void);
 
