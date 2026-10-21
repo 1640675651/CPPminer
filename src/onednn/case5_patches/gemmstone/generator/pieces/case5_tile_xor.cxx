@@ -672,6 +672,55 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
         xor_(simd, foldReg.ud(), foldReg.ud(), C.d(0)(1));
     };
 
+    // Xe-HP and later have bfn: 0x96 (s0 ^ s1 ^ s2) folds two accumulator chunks per instruction, half
+    // the ALU cycles of the 2-input chain. That matters on dp4a kernels (Xe-LPG), where the fold shares
+    // the ALU pipe with dp4a: 128 -> 64 fold instructions per milestone for a 32x32 tile. Only
+    // GRF-aligned chunks are paired (3-source operands starting mid-GRF misbehaved on XeHPG).
+    // CASE5_XOR_BFN=0 keeps the 2-input xor.
+    const bool foldBfn = [&] {
+        const char *v = std::getenv("CASE5_XOR_BFN");
+        return hw >= HW::XeHP && !(v && v[0] == '0');
+    }();
+    // folds[f] = XOR of chunks[f] (simd lanes each). The first pair initialises the fold, so no zeroing.
+    // The folds' chains are emitted round-robin, so consecutive instructions do not depend on each other.
+    auto foldChunksInto = [&](const std::vector<GRF> &foldRegs, const std::vector<std::vector<Subregister>> &chunks) {
+        struct Op { int kind; Subregister a, b; };   // 0 mov a, 1 xor a b (init), 2 bfn a b, 3 xor a (accumulate)
+        std::vector<std::vector<Op>> ops(foldRegs.size());
+        size_t longest = 0;
+        for (size_t f = 0; f < foldRegs.size(); f++) {
+            const auto &c = chunks[f];
+            auto &o = ops[f];
+            size_t i = 0;
+            if (c.size() >= 2) { o.push_back({1, c[0], c[1]}); i = 2; }
+            else if (c.size() == 1) { o.push_back({0, c[0], c[0]}); i = 1; }
+            while (i < c.size()) {
+                if (foldBfn && i + 1 < c.size() && c[i].getOffset() == 0 && c[i + 1].getOffset() == 0) {
+                    o.push_back({2, c[i], c[i + 1]});
+                    i += 2;
+                } else {
+                    o.push_back({3, c[i], c[i]});
+                    i += 1;
+                }
+            }
+            longest = std::max(longest, o.size());
+        }
+        for (size_t f = 0; f < foldRegs.size(); f++)
+            if (ops[f].empty()) mov(simd, foldRegs[f].ud(), uint16_t(0));
+        for (size_t k = 0; k < longest; k++) {
+            for (size_t f = 0; f < foldRegs.size(); f++) {
+                if (k >= ops[f].size()) continue;
+                const Op &op = ops[f][k];
+                const GRF &dst = foldRegs[f];
+                switch (op.kind) {
+                    case 0: mov(simd, dst.ud(), op.a.d(0)(1)); break;
+                    case 1: xor_(simd, dst.ud(), op.a.d(0)(1), op.b.d(0)(1)); break;
+                    case 2: bfn(simd, 0x96, dst.ud(), dst.ud(), op.a.ud(0)(1), op.b.ud(0)(1)); break;
+                    default: xorSimdIntoFold(dst, op.a); break;
+                }
+            }
+        }
+    };
+
     auto treeMergeGrfPartials = [&](const std::vector<GRF> &partials) {
         for (int n = kFoldTreeFanin >> 1; n >= 1; n >>= 1)
             for (int j = 0; j < n; j++)
@@ -814,7 +863,10 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
             auto F = state.ra.try_alloc_range(2, getHint(HintType::TempComp0, strategy));
             if (F.isValid()) {
                 xor_(16, F[0].ud(), state.C_regs[0][0].ud(), state.C_regs[0][2].ud());
-                for (int r = 4; r < nGrf; r += 2)
+                int r = 4;
+                for (; foldBfn && r + 2 < nGrf; r += 4)
+                    bfn(16, 0x96, F[0].ud(), F[0].ud(), state.C_regs[0][r].ud(), state.C_regs[0][r + 2].ud());
+                for (; r < nGrf; r += 2)
                     xor_(16, F[0].ud(), F[0].ud(), state.C_regs[0][r].ud());
                 xor_(simd, fold.ud(), F[0].ud(), F[1].ud());
                 state.ra.safeRelease(F);
@@ -850,18 +902,13 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
             return;
         }
 
-        for (int i = 0; i < nFolds; i++)
-            mov(simd, folds[i].ud(), uint16_t(0));
-
-        auto foldAt = [&](int sr, int sc) { return folds[sr * subGridN + sc]; };
-
+        std::vector<std::vector<Subregister>> chunks(nFolds);
         if (state.C_layout.colMajor()) {
             for (int col = 0; col < unrollN; col++) {
                 const int sc = col / subN;
                 for (int row = 0; row < unrollM; row += simd) {
                     const int sr = row / subM;
-                    Subregister C0 = state.C_layout.find(row, col, state.C_regs[0]);
-                    xorSimdIntoFold(foldAt(sr, sc), C0);
+                    chunks[sr * subGridN + sc].push_back(state.C_layout.find(row, col, state.C_regs[0]));
                 }
             }
         } else {
@@ -869,11 +916,12 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
                 const int sr = row / subM;
                 for (int col = 0; col < unrollN; col += simd) {
                     const int sc = col / subN;
-                    Subregister C0 = state.C_layout.find(row, col, state.C_regs[0]);
-                    xorSimdIntoFold(foldAt(sr, sc), C0);
+                    chunks[sr * subGridN + sc].push_back(state.C_layout.find(row, col, state.C_regs[0]));
                 }
             }
         }
+        std::vector<GRF> foldRegs(folds.begin(), folds.begin() + nFolds);
+        foldChunksInto(foldRegs, chunks);
 
         for (int i = 0; i < nFolds; i++)
             reduceFoldGrfToScalar(folds[i]);
