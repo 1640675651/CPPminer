@@ -448,6 +448,27 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 problem.case5TileXorFold16 = problem.case5TileXorInterleaved
                         && problem.case5XorMaxMilestones % 16 == 0 && !(f16 && f16[0] == '0');
             }
+            // Separate jackpot without the XMX interleaved fold (Gen12LP, Xe-LPG): fold each milestone into
+            // the 16-word jackpot message in registers (the fused path's wrap-GRF fold: rotl 13, then xor
+            // into word ms % 16) and write the 16 words per tile once at the end, instead of a global store
+            // per hash tile and milestone inside the k loop. The jackpot kernel then only hashes (fold16
+            // contract). In gemm_xor the same fold (Case 5.5) beats per-milestone stores (Case 5) once a
+            // thread holds two or more hash tiles: UHD 770 entry 24 185.8 vs 186.4 ms, Xe-LPG 7132 vs 7096
+            // GOPS. CASE5_SEPARATE_WRAP=0 keeps the per-milestone stores.
+            bool wrapMsg = false;
+            {
+                const char *sw = std::getenv("CASE5_SEPARATE_WRAP");
+                wrapMsg = !problem.case5FuseJackpot && !problem.case5TileXorInterleaved && !xor_nop
+                        && !problem.case5TileXorSlm && !(sw && sw[0] == '0')
+                        && problem.case5XorMaxMilestones >= 16 && problem.case5XorMaxMilestones % 16 == 0;
+                if (wrapMsg) {
+                    problem.case5TileXorWrap = true;
+                    problem.case5TileXorWrapGrf = true;
+                    problem.case5TileXorWrapGrfStoreMode = 2;          // flush at the end of the thread
+                    problem.case5TileXorWrapGrfStageUnified = true;
+                    problem.case5XorOutputMilestones = 16;             // word ms % 16 of the message
+                }
+            }
 
             InterfaceHandler iface(hw);
             init_case5_gemm_interface(iface, hw, problem, strategy,
@@ -459,7 +480,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->hwName = hw_name(hw);
                 info->milestoneK = milestone_k;
                 info->xorLayout = problem.case5XorLayout;
-                info->fold16 = problem.case5TileXorFold16;
+                info->fold16 = problem.case5TileXorFold16 || wrapMsg;
+                info->wrapMsg = wrapMsg;
                 info->jackpotCoop = problem.case5JackpotCoop;
                 info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
                 info->jackpotCoopSlm = problem.case5JackpotCoopSlm;

@@ -563,6 +563,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     const char *scan_mode = fused_jackpot_ ? (info_.jackpotCoop ? (info_.jackpotCoopSlm ? "igemm+fold16+slmSIMD8Blake3+gpuJudge"
                                                                                         : "igemm+fold16+ownTileBlake3+gpuJudge")
                                                                 : "igemm+wrapGRF+case56Blake3+gpuJudge")
+                            : info_.wrapMsg ? "igemm+wrapGRF+msg16+GPUjackpot"
                             : info_.fold16 ? "igemm+tileXOR+fold16+GPUjackpot"
                                            : "igemm+tileXOR+GPUjackpot";
     char layout_name[8] = {};

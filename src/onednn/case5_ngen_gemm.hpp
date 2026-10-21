@@ -34,6 +34,7 @@ struct DriverInfo {
     int milestoneK = 128;
     int xorLayout = 0; // tile_xor index layout actually compiled (see case5_tile_xor_index)
     bool fold16 = false; // tile_xor holds the 16-word folded jackpot message per tile, not raw milestones
+    bool wrapMsg = false; // the 16-word message comes from the wrap-GRF fold, flushed once per tile (no XMX)
     bool jackpotCoop = false; // fused jackpot: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM (no tile_xor traffic)
     int bPackCols = 0;          // B in gemmstone packed rows: panels of this many columns (0 = plain)
     int bPackCp = 0;            // ... with this many consecutive k per column (crosspack)
