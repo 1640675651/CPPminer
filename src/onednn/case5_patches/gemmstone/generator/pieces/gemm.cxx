@@ -420,10 +420,30 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
         add(1 | gt | state.flagAP, idK, idK, state.lidK);
 
     if (problem.case5TileXor) {
+        if (problem.case5JackpotArgsInBuf) {
+            // Wrap-GRF fused jackpot: key, bound and tile bases travel in the found buffer (cooperative-path
+            // layout) and the epilogue reloads them. Release their registers before the Case 5 prologue and
+            // the k loop allocate, so those allocations land where they do in the separate jackpot instead
+            // of after the longer argument list (XeHPG dp4a: A on an odd GRF / in B's bundle otherwise).
+            auto &in = state.inputs;
+            for (int i = 0; i < 8; i++) {
+                state.ra.safeRelease(in.blake3KeyWords[i]);
+                state.ra.safeRelease(in.blake3BoundWords[i]);
+            }
+            state.ra.safeRelease(in.trBase);
+            state.ra.safeRelease(in.tcBase);
+        }
         gemmCase5TileXorAlloc(problem, strategy, state);
         case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
         if (problem.case5JackpotCoop)
             gemmCase5TileXorCoopStageArgs(problem, strategy, state);
+        if (problem.case5JackpotArgsInBuf) {
+            // tile_cols / tile_count were needed for the spatial id above; see the release before
+            // gemmCase5TileXorAlloc for the rest.
+            state.ra.safeRelease(state.inputs.tileCols);
+            state.ra.safeRelease(state.inputs.tileCount);
+            state.ra.safeRelease(state.inputs.xorPeriod);
+        }
         if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "after tileXorAlloc", state.ra.countAllocedRegisters());
         if (std::getenv("CASE5_DEBUG_RA")) {
             auto pr = [](const char *n, const ngen::Subregister &s) { if (s.isValid()) std::fprintf(stderr, "  %s=r%d.%d", n, s.getBase(), s.getOffset()); };

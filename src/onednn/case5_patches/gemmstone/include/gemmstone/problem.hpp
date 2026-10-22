@@ -163,6 +163,21 @@ struct CommonProblem {
 };
 
 // GEMM kernel problem description.
+// Set by the generator right after gemmAllocRegs: an A/B operand register block of an XeHPG dp4a
+// (non-systolic) kernel starts on an odd GRF. SIMD16 dword operands then straddle a GRF pair, the slow
+// placement on XeHPG cores (A770 dp4a microbenchmark 79.6% vs 96%). Extra kernel arguments (the fused
+// jackpot's key, bound and found pointer) shift the allocation and can cause it. case5OperandOddBase()
+// holds the first such block's start; the host rebuilds with case5RegPadAt = that register, so the block
+// moves up by one. Reset by the host before each build.
+inline bool &case5OperandOddGrf() {
+    static bool odd = false;
+    return odd;
+}
+inline int &case5OperandOddBase() {
+    static int base = -1;
+    return base;
+}
+
 struct GEMMProblem : public CommonProblem {
     Type Ta, Tb, Tc, Ts;                            // Types for A/B/C/scalars in registers.
     Type Ta_ext, Tb_ext, Tc_ext;                    // Types for A/B/C data in memory.
@@ -209,11 +224,13 @@ struct GEMMProblem : public CommonProblem {
     bool case5TileXorBlake3 = false;                // Case5.6: b3_compress64 on 16 wrap-GRF slots per tile
     bool case5FuseJackpot = false;                  // wrap-GRF fold uses rotl(slot,13)^x (cp_jackpot)
     bool case5JackpotCoop = false;                  // fused jackpot on the fold16 message: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM
+    bool case5JackpotArgsInBuf = false;             // wrap-GRF fused jackpot: arguments read from the found buffer
     bool case5JackpotCoopSlm = false;               // coop: SLM transpose + SIMD8 hashing threads (CASE5_COOP_OWN=0) instead of own-tile SIMD-N
     bool case5JackpotCoopAudit = false;             // coop: also write every tile's digest and message to the found buffer (host audit)
     int case5XorFoldChunks = 8;                     // Case5.2: column/GRF chunks per milestone panel
     int case5XorMaxMilestones = 1;                  // K / milestone_k (K-loop milestone count)
     int case5XorOutputMilestones = 0;               // Case5.4: global tile_xor rows (0 → max/2 when wrap)
+    int case5RegPadAt = -1;                         // GRF reserved during gemmAllocRegs (operand bank fix)
     int case5XorPeriod = 1;                         // Store every N unrollK panels (KR=128 -> 4 when k32)
     int case5XorEveryK = 0;                         // Store every N k inside a panel (0 → unrollK; for unrollK > KR)
     int case5XorSubM = 0;                           // Logical sub-tile height (<= unrollM)

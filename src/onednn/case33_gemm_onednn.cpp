@@ -876,6 +876,15 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
         bufs.found_flag = found_buf_;
         bufs.tr_base = tr_base;
         bufs.tc_base = tc_base;
+        if (info_.jackpotArgsInBuf) {
+            // Wrap-GRF fused jackpot: the kernel reads this panel's tile arguments from the found buffer
+            // (cooperative-path layout; the key before them is staged once at scan start).
+            uint32_t args[4] = {static_cast<uint32_t>(panel_tile_cols), static_cast<uint32_t>(tr_base),
+                                static_cast<uint32_t>(tc_base), static_cast<uint32_t>(panel_tile_count)};
+            if (!ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff + 32)) {
+                return false;
+            }
+        }
         if (info_.jackpotCoop) {
             // The kernel keeps only the tile_xor pointer: bind the found buffer to it and stage
             // this panel's tile arguments there (in-order queue: visible to this panel's kernel).
@@ -1636,7 +1645,7 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
         if (!stage_found_bound_()) {   // found_buf_[0..31] holds the bound in fused mode
             return false;
         }
-        if (info_.jackpotCoop) {   // the cooperative kernel reads its key from the found buffer
+        if (info_.jackpotCoop || info_.jackpotArgsInBuf) {   // these kernels read their key from the found buffer
             const bool ok = scan_key_dev_
                     ? ocl_.copy_buffer(prep_.a_key_buffer(), 0, found_buf_, kJackpotCoopArgsOff, 32)
                     : ocl_.write_buffer(found_buf_, a_key8, 32, kJackpotCoopArgsOff);

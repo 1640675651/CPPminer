@@ -1824,7 +1824,39 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
     }
 
     // Allocate data registers.
+    GRF case5Pad;
+    if (problem.case5RegPadAt >= 0) {
+        case5Pad = GRF(problem.case5RegPadAt);
+        state.ra.claim(case5Pad);
+    }
     gemmAllocRegs(problem, strategy, state);
+    if (case5Pad.isValid())
+        state.ra.safeRelease(case5Pad);
+    if (problem.case5TileXor && hw == HW::XeHPG && !strategy.systolic) {
+        // dp4a operands: report a block starting on an odd GRF (see case5OperandOddGrf).
+        bool odd = false;
+        auto check = [&](const GRFMultirange &mr) {
+            for (auto &r : mr.ranges)
+                if (r.isValid() && r.getLen() >= 2 && (r.getBase() & 1)) {
+                    if (!odd) case5OperandOddBase() = r.getBase();
+                    odd = true;
+                }
+        };
+        for (auto &mr : state.A_regs) check(mr);
+        for (auto &mr : state.B_regs) check(mr);
+        check(state.Ar_regs);
+        check(state.Br_regs);
+        if (std::getenv("CASE5_DEBUG_RA")) {
+            auto dump = [&](const char *n, const GRFMultirange &mr) {
+                for (auto &r : mr.ranges)
+                    if (r.isValid()) std::fprintf(stderr, "[case5 ra] %s r%d+%d\n", n, r.getBase(), r.getLen());
+            };
+            for (auto &mr : state.A_regs) dump("A", mr);
+            for (auto &mr : state.B_regs) dump("B", mr);
+            std::fprintf(stderr, "[case5 ra] odd=%d pad_at=%d\n", int(odd), problem.case5RegPadAt);
+        }
+        case5OperandOddGrf() = odd;
+    }
     gemmAllocAoBoRegs(strategy, state);
 
     // Allocate address registers for A/B loads. We don't need C addresses yet.

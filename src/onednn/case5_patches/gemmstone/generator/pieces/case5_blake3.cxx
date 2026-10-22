@@ -325,10 +325,8 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
     const int hashNr = (problem.case5XorSubN > 0) ? problem.case5XorSubN : strategy.unroll[LoopN];
 
     const bool gpuJudge = problem.case5FuseJackpot && state.inputs.foundFlag.isValid()
-
-            && state.inputs.trBase.isValid()
-
-            && state.inputs.tcBase.isValid();
+            && (problem.case5JackpotArgsInBuf || state.inputs.trBase.isValid())
+            && (problem.case5JackpotArgsInBuf || state.inputs.tcBase.isValid());
 
     if (!gpuJudge) {
 
@@ -355,9 +353,28 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
         const char *simdEnv = std::getenv("CASE5_JACKPOT_SIMDN");
         const int N = subGridM * subGridN;
         const int dpg = grfDwords(hw);
-        if (!(simdEnv && simdEnv[0] == '0') && N >= 2 && N <= 8 && N <= dpg
-                && (N & (N - 1)) == 0 && state.inputs.tileCols.isValid()) {
+        const bool argsInBuf = problem.case5JackpotArgsInBuf;
+        if (argsInBuf || (!(simdEnv && simdEnv[0] == '0') && N >= 2 && N <= 8 && N <= dpg
+                && (N & (N - 1)) == 0 && state.inputs.tileCols.isValid())) {
             gemmCase5ReleaseAccForBlake3(strategy, state);
+
+            // problem.case5JackpotArgsInBuf: the arguments come from the found buffer (cooperative-path
+            // layout): bound dw 0-7, key dw 16-23, tile_cols 24, tr_base 25, tc_base 26, tile_count 27.
+            GRFRange args, argHdr;
+            if (argsInBuf) {
+                args = state.ra.alloc_range(128 / GRF::bytes(hw));
+                argHdr = state.ra.alloc_range(1);
+                emov(1, argHdr[0].uq(0), state.inputs.foundFlag, strategy, state);
+                if (hw >= HW::XeHPG)
+                    load(1, args, block(D32, 32), A64, argHdr);
+                else
+                    load(16, args[0], block_oword(8), A64, argHdr[0]);
+            }
+            auto ARG = [&](int i) { return args[i / dpg].ud(i % dpg); };
+            const Subregister tileColsA = argsInBuf ? ARG(24) : state.inputs.tileCols;
+            const Subregister trBaseA = argsInBuf ? ARG(25) : state.inputs.trBase;
+            const Subregister tcBaseA = argsInBuf ? ARG(26) : state.inputs.tcBase;
+            const Subregister tileCountA = argsInBuf ? ARG(27) : state.inputs.tileCount;
 
             GRF lrG = state.ra.alloc(), lcG = state.ra.alloc(), sidG = state.ra.alloc();
             for (int fi = 0; fi < N; fi++) {
@@ -366,7 +383,7 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
                 if (sr) add(1, lrG.ud(fi), lrG.ud(fi), uint16_t(sr));
                 mulConstant(1, lcG.ud(fi), state.tileXorCol, subGridN);
                 if (sc) add(1, lcG.ud(fi), lcG.ud(fi), uint16_t(sc));
-                emad(1, sidG.ud(fi), lcG.ud(fi), lrG.ud(fi), state.inputs.tileCols, strategy, state);
+                emad(1, sidG.ud(fi), lcG.ud(fi), lrG.ud(fi), tileColsA, strategy, state);
             }
 
             GRFRange m = state.ra.alloc_range(kBlake3MsgWords), v = state.ra.alloc_range(16);
@@ -380,7 +397,9 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             auto Mw = [&](int w) { return m[w].ud(); };
             auto T = [&](int k) { return t[k].ud(); };
             for (int i = 0; i < kBlake3DigestWords; ++i) {
-                if (state.inputs.blake3KeyWords[i].isValid()) {
+                if (argsInBuf) {
+                    mov(N, V(i), ARG(16 + i));
+                } else if (state.inputs.blake3KeyWords[i].isValid()) {
                     mov(N, V(i), state.inputs.blake3KeyWords[i]);
                 } else {
                     mov(N, V(i), uint32_t(0xA5A5A5A5u ^ static_cast<uint32_t>(i * 0x9E3779B9u)));
@@ -402,7 +421,9 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             mov(8, beat.ud(), uint32_t(0));
             mov(8, resolved.ud(), uint32_t(0));
             for (int w = kBlake3DigestWords - 1; w >= 0; --w) {
-                if (state.inputs.blake3BoundWords[w].isValid()) {
+                if (argsInBuf) {
+                    mov(1, bnd.ud(0), ARG(w));
+                } else if (state.inputs.blake3BoundWords[w].isValid()) {
                     mov(1, bnd.ud(0), state.inputs.blake3BoundWords[w]);
                 } else {
                     mov(1, bnd.ud(0), uint32_t(0));
@@ -418,8 +439,8 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             }
             not_(N, T(0), resolved.ud());                       // all words equal => beat
             or_(N, beat.ud(), beat.ud(), T(0));
-            if (state.inputs.tileCount.isValid()) {             // tiles past the panel never win
-                cmp(N | lt, ltM.ud(), sidG.ud(), state.inputs.tileCount);
+            if (tileCountA.isValid()) {                         // tiles past the panel never win
+                cmp(N | lt, ltM.ud(), sidG.ud(), tileCountA);
                 and_(N, beat.ud(), beat.ud(), ltM.ud());
             }
 
@@ -430,9 +451,9 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             eadd(1, hdrC[0].uq(0), state.inputs.foundFlag, kJackpotFoundCoordsOff, strategy, state);
             mov(1, one.ud(0), uint32_t(1));
             for (int fi = 0; fi < N; fi++) {
-                add(1, T(2), lrG.ud(fi), state.inputs.trBase);
+                add(1, T(2), lrG.ud(fi), trBaseA);
                 mulConstant(1, coords.ud(0), t[2].ud(0), hashMr);
-                add(1, T(3), lcG.ud(fi), state.inputs.tcBase);
+                add(1, T(3), lcG.ud(fi), tcBaseA);
                 mulConstant(1, coords.ud(1), t[3].ud(0), hashNr);
                 cmp(1 | ne | f0[0], null.ud(), beat.ud(fi), uint32_t(0));
                 atomic(AtomicOp::mov, 1 | f0[0], scattered_dword(), A64, hdrF[0], one);
@@ -453,6 +474,10 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
             state.ra.safeRelease(sidG);
             state.ra.safeRelease(lcG);
             state.ra.safeRelease(lrG);
+            if (argsInBuf) {
+                state.ra.safeRelease(argHdr);
+                state.ra.safeRelease(args);
+            }
             return;
         }
     }

@@ -12,6 +12,7 @@
 
 #include "ngen_opencl.hpp"
 
+#include <memory>
 #include <cstdio>
 #include <exception>
 #include <cstdlib>
@@ -470,6 +471,21 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 }
             }
 
+            // Wrap-GRF fused jackpot with the SIMD-N judge: the jackpot's arguments come from the found buffer
+            // (cooperative-path layout, written by the host) and their registers are released before the k
+            // loop, so the loop allocates exactly as in the separate jackpot. Their registers otherwise shift
+            // the operand blocks: Xe-LPG kernel A at r27 (odd) or, padded, at r30 (bundle conflicts with B),
+            // fused 2.97 / 2.54 s against 2.39 s separate on the A770. CASE5_JACKPOT_ARGBUF=0 keeps arguments.
+            {
+                const char *ab = std::getenv("CASE5_JACKPOT_ARGBUF");
+                const char *sn = std::getenv("CASE5_JACKPOT_SIMDN");
+                const int nTiles = xsd.subGridM * xsd.subGridN;
+                problem.case5JackpotArgsInBuf = problem.case5FuseJackpot && problem.case5TileXorBlake3
+                        && problem.case5TileXorWrapGrf && !problem.case5JackpotCoop && !xor_nop
+                        && !(ab && ab[0] == '0') && !(sn && sn[0] == '0') && nTiles >= 2 && nTiles <= 8
+                        && (nTiles & (nTiles - 1)) == 0 && nTiles <= GRF::bytes(hw) / 4;
+            }
+
             InterfaceHandler iface(hw);
             init_case5_gemm_interface(iface, hw, problem, strategy,
                     problem.case5TileXorNop ? kKernelNameNop : kKernelName);
@@ -482,6 +498,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->xorLayout = problem.case5XorLayout;
                 info->fold16 = problem.case5TileXorFold16 || wrapMsg;
                 info->wrapMsg = wrapMsg;
+                info->jackpotArgsInBuf = problem.case5JackpotArgsInBuf;
                 info->jackpotCoop = problem.case5JackpotCoop;
                 info->jackpotCoopAudit = problem.case5JackpotCoopAudit;
                 info->jackpotCoopSlm = problem.case5JackpotCoopSlm;
@@ -500,8 +517,40 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 log_strategy_fallback(candidate.label.c_str(), rejected, nullptr);
             }
 
-            Generator<hw> gen(product);
-            gen.gemm(problem, strategy, iface);
+            // XeHPG dp4a: if gemmAllocRegs put an A/B operand block on an odd GRF (slow placement), rebuild
+            // once with that start register reserved, so the block moves up to an even GRF, and keep that
+            // build when its operands are even (case5OperandOddGrf in problem.hpp). The fused jackpot's
+            // extra arguments caused it on the Xe-LPG kernel (entry 329): A770 test 10.53 -> 8.87 ms, the
+            // fused hash then costs 0.3% (gemm_xor note.md). CASE5_REG_PAD=0 disables.
+            auto genPtr = std::make_unique<Generator<hw>>(product);
+            {
+                const char *padEnv = std::getenv("CASE5_REG_PAD");
+                const bool padAuto = !(padEnv && padEnv[0] == '0');
+                case5OperandOddGrf() = false;
+                case5OperandOddBase() = -1;
+                genPtr->gemm(problem, strategy, iface);
+                if (padAuto && case5OperandOddGrf() && problem.case5RegPadAt < 0 && case5OperandOddBase() >= 0) {
+                    try {
+                        GEMMProblem padded = problem;
+                        padded.case5RegPadAt = case5OperandOddBase();
+                        InterfaceHandler iface2(hw);
+                        init_case5_gemm_interface(iface2, hw, padded, strategy,
+                                padded.case5TileXorNop ? kKernelNameNop : kKernelName);
+                        auto gen2 = std::make_unique<Generator<hw>>(product);
+                        case5OperandOddGrf() = false;
+                        gen2->gemm(padded, strategy, iface2);
+                        if (!case5OperandOddGrf()) {
+                            genPtr = std::move(gen2);
+                            if (std::getenv("CASE5_DEBUG_SELECT"))
+                                std::fprintf(stderr, "[case5] %s: operand registers padded to even GRFs\n",
+                                             candidate.label.c_str());
+                        }
+                    } catch (const std::exception &) {
+                        // keep the first build (e.g. the reserved register does not fit the budget)
+                    }
+                }
+            }
+            auto &gen = *genPtr;
             // CASE5_DUMP_BINARY=<file>: save the device binary (for `ocloc disasm`).
             if (const char *dump = std::getenv("CASE5_DUMP_BINARY")) {
                 if (dump[0]) {
