@@ -57,6 +57,10 @@
  * (fewer kernel tails), and 16 panels per attempt need fewer host syncs than 64. On the
  * A380, 1024x1024 measured fastest of the sizes up to 1024 (PR #36). */
 #define CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT 2048
+/* dp4a (non-XMX) kernels: 8192x8192 GEMM per panel, i.e. 512x512 hash tiles of 16x16 (256 panels per
+ * 131072^2 attempt). 4096x4096 (256x256 tiles) cost the fused jackpot a host round trip per short panel;
+ * 16384x16384 made the UHD 770 hash rate less steady. */
+#define CP_ONEDNN_DP4A_PANEL_MN 8192
 /* Cards with >= 12 GiB: 4096x4096-tile panels (65536^2 GEMM, 4 per attempt), +0.8% on the A770
  * (fewer kernel boundaries; idle 2.2 -> 0.4 ms per attempt). */
 #define CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM 4096

@@ -181,13 +181,13 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 
 | Flag | Description |
 |------|-------------|
-| `--fused-jackpot` | **Fused path:** one gemmstone kernel (IGEMM + wrap-GRF fold + BLAKE3 + in-kernel jackpot compare). No `tile_xor` global readback. |
+| `--fused-jackpot` | **Fused path (default):** one gemmstone kernel (IGEMM + fold + BLAKE3 + in-kernel jackpot compare). No `tile_xor` global readback. `--no-fused-jackpot` selects the separate jackpot kernel. |
 | `--onednn-layout NAME` | Device A/B layout: `TN` (default), `TT`, `NT`, `NN`. `T`/`N` = row/column major; C is always N. Env: `CASE5_GEMM_LAYOUT`. Legacy `TNN`/`TTN`/… (3 chars) still accepted. |
 
 **Scan paths**
 
-- **Default (`--no-fused-jackpot`):** Case 5 IGEMM writes each tile's 16-word jackpot message to `tile_xor` → separate device jackpot kernel. On XMX GPUs the message comes from the interleaved fold; elsewhere (Gen12LP, Xe-LPG) the milestones are folded into it in registers and flushed once per tile (`CASE5_SEPARATE_WRAP=0`: one store per milestone instead). Higher VRAM traffic (`tile_xor` panel buffer) but simpler judge (OpenCL reference in `kernels/cp_onednn_jackpot.cl`).
-- **`--fused-jackpot`:** Case 5.6 fused kernel — fold, BLAKE3, and target compare in-register; host readback is `found_flag` + packed `(t_rows, t_cols)` only. Lower panel I/O; recommended for production Intel GPU mining.
+- **`--no-fused-jackpot`:** Case 5 IGEMM writes each tile's 16-word jackpot message to `tile_xor` → separate device jackpot kernel. On XMX GPUs the message comes from the interleaved fold; elsewhere (Gen12LP, Xe-LPG) the milestones are folded into it in registers and flushed once per tile (`CASE5_SEPARATE_WRAP=0`: one store per milestone instead). Higher VRAM traffic (`tile_xor` panel buffer) but simpler judge (OpenCL reference in `kernels/cp_onednn_jackpot.cl`).
+- **Default (`--fused-jackpot`):** fused kernel — fold, BLAKE3, and target compare in-register; host readback is `found_flag` + packed `(t_rows, t_cols)` only. Lower panel I/O.
 
 **Batching:** `--row-period-batch` and `--batch-size` count **hash tiles** on the gemmstone unroll grid (typically 16×16 at production; see startup log `hash tile: MxN logical`). Host syncs after each panel for cancel/progress/share checks. Non-fused panels also size the `tile_xor` GPU buffer (~`row_batch × col_batch × (K/128)` dwords per panel).
 

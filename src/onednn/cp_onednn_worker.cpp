@@ -320,6 +320,13 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
             cp_onednn_worker_set_row_period_batch(batch);
         if (g_col_batch_auto)
             cp_onednn_worker_set_col_period_batch(batch);
+    } else if (di.xorSubM > 0 && di.xorSubN > 0 && di.xorSubM <= CP_ONEDNN_DP4A_PANEL_MN
+               && di.xorSubN <= CP_ONEDNN_DP4A_PANEL_MN) {
+        // dp4a kernels: CP_ONEDNN_DP4A_PANEL_MN x CP_ONEDNN_DP4A_PANEL_MN GEMM per panel, in hash tiles.
+        if (g_row_batch_auto)
+            cp_onednn_worker_set_row_period_batch(CP_ONEDNN_DP4A_PANEL_MN / di.xorSubM);
+        if (g_col_batch_auto)
+            cp_onednn_worker_set_col_period_batch(CP_ONEDNN_DP4A_PANEL_MN / di.xorSubN);
     }
     printf("[onednn] device[%d]: %s\n", g_gemm.device_index(), g_gemm.device_name());
     printf("[onednn] platform: %s\n", g_gemm.platform_name());

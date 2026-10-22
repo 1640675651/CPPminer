@@ -153,16 +153,18 @@ static void print_usage(void)
            ""
 #endif
            );
-#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
-    printf("  --fused-jackpot       oneDNN in-reg fold + flush + GPU jackpot (found flag only)\n");
-    printf("  --no-fused-jackpot    oneDNN GEMM + separate device fold/BLAKE jackpot (default)\n");
-    printf("  --onednn-layout NAME  device A/B layout: TN (default), TT, NT, NN (C always N)\n");
-    printf("                       (CASE5_GEMM_LAYOUT env when flag unset)\n");
-#endif
-    printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
+    printf("  --cpu-gen           host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
     printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
     printf("  --align-test-prod    include checks at the --m/--n size (~1 GiB RAM at default, slow)\n");
     printf("  --profile-scan [N]   time GEMM vs jackpot per period batch (default N=10)\n");
+#endif
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    printf("  --fused-jackpot       oneDNN in-reg fold + BLAKE3 + in-kernel jackpot (default)\n");
+    printf("  --no-fused-jackpot    oneDNN GEMM + separate device jackpot kernel\n");
+    printf("  --onednn-layout NAME  device A/B layout: TN (default), TT, NT, NN (C always N)\n");
+    printf("                       (CASE5_GEMM_LAYOUT env when flag unset)\n");
+    printf("  --row-period-batch N, --batch-size N  oneDNN panel in hash tiles (default: 8192x8192\n");
+    printf("                       GEMM per panel on dp4a GPUs, 2048/4096 tiles on XMX GPUs)\n");
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
@@ -462,7 +464,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
-    int fused_jackpot = 0;
+    int fused_jackpot = -1;   /* unset: on for --backend onednn, off for hexagon */
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
@@ -1401,6 +1403,8 @@ int main(int argc, char** argv)
         cp_onednn_worker_set_auto_batch(!batch_size_set, !row_period_batch_set);
     }
 #endif
+    if(fused_jackpot < 0)
+        fused_jackpot = (cp_worker_backend_id() == CP_BACKEND_ONEDNN) ? 1 : 0;
     cp_worker_set_period_batch(batch_size);
     cp_worker_set_row_period_batch(row_period_batch);
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON){
