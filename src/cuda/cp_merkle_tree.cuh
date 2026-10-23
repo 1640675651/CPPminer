@@ -203,6 +203,55 @@ __global__ void cp_keyed_chunk_roots_kernel(
     d_mt_store_root_words(smem_leaves, CP_MT_THREADS, roots_out, bid);
 }
 
+/* A's noise seed on the device (mirrors pearl_a_noise_seed_from_hash in cp_noise.c):
+ *   root_a = Merkle root of the signal A (32 bytes at root[0..31]);
+ *   salted: root_a = BLAKE3_keyed(SALT_A, root_a || le32(m) || zeros), a 64-byte message;
+ *   a_seed = BLAKE3(b_noise_seed || root_a), a 64-byte message.
+ * Writes a_seed to seed_out (the noise kernels' seed) and key_out (the scan's jackpot key), and copies
+ * the root to root_out (the share witness root). One thread. */
+struct CpSeedWords { uint32_t w[8]; };
+
+__device__ __constant__ uint32_t CP_SEED_SALT_A_W[8] = {
+    0x6C404982u, 0x1615EDA0u, 0x92F61696u, 0xF876F0FCu,
+    0x2ADBDB92u, 0x52B82370u, 0x1977D4F0u, 0x7B0190C3u
+};
+
+__global__ void cp_a_noise_seed_kernel(
+    const uint8_t* root, uint32_t m, int salted, CpSeedWords b_seed,
+    uint8_t* seed_out, uint8_t* key_out, uint8_t* root_out)
+{
+    if(threadIdx.x != 0 || blockIdx.x != 0) return;
+    const uint8_t flags = (uint8_t)(D_B3_CHUNK_START | D_B3_CHUNK_END | D_B3_ROOT);
+    uint32_t r[8];
+    for(int i = 0; i < 8; i++){
+        r[i] = d_b3_load32(root + 4 * i);
+        d_b3_store32(root_out + 4 * i, r[i]);
+    }
+    uint8_t block[D_B3_BLOCK];
+    if(salted){
+        uint32_t cv[8];
+        for(int i = 0; i < 8; i++){
+            cv[i] = CP_SEED_SALT_A_W[i];
+            d_b3_store32(block + 4 * i, r[i]);
+        }
+        d_b3_store32(block + 32, m);
+        for(int i = 9; i < 16; i++) d_b3_store32(block + 4 * i, 0u);
+        d_b3_compress_in_place(cv, block, 64, 0, (uint8_t)(flags | D_B3_KEYED));
+        for(int i = 0; i < 8; i++) r[i] = cv[i];
+    }
+    uint32_t cv[8];
+    for(int i = 0; i < 8; i++){
+        cv[i] = D_B3_IV[i];
+        d_b3_store32(block + 4 * i, b_seed.w[i]);
+        d_b3_store32(block + 32 + 4 * i, r[i]);
+    }
+    d_b3_compress_in_place(cv, block, 64, 0, flags);
+    for(int i = 0; i < 8; i++){
+        d_b3_store32(seed_out + 4 * i, cv[i]);
+        d_b3_store32(key_out + 4 * i, cv[i]);
+    }
+}
+
 template<int kLeavesPerBlock, bool IsSingleBlock>
 __global__ void cp_compute_blake_mt_kernel(
     const uint8_t job_key[32], uint8_t* roots, int num_leaves)

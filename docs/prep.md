@@ -171,6 +171,12 @@ full A/B prep, the alignment test) marks the signal stale, so the next attempt s
 GTX 1070 at 131072^2: random A 22 ms -> under 1 ms, commitment 35 ms -> under 1 ms, prep 73 -> 24 ms
 per attempt (the rest is the A noise). `CP_CUDA_PREP_CHECK=1` compares the row with the host formula and
 the incremental root with a full rehash every nonce; `CP_CUDA_PREP_ROWPOKE=0` restores full regeneration.
+The host round trips of section 6 are gone there too: the job key is written when it changes,
+`cp_a_noise_seed_kernel` derives A's noise seed from the root on the device and writes it as the noise
+seed, the jackpot key (`d_a_key8`) and the witness root (`d_a_root`, read when a share is proven), and the
+found flag is cleared with a device memset. The first derivation in a process is compared with the host
+formula (fallback to the host on a mismatch; every nonce with `CP_CUDA_PREP_CHECK=1`). Steady state per
+attempt: no host-to-device copies, and one 4-byte found-flag read per scan batch (32 on the GTX 1070).
 
 ### 4. Noisy A written in the systolic (packed) layout
 

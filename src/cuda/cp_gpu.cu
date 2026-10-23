@@ -73,6 +73,11 @@ typedef struct {
     uint8_t*  d_seed_a;
     uint8_t*  d_seed_b;
     uint8_t*  d_job_key;
+    /* Host copy of what d_job_key holds (written only when the key changes). */
+    uint8_t   job_key_dev[32];
+    int       job_key_dev_valid;
+    /* Signal-A root of the current attempt (share witness), written by cp_a_noise_seed_kernel. */
+    uint8_t*  d_a_root;
     int*      d_found;
     int*      d_out_t_rows;
     int*      d_out_t_cols;
@@ -150,12 +155,15 @@ static struct {
     uint8_t bt_root[32];
 } g_zero_b = {};
 
-/* Signal A commitment of the last prepared attempt (sub-roots stay in g0->d_a_subroots). */
+/* Signal A commitment of the last prepared attempt (root in g0->d_a_root, sub-roots in
+ * g0->d_a_subroots; both read when a share is proven). */
 static struct {
-    uint8_t root[32];
     int num_subroots;
     int valid;
 } g_attempt_a = {};
+
+/* A noise seed derivation: -1 untested, 1 on the device, 0 on the host (device result differed). */
+static int g_a_seed_mode = -1;
 
 static int zero_b_cache_matches(const uint8_t job_key[32], int m, int n)
 {
@@ -466,6 +474,9 @@ void cp_gpu_shutdown(void)
         if(g->d_seed_a) cudaFree(g->d_seed_a);
         if(g->d_seed_b) cudaFree(g->d_seed_b);
         if(g->d_job_key) cudaFree(g->d_job_key);
+        if(g->d_a_root) cudaFree(g->d_a_root);
+        g->d_a_root = nullptr;
+        g->job_key_dev_valid = 0;
         g->merkle_roots_cap = 0;
         if(g->d_found) cudaFree(g->d_found);
         if(g->d_out_t_rows) cudaFree(g->d_out_t_rows);
@@ -516,6 +527,8 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         CU_CHECK(cudaMalloc(&g->d_seed_a, 32));
         CU_CHECK(cudaMalloc(&g->d_seed_b, 32));
         CU_CHECK(cudaMalloc(&g->d_job_key, 32));
+        CU_CHECK(cudaMalloc(&g->d_a_root, 32));
+        g->job_key_dev_valid = 0;
     }
     if(merkle_need > g->merkle_roots_cap){
         if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
@@ -847,7 +860,17 @@ static void cp_gpu_merkle_finish_root(
     CU_CHECK(cudaGetLastError());
 }
 
+/* d_job_key <- job_key, written only when it changes (once per job). */
+static void gpu_set_job_key(GpuCtx* g, const uint8_t job_key[32])
+{
+    if(g->job_key_dev_valid && memcmp(g->job_key_dev, job_key, 32) == 0) return;
+    CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
+    memcpy(g->job_key_dev, job_key, 32);
+    g->job_key_dev_valid = 1;
+}
+
 /* Keyed Merkle root of d_mat. d_mat may be NULL with raw_len 0 for an all-zero matrix.
+ * The root is left in d_merkle_roots[0..31]; out (may be NULL) also receives a host copy.
  * With subroots_out (device or host), also returns the per-CP_MT_THREADS-chunk sub-roots
  * the finish pass folds in place; *out_num_subroots is 0 when the matrix is a single chunk. */
 static int gpu_matrix_keyed_hash_ex(GpuCtx* g, const int8_t* d_mat,
@@ -859,15 +882,18 @@ static int gpu_matrix_keyed_hash_ex(GpuCtx* g, const int8_t* d_mat,
     int num_chunks = (int)(pad_len / 1024);
     if(out_num_subroots) *out_num_subroots = 0;
     if(num_chunks == 1){
+        uint8_t root[32];
         uint8_t* tmp = (uint8_t*)calloc(1, pad_len);
         if(!tmp) return -1;
         if(d_mat && raw_len > 0)
             CU_CHECK(cudaMemcpy(tmp, d_mat, raw_len, cudaMemcpyDeviceToHost));
-        pearl_keyed_matrix_digest(tmp, pad_len, job_key, out);
+        pearl_keyed_matrix_digest(tmp, pad_len, job_key, root);
         free(tmp);
+        CU_CHECK(cudaMemcpy(g->d_merkle_roots, root, 32, cudaMemcpyHostToDevice));
+        if(out) memcpy(out, root, 32);
         return 0;
     }
-    CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
+    gpu_set_job_key(g, job_key);
     {
         int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
         cp_keyed_chunk_roots_kernel<<<num_subroots, CP_MT_THREADS, CP_MT_SMEM_BYTES>>>(
@@ -881,8 +907,10 @@ static int gpu_matrix_keyed_hash_ex(GpuCtx* g, const int8_t* d_mat,
         }
         cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots);
     }
-    CU_CHECK(cudaDeviceSynchronize());
-    CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    if(out){
+        CU_CHECK(cudaDeviceSynchronize());
+        CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    }
     return 0;
 }
 
@@ -895,14 +923,15 @@ static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
 }
 
 /* Signal A changed only inside sub-root group `group` (CP_MT_THREADS chunks): recompute that
- * sub-root into d_a_subroots and reduce a copy of all sub-roots to the root. */
+ * sub-root into d_a_subroots and reduce a copy of all sub-roots to the root (left in
+ * d_merkle_roots[0..31]; out, if not NULL, gets a host copy). */
 static int gpu_rehash_a_group(GpuCtx* g, size_t raw_len, size_t pad_len,
                               const uint8_t job_key[32], int group, uint8_t out[32])
 {
     const int num_chunks = (int)(pad_len / 1024);
     const int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
     if(num_chunks <= 1 || group < 0 || group >= num_subroots) return -1;
-    CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
+    gpu_set_job_key(g, job_key);
     cp_keyed_chunk_roots_kernel<<<1, CP_MT_THREADS, CP_MT_SMEM_BYTES>>>(
         (const uint8_t*)g->d_A_sig, raw_len, pad_len, g->d_job_key,
         g->d_a_subroots, num_chunks, group);
@@ -911,8 +940,50 @@ static int gpu_rehash_a_group(GpuCtx* g, size_t raw_len, size_t pad_len,
     CU_CHECK(cudaMemcpy(g->d_merkle_roots, g->d_a_subroots, (size_t)num_subroots * 32,
                         cudaMemcpyDeviceToDevice));
     cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots);
-    CU_CHECK(cudaDeviceSynchronize());
-    CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaGetLastError());
+    if(out){
+        CU_CHECK(cudaDeviceSynchronize());
+        CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    }
+    return 0;
+}
+
+/* A noise seed from the root in d_merkle_roots[0..31] into d_seed_a (noise kernels), d_a_key8 (the
+ * scan's jackpot key) and d_a_root (share witness), on the device. The first derivation in a process
+ * (and every one with CP_CUDA_PREP_CHECK=1) is compared with the host formula; on a mismatch the
+ * host derives it from then on (root read, seed written). */
+static int gpu_derive_a_noise_seed(GpuCtx* g, int m)
+{
+    if(g_a_seed_mode != 0){
+        CpSeedWords bw;
+        memcpy(bw.w, g_zero_b.b_noise_seed, 32);   /* little-endian words, as d_b3_load32 */
+        cp_a_noise_seed_kernel<<<1, 1>>>(g->d_merkle_roots, (uint32_t)m, g_salted ? 1 : 0, bw,
+                                         g->d_seed_a, (uint8_t*)g->d_a_key8, g->d_a_root);
+        CU_CHECK(cudaGetLastError());
+        if(g_a_seed_mode > 0 && !gpu_prep_check_enabled())
+            return 0;
+        uint8_t root[32], dev[32], host[32];
+        CU_CHECK(cudaMemcpy(root, g->d_a_root, 32, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(dev, g->d_a_key8, 32, cudaMemcpyDeviceToHost));
+        pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, root, (uint32_t)m, g_salted, host);
+        const int same = memcmp(dev, host, 32) == 0;
+        if(!same || gpu_prep_check_enabled()){
+            printf("[gpu-prep] device A noise seed check: %s\n",
+                   same ? "identical" : "MISMATCH, deriving it on the host from now on");
+            fflush(stdout);
+        }
+        if(same){
+            g_a_seed_mode = 1;
+            return 0;
+        }
+        g_a_seed_mode = 0;
+    }
+    uint8_t root[32], seed[32];
+    CU_CHECK(cudaMemcpy(root, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, root, (uint32_t)m, g_salted, seed);
+    CU_CHECK(cudaMemcpy(g->d_seed_a, seed, 32, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_a_key8, seed, 32, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_a_root, root, 32, cudaMemcpyHostToDevice));
     return 0;
 }
 
@@ -1059,15 +1130,16 @@ static int gpu_prepare_job_b(GpuCtx* g, const uint8_t job_key[32], int m, int n)
     return cp_job_should_cancel() ? -1 : 0;
 }
 
-/* Per-nonce: random A + hash + A-side noise into d_Ap. Reuses cached b_noise_seed. */
+/* Per-nonce: random A + hash + A-side noise into d_Ap. Reuses cached b_noise_seed.
+ * Leaves the scan's jackpot key in d_a_key8 and the witness root in d_a_root; in the steady state
+ * the only host-device traffic is kernel launches. */
 static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job_key[32],
-                                 int m, int n, uint8_t a_key_out[32])
+                                 int m, int n)
 {
     size_t szAp = (size_t)m * K_DIM;
     size_t pad_a = (szAp + 1023) / 1024 * 1024;
     const int tpb = 256;
     int total_a = m * K_DIM;
-    uint8_t hash_a[32];
     double t_step, t_total;
 
     CU_CHECK(cudaSetDevice(g->dev));
@@ -1121,10 +1193,11 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
     if(!incremental || !g->a_sub_valid || memcmp(g->a_sub_key, job_key, 32) != 0){
         /* First attempt or new job key (the hash is keyed): commit the whole signal. */
         g->a_sub_valid = 0;
-        if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, hash_a,
+        if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, nullptr,
                                     g->d_a_subroots, cudaMemcpyDeviceToDevice,
                                     &g_attempt_a.num_subroots) != 0)
             return -1;
+        CU_CHECK(cudaDeviceSynchronize());
         if(g_attempt_a.num_subroots > 0){
             g->a_sub_valid = 1;
             memcpy(g->a_sub_key, job_key, 32);
@@ -1132,10 +1205,13 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
         printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
     } else {
         const int group = (int)(((size_t)row * K_DIM / 1024) / CP_MT_THREADS);
-        if(gpu_rehash_a_group(g, szAp, pad_a, job_key, group, hash_a) != 0)
+        const int check = gpu_prep_check_enabled();
+        uint8_t hash_a[32];
+        if(gpu_rehash_a_group(g, szAp, pad_a, job_key, group, check ? hash_a : nullptr) != 0)
             return -1;
+        CU_CHECK(cudaDeviceSynchronize());
         printf("[gpu-prep] keyed hash A (group %d) %.3fs\n", group, cp_now_sec() - t_step);
-        if(gpu_prep_check_enabled()){
+        if(check){
             /* Full commitment (also refreshes the stored sub-roots) against the incremental root. */
             uint8_t full[32];
             int nsub = 0;
@@ -1148,13 +1224,10 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
             if(!same) return -1;
         }
     }
-    memcpy(g_attempt_a.root, hash_a, 32);
-    g_attempt_a.valid = 1;
     fflush(stdout);
 
-    pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, hash_a, (uint32_t)m, g_salted,
-                                 a_key_out);
-    CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
+    if(gpu_derive_a_noise_seed(g, m) != 0) return -1;
+    g_attempt_a.valid = 1;
 
     t_step = cp_now_sec();
     gpu_noise_generate_a(g, m);
@@ -1289,6 +1362,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     {
         uint8_t gpu_digest[32], cpu_digest[32];
         cp_test_perm_hash_kernel<<<1, 1>>>(0, g->d_seed_a, g->d_job_key);
+        g->job_key_dev_valid = 0;   /* d_job_key used as scratch output */
         CU_CHECK(cudaGetLastError());
         CU_CHECK(cudaDeviceSynchronize());
         CU_CHECK(cudaMemcpy(gpu_digest, g->d_job_key, 32, cudaMemcpyDeviceToHost));
@@ -2048,7 +2122,6 @@ int cp_gpu_mine_attempt(
     (void)h_Bt_sig;
     const double attempt_t0 = cp_now_sec();
     size_t szAp = (size_t)m * K_DIM;
-    uint8_t a_key_local[32];
     const uint8_t* scan_key = a_key;
     int zero = 0;
 
@@ -2072,23 +2145,20 @@ int cp_gpu_mine_attempt(
             if(gpu_prepare_job_b(g0, job_key, m, n) != 0)
                 return -1;
         }
-        if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
-                                 a_key_local) != 0)
+        /* Jackpot key: written to g0->d_a_key8 by the prep (no host copy). */
+        if(gpu_prepare_attempt_a(g0, cp_gpu_fresh_rng_seed(), job_key, m, n) != 0)
             return -1;
-        scan_key = a_key_local;
-        uint32_t a_key32[8];
-        memcpy(a_key32, scan_key, 32);
+        scan_key = nullptr;
         CU_CHECK(cudaSetDevice(g0->dev));
-        CU_CHECK(cudaMemcpy(g0->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-        CU_CHECK(cudaMemcpy(g0->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemset(g0->d_found, 0, sizeof(int)));
         for(int i = 1; i < g_ngpu; i++){
             GpuCtx* g = &g_gpus[i];
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
             CU_CHECK(cudaMemcpy(g->d_Ap, g0->d_Ap, szAp, cudaMemcpyDeviceToDevice));
             /* d_BpT already mirrored in gpu_prepare_job_b. */
-            CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-            CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+            CU_CHECK(cudaMemcpyPeer(g->d_a_key8, g->dev, g0->d_a_key8, g0->dev, 32));
+            CU_CHECK(cudaMemset(g->d_found, 0, sizeof(int)));
         }
     }
 
@@ -2172,7 +2242,7 @@ int cp_gpu_fetch_share_witness(int t_rows, int t_cols, int tile_layout, CpShareW
         CU_CHECK(cudaMemcpy(w->a_subroots, g0->d_a_subroots, bytes, cudaMemcpyDeviceToHost));
         w->a_num_subroots = (size_t)g_attempt_a.num_subroots;
     }
-    memcpy(w->a_root, g_attempt_a.root, 32);
+    CU_CHECK(cudaMemcpy(w->a_root, g0->d_a_root, 32, cudaMemcpyDeviceToHost));
 
     if(g_zero_b.bt_num_subroots > 0){
         size_t bytes = (size_t)g_zero_b.bt_num_subroots * 32;
