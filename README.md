@@ -162,6 +162,7 @@ cppminer --backend opencl --devices 0 --mock
 | `--ocl-cpm-type T` | Scalar (no int8 dot) MAC: `auto` (default; `mad24` on AMD GCN gfx6-8, else `float`), `float`, `int`, or `mad24` |
 | `--ocl-lds on/off` | Stage A/B panels in `__local` (default `off`) |
 | `--ocl-double-buff on/off` | Register double-buffered GEMM k-group loop (default `off`; faster on some GPUs, but more registers per work-item can spill on others) |
+| `--ocl-throttle L` | OpenCL and oneDNN backends: `cl_khr_throttle_hints` queue hint, `low`, `med`, `high`, or `off`. With `low`, Intel's driver sleeps while waiting for the GPU instead of spinning a CPU core; `med`, `high` and `off` spin. Default `low` on `--backend onednn` (A770 and UHD 770: 0.5-1 core to about 0, hashrate within 0.6%) and `off` on `--backend opencl` (its ~5 ms launches lost 3.6% on the A770 with `low`). Ignored by devices without the extension (NVIDIA) |
 
 `--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-macro` sets the WG macro block (work-group covers one macro); it is independent of the register tile. Examples: `--ocl-tile 4x8 --ocl-macro 64x64` or `--ocl-tile 4x8/64x64`. `--ocl-issue` / `--ocl-dot` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** picks the best available accelerated dot, then float **B-scalar broadcast** fallback.
 

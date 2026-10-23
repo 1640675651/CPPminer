@@ -63,6 +63,10 @@ void cp_worker_set_ocl_cpm_type(int type);
 void cp_worker_set_ocl_lds(int on);
 /* OpenCL-only: register double-buffered GEMM k-group loop (0 = off default, 1 = on). */
 void cp_worker_set_ocl_double_buff(int on);
+/* OpenCL and oneDNN backends: cl_khr_throttle_hints level of new OpenCL queues. 0 = no hint
+ * (default until set), 1 = high, 2 = med, 3 = low (Intel's runtime then sleeps in waits instead of
+ * spinning). main sets low for oneDNN and no hint for the OpenCL backend unless --ocl-throttle. */
+void cp_ocl_set_queue_throttle(int level);
 /* wgpu-only (pearl): stage A/B panels in workgroup memory (-1 = auto default, 0 = off, 1 = on). */
 void cp_worker_set_wgpu_lds(int mode);
 /* wgpu-only (pearl): register tile 4x4/4x8/8x8/8x16 (default 8x8), macro 64x64/128x128. */

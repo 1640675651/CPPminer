@@ -1395,7 +1395,7 @@ bool Case33GemmOnednn::ensure_pipeline_(int panel_tile_count) {
         cl_command_queue_properties props = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
         if (profile_scan_enabled())
             props |= CL_QUEUE_PROFILING_ENABLE;
-        pipe_queue_ = clCreateCommandQueue(ocl_.context, ocl_.device, props, &err);
+        pipe_queue_ = OpenClContext::create_queue(ocl_.context, ocl_.device, props, &err);
         if (!pipe_queue_ || err != CL_SUCCESS) {
             pipe_queue_ = nullptr;
             return false;

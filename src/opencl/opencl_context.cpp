@@ -279,6 +279,50 @@ int OpenClContext::list_devices(int platform_filter) {
     return static_cast<int>(devices.size());
 }
 
+static int g_queue_throttle = 0;   /* 0 no hint, 1 high, 2 med, 3 low (cp_ocl_set_queue_throttle) */
+
+extern "C" void cp_ocl_set_queue_throttle(int level) {
+    g_queue_throttle = level;
+}
+
+#ifndef CL_VERSION_2_0
+/* OpenCL 2.0 entry point (exported by the ICD loader); the 1.2 headers do not declare it. */
+extern "C" CL_API_ENTRY cl_command_queue CL_API_CALL clCreateCommandQueueWithProperties(
+        cl_context, cl_device_id, const cl_ulong *, cl_int *);
+#endif
+
+cl_command_queue OpenClContext::create_queue(cl_context context, cl_device_id device,
+                                             cl_command_queue_properties props, cl_int *err) {
+    if (g_queue_throttle >= 1 && g_queue_throttle <= 3) {
+        size_t len = 0;
+        std::string ext;
+        if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &len) == CL_SUCCESS && len > 0) {
+            ext.resize(len);
+            if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, len, &ext[0], nullptr) != CL_SUCCESS) {
+                ext.clear();
+            }
+        }
+        if (ext.find("cl_khr_throttle_hints") != std::string::npos) {
+            /* CL_QUEUE_THROTTLE_KHR (0x1097): HIGH 1 << 0, MED 1 << 1, LOW 1 << 2. */
+            const cl_ulong level = 1u << (g_queue_throttle - 1);
+            const cl_ulong qp[] = {CL_QUEUE_PROPERTIES, props, 0x1097, level, 0};
+            cl_int e = CL_SUCCESS;
+            cl_command_queue q = clCreateCommandQueueWithProperties(context, device, qp, &e);
+            if (q && e == CL_SUCCESS) {
+                if (err) *err = CL_SUCCESS;
+                return q;
+            }
+            std::fprintf(stderr, "[ocl] queue throttle hint rejected (%d); using a plain queue\n", e);
+        }
+    }
+#ifdef CL_VERSION_2_0
+    const cl_queue_properties plain[] = {CL_QUEUE_PROPERTIES, props, 0};
+    return clCreateCommandQueueWithProperties(context, device, plain, err);
+#else
+    return clCreateCommandQueue(context, device, props, err);
+#endif
+}
+
 bool OpenClContext::init(const OclDeviceInfo &pick) {
     platform = pick.platform;
     device = pick.device;
@@ -310,12 +354,7 @@ bool OpenClContext::init(const OclDeviceInfo &pick) {
     const char *prof_env = std::getenv("CP_OCL_QUEUE_PROFILING");
     const bool profiling = prof_env && prof_env[0] && prof_env[0] != '0';
     const cl_command_queue_properties qprops = profiling ? CL_QUEUE_PROFILING_ENABLE : 0;
-#ifdef CL_VERSION_2_0
-    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, qprops, 0};
-    queue = clCreateCommandQueueWithProperties(context, device, props, &err);
-#else
-    queue = clCreateCommandQueue(context, device, qprops, &err);
-#endif
+    queue = create_queue(context, device, qprops, &err);
     if (!queue || err != CL_SUCCESS) {
         log_cl_error("clCreateCommandQueue", err);
         return false;

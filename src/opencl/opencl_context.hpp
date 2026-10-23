@@ -96,6 +96,13 @@ struct OpenClContext {
 
     static std::string error_string(cl_int err);
 
+    /* Command queue with the cl_khr_throttle_hints level set by cp_ocl_set_queue_throttle (LOW:
+       Intel's runtime then sleeps in clFinish / clWaitForEvents / blocking reads instead of spinning
+       a CPU core) when the device advertises the extension; otherwise, or if the driver rejects the
+       hint, a plain queue. */
+    static cl_command_queue create_queue(cl_context context, cl_device_id device,
+                                         cl_command_queue_properties props, cl_int *err);
+
 private:
     static void dump_program_binary_(cl_program prog);
     bool stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const;

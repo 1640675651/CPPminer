@@ -166,6 +166,11 @@ static void print_usage(void)
     printf("  --row-period-batch N, --batch-size N  oneDNN panel in hash tiles (default: 8192x8192\n");
     printf("                       GEMM per panel on dp4a GPUs, 2048/4096 tiles on XMX GPUs)\n");
 #endif
+#if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
+    printf("  --ocl-throttle L     OpenCL queue throttle hint: low, med, high, or off. low makes\n");
+    printf("                       Intel's driver sleep while waiting for the GPU instead of\n");
+    printf("                       spinning a core (default low on onednn, off on opencl)\n");
+#endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
@@ -512,6 +517,7 @@ int main(int argc, char** argv)
     int ocl_cpm_type = 0; /* Case32OclCpmType: 0=auto, 1=float, 2=int, 3=mad24 */
     int ocl_lds = 0;
     int ocl_double_buff = 0;
+    int ocl_throttle = -1; /* cl_khr_throttle_hints: -1 = per backend, 0 = off, 1 = high, 2 = med, 3 = low */
     int wgpu_lds = -1;
     int wgpu_tile_mr = 0;
     int wgpu_tile_nr = 0;
@@ -687,6 +693,26 @@ int main(int argc, char** argv)
             } else {
                 fprintf(stderr,
                         "invalid --ocl-cpm-type %s (expected auto, float, int, or mad24)\n", v);
+                return 1;
+            }
+        } else if(!strncmp(argv[i], "--ocl-throttle", 14)){
+            const char* v = argv[i] + 14;
+            if(*v == '=') v++;
+            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
+            else {
+                fprintf(stderr, "--ocl-throttle requires low, med, high, or off\n");
+                return 1;
+            }
+            if(!strcmp(v, "low")){
+                ocl_throttle = 3;
+            } else if(!strcmp(v, "med") || !strcmp(v, "medium")){
+                ocl_throttle = 2;
+            } else if(!strcmp(v, "high")){
+                ocl_throttle = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "none")){
+                ocl_throttle = 0;
+            } else {
+                fprintf(stderr, "invalid --ocl-throttle %s (expected low, med, high, or off)\n", v);
                 return 1;
             }
         } else if(!strncmp(argv[i], "--ocl-lds", 9)){
@@ -1154,6 +1180,14 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_lds(1);
     if(ocl_double_buff)
         cp_worker_set_ocl_double_buff(1);
+#endif
+#if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
+    /* Default: low on oneDNN (panels of tens to hundreds of ms; Intel's driver then sleeps instead of
+     * spinning a core, hashrate within 0.6%). Off on the OpenCL backend: its ~5 ms launches lost 3.6%
+     * on the A770 to the wake-up latency. */
+    if(ocl_throttle < 0)
+        ocl_throttle = (cp_worker_backend_id() == CP_BACKEND_ONEDNN) ? 3 : 0;
+    cp_ocl_set_queue_throttle(ocl_throttle);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(wgpu_lds >= 0)
