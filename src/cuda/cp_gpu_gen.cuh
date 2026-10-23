@@ -75,6 +75,16 @@ __device__ __forceinline__ uint64_t cp_splitmix64(uint64_t x){
     return x ^ (x >> 31);
 }
 
+__device__ __forceinline__ int8_t cp_random_matrix_elem(
+    unsigned long long rng_seed, int matrix_tag, int idx)
+{
+    uint64_t s = rng_seed
+               ^ ((uint64_t)matrix_tag * 0xD1B54A32D192ED03ULL)
+               ^ (uint64_t)idx * 0x9E3779B97F4A7C15ULL;
+    s = cp_splitmix64(s);
+    return (int8_t)((int)((s >> 32) % 128u) - 64);
+}
+
 /* Fill int8 matrix with arbitrary random values in [-64, 63] (same range as pearl_generate_ab). */
 __global__ void cp_gen_random_matrix_kernel(
     unsigned long long rng_seed, int matrix_tag,
@@ -82,11 +92,17 @@ __global__ void cp_gen_random_matrix_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= total_elems) return;
-    uint64_t s = rng_seed
-               ^ ((uint64_t)matrix_tag * 0xD1B54A32D192ED03ULL)
-               ^ (uint64_t)idx * 0x9E3779B97F4A7C15ULL;
-    s = cp_splitmix64(s);
-    out[idx] = (int8_t)((int)((s >> 32) % 128u) - 64);
+    out[idx] = cp_random_matrix_elem(rng_seed, matrix_tag, idx);
+}
+
+/* Elements [first, first + count) of cp_gen_random_matrix_kernel's matrix (one-row update). */
+__global__ void cp_gen_random_range_kernel(
+    unsigned long long rng_seed, int matrix_tag,
+    int first, int count, int8_t* out)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= count) return;
+    out[first + i] = cp_random_matrix_elem(rng_seed, matrix_tag, first + i);
 }
 __global__ void cp_keyed_chunk_cv_kernel(
     const uint8_t* mat, size_t raw_len, size_t pad_len,

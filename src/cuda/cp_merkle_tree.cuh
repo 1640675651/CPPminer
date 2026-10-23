@@ -150,15 +150,17 @@ __device__ __forceinline__ void d_mt_store_root_words(
     d_b3_store32(roots_out + (size_t)root_index * D_B3_OUT + (size_t)tid * 4, w);
 }
 
-/* Stage 1: keyed chunk CVs + per-block Merkle fold → sub-roots in roots_out. */
+/* Stage 1: keyed chunk CVs + per-block Merkle fold → sub-roots in roots_out.
+ * block_offset: launch a subset of the sub-roots (blocks block_offset.. of the full grid). */
 __global__ void cp_keyed_chunk_roots_kernel(
     const uint8_t* mat, size_t raw_len, size_t pad_len,
-    const uint8_t job_key[32], uint8_t* roots_out, int num_chunks)
+    const uint8_t job_key[32], uint8_t* roots_out, int num_chunks,
+    int block_offset = 0)
 {
     extern __shared__ uint32_t smem_leaves[];
     const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
-    const int num_grid_blocks = gridDim.x;
+    const int bid = blockIdx.x + block_offset;
+    const int num_grid_blocks = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
     const bool is_last_block = (bid == num_grid_blocks - 1);
     const int global_chunk = bid * CP_MT_THREADS + tid;
 

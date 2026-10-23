@@ -65,6 +65,11 @@ typedef struct {
     /* Signal-A sub-roots of the current attempt, kept for share proofs. */
     uint8_t*  d_a_subroots;
     size_t    a_subroots_cap;
+    /* One-row update: d_A_sig holds a persisting m-row signal (a_sig_m, 0 = none), and
+     * d_a_subroots its commitment under a_sub_key while a_sub_valid. */
+    int       a_sig_m;
+    int       a_sub_valid;
+    uint8_t   a_sub_key[32];
     uint8_t*  d_seed_a;
     uint8_t*  d_seed_b;
     uint8_t*  d_job_key;
@@ -92,6 +97,45 @@ static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 0; /* Case 10 default; main sets 1 for cuBLAS period */
 /* Cert V3: bind Merkle roots with m/n before noise-seed chain. Set by begin_job. */
 static int g_salted = 1;
+
+/* CP_CUDA_PREP_ROWPOKE=0: regenerate and rehash the whole signal A every nonce instead of
+ * replacing one random row and rehashing its Merkle group (same scheme as the OpenCL prep). */
+static int gpu_prep_rowpoke_enabled(void)
+{
+    static int on = -1;
+    if(on < 0){
+        const char* v = getenv("CP_CUDA_PREP_ROWPOKE");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* CP_CUDA_PREP_CHECK=1: check the regenerated row against the host formula and the incremental
+ * commitment against a full rehash, every nonce. */
+static int gpu_prep_check_enabled(void)
+{
+    static int on = -1;
+    if(on < 0){
+        const char* v = getenv("CP_CUDA_PREP_CHECK");
+        on = v && v[0] == '1';
+    }
+    return on;
+}
+
+/* Something other than gpu_prepare_attempt_a wrote d_A_sig: the next attempt regenerates it. */
+static void gpu_a_sig_invalidate(GpuCtx* g)
+{
+    g->a_sig_m = 0;
+    g->a_sub_valid = 0;
+}
+
+static inline uint64_t gpu_host_splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
 
 /* Zero-B job cache: signal B^T = 0; noisy B fixed for the job. */
 static struct {
@@ -418,6 +462,7 @@ void cp_gpu_shutdown(void)
         if(g->d_a_subroots) cudaFree(g->d_a_subroots);
         g->d_a_subroots = nullptr;
         g->a_subroots_cap = 0;
+        gpu_a_sig_invalidate(g);
         if(g->d_seed_a) cudaFree(g->d_seed_a);
         if(g->d_seed_b) cudaFree(g->d_seed_b);
         if(g->d_job_key) cudaFree(g->d_job_key);
@@ -600,6 +645,7 @@ static void gpu_upload_rowmajor_noisy(
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
     ensure_bt_sig(g, szBpT);
+    gpu_a_sig_invalidate(g);
     CU_CHECK(cudaMemcpy(g->d_A_sig, h_a, szAp, cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemcpy(g->d_Bt_sig, h_b, szBpT, cudaMemcpyHostToDevice));
     if(g_step_major_ap){
@@ -848,6 +894,28 @@ static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
                                     nullptr, cudaMemcpyDeviceToDevice, nullptr);
 }
 
+/* Signal A changed only inside sub-root group `group` (CP_MT_THREADS chunks): recompute that
+ * sub-root into d_a_subroots and reduce a copy of all sub-roots to the root. */
+static int gpu_rehash_a_group(GpuCtx* g, size_t raw_len, size_t pad_len,
+                              const uint8_t job_key[32], int group, uint8_t out[32])
+{
+    const int num_chunks = (int)(pad_len / 1024);
+    const int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
+    if(num_chunks <= 1 || group < 0 || group >= num_subroots) return -1;
+    CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
+    cp_keyed_chunk_roots_kernel<<<1, CP_MT_THREADS, CP_MT_SMEM_BYTES>>>(
+        (const uint8_t*)g->d_A_sig, raw_len, pad_len, g->d_job_key,
+        g->d_a_subroots, num_chunks, group);
+    CU_CHECK(cudaGetLastError());
+    /* The finish pass folds in place: run it on a copy of the stored sub-roots. */
+    CU_CHECK(cudaMemcpy(g->d_merkle_roots, g->d_a_subroots, (size_t)num_subroots * 32,
+                        cudaMemcpyDeviceToDevice));
+    cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots);
+    CU_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    return 0;
+}
+
 static uint64_t cp_gpu_fresh_rng_seed(void)
 {
     uint64_t s = 0;
@@ -879,6 +947,7 @@ static int gpu_prepare_noisy_matrices(
 
     CU_CHECK(cudaSetDevice(g->dev));
     ensure_bt_sig(g, szBpT);
+    gpu_a_sig_invalidate(g);
 
     t_total = cp_now_sec();
 
@@ -1005,24 +1074,82 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
     t_total = cp_now_sec();
     g_attempt_a.valid = 0;
 
+    /* After the first attempt only one random row changes per nonce: the values the full
+     * generator gives that row for this nonce's seed. The rest keeps earlier nonces' rows. */
+    const int incremental = gpu_prep_rowpoke_enabled() && g->a_sig_m == m && m > 0 &&
+                            (K_DIM % 1024) == 0 && pad_a == szAp && pad_a / 1024 > 1;
+    uint32_t row = 0;
     t_step = cp_now_sec();
-    cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
-        rng_seed, 0, total_a, g->d_A_sig);
+    if(!incremental){
+        cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
+            rng_seed, 0, total_a, g->d_A_sig);
+        g->a_sig_m = m;
+        g->a_sub_valid = 0;
+    } else {
+        row = (uint32_t)(gpu_host_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) % (uint64_t)m);
+        cp_gen_random_range_kernel<<<(K_DIM + tpb - 1) / tpb, tpb>>>(
+            rng_seed, 0, (int)row * K_DIM, K_DIM, g->d_A_sig);
+    }
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
-    printf("[gpu-prep] random A gen %.3fs\n", cp_now_sec() - t_step);
+    if(incremental)
+        printf("[gpu-prep] random A row %u %.3fs\n", row, cp_now_sec() - t_step);
+    else
+        printf("[gpu-prep] random A gen %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
+
+    if(incremental && gpu_prep_check_enabled()){
+        /* Compare the GPU row with the host formula of the full generator. */
+        int8_t* got = (int8_t*)malloc(K_DIM);
+        if(!got) return -1;
+        CU_CHECK(cudaMemcpy(got, g->d_A_sig + (size_t)row * K_DIM, K_DIM, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        for(int j = 0; j < K_DIM; j++){
+            const uint64_t idx = (uint64_t)row * K_DIM + (uint64_t)j;
+            const uint64_t sv = gpu_host_splitmix64(rng_seed ^ (idx * 0x9E3779B97F4A7C15ULL));
+            bad += got[j] != (int8_t)((int)((sv >> 32) % 128u) - 64);
+        }
+        free(got);
+        printf("[gpu-prep] GPU row %u check: %s\n", row, bad ? "MISMATCH" : "identical");
+        fflush(stdout);
+        if(bad) return -1;
+    }
 
     if(cp_job_should_cancel()) return -1;
 
     t_step = cp_now_sec();
-    if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, hash_a,
-                                g->d_a_subroots, cudaMemcpyDeviceToDevice,
-                                &g_attempt_a.num_subroots) != 0)
-        return -1;
+    if(!incremental || !g->a_sub_valid || memcmp(g->a_sub_key, job_key, 32) != 0){
+        /* First attempt or new job key (the hash is keyed): commit the whole signal. */
+        g->a_sub_valid = 0;
+        if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, hash_a,
+                                    g->d_a_subroots, cudaMemcpyDeviceToDevice,
+                                    &g_attempt_a.num_subroots) != 0)
+            return -1;
+        if(g_attempt_a.num_subroots > 0){
+            g->a_sub_valid = 1;
+            memcpy(g->a_sub_key, job_key, 32);
+        }
+        printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
+    } else {
+        const int group = (int)(((size_t)row * K_DIM / 1024) / CP_MT_THREADS);
+        if(gpu_rehash_a_group(g, szAp, pad_a, job_key, group, hash_a) != 0)
+            return -1;
+        printf("[gpu-prep] keyed hash A (group %d) %.3fs\n", group, cp_now_sec() - t_step);
+        if(gpu_prep_check_enabled()){
+            /* Full commitment (also refreshes the stored sub-roots) against the incremental root. */
+            uint8_t full[32];
+            int nsub = 0;
+            if(gpu_matrix_keyed_hash_ex(g, g->d_A_sig, szAp, pad_a, job_key, full,
+                                        g->d_a_subroots, cudaMemcpyDeviceToDevice, &nsub) != 0)
+                return -1;
+            const int same = memcmp(full, hash_a, 32) == 0 && nsub == g_attempt_a.num_subroots;
+            printf("[gpu-prep] incremental commitment check (row %u): %s\n", row,
+                   same ? "identical" : "MISMATCH");
+            if(!same) return -1;
+        }
+    }
     memcpy(g_attempt_a.root, hash_a, 32);
     g_attempt_a.valid = 1;
-    printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
     pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, hash_a, (uint32_t)m, g_salted,
@@ -1090,6 +1217,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     GpuCtx* g = &g_gpus[0];
     ensure_buffers(g, m, n);
     ensure_bt_sig(g, szBpT);
+    gpu_a_sig_invalidate(g);
     CU_CHECK(cudaSetDevice(g->dev));
 
     t0 = cp_now_sec();

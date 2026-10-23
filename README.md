@@ -182,7 +182,7 @@ Intel GPU backend (XeLP / Gen12LP or XeHPG). Requires `-Backend OneDnn` at build
 | Flag | Description |
 |------|-------------|
 | `--fused-jackpot` | **Fused path (default):** one gemmstone kernel (IGEMM + fold + BLAKE3 + in-kernel jackpot compare). No `tile_xor` global readback. `--no-fused-jackpot` selects the separate jackpot kernel. |
-| `--onednn-layout NAME` | Device A/B layout: `TN` (default), `TT`, `NT`, `NN`. `T`/`N` = row/column major; C is always N. Env: `CASE5_GEMM_LAYOUT`. Legacy `TNN`/`TTN`/… (3 chars) still accepted. |
+| `--onednn-layout NAME` | Device A/B layout: `TN` (default), `TT`, `NT`, `NN`. `T`/`N` = row/column major; C is always N. Env: `CASE5_GEMM_LAYOUT`. (Deprecated, now debug only) |
 
 **Scan paths**
 
@@ -242,49 +242,50 @@ At the defaults one launch is 4096×4096 = 65536 hash tiles (4×64), about 170 m
 
 ## Performance
 
-Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings.
+Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings. GPUs are tested with stock settings, no clock/power/voltage tuning unless explicitly stated. Power is readed from HWinfo64.
 
 ### NVIDIA GPU (CUDA)
 
-| Device | ISA | Hashrate |
-|--------|-----|----------|
-| GTX 1070 | DP4A | ~9.1 TH/s |
+| Device | ISA | Hashrate | Power (W) |
+|--------|-----|----------|-----------|
+| GTX 1070 | DP4A | 9.1 TH/s | 150 |
 
 ### AMD GPU (OpenCL)
 
-| Device | ISA | Hashrate |
-|--------|-----|----------|
-| Radeon Pro 5500M | DP4A | ~5.0 TH/s |
+| Device | ISA | Hashrate | Power (W) |
+|--------|-----|----------|-----------|
+| Radeon Pro 5500M | DP4A | 5.4 TH/s | 50 |
 
 ### Intel GPU (OneDNN)
 
-| Device | ISA | Layout | Hashrate |
-|--------|-----|--------|----------|
-| UHD 770 | DP4A | TN | ~1.3 TH/s |
-| Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | NT | ~3.0 TH/s |
+| Device | ISA | Hashrate | Power (W) |
+|--------|-----|----------|-----------|
+| UHD 770 | DP4A | 1.4 TH/s | 13 |
+| Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | 3.5 TH/s | 14 |
 
 ### Other GPU (OpenCL)
 | Device | ISA | Tile size | Hashrate |
 |--------|-----|-----------|----------|
-| Intel HD graphics 10EU (Haswell) | Scalar | 4x8 | ~25 GH/s |
-| Intel UHD 630 | Scalar | 4x8 | ~130 GH/s |
-| Mali-G57 MC2 | DP4A | 4x8 | ~100 GH/s |
+| Intel HD graphics 10EU (Haswell) | Scalar | 4x8 | 25 GH/s |
+| Intel UHD 630 | Scalar | 4x8 | 140 GH/s |
+| Mali-G57 MC2 | DP4A | 4x8 | 115 GH/s |
 
 ### Hexagon DSP
 
 | Device | Hashrate |
 |--------|----------|
-| Hexagon 686 (Snapdragon 480, v66, 2x HVX, 940MHz) | ~400 GH/s |
+| Hexagon 686 (Snapdragon 480, v66, 2x HVX, 940MHz) | 400 GH/s |
 
 ### CPU
 
 | Device | ISA | Hashrate | Bzminer v25.0.1b2 baseline |
 |--------|-----|----------| ---------------------------|
-| Celeron G1840 @ 2.8GHz | SSSE3 | ~35 GH/s | ~4 GH/s |
-| Core i9 9980HK @ 2.4GHz | AVX2 | ~440 GH/s | ~300 GH/s |
-| Core i5 12490F @ 4.0GHz | AVX-VNNI | ~1.1 TH/s | ~400 GH/s |
-| Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | ~2.3 TH/s | ~920 GH/s |
-| Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | ~160 GH/s | N/A |
+| Celeron G1840 @ 2.8GHz | SSSE3 | 35 GH/s | 4 GH/s |
+| Core i9 9980HK @ 2.4GHz | AVX2 | 440 GH/s | 300 GH/s |
+| Core i5 12490F @ 4.0GHz | AVX-VNNI | 1.1 TH/s | 400 GH/s |
+| Core i9 12900K 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | 2.3 TH/s | 920 GH/s |
+| BCM2837 4x A53 @ 1.2GHz (rpi3b m=n=32) | NEON | 9 GH/s | N/A |
+| Dimensity 6300 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | 160 GH/s | N/A |
 
 ## Vendored proof stack (`third_party/`)
 

@@ -164,6 +164,14 @@ commitment every nonce and compares roots; `CP_OCL_PREP_ROWPOKE=0` restores full
 Other GPUs gain the same way: the OpenCL backend on the A770 at 65536^2 went from 11 to 4 ms of prep per
 attempt, and on the GTX 1070 at 32768^2 from 9.1 to 2.4 ms.
 
+The CUDA backend (`gpu_prepare_attempt_a`) uses the same scheme: `cp_gen_random_range_kernel` writes the
+row with the full generator's formula, and `cp_keyed_chunk_roots_kernel` got a `block_offset` argument
+to rehash the one subtree into `d_a_subroots`. Anything else that writes `d_A_sig` (host upload, the
+full A/B prep, the alignment test) marks the signal stale, so the next attempt starts over in full.
+GTX 1070 at 131072^2: random A 22 ms -> under 1 ms, commitment 35 ms -> under 1 ms, prep 73 -> 24 ms
+per attempt (the rest is the A noise). `CP_CUDA_PREP_CHECK=1` compares the row with the host formula and
+the incremental root with a full rehash every nonce; `CP_CUDA_PREP_ROWPOKE=0` restores full regeneration.
+
 ### 4. Noisy A written in the systolic (packed) layout
 
 The preferred kernel used to gather A: every load message was 8 lanes reading one dword (4 consecutive
