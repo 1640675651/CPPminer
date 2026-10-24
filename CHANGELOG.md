@@ -27,6 +27,7 @@
 - SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
 - Prepack A and B to reduce data reordering in GEMM
 - Layout parameter is deprecated, packed layout is optimal
+- --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (cause GPU hang sometimes due to buggy intel driver, off by default)
 
 ## v0.5
 ### New features

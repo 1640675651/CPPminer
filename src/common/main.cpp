@@ -169,7 +169,7 @@ static void print_usage(void)
 #if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
     printf("  --ocl-throttle L     OpenCL queue throttle hint: low, med, high, or off. low makes\n");
     printf("                       Intel's driver sleep while waiting for the GPU instead of\n");
-    printf("                       spinning a core (default low on onednn, off on opencl)\n");
+    printf("                       spinning a core, but can stall ~70 s on Arc (default off)\n");
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
@@ -517,7 +517,7 @@ int main(int argc, char** argv)
     int ocl_cpm_type = 0; /* Case32OclCpmType: 0=auto, 1=float, 2=int, 3=mad24 */
     int ocl_lds = 0;
     int ocl_double_buff = 0;
-    int ocl_throttle = -1; /* cl_khr_throttle_hints: -1 = per backend, 0 = off, 1 = high, 2 = med, 3 = low */
+    int ocl_throttle = 0; /* cl_khr_throttle_hints: 0 = off, 1 = high, 2 = med, 3 = low */
     int wgpu_lds = -1;
     int wgpu_tile_mr = 0;
     int wgpu_tile_nr = 0;
@@ -1182,11 +1182,9 @@ int main(int argc, char** argv)
         cp_worker_set_ocl_double_buff(1);
 #endif
 #if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
-    /* Default: low on oneDNN (panels of tens to hundreds of ms; Intel's driver then sleeps instead of
-     * spinning a core, hashrate within 0.6%). Off on the OpenCL backend: its ~5 ms launches lost 3.6%
-     * on the A770 to the wake-up latency. */
-    if(ocl_throttle < 0)
-        ocl_throttle = (cp_worker_backend_id() == CP_BACKEND_ONEDNN) ? 3 : 0;
+    /* Default off on both backends. low saves a CPU core on oneDNN, but the A770 driver's sleeping wait
+     * can miss its wake-up and stall a scan for ~70 s (arc-ocl-stall); on the OpenCL backend it also
+     * cost 3.6% to the wake-up latency. */
     cp_ocl_set_queue_throttle(ocl_throttle);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
