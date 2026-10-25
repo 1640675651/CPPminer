@@ -78,9 +78,9 @@ remain diagnostics: only TN gets the family kernels.
 
 See [docs/prep.md](../../docs/prep.md) for the full write-up, including PR #27.
 
-Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB). The random signal A_sig is generated
-in full once (`ocl_gen_random_matrix16`) and hashed in full once; every later nonce replaces one random
-row (the values the full generator would give that row for the nonce's seed, written from the host) and
+Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB). The random signal A_sig starts as
+zeros (`clEnqueueFillBuffer`) and is hashed in full once; every nonce replaces one random row (the values
+the full generator `ocl_gen_random_matrix16` gives that row for the nonce's seed, run over just that row) and
 updates the BLAKE3 Merkle commitment incrementally: the row's 256-chunk group is rehashed by one work
 group of the same kernel and the stored subroots are reduced again (`CP_OCL_PREP_ROWPOKE=0` restores the
 full regeneration; a new job key triggers one full rehash since the hash is keyed). Then 128 uniform

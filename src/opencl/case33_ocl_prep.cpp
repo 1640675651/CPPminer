@@ -1192,11 +1192,26 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
     const size_t raw_a = static_cast<size_t>(m) * static_cast<size_t>(K);
     const size_t pad_a = (raw_a + 1023) / 1024 * 1024;
     const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
-    const bool incremental = prep_rowpoke_enabled() && a_sig_init_ && a_sig_m_ == m && a_sig_k_ == K &&
-            m > 0 && K > 0 && (K % 1024) == 0 && pad_a == raw_a;
+    const bool incremental = prep_rowpoke_enabled() && m > 0 && K > 0 && (K % 1024) == 0 &&
+            pad_a == raw_a;
     uint8_t root_local[32];
+    bool full_hash = false;
+    if (incremental && (!a_sig_init_ || a_sig_m_ != m || a_sig_k_ != K)) {
+        /* First attempt (or new dimensions): start from a zero signal, then hash it all once. */
+        const cl_char zero = 0;
+        if (clEnqueueFillBuffer(ocl_->queue, d_A_sig_, &zero, sizeof(zero), 0, raw_a, 0, nullptr,
+                                nullptr) != CL_SUCCESS &&
+            !gen_random_a_(rng_seed, m * K)) {
+            return false;
+        }
+        a_sig_init_ = true;
+        a_sig_m_ = m;
+        a_sig_k_ = K;
+        full_hash = true;
+    }
     if (!incremental) {
-        /* First attempt (or new dimensions): the full random signal and its full commitment. */
+        /* Rows not whole chunks, or CP_OCL_PREP_ROWPOKE=0: the full random signal and its full
+           commitment. */
         if (!gen_random_a_(rng_seed, m * K)) {
             return false;
         }
@@ -1214,7 +1229,8 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
     }
 
     /* One random full row, generated on the GPU by the full generator (ocl_gen_random_matrix, tag 0)
-       over just that row (global work offset); the rest of the signal keeps earlier nonces' rows. */
+       over just that row (global work offset); the rest of the signal keeps earlier nonces' rows,
+       zero until written. */
     const uint32_t row = static_cast<uint32_t>(prep_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) %
                                                static_cast<uint64_t>(m));
     {
@@ -1263,8 +1279,8 @@ bool Case33OclPrep::update_signal_a_(const uint8_t *ab_seed, int ab_seed_len,
 
     /* The root stays on the device (d_merkle_roots_[0..31]) unless hash_a asks for a copy. */
     uint8_t *root_out = hash_a ? hash_a : (prep_check_enabled() ? root_local : nullptr);
-    if (!a_witness_valid_ || memcmp(a_hash_key_, job_key, 32) != 0) {
-        /* New job key: every subroot changes, so hash the whole (persisting) signal once. */
+    if (full_hash || !a_witness_valid_ || memcmp(a_hash_key_, job_key, 32) != 0) {
+        /* First attempt or new job key (every subroot changes): hash the whole signal once. */
         if (!hash_signal_a_(raw_a, pad_a, job_key, root_out ? root_out : root_local)) {
             return false;
         }

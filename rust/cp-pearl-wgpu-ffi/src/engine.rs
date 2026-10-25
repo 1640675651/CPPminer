@@ -449,8 +449,8 @@ struct JobBuffers {
     a_num_subroots: i32,
     a_root: [u8; 32],
     a_witness_valid: bool,
-    /// a_sig holds a whole generated signal, so a nonce may replace just one row.
-    a_sig_full: bool,
+    /// a_sig has been zeroed (or filled), so a nonce may replace just one row.
+    a_sig_ready: bool,
     /// a_subroots are the sub-roots of a_sig under this job key (incremental commitment).
     a_sub_key: Option<[u8; 32]>,
     a_key8: wgpu::Buffer,
@@ -806,7 +806,7 @@ impl PearlEngine {
             a_num_subroots: 0,
             a_root: [0u8; 32],
             a_witness_valid: false,
-            a_sig_full: false,
+            a_sig_ready: false,
             a_sub_key: None,
             a_key8: Self::mk_storage(device, 32, "a_key8", wgpu::BufferUsages::empty()),
             bound: Self::mk_storage(device, 32, "bound", wgpu::BufferUsages::empty()),
@@ -1083,25 +1083,31 @@ impl PearlEngine {
         job_key: &[u8; 32],
         hash_a_out: &mut [u8; 32],
     ) -> Result<(), String> {
-        let (m, k, a_sig_full, sub_key_matches) = {
+        let (m, k, a_sig_ready, sub_key_matches) = {
             let job = self.job.as_ref().ok_or("begin_job not called")?;
-            (job.m, job.k, job.a_sig_full, job.a_sub_key.as_ref() == Some(job_key))
+            (job.m, job.k, job.a_sig_ready, job.a_sub_key.as_ref() == Some(job_key))
         };
         let total = m * k;
         let rng = seed_to_u64(ab_seed);
         let raw_len = (m as u64) * (k as u64);
 
-        // After the first attempt only one random row changes per nonce: the values the full
-        // generator gives that row for this nonce's seed. The rest keeps earlier nonces' rows.
+        // Only one random row changes per nonce: the values the full generator gives that row for
+        // this nonce's seed. The rest keeps earlier nonces' rows, zero until written.
         // A row must be whole words and lie inside one 256-chunk Merkle group.
         let incremental = prep_rowpoke_enabled()
-            && a_sig_full
             && raw_len % B3_CHUNK == 0
             && raw_len / B3_CHUNK > 1
             && k % 4 == 0
             && WITNESS_BLOCK_BYTES % (k as u64) == 0;
         let mut row = 0u32;
         if incremental {
+            if !a_sig_ready {
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("clear_a_sig"),
+                });
+                enc.clear_buffer(&self.job.as_ref().unwrap().a_sig, 0, None);
+                self.submit_and_wait(enc)?;
+            }
             row = (splitmix64(rng ^ 0xD1B54A32D192ED03) % m as u64) as u32;
             self.gen_signal_words(rng, total, row * (k as u32 / 4), k as u32 / 4)?;
         } else {
@@ -1120,7 +1126,7 @@ impl PearlEngine {
 
         {
             let job = self.job.as_mut().unwrap();
-            job.a_sig_full = true;
+            job.a_sig_ready = true;
             job.a_witness_valid = false;
         }
         let num_subroots = if incremental && sub_key_matches {

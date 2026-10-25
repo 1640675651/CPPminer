@@ -174,7 +174,7 @@ private:
     int a_num_subroots_ = 0;
     uint8_t a_root_[32] = {};
     bool a_witness_valid_ = false;
-    bool a_sig_init_ = false;     // d_A_sig_ holds a fully generated signal (row updates build on it)
+    bool a_sig_init_ = false;     // d_A_sig_ was zeroed for row updates (each nonce writes one row)
     int a_sig_m_ = 0;
     int a_sig_k_ = 0;
     uint8_t a_hash_key_[32] = {}; // job key the stored subroots were hashed with

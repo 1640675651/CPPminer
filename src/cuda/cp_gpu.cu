@@ -65,7 +65,8 @@ typedef struct {
     /* Signal-A sub-roots of the current attempt, kept for share proofs. */
     uint8_t*  d_a_subroots;
     size_t    a_subroots_cap;
-    /* One-row update: d_A_sig holds a persisting m-row signal (a_sig_m, 0 = none), and
+    /* One-row update: d_A_sig holds a persisting m-row signal, zeroed when first used (a_sig_m,
+     * 0 = none), and
      * d_a_subroots its commitment under a_sub_key while a_sub_valid. */
     int       a_sig_m;
     int       a_sub_valid;
@@ -127,7 +128,7 @@ static int gpu_prep_check_enabled(void)
     return on;
 }
 
-/* Something other than gpu_prepare_attempt_a wrote d_A_sig: the next attempt regenerates it. */
+/* Something other than gpu_prepare_attempt_a wrote d_A_sig: the next attempt zeroes it again. */
 static void gpu_a_sig_invalidate(GpuCtx* g)
 {
     g->a_sig_m = 0;
@@ -1146,9 +1147,9 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
     t_total = cp_now_sec();
     g_attempt_a.valid = 0;
 
-    /* After the first attempt only one random row changes per nonce: the values the full
-     * generator gives that row for this nonce's seed. The rest keeps earlier nonces' rows. */
-    const int incremental = gpu_prep_rowpoke_enabled() && g->a_sig_m == m && m > 0 &&
+    /* Only one random row changes per nonce: the values the full generator gives that row for
+     * this nonce's seed. The rest keeps earlier nonces' rows, zero until written. */
+    const int incremental = gpu_prep_rowpoke_enabled() && m > 0 &&
                             (K_DIM % 1024) == 0 && pad_a == szAp && pad_a / 1024 > 1;
     uint32_t row = 0;
     t_step = cp_now_sec();
@@ -1158,6 +1159,11 @@ static int gpu_prepare_attempt_a(GpuCtx* g, uint64_t rng_seed, const uint8_t job
         g->a_sig_m = m;
         g->a_sub_valid = 0;
     } else {
+        if(g->a_sig_m != m){
+            CU_CHECK(cudaMemset(g->d_A_sig, 0, szAp));
+            g->a_sig_m = m;
+            g->a_sub_valid = 0;
+        }
         row = (uint32_t)(gpu_host_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) % (uint64_t)m);
         cp_gen_random_range_kernel<<<(K_DIM + tpb - 1) / tpb, tpb>>>(
             rng_seed, 0, (int)row * K_DIM, K_DIM, g->d_A_sig);

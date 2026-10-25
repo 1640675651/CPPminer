@@ -155,8 +155,9 @@ random row is the better unit:
   `group_base` argument and rehashes the one affected subtree into the stored subroots (the same
   buffer the witness path keeps); the stored subroots are copied and reduced to the new root.
 
-A_sig is generated and hashed in full on the first attempt, after a dimension change, and on a new job
-key (the hash is keyed). Afterwards the host derives the row index from the nonce's seed and the full
+A_sig is zeroed (`clEnqueueFillBuffer`) on the first attempt and after a dimension change, and hashed in
+full then and on a new job key (the hash is keyed). Until 2026-10-25 it was generated in full instead;
+the zero rows are as valid a signal and fill in as nonces write them. Every nonce the host derives the row index from the nonce's seed and the full
 generator kernel runs over just that row (global work offset row * K / 16, K / 16 work items), so the
 values are the ones the full generation would give. (Until 2026-10-20 the host computed the row and
 wrote 4 KiB; see section 6.) Signal 4.3 -> 0.2 ms,
@@ -169,7 +170,8 @@ attempt, and on the GTX 1070 at 32768^2 from 9.1 to 2.4 ms.
 The CUDA backend (`gpu_prepare_attempt_a`) uses the same scheme: `cp_gen_random_range_kernel` writes the
 row with the full generator's formula, and `cp_keyed_chunk_roots_kernel` got a `block_offset` argument
 to rehash the one subtree into `d_a_subroots`. Anything else that writes `d_A_sig` (host upload, the
-full A/B prep, the alignment test) marks the signal stale, so the next attempt starts over in full.
+full A/B prep, the alignment test) marks the signal stale, so the next attempt zeroes it again
+(`cudaMemset`) and hashes it in full.
 GTX 1070 at 131072^2: random A 22 ms -> under 1 ms, commitment 35 ms -> under 1 ms, prep 73 -> 24 ms
 per attempt (the rest is the A noise). `CP_CUDA_PREP_CHECK=1` compares the row with the host formula and
 the incremental root with a full rehash every nonce; `CP_CUDA_PREP_ROWPOKE=0` restores full regeneration.
@@ -184,14 +186,15 @@ The wgpu backend (`PearlEngine::prep_a_signal` in `rust/cp-pearl-wgpu-ffi`) does
 existing kernels: `pearl_gen_random_matrix` regenerates the row's 1,024 words (its parameters gained a
 `word_end`, so a dispatch never writes past its binding), and `pearl_keyed_chunk_roots` runs one work
 group with `bid_begin` = the row's group, writing straight into `a_subroots`; a copy of those is reduced
-to the root. A new job key, or a change of dimensions, commits the whole signal again. GTX 1070 (Vulkan)
+to the root. `a_sig` is cleared once when the job buffers are created; the first attempt, a new job key
+or a change of dimensions commits the whole signal again. GTX 1070 (Vulkan)
 at 131072^2: prep 145 -> 50 ms per attempt. `CP_WGPU_PREP_CHECK=1` compares the row with the host
 formula and the incremental root with a full rehash every nonce; `CP_WGPU_PREP_ROWPOKE=0` restores full
 regeneration. The noise seed is still derived on the host (one 32-byte root read per attempt).
 
 The CPU worker (`zero_b_prepare_attempt` in `src/cpu/cp_cpu_worker.cpp`) rewrites one row per nonce
-with `pearl_fill_random_a_row` (same row choice and values as the GPU kernels), but skips the full fill:
-A starts as the zeroed launch buffer and fills in as rows are written. The commitment uses the
+with `pearl_fill_random_a_row` (same row choice and values as the GPU kernels); like the GPUs, A starts
+as the zeroed launch buffer and fills in as rows are written. The commitment uses the
 incremental `PearlMatrixHash`, which rehashes the row's 4 chunks and their tree ancestors; the first
 nonce, a new job key or another buffer hashes everything. 131072^2 on an i9-12900K: prep 1.3 s (full
 regeneration) -> 0.12 s per attempt, against a 46 s scan; the old per-column writes changed chunks all
