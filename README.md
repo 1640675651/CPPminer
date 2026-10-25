@@ -140,7 +140,7 @@ cppminer --backend opencl --devices 0 --mock
 | `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |
 | `--max-nonce N` | Stop after N attempts per job |
-| `--dry-run` | Build proof without submitting |
+| `--dry-run` | Build proof without submitting; saves `pp_header.bin` / `pp_proof.b64` next to the executable (a normal run writes nothing to disk) |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
 | `--mock` / `-mock` | Offline: fixed job, mine until first share, verify, exit (implies dry-run). Pearl: zk-pow verify; Quantus: Poseidon2 `hash < target` |
 | `--mock-diff D` | Mock difficulty (higher = longer). Defaults: Pearl **44** (unscaled target 2^(256-D)); Quantus **1000000** (`U512::MAX / D`). `--mock-diff` overrides for either. |

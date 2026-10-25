@@ -46,74 +46,31 @@ struct ShareSnapshot {
     CpShareWitness *witness = nullptr;
 };
 
-static int verify_proof_file(const char *hdr_path, const char *target_hex, const char *proof_path,
-                             uint32_t cert_version) {
-    uint8_t header[INCOMPLETE_HEADER_BYTES];
+/* Verify from memory: the header the share was mined with and the proof just built. (Reading them
+ * back from pp_header.bin / pp_proof.b64 raced with other miners sharing the working directory.) */
+static int verify_proof(const uint8_t *header, int header_len, const char *target_hex,
+                        const char *b64, size_t b64_len, uint32_t cert_version) {
     uint8_t target_be[32];
     char errbuf[4096];
-    char *b64 = nullptr;
-    size_t cap = 0;
-    size_t n = 0;
-    FILE *pf = nullptr;
 
     if (!target_hex || !target_hex[0]) {
         return -1;
     }
-
-    FILE *hf = fopen(hdr_path, "rb");
-    if (!hf) {
-        perror("verify: header open");
-        return -1;
-    }
-    if (fread(header, 1, sizeof(header), hf) != sizeof(header)) {
+    if (header_len != INCOMPLETE_HEADER_BYTES) {
         fprintf(stderr, "verify: header must be %d bytes\n", INCOMPLETE_HEADER_BYTES);
-        fclose(hf);
         return -1;
     }
-    fclose(hf);
-
     if (cp_hex_to_bytes(target_hex, target_be, 32) != 32) {
         fprintf(stderr, "verify: invalid target hex\n");
         return -1;
     }
 
-    pf = fopen(proof_path, "rb");
-    if (!pf) {
-        perror("verify: proof open");
-        return -1;
-    }
-    fseek(pf, 0, SEEK_END);
-    const long fsz = ftell(pf);
-    fseek(pf, 0, SEEK_SET);
-    if (fsz <= 0 || fsz > (long)PLAIN_PROOF_B64_MAX) {
-        fprintf(stderr, "verify: invalid proof size %ld\n", fsz);
-        fclose(pf);
-        return -1;
-    }
-    cap = (size_t)fsz + 1;
-    b64 = (char *)malloc(cap);
-    if (!b64) {
-        fclose(pf);
-        return -1;
-    }
-    n = fread(b64, 1, (size_t)fsz, pf);
-    fclose(pf);
-    if (n != (size_t)fsz) {
-        free(b64);
-        return -1;
-    }
-    while (n > 0 && (b64[n - 1] == '\n' || b64[n - 1] == '\r')) {
-        b64[--n] = 0;
-    }
-
     errbuf[0] = 0;
-    if (cp_proof_verify(header, sizeof(header), (const uint8_t *)b64, n, target_be, cert_version,
-                        errbuf, sizeof(errbuf)) != 0) {
+    if (cp_proof_verify(header, (size_t)header_len, (const uint8_t *)b64, b64_len, target_be,
+                        cert_version, errbuf, sizeof(errbuf)) != 0) {
         fprintf(stderr, "verify FAIL: %s\n", errbuf[0] ? errbuf : "unknown");
-        free(b64);
         return -1;
     }
-    free(b64);
     return 0;
 }
 
@@ -292,11 +249,12 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         return;
     }
 
-    if (g_dry_run || g_plain_verify) {
-        FILE *pf = fopen(job_ctx.proof_path, "wb");
-        if (pf) {
-            fwrite(b64, 1, (size_t)bn, pf);
-            fclose(pf);
+    /* Only --dry-run (and --mock) keeps the proof and its header on disk; a real run writes nothing. */
+    if (g_dry_run) {
+        if (!cp_write_file_bin(job_ctx.hdr_path, snap->header, (size_t)snap->header_len) ||
+            !cp_write_file_bin(job_ctx.proof_path, b64, (size_t)bn)) {
+            fprintf(stderr, "[plain] dry-run: could not save %s / %s\n", job_ctx.hdr_path,
+                    job_ctx.proof_path);
         }
     }
 
@@ -314,8 +272,8 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     double proof_verify_sec = 0.0;
     if (g_plain_verify && snap->target_hex[0]) {
         const double verify_started = cp_now_sec();
-        if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path,
-                              job_ctx.cert_version) != 0) {
+        if (verify_proof(snap->header, snap->header_len, snap->target_hex, b64, (size_t)bn,
+                         job_ctx.cert_version) != 0) {
             printf("[plain] verify failed (nonce=%llu cert_version=%u)\n",
                    (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
             fflush(stdout);

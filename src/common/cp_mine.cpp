@@ -122,15 +122,6 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     int share_witness = 0;
 
     {
-        FILE *hf = fopen(hdr_path, "wb");
-        if (!hf) {
-            perror("header tmp");
-            rc = CP_JOB_NONE;
-            goto job_done;
-        }
-        fwrite(header, 1, (size_t)hlen, hf);
-        fclose(hf);
-
         host_matrices = (g_cpu_matrix_gen || cp_worker_prefers_host_matrices()) &&
                         !cp_worker_worker_handles_matrix_prep();
         if (host_matrices) {

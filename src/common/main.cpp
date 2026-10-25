@@ -175,7 +175,8 @@ static void print_usage(void)
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
     printf("  --max-nonce N        stop after N matrix attempts per job\n");
-    printf("  --dry-run            build proof but do not submit\n");
+    printf("  --dry-run            build proof but do not submit; saves pp_header.bin and\n");
+    printf("                       pp_proof.b64 next to the executable (nothing else is written)\n");
     printf("  --verify             run in-process zk-pow verify before submit\n");
     printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
     printf("                       default 3; without this flag, pool notify cert_version wins)\n");

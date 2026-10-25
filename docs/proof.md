@@ -317,6 +317,10 @@ The pool already holds `header` from `mining.notify`. It parses the proof, recon
 ### Local verify (`--verify`)
 
 `cp_proof_verify` checks jackpot against a **pool target** (32-byte BE U256) using zk-pow, with the same header and proof blob. Optional pre-submit check in the miner when `--verify` is enabled.
+The miner verifies from memory (the share's header snapshot and the proof just built) and writes nothing
+to disk; only `--dry-run` (and `--mock`) saves `pp_header.bin` / `pp_proof.b64` next to the executable.
+Until 2026-10-25 the header was written there every job and `--verify` read both files back, so two
+miners started from the same directory could verify against each other's header ("Hash A mismatch").
 
 ---
 
