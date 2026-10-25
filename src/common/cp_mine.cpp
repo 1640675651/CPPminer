@@ -19,8 +19,9 @@ void cp_mine_init_host_buffers(void)
 {
     size_t szAp = (size_t)g_m_active * K_DIM;
     size_t szBpT = (size_t)g_n_active * K_DIM;
-    /* Zero once at launch: OpenCL/oneDNN/wgpu zero-B keep B^T as committed zeros; CPU sparse A
-     * pokes assume the rest of A stays in [-64, 63]. Do not re-zero per job/attempt.
+    /* Zero once at launch: OpenCL/oneDNN/wgpu zero-B keep B^T as committed zeros; the CPU's
+     * one-row and Hexagon's per-column A writes assume the rest of A stays in [-64, 63].
+     * Do not re-zero per job/attempt.
      * Share-witness backends prove from device sub-roots and need neither buffer; CPU proves
      * its all-zero B^T without one. */
     if (!cp_worker_supports_share_witness()) {

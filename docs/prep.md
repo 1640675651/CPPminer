@@ -143,8 +143,10 @@ prep kernels for experiments: `NSG_KPL` (4 or 16 bytes per item), `NSG_UNROLL` (
 ### 3. One random row per nonce and an incremental commitment
 
 The signal does not have to be regenerated in full per nonce: the share commits to whatever A_sig was
-used, and the noise rebuilt from the new root changes every element of A anyway. The CPU worker writes
-one random value per column into a zero matrix. For the GPU a full random row is the better unit:
+used, and the noise rebuilt from the new root changes every element of A anyway. The CPU worker used to
+write one random value per column into a zero matrix (the Hexagon worker still does; the CPU now writes
+one row into it). For the GPU a full
+random row is the better unit:
 
 - A row is 4 KiB contiguous: four consecutive 1 KiB Merkle chunks, inside one 256-chunk subtree. Per-column
   writes touch about 1,900 of the 2,048 subtrees, which would need a stored hash per chunk to avoid
@@ -186,6 +188,16 @@ to the root. A new job key, or a change of dimensions, commits the whole signal 
 at 131072^2: prep 145 -> 50 ms per attempt. `CP_WGPU_PREP_CHECK=1` compares the row with the host
 formula and the incremental root with a full rehash every nonce; `CP_WGPU_PREP_ROWPOKE=0` restores full
 regeneration. The noise seed is still derived on the host (one 32-byte root read per attempt).
+
+The CPU worker (`zero_b_prepare_attempt` in `src/cpu/cp_cpu_worker.cpp`) rewrites one row per nonce
+with `pearl_fill_random_a_row` (same row choice and values as the GPU kernels), but skips the full fill:
+A starts as the zeroed launch buffer and fills in as rows are written. The commitment uses the
+incremental `PearlMatrixHash`, which rehashes the row's 4 chunks and their tree ancestors; the first
+nonce, a new job key or another buffer hashes everything. 131072^2 on an i9-12900K: prep 1.3 s (full
+regeneration) -> 0.12 s per attempt, against a 46 s scan; the old per-column writes changed chunks all
+over A and rehashed the whole matrix every nonce.
+`CP_CPU_PREP_CHECK=1` compares the incremental root with a full rehash every nonce;
+`CP_CPU_PREP_ROWPOKE=0` restores full regeneration.
 
 ### 4. Noisy A written in the systolic (packed) layout
 

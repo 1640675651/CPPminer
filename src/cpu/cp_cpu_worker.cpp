@@ -42,6 +42,35 @@ static Case33Isa g_isa_pref = Case33Isa::Auto;
 static Case33SseTile g_sse_tile = Case33SseTile::R4C8;
 static CpPrepackMode g_prepack_mode = CP_PREPACK_FUSED;
 
+/* Signal A: the buffer the incremental keyed Merkle hash was built over (each nonce rewrites one
+ * row of it) and that hash. */
+static const int8_t* g_a_sig_hashed = NULL;
+static int g_a_sig_m = 0;
+static PearlMatrixHash* g_a_hash = NULL;
+
+/* CP_CPU_PREP_ROWPOKE=0: regenerate and rehash the whole signal A every nonce instead of
+ * replacing one random row and rehashing its chunks (same scheme as the GPU backends). */
+static int prep_rowpoke_enabled(void)
+{
+    static int on = -1;
+    if(on < 0){
+        const char* v = getenv("CP_CPU_PREP_ROWPOKE");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* CP_CPU_PREP_CHECK=1: compare the incremental commitment with a full rehash every nonce. */
+static int prep_check_enabled(void)
+{
+    static int on = -1;
+    if(on < 0){
+        const char* v = getenv("CP_CPU_PREP_CHECK");
+        on = v && v[0] == '1';
+    }
+    return on;
+}
+
 static void apply_prepack_mode_to_gemm(void)
 {
     switch(g_prepack_mode){
@@ -178,13 +207,61 @@ static int zero_b_prepare_attempt(
         return -2;
     }
 
-    /* ~K_DIM writes: random row + value per column; rest of A left as-is. */
-    if(pearl_perturb_random_a_one_per_col(a_rng, (int)sizeof(a_rng), m, K_DIM,
-                                          h_A_sig) != 0)
+    /* Only one random row changes per nonce: the values the full generator gives that row for
+     * this nonce's seed. The rest keeps earlier nonces' rows (zero from launch until written). */
+    const int log_step = (m >= 65536) ? 1 : 0;
+    const double t_sig = cp_now_sec();
+    const int rowpoke = prep_rowpoke_enabled();
+    const int incremental = rowpoke && g_a_sig_hashed == h_A_sig && g_a_sig_m == m;
+    int row = -1;
+    g_a_sig_hashed = NULL;
+    if(rowpoke ? pearl_fill_random_a_row(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig, &row) != 0
+               : pearl_generate_random_a(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig) != 0)
         return -1;
+    g_a_sig_hashed = h_A_sig;
+    g_a_sig_m = m;
 
-    pearl_a_noise_seed_from_a(job_key, g_zero_b.b_noise_seed,
-                              h_A_sig, m, K_DIM, g_zero_b.salted, a_key_out);
+    /* Commitment: only the row's chunks and their tree ancestors are hashed again; the first
+     * nonce, a regenerated A, a new job key or another buffer hashes everything. */
+    if(!g_a_hash) g_a_hash = pearl_matrix_hash_create();
+    if(!incremental) pearl_matrix_hash_invalidate(g_a_hash);
+    std::vector<uint64_t> dirty;
+    if(incremental){
+        const uint64_t base = (uint64_t)row * K_DIM;
+        for(uint64_t off = 0; off < (uint64_t)K_DIM; off += 1024)
+            dirty.push_back(base + off);
+        dirty.push_back(base + K_DIM - 1);
+    }
+    uint8_t hash_a[32];
+    size_t rehashed = 0;
+    if(pearl_matrix_hash_digest(g_a_hash, h_A_sig, szA, job_key, dirty.data(), dirty.size(),
+                                hash_a, &rehashed) != 0){
+        fprintf(stderr, "[cpu] incremental hash of signal A failed; hashing it all\n");
+        pearl_matrix_hash_invalidate(g_a_hash);
+        pearl_keyed_digest_int8(h_A_sig, szA, job_key, hash_a);
+        rehashed = szA / 1024;
+    }
+    if(prep_check_enabled()){
+        uint8_t full[32];
+        pearl_keyed_digest_int8(h_A_sig, szA, job_key, full);
+        const int same = memcmp(full, hash_a, 32) == 0;
+        printf("[cpu] commitment check (row %d): incremental %s the full hash\n", row,
+               same ? "matches" : "DIFFERS FROM");
+        if(!same){
+            pearl_matrix_hash_invalidate(g_a_hash);
+            memcpy(hash_a, full, 32);
+        }
+    }
+    if(log_step){
+        if(row >= 0)
+            printf("[gen]   random A row %d + commitment (%zu chunks) %.3fs\n", row, rehashed,
+                   cp_now_sec() - t_sig);
+        else
+            printf("[gen]   random A + commitment (%zu chunks) %.1fs\n", rehashed, cp_now_sec() - t_sig);
+        fflush(stdout);
+    }
+    pearl_a_noise_seed_from_hash(g_zero_b.b_noise_seed, hash_a, (uint32_t)m, g_zero_b.salted,
+                                 a_key_out);
 
     if(g_prepack_mode == CP_PREPACK_FUSED){
         if(!g_gemm.prepare_attempt_a(&g_A_noisy, h_A_sig, a_key_out, R_RANK)){
@@ -330,6 +407,9 @@ extern "C" void cp_cpu_worker_shutdown(void)
     g_zero_b.B_noisy.clear();
     g_A_noisy.clear();
     g_gemm.reset();
+    pearl_matrix_hash_free(g_a_hash);
+    g_a_hash = NULL;
+    g_a_sig_hashed = NULL;
 }
 
 extern "C" int cp_cpu_worker_mine_attempt(

@@ -353,6 +353,25 @@ int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
     return 0;
 }
 
+/* One random row per nonce, as the GPU backends do it: row = splitmix64(seed ^ 0xD1B54A32D192ED03)
+ * mod m, filled with the values pearl_generate_random_a gives that row for this seed. */
+int pearl_fill_random_a_row(const uint8_t* seed, int seed_len, int m, int k, int8_t* A_inout,
+                            int* row_out)
+{
+    if(!A_inout || m <= 0 || k <= 0)
+        return -1;
+    const uint64_t rng_seed = pearl_seed_to_u64(seed, seed_len);
+    const int row = (int)(pearl_splitmix64(rng_seed ^ 0xD1B54A32D192ED03ULL) % (uint64_t)m);
+    const size_t base = (size_t)row * (size_t)k;
+    for(int j = 0; j < k; j++){
+        const uint64_t s = pearl_splitmix64(rng_seed ^ (uint64_t)(base + (size_t)j) * 0x9E3779B97F4A7C15ULL);
+        A_inout[base + (size_t)j] = (int8_t)((int)((s >> 32) % 128u) - 64);
+    }
+    if(row_out)
+        *row_out = row;
+    return 0;
+}
+
 /* One random [-64,63] write per column; ~k stores. Does not clear other entries. */
 int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
                                        int8_t* A_inout)

@@ -13,7 +13,7 @@
 - OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
 - OpenCL: 2 launches in flight, reducing GPU idle time (thanks @danifest751)
 - Faster noisy matrix preparation (joint effort with @danifest751)
-- Light random A matrix generation on GPU, only fill one random row and hash incrementally
+- Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
 
 ### Pearl Hexagon
 - DSP self-guided loop, negligible kernel launch overhead
