@@ -13,7 +13,7 @@
 - OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
 - OpenCL: 2 launches in flight, reducing GPU idle time (thanks @danifest751)
 - Faster noisy matrix preparation (joint effort with @danifest751)
-- Light random A matrix generation on GPU, only fill one random row and hash incrementally (OpenCL, OneDNN, CUDA)
+- Light random A matrix generation on GPU, only fill one random row and hash incrementally
 
 ### Pearl Hexagon
 - DSP self-guided loop, negligible kernel launch overhead
@@ -27,7 +27,7 @@
 - SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
 - Prepack A and B to reduce data reordering in GEMM
 - Layout parameter is deprecated, packed layout is optimal
-- --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (cause GPU hang sometimes due to buggy intel driver, off by default)
+- --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (cause GPU stall sometimes due to buggy intel driver, off by default)
 
 ## v0.5
 ### New features

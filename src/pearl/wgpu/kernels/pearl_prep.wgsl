@@ -674,7 +674,7 @@ struct PearlGenRandomParams {
     total_elems: i32,
     wg_x: i32,
     word_begin: i32, // base packed-u32 index for chunked dispatch (TDR-safe)
-    _pad1: i32,
+    word_end: i32,   // one past the last word of this dispatch (out is bound [word_begin, word_end))
     _pad2: i32,
 }
 
@@ -756,7 +756,7 @@ fn pearl_gen_random_matrix(
     let wg = i32(workgroup_id.y) * gen_params.wg_x + i32(workgroup_id.x);
     let word_idx = gen_params.word_begin + wg * 256 + i32(local_invocation_index);
     let base = word_idx * 4;
-    if (base >= gen_params.total_elems) {
+    if (word_idx >= gen_params.word_end || base >= gen_params.total_elems) {
         return;
     }
     var packed = 0u;

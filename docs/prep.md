@@ -178,6 +178,15 @@ found flag is cleared with a device memset. The first derivation in a process is
 formula (fallback to the host on a mismatch; every nonce with `CP_CUDA_PREP_CHECK=1`). Steady state per
 attempt: no host-to-device copies, and one 4-byte found-flag read per scan batch (32 on the GTX 1070).
 
+The wgpu backend (`PearlEngine::prep_a_signal` in `rust/cp-pearl-wgpu-ffi`) does the same with its
+existing kernels: `pearl_gen_random_matrix` regenerates the row's 1,024 words (its parameters gained a
+`word_end`, so a dispatch never writes past its binding), and `pearl_keyed_chunk_roots` runs one work
+group with `bid_begin` = the row's group, writing straight into `a_subroots`; a copy of those is reduced
+to the root. A new job key, or a change of dimensions, commits the whole signal again. GTX 1070 (Vulkan)
+at 131072^2: prep 145 -> 50 ms per attempt. `CP_WGPU_PREP_CHECK=1` compares the row with the host
+formula and the incremental root with a full rehash every nonce; `CP_WGPU_PREP_ROWPOKE=0` restores full
+regeneration. The noise seed is still derived on the host (one 32-byte root read per attempt).
+
 ### 4. Noisy A written in the systolic (packed) layout
 
 The preferred kernel used to gather A: every load message was 8 lanes reading one dword (4 consecutive

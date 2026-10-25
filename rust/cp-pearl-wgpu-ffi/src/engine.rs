@@ -170,7 +170,7 @@ struct PearlGenRandomParams {
     total_elems: i32,
     wg_x: i32,
     word_begin: i32,
-    _pad1: i32,
+    word_end: i32,
     _pad2: i32,
 }
 
@@ -276,6 +276,33 @@ fn max_wg_per_submit(device_type: wgpu::DeviceType) -> u32 {
         wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu => 2048,
         _ => 16384,
     }
+}
+
+/// CP_WGPU_PREP_ROWPOKE=0: regenerate and rehash the whole signal A every nonce instead of
+/// replacing one random row and rehashing its Merkle group (same scheme as the OpenCL/CUDA prep).
+fn prep_rowpoke_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("CP_WGPU_PREP_ROWPOKE").is_ok_and(|v| v.starts_with('0')))
+}
+
+/// CP_WGPU_PREP_CHECK=1: check the regenerated row against the host formula and the incremental
+/// commitment against a full rehash, every nonce.
+fn prep_check_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CP_WGPU_PREP_CHECK").is_ok_and(|v| v.starts_with('1')))
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
+/// Host copy of pearl_gen_random_matrix (matrix tag 0) for element `idx`.
+fn signal_elem(rng: u64, idx: u64) -> i8 {
+    let s = splitmix64(rng ^ idx.wrapping_mul(0x9E3779B97F4A7C15));
+    (((s >> 32) % 128) as i32 - 64) as i8
 }
 
 fn seed_to_u64(seed: &[u8]) -> u64 {
@@ -422,6 +449,10 @@ struct JobBuffers {
     a_num_subroots: i32,
     a_root: [u8; 32],
     a_witness_valid: bool,
+    /// a_sig holds a whole generated signal, so a nonce may replace just one row.
+    a_sig_full: bool,
+    /// a_subroots are the sub-roots of a_sig under this job key (incremental commitment).
+    a_sub_key: Option<[u8; 32]>,
     a_key8: wgpu::Buffer,
     bound: wgpu::Buffer,
     found_flag: wgpu::Buffer,
@@ -775,6 +806,8 @@ impl PearlEngine {
             a_num_subroots: 0,
             a_root: [0u8; 32],
             a_witness_valid: false,
+            a_sig_full: false,
+            a_sub_key: None,
             a_key8: Self::mk_storage(device, 32, "a_key8", wgpu::BufferUsages::empty()),
             bound: Self::mk_storage(device, 32, "bound", wgpu::BufferUsages::empty()),
             found_flag: Self::mk_storage(device, 4, "found_flag", wgpu::BufferUsages::empty()),
@@ -1050,21 +1083,87 @@ impl PearlEngine {
         job_key: &[u8; 32],
         hash_a_out: &mut [u8; 32],
     ) -> Result<(), String> {
-        let (m, k, blocks_k) = {
+        let (m, k, a_sig_full, sub_key_matches) = {
             let job = self.job.as_ref().ok_or("begin_job not called")?;
-            (job.m, job.k, job.blocks_k)
+            (job.m, job.k, job.a_sig_full, job.a_sub_key.as_ref() == Some(job_key))
         };
-        let _ = blocks_k;
         let total = m * k;
         let rng = seed_to_u64(ab_seed);
+        let raw_len = (m as u64) * (k as u64);
 
-        // Pack 4 s8 / WI 鈫?workgroups cover ceil(total/4) threads; chunk for TDR.
-        let num_words = ((total + 3) / 4) as u32;
-        let num_wg_total = ((num_words + 255) / 256).max(1);
+        // After the first attempt only one random row changes per nonce: the values the full
+        // generator gives that row for this nonce's seed. The rest keeps earlier nonces' rows.
+        // A row must be whole words and lie inside one 256-chunk Merkle group.
+        let incremental = prep_rowpoke_enabled()
+            && a_sig_full
+            && raw_len % B3_CHUNK == 0
+            && raw_len / B3_CHUNK > 1
+            && k % 4 == 0
+            && WITNESS_BLOCK_BYTES % (k as u64) == 0;
+        let mut row = 0u32;
+        if incremental {
+            row = (splitmix64(rng ^ 0xD1B54A32D192ED03) % m as u64) as u32;
+            self.gen_signal_words(rng, total, row * (k as u32 / 4), k as u32 / 4)?;
+        } else {
+            self.gen_signal_words(rng, total, 0, ((total + 3) / 4) as u32)?;
+        }
+
+        if incremental && prep_check_enabled() {
+            let got = self.read_bytes_at(&self.job.as_ref().unwrap().a_sig, row as u64 * k as u64, k as u64)?;
+            let base = row as u64 * k as u64;
+            let bad = (0..k as u64).filter(|&j| got[j as usize] as i8 != signal_elem(rng, base + j)).count();
+            println!("[pearl-wgpu] GPU row {row} check: {}", if bad == 0 { "identical" } else { "MISMATCH" });
+            if bad != 0 {
+                return Err("regenerated row differs from the host formula".into());
+            }
+        }
+
+        {
+            let job = self.job.as_mut().unwrap();
+            job.a_sig_full = true;
+            job.a_witness_valid = false;
+        }
+        let num_subroots = if incremental && sub_key_matches {
+            let group = (row as u64 * k as u64 / WITNESS_BLOCK_BYTES) as i32;
+            let n = self.rehash_a_group(group, hash_a_out)?;
+            if prep_check_enabled() {
+                // Full commitment (also refreshes the stored sub-roots) against the incremental root.
+                let mut full = [0u8; 32];
+                let nsub = self.matrix_keyed_hash(job_key, &mut full)?;
+                let same = full == *hash_a_out && nsub == n;
+                println!(
+                    "[pearl-wgpu] incremental commitment check (row {row}): {}",
+                    if same { "identical" } else { "MISMATCH" }
+                );
+                if !same {
+                    return Err("incremental commitment differs from a full rehash".into());
+                }
+            }
+            n
+        } else {
+            // First attempt or new job key (the hash is keyed): commit the whole signal.
+            self.job.as_mut().unwrap().a_sub_key = None;
+            let n = self.matrix_keyed_hash(job_key, hash_a_out)?;
+            if n > 0 {
+                self.job.as_mut().unwrap().a_sub_key = Some(*job_key);
+            }
+            n
+        };
+        let job = self.job.as_mut().unwrap();
+        job.a_num_subroots = num_subroots;
+        job.a_root = *hash_a_out;
+        job.a_witness_valid = true;
+        Ok(())
+    }
+
+    /// Signal values for packed words [first_word, first_word + num_words) of a_sig.
+    fn gen_signal_words(&self, rng: u64, total: i32, first_word: u32, num_words: u32) -> Result<(), String> {
+        // Pack 4 s8 / WI → workgroups cover the words; chunk for TDR.
+        let num_wg_total = num_words.div_ceil(256).max(1);
         let cap = self.max_wg_submit.min((self.max_binding / 1024).max(1) as u32);
         self.dispatch_chunked_cap(num_wg_total, cap, |wg_begin, wg_x, wg_y, wg_x_i| {
             let job = self.job.as_ref().unwrap();
-            let word_begin = (wg_begin * 256) as i32;
+            let word_begin = first_word + wg_begin * 256;
             let words = (wg_x * wg_y * 256).min(num_words - wg_begin * 256);
             self.write_uniform(
                 &job.u_gen,
@@ -1073,8 +1172,8 @@ impl PearlEngine {
                     matrix_tag: 0,
                     total_elems: total,
                     wg_x: wg_x_i,
-                    word_begin,
-                    _pad1: 0,
+                    word_begin: word_begin as i32,
+                    word_end: (word_begin + words) as i32,
                     _pad2: 0,
                 },
             );
@@ -1105,19 +1204,73 @@ impl PearlEngine {
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
             self.submit_and_wait(enc)
-        })?;
+        })
+    }
 
-        {
-            let job = self.job.as_mut().unwrap();
-            job.a_witness_valid = false;
-            self.queue.write_buffer(&job.job_key, 0, job_key);
+    /// Signal A changed only inside sub-root group `group` (256 chunks): recompute that sub-root
+    /// in a_subroots and reduce a copy of all sub-roots to the root (into `out`). The job key
+    /// buffer already holds the key a_subroots were made with.
+    fn rehash_a_group(&self, group: i32, out: &mut [u8; 32]) -> Result<i32, String> {
+        let job = self.job.as_ref().ok_or("no job")?;
+        let raw_len = (job.m as u64) * (job.k as u64);
+        let num_chunks = (raw_len / B3_CHUNK) as i32;
+        let num_subroots = (num_chunks + 255) / 256;
+        if group < 0 || group >= num_subroots {
+            return Err(format!("group {group} out of range ({num_subroots} sub-roots)"));
         }
-        let num_subroots = self.matrix_keyed_hash(job_key, hash_a_out)?;
-        let job = self.job.as_mut().unwrap();
-        job.a_num_subroots = num_subroots;
-        job.a_root = *hash_a_out;
-        job.a_witness_valid = true;
-        Ok(())
+        let mat_off = group as u64 * WITNESS_BLOCK_BYTES;
+        let mat_len = WITNESS_BLOCK_BYTES.min(raw_len - mat_off);
+        self.write_uniform(
+            &job.u_chunk,
+            &PearlMerkleChunkParams {
+                raw_len: raw_len as u32,
+                pad_len: raw_len as u32,
+                num_chunks,
+                bid_begin: group,
+            },
+        );
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_chunk_group"),
+            layout: &self.pipelines.keyed_chunk.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: job.u_chunk.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: buf_range(&job.a_sig, mat_off, mat_len),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: job.job_key.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: job.a_subroots.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("keyed_chunk_group"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("keyed_chunk_group"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.keyed_chunk);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        // The root reduction folds in place: run it on a copy of the stored sub-roots.
+        enc.copy_buffer_to_buffer(&job.a_subroots, 0, &job.merkle_roots, 0, num_subroots as u64 * 32);
+        self.submit_and_wait(enc)?;
+
+        self.merkle_finish_root(num_subroots)?;
+        let root_bytes = self.read_bytes(&job.merkle_roots, 32)?;
+        out.copy_from_slice(&root_bytes);
+        Ok(num_subroots)
     }
 
     /// Hashes a_sig into `out`; returns how many sub-roots were saved to `a_subroots`

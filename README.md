@@ -1,6 +1,6 @@
 # CPPminer
 
-Cross-Platform Pearl (now multi-algo) miner written in C++. Select the algorithm at runtime with `--algo` (default `pearl`).
+Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide range of hardware. Select the algorithm at runtime with `--algo` (default `pearl`).
 
 | Algo | Backends | PoW |
 |------|----------|-----|
