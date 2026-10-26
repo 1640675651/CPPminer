@@ -39,6 +39,8 @@ static int net_pos = 0;
 static char json_msg[65536];
 /* id of the mining.authorize awaiting its response (-1 = none). */
 static std::atomic<int> g_auth_msg_id{-1};
+/* Written by the reader thread, read by the share-queue thread. */
+static std::atomic<int> g_pool_proof_gzip{0};
 static char g_pool_host[256] = {0};
 
 static int tcp_connect(const char* host, int port)
@@ -300,7 +302,7 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
     /* Strictly response-driven: assume plain proofs until this authorize's
      * response says "type":"v2" (re-evaluated on every authorize, including
      * the dev-fee wallet switch). */
-    g_pool_proof_gzip = 0;
+    g_pool_proof_gzip.store(0);
     g_auth_msg_id.store(msg_id);
     const std::string msg =
         "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(msg_id) +
@@ -310,8 +312,9 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
         "\",\"agent\":\"" + cp_json_escape(agent) +
         "\",\"password\":\"" + cp_json_escape(password ? password : "x") +
         "\",\"type\":\"v2\"}}";
+    /* Never log the request itself: it carries the password and, during the dev-fee
+     * window, the fee wallet. */
     printf("[net] authorize (wallet/worker/agent/password, offering type v2 gzip proofs)\n");
-    printf("[net] >> %s\n", msg.c_str());
     fflush(stdout);
     return cp_send_json(tcp_sock, msg.c_str());
 }
@@ -329,12 +332,17 @@ int cp_pool_on_authorize_response(const char* line)
     char type[16];
     const int v2 = cp_json_str(line, "type", type, (int)sizeof(type)) &&
                    strcmp(type, "v2") == 0;
-    g_pool_proof_gzip = v2;
+    g_pool_proof_gzip.store(v2);
     printf("[pool] authorize response: %s\n", line);
     printf("[pool] proof encoding: %s\n",
            v2 ? "gzip (pool answered type v2)" : "plain base64 (no type v2 in response)");
     fflush(stdout);
     return 1;
+}
+
+int cp_pool_proof_gzip(void)
+{
+    return g_pool_proof_gzip.load();
 }
 
 int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,

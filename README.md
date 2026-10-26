@@ -318,7 +318,7 @@ Kryptex's "Pearl stratum gzip protocol" ([spec](https://gist.github.com/maxmalys
 - A response without `"type":"v2"` (LuckyPool) keeps plain base64 proofs. The flag is re-evaluated on every authorize (dev-fee wallet switch included).
 - Custom share difficulty: `--pool-pass d=2097152` (Kryptex default; `d = hashrate_H/s * target_share_seconds / 4294967296`).
 
-gzip helps most when the committed matrices are repetitive: the CPU backend's sparse random A (one write per column) and the all-zero B^T compress ~61x (134764 -> 2200 base64 chars); the GPU backends' dense random A rows only 2.2-3.3x (about 40 KB per proof).
+gzip helps because the committed matrices are repetitive: the light random A (one random row) and the all-zero B^T compress well, e.g. an OpenCL proof goes from 68160 to 1948 base64 chars (35x).
 
 ## Dev Fee
 
