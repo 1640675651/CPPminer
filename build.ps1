@@ -9,6 +9,9 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Wgpu
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl,OneDnn -CudaArch 75
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,IntelNpu
+#     (IntelNpu: Pearl on the Intel NPU; the first build fetches, patches and builds OpenVINO and the NPU
+#      compiler through src\pearl\intel_npu\prepare_intel_npu_deps.ps1, which takes hours)
 #
 # Requires: MSVC, CMake, and (for proofs / wgpu) cargo. OpenCL headers/CUTLASS are
 # fetched as needed. The script snapshots and restores your shell environment.
@@ -44,7 +47,8 @@ foreach ($i in 0..($BackendList.Count - 1)) {
         '^(?i)cuda$'   { $BackendList[$i] = 'Cuda' }
         '^(?i)cpu$'    { $BackendList[$i] = 'Cpu' }
         '^(?i)wgpu$'   { $BackendList[$i] = 'Wgpu' }
-        default { throw "Unknown backend '$($BackendList[$i])' (valid: Cpu,Cuda,OpenCl,OneDnn,Wgpu)" }
+        '^(?i)(intelnpu|intel_npu|npu)$' { $BackendList[$i] = 'IntelNpu' }
+        default { throw "Unknown backend '$($BackendList[$i])' (valid: Cpu,Cuda,OpenCl,OneDnn,Wgpu,IntelNpu)" }
     }
 }
 $EnableCpu = $BackendList -contains "Cpu"
@@ -52,8 +56,9 @@ $EnableCuda = $BackendList -contains "Cuda"
 $EnableOpenCl = $BackendList -contains "OpenCl"
 $EnableOneDnn = $BackendList -contains "OneDnn"
 $EnableWgpu = $BackendList -contains "Wgpu"
-if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $EnableWgpu)) {
-    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn,Wgpu"
+$EnableIntelNpu = $BackendList -contains "IntelNpu"
+if (-not ($EnableCpu -or $EnableCuda -or $EnableOpenCl -or $EnableOneDnn -or $EnableWgpu -or $EnableIntelNpu)) {
+    throw "Select at least one backend: -Backend Cpu,Cuda,OpenCl,OneDnn,Wgpu,IntelNpu"
 }
 if ($EnableCublas -and -not $EnableCuda) {
     throw "-EnableCublas requires -Backend Cuda (or Cpu,Cuda / ...)"
@@ -336,6 +341,31 @@ function Ensure-OneDnnDeps {
     }
 }
 
+function Ensure-IntelNpuDeps {
+    $prep = Join-Path $Root "src\pearl\intel_npu\prepare_intel_npu_deps.ps1"
+    if (-not (Test-Path $prep)) { throw "Missing $prep" }
+    Write-Host "=== Intel NPU deps: OpenVINO + patched NPU compiler (prepare_intel_npu_deps.ps1) ==="
+    # Own process: the script imports the MSVC environment and runs long Ninja builds.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $prep
+    if ($LASTEXITCODE -ne 0) { throw "prepare_intel_npu_deps.ps1 failed" }
+    $paths = Join-Path $Root "third_party\intel_npu\paths.cmake"
+    if (-not (Test-Path $paths)) { throw "Intel NPU deps missing after prepare ($paths)" }
+}
+
+function Copy-IntelNpuRuntime([string]$BuiltDir) {
+    # The OpenVINO runtime, the patched compiler and the TileXorAcc kernel, next to the root cppminer.exe.
+    foreach ($name in @("openvino.dll", "openvino_intel_npu_plugin.dll", "openvino_intel_npu_compiler.dll",
+                        "openvino_intel_npu_compiler_loader.dll", "tbb12.dll", "tbbbind_2_5.dll", "tbbmalloc.dll",
+                        "plugins.xml")) {
+        $src = Join-Path $BuiltDir $name
+        if (Test-Path $src) { Copy-Item $src (Join-Path $Root $name) -Force }
+    }
+    $kernelDst = Join-Path $Root "kernels\intel_npu"
+    New-Item -ItemType Directory -Force -Path $kernelDst | Out-Null
+    Copy-Item (Join-Path $Root "src\pearl\intel_npu\kernels\*.elf") $kernelDst -Force
+    Write-Host "=== Copied the OpenVINO runtime, patched NPU compiler and kernels\intel_npu ==="
+}
+
 function Ensure-Blake3 {
     $b3Src = Join-Path $Root "third_party\blake3"
     $b3Header = Join-Path $b3Src "blake3.h"
@@ -408,7 +438,7 @@ try {
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     Ensure-Blake3
 
-    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn WGPU=$EnableWgpu CUBLAS=$EnableCublas) ==="
+    Write-Host "=== Backend: $($BackendList -join ',') (CPU=$EnableCpu CUDA=$EnableCuda OpenCL=$EnableOpenCl OneDNN=$EnableOneDnn WGPU=$EnableWgpu IntelNPU=$EnableIntelNpu CUBLAS=$EnableCublas) ==="
 
     if ($EnableOpenCl -or $EnableOneDnn) {
         $null = Ensure-OpenClHeaders
@@ -416,6 +446,9 @@ try {
     }
     if ($EnableOneDnn) {
         Ensure-OneDnnDeps
+    }
+    if ($EnableIntelNpu) {
+        Ensure-IntelNpuDeps
     }
     if ($EnableCuda) {
         $null = Ensure-Cutlass
@@ -442,6 +475,7 @@ try {
         "-DCP_ENABLE_OPENCL=$(if ($EnableOpenCl) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_ONEDNN=$(if ($EnableOneDnn) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_WGPU=$(if ($EnableWgpu) { 'ON' } else { 'OFF' })",
+        "-DCP_ENABLE_INTEL_NPU=$(if ($EnableIntelNpu) { 'ON' } else { 'OFF' })",
         "-DCP_ENABLE_CUBLAS=$(if ($EnableCublas) { 'ON' } else { 'OFF' })"
     )
     if ($EnableCuda -and $CudaArch) {
@@ -459,6 +493,9 @@ try {
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $built) { throw "cppminer.exe not found under $CmakeBuild" }
     Copy-Item $built $OutExe -Force
+    if ($EnableIntelNpu) {
+        Copy-IntelNpuRuntime (Split-Path -Parent $built)
+    }
     if ($EnableOpenCl -or $EnableOneDnn) {
         Copy-OpenClKernels
     }

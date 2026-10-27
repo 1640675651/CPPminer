@@ -13,6 +13,11 @@
 /third_party/cutlass/
 /third_party/cutlass_override/
 /third_party/opencl-headers/
+/third_party/openvino-src/
+/third_party/npu_compiler-src/
+/third_party/intel_npu/
+/npu_cache/
+plugins.xml
 /src/onednn/third_party/gemmstone/
 /src/onednn/third_party/ngen/
 /src/onednn/third_party/.case5_onednn_tag

@@ -77,6 +77,9 @@ static void print_usage(void)
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     printf("|hexagon");
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    printf("|intel_npu");
+#endif
     printf(" (built: ");
     {
         int first = 1;
@@ -86,6 +89,7 @@ static void print_usage(void)
         if(cp_worker_has_onednn()){ printf("%sonednn", first ? "" : ","); first = 0; }
         if(cp_worker_has_wgpu()){ printf("%swgpu", first ? "" : ","); first = 0; }
         if(cp_worker_has_hexagon()){ printf("%shexagon", first ? "" : ","); first = 0; }
+        if(cp_worker_has_intel_npu()){ printf("%sintel_npu", first ? "" : ","); first = 0; }
         if(first) printf("none");
     }
     printf(")\n");
@@ -119,6 +123,11 @@ static void print_usage(void)
     printf("  --wgpu-tile MxN[/MmMm]  wgpu (pearl) register tile: 4x4, 4x8, 8x8 (default), 8x16;\n");
     printf("                     optional /64x64 or /128x128 macro (same as --wgpu-macro)\n");
     printf("  --wgpu-macro MxN   wgpu (pearl) macro block: 64x64 or 128x128 (default 128x128)\n");
+#endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    printf("  intel_npu (pearl): Intel NPU (Core Ultra) via OpenVINO and the patched NPU compiler,\n");
+    printf("                     8x16 hash tiles, launches of 512x512xK; CP_NPU_LANES = requests in\n");
+    printf("                     flight (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
@@ -562,6 +571,7 @@ int main(int argc, char** argv)
             else if(!strcmp(b, "onednn")) backend_sel = CP_BACKEND_ONEDNN;
             else if(!strcmp(b, "wgpu")) backend_sel = CP_BACKEND_WGPU;
             else if(!strcmp(b, "hexagon")) backend_sel = CP_BACKEND_HEXAGON;
+            else if(!strcmp(b, "intel_npu") || !strcmp(b, "npu")) backend_sel = CP_BACKEND_INTEL_NPU;
             else {
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
@@ -1597,6 +1607,10 @@ int main(int argc, char** argv)
                    "(--row-period-batch x --batch-size), %d hash tiles\n",
                    lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
             printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
+        } else if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU){
+            printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 8x16 tile XOR (SHAVE) + host jackpot\n");
+            printf("[mode] NPU launch: 512x512 (K=%d), %d launches per attempt; noisy A and B built and "
+                   "packed on the host\n", K_DIM, (g_m_active / 512) * (g_n_active / 512));
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");

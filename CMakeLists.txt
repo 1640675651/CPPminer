@@ -8,6 +8,7 @@ option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
 option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
 option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
 option(CP_ENABLE_HEXAGON "Build Pearl Hexagon cDSP (HVX) worker (Android/Linux on Snapdragon)" OFF)
+option(CP_ENABLE_INTEL_NPU "Build Pearl Intel NPU worker (OpenVINO + patched NPU compiler)" OFF)
 option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
 option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
 # Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
@@ -23,8 +24,8 @@ if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
     message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
 endif()
 
-if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU AND NOT CP_ENABLE_HEXAGON)
-    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU, CP_ENABLE_HEXAGON")
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU AND NOT CP_ENABLE_HEXAGON AND NOT CP_ENABLE_INTEL_NPU)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU, CP_ENABLE_HEXAGON, CP_ENABLE_INTEL_NPU")
 endif()
 
 set(_cp_langs CXX C)
@@ -85,6 +86,7 @@ set(CP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
     ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
     ${CMAKE_SOURCE_DIR}/src/pearl/hexagon
+    ${CMAKE_SOURCE_DIR}/src/pearl/intel_npu
     ${CMAKE_SOURCE_DIR}/src/qpow/opencl
     ${CMAKE_SOURCE_DIR}/src/qpow/include
 )
@@ -461,10 +463,73 @@ else()
     add_compile_definitions(CP_ENABLE_HEXAGON=0)
 endif()
 
+# Intel NPU: OpenVINO built from source with the patched in-plugin NPU compiler
+# (src/pearl/intel_npu/prepare_intel_npu_deps.ps1 fetches, patches and builds both, and writes
+# third_party/intel_npu/paths.cmake with the OpenVINO build and binary directories).
+if(CP_ENABLE_INTEL_NPU)
+    set(_CP_NPU_DIR "${CMAKE_SOURCE_DIR}/src/pearl/intel_npu")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/intel_npu/paths.cmake")
+        include("${CMAKE_SOURCE_DIR}/third_party/intel_npu/paths.cmake")
+    endif()
+    set(CP_INTEL_NPU_OPENVINO_DIR "${CP_INTEL_NPU_OPENVINO_DIR}" CACHE PATH
+        "OpenVINO build tree with OpenVINOConfig.cmake (build-x86_64/Release)")
+    set(CP_INTEL_NPU_OPENVINO_BIN_DIR "${CP_INTEL_NPU_OPENVINO_BIN_DIR}" CACHE PATH
+        "OpenVINO runtime binaries (bin/intel64/Release), holding the patched openvino_intel_npu_compiler")
+    if(NOT CP_INTEL_NPU_OPENVINO_DIR)
+        message(FATAL_ERROR "CP_ENABLE_INTEL_NPU needs OpenVINO and the patched NPU compiler. Run "
+            "src/pearl/intel_npu/prepare_intel_npu_deps.ps1 (or pass -DCP_INTEL_NPU_OPENVINO_DIR=<build-x86_64/Release> "
+            "-DCP_INTEL_NPU_OPENVINO_BIN_DIR=<bin/intel64/Release>)")
+    endif()
+    find_package(OpenVINO REQUIRED COMPONENTS Runtime PATHS "${CP_INTEL_NPU_OPENVINO_DIR}" NO_DEFAULT_PATH)
+    list(APPEND CP_SOURCES
+        src/pearl/intel_npu/cp_pearl_npu_worker.cpp
+        src/pearl/intel_npu/cp_npu_engine.cpp
+        src/pearl/intel_npu/cp_npu_graph.cpp)
+    add_compile_definitions(CP_ENABLE_INTEL_NPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_INTEL_NPU=0)
+endif()
+
 add_executable(cppminer ${CP_SOURCES} ${CP_QPOW_AVX2_OBJECTS})
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 if(CP_ENABLE_HEXAGON)
     target_link_libraries(cppminer PRIVATE ${CMAKE_DL_LIBS})
+endif()
+if(CP_ENABLE_INTEL_NPU)
+    target_link_libraries(cppminer PRIVATE openvino::runtime)
+    target_compile_definitions(cppminer PRIVATE "CP_INTEL_NPU_SOURCE_KERNEL_DIR=\"${_CP_NPU_DIR}/kernels\"")
+    # The TileXorAcc SHAVE kernel (prebuilt, see src/pearl/intel_npu/README.md) next to the miner, where
+    # the patched compiler loads it from, and the OpenVINO runtime with the patched compiler.
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels/intel_npu"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx.elf"
+            "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx_lsu0_wo.elf"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/intel_npu/"
+        COMMENT "Copy the Intel NPU TileXorAcc kernel next to cppminer")
+    if(CP_INTEL_NPU_OPENVINO_BIN_DIR)
+        set(_cp_npu_runtime)
+        foreach(_f openvino.dll openvino_intel_npu_plugin.dll openvino_intel_npu_compiler.dll
+                   openvino_intel_npu_compiler_loader.dll tbb12.dll tbbbind_2_5.dll tbbmalloc.dll plugins.xml
+                   libopenvino.so libopenvino_intel_npu_plugin.so libopenvino_intel_npu_compiler.so)
+            if(EXISTS "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")
+                list(APPEND _cp_npu_runtime "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")
+            endif()
+        endforeach()
+        if(_cp_npu_runtime)
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_cp_npu_runtime} "$<TARGET_FILE_DIR:cppminer>/"
+                COMMENT "Copy the OpenVINO runtime and the patched NPU compiler next to cppminer")
+        endif()
+    endif()
+    # Standalone check of one launch against a host reference, and its launch rate.
+    add_executable(cp_npu_launch_test
+        src/pearl/intel_npu/cp_npu_launch_test.cpp
+        src/pearl/intel_npu/cp_npu_engine.cpp
+        src/pearl/intel_npu/cp_npu_graph.cpp)
+    target_include_directories(cp_npu_launch_test PRIVATE ${_CP_NPU_DIR})
+    target_link_libraries(cp_npu_launch_test PRIVATE openvino::runtime)
+    target_compile_definitions(cp_npu_launch_test PRIVATE "CP_INTEL_NPU_SOURCE_KERNEL_DIR=\"${_CP_NPU_DIR}/kernels\"")
 endif()
 
 if(CP_ENABLE_CUDA)
@@ -1049,4 +1114,4 @@ if(CP_STATIC_LIBCXX AND NOT MSVC)
     unset(_cp_libcxx_hints)
 endif()
 
-message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} HEXAGON=${CP_ENABLE_HEXAGON} CUBLAS=${CP_ENABLE_CUBLAS}")
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} HEXAGON=${CP_ENABLE_HEXAGON} INTEL_NPU=${CP_ENABLE_INTEL_NPU} CUBLAS=${CP_ENABLE_CUBLAS}")

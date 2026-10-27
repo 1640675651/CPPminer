@@ -4,7 +4,7 @@ Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide ran
 
 | Algo | Backends | PoW |
 |------|----------|-----|
-| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` | GEMM+XOR jackpot + `plain_proof` |
+| `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu` | GEMM+XOR jackpot + `plain_proof` |
 | `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
 Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
@@ -17,6 +17,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
 | Pearl Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
+| Pearl Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + 8×16 tile XOR on the SHAVEs + host jackpot ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
@@ -30,6 +31,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
 - **Hexagon build:** Android/Linux on a Snapdragon with a cDSP (tested: Snapdragon 480, Hexagon v66). The miner needs no SDK; the DSP library `libpearlx_skel.so` is built with the Hexagon SDK (see [`src/pearl/hexagon/README.md`](src/pearl/hexagon/README.md)).
+- **Intel NPU build:** Windows on a Core Ultra (NPU3720 class) with the stock NPU driver; OpenVINO and the patched `npu_compiler` built from source at pinned commits by `src/pearl/intel_npu/prepare_intel_npu_deps.ps1` (Git, Ninja, Python 3; hours on the first run). See [`src/pearl/intel_npu/README.md`](src/pearl/intel_npu/README.md).
 - **wgpu build:** Rust toolchain. Enable with `-DCP_ENABLE_WGPU=ON` / `-Backend Wgpu`. Builds two FFI crates: `rust/cp-pearl-wgpu-ffi` (Pearl) and `rust/cp-quantus-wgpu-ffi` (Quantus; build scripts fetch [`Quantus-Network/quantus-miner`](https://github.com/Quantus-Network/quantus-miner) into `third_party/quantus-miner` for `engine-gpu`).
 
 ## Build options (CMake)
@@ -51,15 +53,16 @@ cmake --build build --config Release
 | `CP_ENABLE_ONEDNN` | OFF | Intel GPU oneDNN/gemmstone worker |
 | `CP_ENABLE_WGPU` | OFF | wgpu workers: Pearl (`cp-pearl-wgpu-ffi`) and Quantus GpuEngine (`cp-quantus-wgpu-ffi`; fetches `third_party/quantus-miner`) |
 | `CP_ENABLE_HEXAGON` | OFF | Pearl Snapdragon cDSP (HVX) worker; Android/Linux only |
+| `CP_ENABLE_INTEL_NPU` | OFF | Pearl Intel NPU worker (OpenVINO + patched NPU compiler; `CP_INTEL_NPU_OPENVINO_DIR`, `CP_INTEL_NPU_OPENVINO_BIN_DIR`) |
 | `CP_ENABLE_CUBLAS` | OFF | Link cuBLAS for `--cublas-period` debug path (needs CUDA) |
 | `CP_CUDA_ARCH` | native | e.g. `61` for Pascal |
 
 Enable multiple backends in one binary; select at runtime with `--backend`. Both algos are always compiled in; use `--algo pearl|quantus`. Runtime and compile-time **algo×backend matrix**:
 
-| | cpu | cuda | opencl | onednn | wgpu | hexagon |
-|--|-----|------|--------|--------|------|---------|
-| pearl | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| quantus | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ |
+| | cpu | cuda | opencl | onednn | wgpu | hexagon | intel_npu |
+|--|-----|------|--------|--------|------|---------|-----------|
+| pearl | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| quantus | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
 ## Build (Windows)
 
@@ -76,11 +79,13 @@ CUDA, OpenCL, or combinations (comma-separated list):
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl,OneDnn
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Wgpu
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,Cuda,OpenCl
+# Intel NPU: the first build fetches, patches and builds OpenVINO and the NPU compiler (hours)
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,IntelNpu
 # Optional debug: link cuBLAS (large DLLs; not needed for production CUTLASS path)
 powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cuda -EnableCublas -CudaArch 61
 ```
 
-Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_quantus_wgpu_ffi.dll` when wgpu is enabled).
+Produces `cppminer.exe` in the repo root (plus `cp_pearl_wgpu_ffi.dll` and `cp_quantus_wgpu_ffi.dll` when wgpu is enabled, and the OpenVINO runtime, the patched NPU compiler and `kernels/intel_npu` with IntelNpu).
 
 ## Build (*nix)
 ```bash
@@ -99,7 +104,7 @@ cppminer [--algo pearl|quantus] --backend BACKEND [--devices IDS]
          [--pool stratum+tcp://HOST:PORT] --wallet ADDRESS [--worker NAME] [backend options]
 ```
 
-- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu` and `hexagon`; Quantus on `cpu`, `opencl` and `wgpu`. The backend must be enabled in the build.
+- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu`, `hexagon` and `intel_npu`; Quantus on `cpu`, `opencl` and `wgpu`. The backend must be enabled in the build.
 - Pearl defaults to the LuckyPool Pearl pool; Quantus needs `--pool`.
 - `--list-devices` prints the device indices that `--devices` takes.
 - `--mock` mines a fixed job offline until the first share, verifies it and exits; it needs no pool or wallet.
@@ -122,8 +127,8 @@ cppminer --backend opencl --devices 0 --mock
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon`. `--pool` required for Quantus unless `--mock` |
-| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` (must be compiled in; must be valid for `--algo`).
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu`. `--pool` required for Quantus unless `--mock` |
+| `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu` (alias `npu`) (must be compiled in; must be valid for `--algo`).
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
 | `--worker` | Worker name (default `rig01`). On a `kryptex` pool host the wallet is sent as `WALLET.worker` as well |
@@ -272,6 +277,12 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Intel UHD 630 | Scalar | 4x8 | 140 GH/s |
 | Mali-G57 MC2 | DP4A | 4x8 | 115 GH/s |
 
+### Intel NPU
+
+| Device | Hashrate |
+|--------|----------|
+| NPU3720 (Core Ultra 9 275HX, 2 tiles) | 730 GH/s |
+
 ### Hexagon DSP
 
 | Device | Hashrate |
@@ -339,6 +350,7 @@ src/cpu/          CPU worker + fused GEMM+XOR
 src/cuda/         CUDA kernels, CUTLASS, CUDA worker adapter
 src/opencl/       OpenCL fused path + kernels
 src/pearl/hexagon/ Snapdragon cDSP worker; dsp/ = HVX kernel + FastRPC library (Hexagon SDK)
+src/pearl/intel_npu/ Intel NPU worker: OpenVINO launch graph, prebuilt SHAVE kernel, npu_compiler patch + prepare script
 rust/             cp-proof-ffi (plain_proof Merkle + bincode)
 third_party/      blake3, pearl-blake3, zk-pow, plonky2, opencl (+headers), cutlass (CUDA)
 ```
