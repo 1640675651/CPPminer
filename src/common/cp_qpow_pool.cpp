@@ -89,8 +89,10 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
         cp_json_escape(job_id) + "\",\"nonce\":\"" + nonce_hex + "\"}}";
     printf("[net] quantus submit job=%s nonce=%.16s...\n", job_id ? job_id : "", nonce_hex);
     fflush(stdout);
+    /* In flight before sending, see cp_share_queue.cpp. */
+    cp_pool_set_submit_inflight(1);
     int ok = cp_send_json(sock, msg.c_str());
-    if(ok) cp_pool_set_submit_inflight(1);
+    if(!ok) cp_pool_set_submit_inflight(0);
     return ok;
 }
 
