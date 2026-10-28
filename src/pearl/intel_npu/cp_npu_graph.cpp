@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include <openvino/core/attribute_visitor.hpp>
@@ -100,68 +101,96 @@ Out panel(const Out& input, int64_t p) {
 
 } // namespace
 
+const char* launch_shape_error(const LaunchShape& s) {
+    if (s.k % kKr)
+        return "K must be a multiple of 128";
+    if (s.chunk_m % (2 * kTileRows) || s.rows % s.chunk_m)
+        return "rows must be a multiple of the row block (chunk_m, itself a multiple of 16)";
+    if (s.chunk_n % kTileCols || s.cols % s.chunk_n)
+        return "cols must be a multiple of the column chain (chunk_n, itself a multiple of 16)";
+    if (s.cols / s.chunk_n > 8)
+        return "at most 8 column chains (cols / chunk_n): lockstep keeps all of them live at once";
+    /* The kernel's record scan needs at least 4 partials per op (3 with an accumulator), so the last
+     * group of panels must not be shorter. */
+    const int tail = s.milestones() % s.group;
+    if (s.group < 4 || s.group > 8 || (tail && tail < 3))
+        return "group must be 4..8 and leave a last group of at least 3 panels";
+    return nullptr;
+}
+
 std::shared_ptr<ov::Model> build_launch_model(const LaunchShape& s, std::vector<int>* word_index) {
-    const int64_t ms = s.milestones(), rows = s.rows, cols = s.cols, chunk_n = s.chunk_n;
-    const int64_t chains = cols / chunk_n, words_per_chain = chunk_n / kTileCols;
-    if (s.k % kKr || rows % (2 * kTileRows) || cols % chunk_n || chunk_n % kTileCols || s.group < 4 ||
-        s.group > 8)
-        throw std::invalid_argument("cp_npu: unsupported launch shape");
+    if (const char* why = launch_shape_error(s))
+        throw std::invalid_argument(std::string("cp_npu: unsupported launch shape: ") + why);
+    const int64_t ms = s.milestones(), cols = s.cols, chunk_m = s.chunk_m, chunk_n = s.chunk_n;
+    const int64_t blocks = s.row_blocks(), chains = cols / chunk_n, words_per_chain = chunk_n / kTileCols;
 
-    auto a = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{size_t(ms), size_t(rows), size_t(kKr)});
+    auto a = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{size_t(ms), size_t(s.rows), size_t(kKr)});
     a->set_friendly_name("a_panels");
-    auto bt = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{size_t(ms), size_t(cols), size_t(kKr)});
-    bt->set_friendly_name("bt_panels");
-
-    /* A panel p is shared by the launch's chains; each B block (panel p, chain c) feeds one GEMM. */
-    std::vector<Out> aq(ms);
-    for (int64_t p = 0; p < ms; ++p)
-        aq[p] = quantize_u8(panel(a, p));
-    auto gemm = [&](int64_t p, int64_t c) {
-        Out bq = quantize_u8(slice(panel(bt, p), {c * chunk_n}, {(c + 1) * chunk_n}, {0}));
-        /* B as rows of B^T (transpose_b): the form the int32-output DPU path handles exactly. */
-        auto mm = std::make_shared<ov::op::v0::MatMul>(aq[p], bq, false, true);
-        return reshape(std::make_shared<ov::op::v0::Convert>(mm, ov::element::i32), {1, 1, rows, chunk_n});
-    };
-
-    /* Per chain: ops over groups of panels, carrying the accumulator. */
-    struct Step {
-        int64_t ms0, count;
-        Out words;
-    };
-    std::vector<std::vector<Step>> steps(chains);
-    for (int64_t c = 0; c < chains; ++c) {
-        Out acc;
-        for (int64_t p0 = 0; p0 < ms; p0 += s.group) {
-            const int64_t p1 = std::min<int64_t>(p0 + s.group, ms);
-            ov::OutputVector inputs;
-            if (p0 > 0)
-                inputs.push_back(acc);
-            for (int64_t p = p0; p < p1; ++p)
-                inputs.push_back(gemm(p, c));
-            auto node = std::make_shared<TileXorAcc>(inputs, p0 > 0);
-            acc = node->output(0);
-            steps[c].push_back({p0, p1 - p0, node->output(1)});
-        }
+    ov::ParameterVector params{a};
+    for (int i = 0; i < s.b_inputs(); ++i) {
+        auto bt = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{size_t(ms), size_t(cols), size_t(kKr)});
+        bt->set_friendly_name(i ? "bt_panels_" + std::to_string(i) : std::string("bt_panels"));
+        params.push_back(bt);
     }
 
-    /* Lockstep order: step s of every chain, then step s + 1. OpenVINO's topological order visits a
-     * node's inputs in order and the compiler's scheduler follows it, so each A panel is used by all
-     * chains in quick succession and freed instead of staying in CMX for the whole launch. */
-    ov::OutputVector words;
-    word_index->assign(size_t(s.tile_cols() * ms), 0);
-    int offset = 0;
-    for (size_t step = 0; step < steps[0].size(); ++step)
+    ov::OutputVector block_words;
+    for (int64_t rb = 0; rb < blocks; ++rb) {
+        const Out& bt = params[size_t(s.split_b ? 1 + rb : 1)];
+        /* A panel p of the row block is shared by its chains; each B block (panel p, chain c) feeds one
+         * GEMM of this row block. Rows are cut before the cast: a cast feeding the MatMul directly is
+         * what the compiler's int32-output path matches. */
+        std::vector<Out> aq(ms);
+        for (int64_t p = 0; p < ms; ++p)
+            aq[p] = quantize_u8(blocks == 1 ? panel(a, p) : slice(panel(a, p), {rb * chunk_m}, {(rb + 1) * chunk_m}, {0}));
+        auto gemm = [&](int64_t p, int64_t c) {
+            Out bq = quantize_u8(slice(panel(bt, p), {c * chunk_n}, {(c + 1) * chunk_n}, {0}));
+            /* B as rows of B^T (transpose_b): the form the int32-output DPU path handles exactly. */
+            auto mm = std::make_shared<ov::op::v0::MatMul>(aq[p], bq, false, true);
+            return reshape(std::make_shared<ov::op::v0::Convert>(mm, ov::element::i32), {1, 1, chunk_m, chunk_n});
+        };
+
+        /* Per chain: ops over groups of panels, carrying the accumulator. */
+        struct Step {
+            int64_t ms0, count;
+            Out words;
+        };
+        std::vector<std::vector<Step>> steps(chains);
         for (int64_t c = 0; c < chains; ++c) {
-            const Step& st = steps[c][step];
-            words.push_back(st.words);
-            for (int64_t i = 0; i < st.count; ++i)
-                for (int64_t t = 0; t < words_per_chain; ++t)
-                    (*word_index)[size_t((c * words_per_chain + t) * ms + st.ms0 + i)] =
-                        offset + int(i * words_per_chain + t);
-            offset += int(st.count * words_per_chain);
+            Out acc;
+            for (int64_t p0 = 0; p0 < ms; p0 += s.group) {
+                const int64_t p1 = std::min<int64_t>(p0 + s.group, ms);
+                ov::OutputVector inputs;
+                if (p0 > 0)
+                    inputs.push_back(acc);
+                for (int64_t p = p0; p < p1; ++p)
+                    inputs.push_back(gemm(p, c));
+                auto node = std::make_shared<TileXorAcc>(inputs, p0 > 0);
+                acc = node->output(0);
+                steps[c].push_back({p0, p1 - p0, node->output(1)});
+            }
         }
-    Out out = reshape(concat(words, 3), {rows / kTileRows, ms * (cols / kTileCols)});
-    return std::make_shared<ov::Model>(ov::OutputVector{out}, ov::ParameterVector{a, bt}, "pearl_npu_launch");
+
+        /* Lockstep order: step s of every chain, then step s + 1. OpenVINO's topological order visits a
+         * node's inputs in order and the compiler's scheduler follows it, so each A panel is used by all
+         * chains in quick succession and freed instead of staying in CMX for the whole row block. Every
+         * row block has the same word order. */
+        ov::OutputVector words;
+        word_index->assign(size_t(s.tile_cols() * ms), 0);
+        int offset = 0;
+        for (size_t step = 0; step < steps[0].size(); ++step)
+            for (int64_t c = 0; c < chains; ++c) {
+                const Step& st = steps[c][step];
+                words.push_back(st.words);
+                for (int64_t i = 0; i < st.count; ++i)
+                    for (int64_t t = 0; t < words_per_chain; ++t)
+                        (*word_index)[size_t((c * words_per_chain + t) * ms + st.ms0 + i)] =
+                            offset + int(i * words_per_chain + t);
+                offset += int(st.count * words_per_chain);
+            }
+        block_words.push_back(concat(words, 3)); /* [1, 1, chunk_m/8, ms * cols/16] */
+    }
+    Out out = reshape(concat(block_words, 2), {s.rows / kTileRows, ms * (cols / kTileCols)});
+    return std::make_shared<ov::Model>(ov::OutputVector{out}, params, "pearl_npu_launch");
 }
 
 } // namespace cp_npu

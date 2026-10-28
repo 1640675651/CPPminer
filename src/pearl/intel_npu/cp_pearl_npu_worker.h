@@ -10,6 +10,10 @@ extern "C" {
 
 /* Pearl on the Intel NPU (NPU3720 class, Core Ultra): fused int8 GEMM + per-tile milestone XOR through
  * OpenVINO and the patched in-plugin NPU compiler (src/pearl/intel_npu/README.md). */
+/* Launch in 128x128 macro blocks, rows x columns (<= 0: default); before init. */
+void cp_pearl_npu_worker_set_launch(int row_macros, int col_macros);
+/* The launch in rows x columns: the compiled one after init, else the one init will pick. */
+void cp_pearl_npu_worker_launch_shape(int *rows, int *cols);
 void cp_pearl_npu_worker_init(int *devices, int ndev);
 void cp_pearl_npu_worker_shutdown(void);
 int cp_pearl_npu_worker_is_ready(void);

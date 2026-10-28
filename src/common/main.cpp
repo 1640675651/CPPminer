@@ -126,8 +126,11 @@ static void print_usage(void)
 #endif
 #if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
     printf("  intel_npu (pearl): Intel NPU (Core Ultra) via OpenVINO and the patched NPU compiler,\n");
-    printf("                     8x16 hash tiles, launches of 512x512xK; CP_NPU_LANES = requests in\n");
-    printf("                     flight (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
+    printf("                     8x16 hash tiles; launch = --row-period-batch x --batch-size 128x128\n");
+    printf("                     macro blocks (default %d x %d, columns <= 4, rows above 4 in\n",
+           CP_INTEL_NPU_ROW_MACROS_DEFAULT, CP_INTEL_NPU_COL_MACROS_DEFAULT);
+    printf("                     steps of 4; each new shape compiles once); CP_NPU_LANES = requests\n");
+    printf("                     in flight (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
@@ -1464,6 +1467,11 @@ int main(int argc, char** argv)
         cp_worker_set_hexagon_launch(row_period_batch, batch_size);
         cp_worker_set_hexagon_fused_jackpot(fused_jackpot);
     }
+    if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU){
+        /* Launch = row x col 128x128 macro blocks; unset means the measured default. */
+        cp_worker_set_intel_npu_launch(row_period_batch_set ? row_period_batch : 0,
+                                       batch_size_set ? batch_size : 0);
+    }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
      * Period batch must be set before init (backend banner + scan loop read batch at init). */
@@ -1609,8 +1617,12 @@ int main(int argc, char** argv)
             printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU){
             printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 8x16 tile XOR (SHAVE) + host jackpot\n");
-            printf("[mode] NPU launch: 512x512 (K=%d), %d launches per attempt; noisy A and B built and "
-                   "packed on the host\n", K_DIM, (g_m_active / 512) * (g_n_active / 512));
+            int lrows = 0, lcols = 0;
+            cp_worker_intel_npu_launch_shape(&lrows, &lcols);
+            printf("[mode] NPU launch: %dx%d macro blocks of 128x128 = %dx%d (K=%d, --row-period-batch x "
+                   "--batch-size), %d launches per attempt\n", lrows / 128, lcols / 128, lrows, lcols, K_DIM,
+                   (g_m_active / lrows) * (g_n_active / lcols));
+            printf("[mode] noisy A and B built and packed on the host\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_CUDA){
             if(cutlass_fused){
                 printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");

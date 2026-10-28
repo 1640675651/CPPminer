@@ -1,3 +1,6 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "cp_pearl_npu_worker.h"
 
 #include "cp_config.h"
@@ -5,6 +8,7 @@
 #include "cp_job_ctrl.h"
 #include "cp_noise.h"
 #include "cp_npu_engine.hpp"
+#include "cp_state.h"
 #include "cp_util.h"
 
 #include <algorithm>
@@ -23,11 +27,12 @@
  * Intel NPU worker (zero-B, like the Hexagon and CPU workers). The host generates and packs all the
  * noise; the NPU runs the fused GEMM + tile XOR; the host keeps signal A, its hash, the seeds and the
  * BLAKE3 jackpot.
- *   job:     noisy B (signal B = 0) built on the host and packed per 512-column block into tensors the
- *            NPU reads in place.
+ *   job:     noisy B (signal B = 0) built on the host and packed per launch column block into tensors
+ *            the NPU reads in place.
  *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs; then the matrix
- *            is scanned in launches of 512 rows x 512 columns x K (one compiled graph, cp_npu_graph.cpp).
- *            A prep thread builds each 512-row panel of noisy A ahead of its launches; each of the
+ *            is scanned in launches of rows x columns x K (one compiled graph, cp_npu_graph.cpp; the
+ *            shape in 128x128 macros from --row-period-batch x --col-period-batch).
+ *            A prep thread builds each row panel of noisy A ahead of its launches; each of the
  *            lanes (one infer request and one host thread each, 4 by default) runs launches back to
  *            back and checks the jackpot of its own output while the NPU runs the other lanes'.
  * Hash tile: 8 rows x 16 columns (proof layout CP_TILE_LAYOUT_CONTIGUOUS). A hit is recomputed on the
@@ -42,12 +47,15 @@ using cp_npu::kTileRows;
 
 constexpr int kMilestones = K_DIM / R_RANK;
 static_assert(R_RANK == cp_npu::kKr, "the NPU graph takes one milestone per 128 values of k");
-constexpr int kLaunchRows = 512;
-constexpr int kLaunchCols = 512;
+constexpr int kMacro = 128;        /* launch shape unit, as the other backends' period batches */
+constexpr int kMaxColMacros = 4;   /* 8 column chains of 64: lockstep keeps all of them live */
+constexpr int kRowBlock = 512;     /* rows per accumulator chain; launches above it are made of whole blocks */
 constexpr int kPanelSlots = 3; /* A panels in flight: the one being scanned, the next, one spare */
 
 cp_npu::Engine* g_eng = nullptr;
 int g_lanes = 4;
+int g_row_macros = 0; /* <= 0: CP_INTEL_NPU_ROW_MACROS_DEFAULT */
+int g_col_macros = 0; /* <= 0: CP_INTEL_NPU_COL_MACROS_DEFAULT */
 PearlMatrixHash* g_ahash = nullptr;
 
 struct JobCache {
@@ -58,8 +66,26 @@ struct JobCache {
     int ready = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<uint32_t> pairs_b;
-    std::vector<ov::Tensor> bt; /* n / 512 blocks of B^T rows, [K/128, 512, 128] u8 (value + 128) */
+    std::vector<ov::Tensor> bt; /* n / cols blocks of B^T rows, [K/128, cols, 128] u8 (value + 128) */
 } g_job;
+
+/* The launch for row_macros x col_macros 128x128 macros (<= 0: default): the largest buildable shape at
+ * or below the request that divides an m x n matrix. Rows above one row block are whole row blocks;
+ * columns stop at kMaxColMacros. m, n are multiples of 1024, so 512 x 512 always fits. */
+void pick_launch(int row_macros, int col_macros, int m, int n, int* rows, int* cols) {
+    if (row_macros <= 0)
+        row_macros = CP_INTEL_NPU_ROW_MACROS_DEFAULT;
+    if (col_macros <= 0)
+        col_macros = CP_INTEL_NPU_COL_MACROS_DEFAULT;
+    int r = std::max(1, std::min(row_macros * kMacro, m > 0 ? m : row_macros * kMacro));
+    while (r > kMacro && ((r > kRowBlock && r % kRowBlock) || (m > 0 && m % r)))
+        r -= kMacro;
+    int c = std::max(1, std::min(col_macros, kMaxColMacros)) * kMacro;
+    while (c > kMacro && n > 0 && n % c)
+        c -= kMacro;
+    *rows = r;
+    *cols = c;
+}
 
 int env_int(const char* name, int def, int lo, int hi) {
     const char* v = std::getenv(name);
@@ -108,8 +134,10 @@ int job_matches(const uint8_t job_key[32], int m, int n) {
 int prepare_job(const uint8_t job_key[32], int m, int n) {
     if (!g_eng || !g_eng->ready())
         return -2;
-    if (m % kLaunchRows != 0 || n % kLaunchCols != 0) {
-        fprintf(stderr, "[intel-npu] m and n must be multiples of %d (got %dx%d)\n", kLaunchCols, m, n);
+    const int rows = g_eng->shape().rows, cols = g_eng->shape().cols;
+    if (m % rows != 0 || n % cols != 0) {
+        fprintf(stderr, "[intel-npu] the %dx%d matrix is not a whole number of %dx%d launches "
+                        "(--row-period-batch / --col-period-batch)\n", m, n, rows, cols);
         return -2;
     }
     const double t0 = cp_now_sec();
@@ -122,7 +150,7 @@ int prepare_job(const uint8_t job_key[32], int m, int n) {
     g_job.pairs_b.assign(size_t(K_DIM) * 2, 0);
     pearl_build_perm_pairs_b(g_job.b_noise_seed, K_DIM, R_RANK, g_job.pairs_b.data());
 
-    const int blocks = n / kLaunchCols;
+    const int blocks = n / cols;
     try {
         if ((int)g_job.bt.size() != blocks) {
             g_job.bt.clear();
@@ -130,7 +158,8 @@ int prepare_job(const uint8_t job_key[32], int m, int n) {
                 g_job.bt.push_back(g_eng->host_tensor(1));
         }
     } catch (const std::exception& e) {
-        fprintf(stderr, "[intel-npu] allocating noisy B (%d blocks of 2 MiB) failed: %s\n", blocks, e.what());
+        fprintf(stderr, "[intel-npu] allocating noisy B (%d blocks of %d KiB) failed: %s\n", blocks,
+                cols * K_DIM / 1024, e.what());
         g_job.bt.clear();
         return -2;
     }
@@ -140,7 +169,7 @@ int prepare_job(const uint8_t job_key[32], int m, int n) {
         for (int j = begin; j < end; ++j) {
             pearl_fuse_noise_row_b_buf(j, K_DIM, R_RANK, g_job.b_noise_seed, g_job.pairs_b.data(), NULL,
                                        row.data(), el.data(), nr.data());
-            pack_row(row.data(), kLaunchCols, j % kLaunchCols, g_job.bt[size_t(j / kLaunchCols)].data<uint8_t>());
+            pack_row(row.data(), cols, j % cols, g_job.bt[size_t(j / cols)].data<uint8_t>());
         }
     });
     printf("[intel-npu] job setup %.3fs: B seed %.3fs, noisy B on the host %.3fs (%d blocks, salted=%d)\n",
@@ -247,13 +276,14 @@ void prep_panels(Scan& s, int gen_threads) {
         }
         const double t = cp_now_sec();
         uint8_t* dst = s.a[slot].data<uint8_t>();
-        parallel_for(kLaunchRows, gen_threads, [&](int begin, int end) {
+        const int rows = g_eng->shape().rows;
+        parallel_for(rows, gen_threads, [&](int begin, int end) {
             std::vector<int8_t> el(R_RANK), nr(K_DIM), row(K_DIM);
             for (int i = begin; i < end; ++i) {
-                const int g = r * kLaunchRows + i;
+                const int g = r * rows + i;
                 pearl_fuse_noise_row_a_buf(g, K_DIM, R_RANK, s.a_seed, s.pairs_a, s.a_sig + size_t(g) * K_DIM,
                                            row.data(), el.data(), nr.data());
-                pack_row(row.data(), kLaunchRows, i, dst);
+                pack_row(row.data(), rows, i, dst);
             }
         });
         std::lock_guard<std::mutex> lock(s.mu);
@@ -285,8 +315,7 @@ void run_lane(Scan& s, int lane) {
                 break;
         }
         try {
-            req.set_input_tensor(0, s.a[slot]);
-            req.set_input_tensor(1, g_job.bt[size_t(cb)]);
+            g_eng->set_inputs(lane, s.a[slot], g_job.bt[size_t(cb)]);
             req.infer();
         } catch (const std::exception& e) {
             s.fail(std::string("NPU inference failed: ") + e.what());
@@ -308,8 +337,8 @@ void run_lane(Scan& s, int lane) {
                 if (!s.hit.found || key < s.hit.key) {
                     s.hit.found = 1;
                     s.hit.key = key;
-                    s.hit.t_rows = r * kLaunchRows + tr * kTileRows;
-                    s.hit.t_cols = cb * kLaunchCols + tc * kTileCols;
+                    s.hit.t_rows = r * shape.rows + tr * kTileRows;
+                    s.hit.t_cols = cb * shape.cols + tc * kTileCols;
                     memcpy(s.hit.xor_words, words, sizeof(words));
                     s.found.store(true);
                 }
@@ -332,6 +361,20 @@ void run_lane(Scan& s, int lane) {
 
 } /* namespace */
 
+extern "C" void cp_pearl_npu_worker_set_launch(int row_macros, int col_macros) {
+    g_row_macros = row_macros;
+    g_col_macros = col_macros;
+}
+
+extern "C" void cp_pearl_npu_worker_launch_shape(int* rows, int* cols) {
+    if (g_eng && g_eng->ready()) {
+        *rows = g_eng->shape().rows;
+        *cols = g_eng->shape().cols;
+        return;
+    }
+    pick_launch(g_row_macros, g_col_macros, g_m_active, g_n_active, rows, cols);
+}
+
 extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     (void)devices;
     (void)ndev;
@@ -339,13 +382,21 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
         return;
     g_lanes = env_int("CP_NPU_LANES", 4, 1, 16);
     cp_npu::LaunchShape shape;
-    shape.rows = kLaunchRows;
-    shape.cols = kLaunchCols;
+    pick_launch(g_row_macros, g_col_macros, g_m_active, g_n_active, &shape.rows, &shape.cols);
+    shape.chunk_m = std::min(shape.rows, kRowBlock);
     shape.k = K_DIM;
+    if ((g_row_macros > 0 && shape.rows != g_row_macros * kMacro) ||
+        (g_col_macros > 0 && shape.cols != g_col_macros * kMacro))
+        printf("[intel-npu] launch %dx%d macros requested; using %dx%d (rows a multiple of %d above it and "
+               "dividing m=%d, at most %d column macros dividing n=%d)\n",
+               g_row_macros > 0 ? g_row_macros : shape.rows / kMacro,
+               g_col_macros > 0 ? g_col_macros : shape.cols / kMacro, shape.rows / kMacro, shape.cols / kMacro,
+               kRowBlock, g_m_active, kMaxColMacros, g_n_active);
     const std::string kernel_dir = cp_npu::default_kernel_dir();
     const char* cache_env = std::getenv("CP_NPU_CACHE_DIR");
     const std::string cache_root = cache_env && *cache_env ? cache_env : cp_npu::default_cache_root();
-    printf("[intel-npu] compiling the %dx%dx%d launch graph (first run about 10 s, then cached in %s)\n",
+    printf("[intel-npu] compiling the %dx%dx%d launch graph (first run of a shape takes seconds to minutes, then "
+           "cached in %s)\n",
            shape.rows, shape.cols, shape.k, cache_root.c_str());
     fflush(stdout);
     g_eng = new cp_npu::Engine();
@@ -481,9 +532,10 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     uint32_t a_key8[8];
     memcpy(a_key8, a_seed, 32);
 
+    const int rows = g_eng->shape().rows, cols = g_eng->shape().cols;
     Scan s;
-    s.nb = n / kLaunchCols;
-    s.panels = m / kLaunchRows;
+    s.nb = n / cols;
+    s.panels = m / rows;
     s.launches = s.nb * s.panels;
     s.a_sig = h_A_sig;
     s.a_seed = a_seed;
@@ -502,7 +554,7 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     printf("[intel-npu] plain_proof scan %d launches of %dx%d (%d row panels), %llu hash tiles, difficulty "
            "scaled by %llu; hash_a %.3fs (%zu of %zu chunks)\n",
-           s.launches, kLaunchRows, kLaunchCols, s.panels, (unsigned long long)total_tiles,
+           s.launches, rows, cols, s.panels, (unsigned long long)total_tiles,
            (unsigned long long)cp_jackpot_scale_factor(), hash_sec, rehashed, size_t(m) * K_DIM / 1024);
     fflush(stdout);
 

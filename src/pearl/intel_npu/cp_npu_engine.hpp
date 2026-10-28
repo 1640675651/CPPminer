@@ -29,6 +29,8 @@ public:
     const std::vector<int>& word_index() const { return m_word_index; }
     int requests() const { return int(m_requests.size()); }
     ov::InferRequest& request(int i) { return m_requests[size_t(i)]; }
+    /* Binds request i's inputs: the A panels, and the B^T panels to every B input of the graph. */
+    void set_inputs(int i, const ov::Tensor& a, const ov::Tensor& bt);
 
     /* A host tensor for input `index` (0: A panels, 1: B^T panels) that the NPU reads in place
      * (the plugin's host allocation); a plain tensor if the plugin offers none. */

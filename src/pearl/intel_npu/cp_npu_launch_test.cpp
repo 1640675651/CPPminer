@@ -1,7 +1,9 @@
 /*
- * cp_npu_launch_test: checks one Intel NPU launch (512 x 512 x 4096 tile XOR) against a host reference
- * on random int8 data, then measures launches per second with several requests in flight.
- *   cp_npu_launch_test [--launches N] [--requests R] [--kernel-dir DIR] [--cache-dir DIR]
+ * cp_npu_launch_test: checks one Intel NPU launch (rows x cols x 4096 tile XOR, default 512 x 512)
+ * against a host reference on random int8 data, then measures launches per second with several
+ * requests in flight.
+ *   cp_npu_launch_test [--rows R] [--cols C] [--group G] [--shared-b] [--launches N] [--requests R]
+ *                      [--kernel-dir DIR] [--cache-dir DIR]
  */
 #include <atomic>
 #include <chrono>
@@ -66,10 +68,19 @@ std::vector<uint32_t> reference(const std::vector<int8_t>& a, const std::vector<
 
 int main(int argc, char** argv) {
     int launches = 400, requests = 4;
+    LaunchShape s;
     std::string kernel_dir = default_kernel_dir(), cache_root = default_cache_root();
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--launches" && i + 1 < argc)
+        if (a == "--rows" && i + 1 < argc)
+            s.rows = std::atoi(argv[++i]);
+        else if (a == "--cols" && i + 1 < argc)
+            s.cols = std::atoi(argv[++i]);
+        else if (a == "--group" && i + 1 < argc)
+            s.group = std::atoi(argv[++i]);
+        else if (a == "--shared-b")
+            s.split_b = false;
+        else if (a == "--launches" && i + 1 < argc)
             launches = std::atoi(argv[++i]);
         else if (a == "--requests" && i + 1 < argc)
             requests = std::atoi(argv[++i]);
@@ -78,20 +89,26 @@ int main(int argc, char** argv) {
         else if (a == "--cache-dir" && i + 1 < argc)
             cache_root = argv[++i];
         else {
-            std::fprintf(stderr, "usage: cp_npu_launch_test [--launches N] [--requests R] [--kernel-dir DIR] "
-                                 "[--cache-dir DIR]\n");
+            std::fprintf(stderr, "usage: cp_npu_launch_test [--rows R] [--cols C] [--group G] [--shared-b] "
+                                 "[--launches N] [--requests R] [--kernel-dir DIR] [--cache-dir DIR]\n");
             return 2;
         }
     }
-    LaunchShape s;
+    s.chunk_m = std::min(s.rows, 512);
+    if (const char* why = launch_shape_error(s)) {
+        std::fprintf(stderr, "launch %dx%d: %s\n", s.rows, s.cols, why);
+        return 2;
+    }
     Engine eng;
     std::string err;
     if (eng.init(s, kernel_dir, cache_root, requests, &err) != 0) {
         std::fprintf(stderr, "init failed: %s\n", err.c_str());
         return 1;
     }
-    std::printf("device %s, launch %dx%dx%d, compile/load %.1f s, cache %s, %s host tensors\n",
-                eng.device_name().c_str(), s.rows, s.cols, s.k, eng.compile_sec(), eng.cache_dir().c_str(),
+    std::printf("device %s, launch %dx%dx%d (%d row blocks, group %d, %s B), compile/load %.1f s, cache %s, %s host "
+                "tensors\n",
+                eng.device_name().c_str(), s.rows, s.cols, s.k, s.row_blocks(), s.group,
+                s.split_b ? "split" : "shared", eng.compile_sec(), eng.cache_dir().c_str(),
                 eng.zero_copy() ? "zero-copy" : "plain");
 
     std::mt19937 rng(7);
@@ -106,8 +123,7 @@ int main(int argc, char** argv) {
     pack_panels(bt.data(), s.cols, s.k, tb.data<uint8_t>());
 
     ov::InferRequest& req = eng.request(0);
-    req.set_input_tensor(0, ta);
-    req.set_input_tensor(1, tb);
+    eng.set_inputs(0, ta, tb);
     req.infer();
     const auto* out = reinterpret_cast<const uint32_t*>(req.get_output_tensor(0).data());
     const auto ref = reference(a, bt, s);
@@ -130,8 +146,7 @@ int main(int argc, char** argv) {
     for (int l = 0; l < eng.requests(); ++l)
         lanes.emplace_back([&, l] {
             ov::InferRequest& r = eng.request(l);
-            r.set_input_tensor(0, ta);
-            r.set_input_tensor(1, tb);
+            eng.set_inputs(l, ta, tb);
             while (next++ < launches)
                 r.infer();
         });

@@ -174,6 +174,13 @@ void Engine::shutdown() {
     m_ready = false;
 }
 
+void Engine::set_inputs(int i, const ov::Tensor& a, const ov::Tensor& bt) {
+    ov::InferRequest& req = m_requests[size_t(i)];
+    req.set_input_tensor(0, a);
+    for (int b = 0; b < m_shape.b_inputs(); ++b)
+        req.set_input_tensor(size_t(1 + b), bt);
+}
+
 ov::Tensor Engine::host_tensor(int index) {
     const auto& port = m_compiled.input(size_t(index));
     if (m_zero_copy) {

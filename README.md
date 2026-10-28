@@ -144,7 +144,7 @@ cppminer --backend opencl --devices 0 --mock
 | `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus wgpu/OpenCL: **nonces per launch** (default 1000000). Aliases: `--period-batch`, `--col-period-batch` |
 | `--period-batch N` | Alias for `--batch-size` |
 | `--col-period-batch N` | Alias for `--batch-size` |
-| `--row-period-batch N` | CUDA only: row-period batch (default 32, max 1024) |
+| `--row-period-batch N` | CUDA: row-period batch (default 32, max 1024); oneDNN, Hexagon, Intel NPU: see below |
 | `--max-nonce N` | Stop after N attempts per job |
 | `--dry-run` | Build proof without submitting; saves `pp_header.bin` / `pp_proof.b64` next to the executable (a normal run writes nothing to disk) |
 | `--verify` | In-process zk-pow jackpot verify before submit (needs vendored `zk-pow`) |
@@ -247,6 +247,17 @@ One DSP launch covers `--row-period-batch` × `--batch-size` macro blocks of 128
 
 At the defaults one launch is 4096×4096 = 65536 hash tiles (4×64), about 170 ms of DSP time. Taller launches amortize the DSP's per-tile copies of B better (2048 rows is ~3% slower). Column width barely matters.
 
+**Intel NPU — 2D macro launches**
+
+One NPU launch covers `--row-period-batch` × `--batch-size` macro blocks of 128×128, one compiled graph per shape (cached in `npu_cache/` after the first compile). Columns stop at 4 macros; rows above 4 macros are whole 512-row blocks; a shape that does not fit or divide the matrix is lowered with a message.
+
+| Flag | Role | Default |
+|------|------|---------|
+| `--row-period-batch` | 128-row macros per launch | 16 (2048 rows) |
+| `--batch-size` / `--period-batch` / `--col-period-batch` | 128-column macros per launch (at most 4) | 4 (512 columns) |
+
+2048×512 is the fastest measured shape: 1.59 TOPS per launch against 1.50 for 512×512 and 1.47 for 16384×512, and 0.80 against 0.75 TMAC/s mining at 131072² ([details](src/pearl/intel_npu/README.md#measurements-core-ultra-9-275hx-npu-2-tiles)).
+
 ## Performance
 
 Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings. GPUs are tested with stock settings, no clock/power/voltage tuning unless explicitly stated. Power is readed from HWinfo64.
@@ -281,7 +292,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Hashrate |
 |--------|----------|
-| NPU3720 (Core Ultra 9 275HX, 2 tiles) | 730 GH/s |
+| NPU3720 (Core Ultra 9 275HX, 2 tiles) | 800 GH/s |
 
 ### Hexagon DSP
 
