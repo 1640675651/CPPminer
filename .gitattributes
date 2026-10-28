@@ -1,0 +1,4 @@
+# Patches are applied with `git apply` to trees whose files keep their own line endings: check them out
+# byte-exact, never converted to CRLF (core.autocrlf would break the hunks).
+*.diff -text
+*.patch -text

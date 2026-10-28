@@ -2,8 +2,7 @@
 
 `--backend intel_npu` mines Pearl on the NPU of Intel Core Ultra processors (NPU3720 class: Meteor Lake, Arrow
 Lake). The NPU runs the exact int8 GEMM and the per-tile milestone XOR; the host builds the noisy matrices and
-runs the BLAKE3 jackpot. The design comes from `gemm_xor_benchmark/npu` (Case 3.4 on the NPU), which has the full
-measurements and the reasoning behind each choice.
+runs the BLAKE3 jackpot (or, with `--fused-jackpot`, the NPU does).
 
 Arrow Lake Core Ultra 9 275HX: about **0.81 TMAC/s** (810 GH/s) with the default 2048 × 512 launch, mock shares
 verify at 8192² and 131072².
@@ -15,7 +14,7 @@ verify at 8192² and 131072².
 | Launch graph | `cp_npu_graph.cpp` | One OpenVINO model per launch shape (rows × cols × 4096, in 128 × 128 macros): per row block of 512 and K panel of 128, an int32 GEMM on the DPU of the A panel with a 64-column block of B, then the `TileXorAcc` op (8 panels per op) keeps the running sum and XORs every 16 × 16 tile on the SHAVEs. The column chains of a row block run in lockstep so each A panel leaves CMX after its last use. |
 | Engine | `cp_npu_engine.cpp` | The patched compiler's switches, the compiled-graph cache (`npu_cache/`, keyed by the kernel ELFs and the compiler DLL), infer requests, NPU-visible host tensors (inputs are read in place). |
 | Worker | `cp_pearl_npu_worker.cpp` | Zero-B like the CPU and Hexagon workers. Per job: noisy B built on the host and packed per launch column block. Per attempt: the sparse signal A, its incremental hash, the seeds; a prep thread packs each launch row panel of noisy A ahead of its launches; the calling thread keeps 4 launches queued (one per infer request, `start_async`), and as each completes it checks that output's jackpot and queues the next launch on that request. A hit is recomputed on the host before it becomes a share. |
-| SHAVE kernels | `kernels/tile_xor_acc.3720xx*.elf`, `kernels/tile_jackpot.3720xx*.elf` | Prebuilt hand-scheduled `TileXorAcc` kernel (it takes the tile height, 8 or 16 rows, from its tensors) and the C `TileJackpot` kernel of `--fused-jackpot`. Sources and generator: `gemm_xor_benchmark/npu/kernels` and `tools/gen_tile_xor_asm.py`, built by `tools/build_tile_xor_kernel.ps1` (needs MoviTools to rebuild). |
+| SHAVE kernels | `kernels/*.elf`, sources in `kernels/src` | Prebuilt hand-scheduled `TileXorAcc` kernel (it takes the tile height, 8 or 16 rows, from its tensors) and the C `TileJackpot` kernel of `--fused-jackpot`; `kernels/build_kernels.ps1` rebuilds both (see [SHAVE kernels](#shave-kernels)). |
 | Compiler patch | `patches/npu_compiler_all.diff` | Against `openvinotoolkit/npu_compiler` at `patches/NPU_COMPILER_COMMIT`: int32 DPU output (`NPU_EXPERIMENTAL_I32_DPU_OUTPUT=1`), the `TileXorAcc` and `TileJackpot` ops from the frontend to the SHAVE kernel calls (both split over the 2 tiles by rows and over each tile's 2 ACT SHAVEs), the tile height (`NPU_EXPERIMENTAL_TILE_XOR_ROWS`, 8 by default), loading external SHAVE kernels (`NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR`), the tile-word layout and cycle costs. The miner sets all three variables itself. |
 
 Hash tile 16 × 16 (proof layout `CP_TILE_LAYOUT_CONTIGUOUS_16x16`). The SHAVE work is the same as with 8 × 16 tiles,
@@ -154,7 +153,8 @@ The DPU is not what limits this backend. The NPU's int8 peak is 13.1 TOPS (2 til
 and the compiler reaches about 11 TOPS on a plain GEMM of these shapes. The milestone XOR runs at 1.6 TOPS,
 7× slower than that GEMM. The bottleneck is the 4 ACT SHAVEs (2 per tile, vector units 128 bits wide). For each
 int32 partial the DPU writes, one per output element and K panel of 128 (256 ops of GEMM), they must add it into
-the running accumulator and XOR it into its tile word. Measurements from `gemm_xor_benchmark/npu/REPORT.md`:
+the running accumulator and XOR it into its tile word. Measured with the NPU profiler's per-SHAVE cycle counters
+during the kernel's development:
 
 | Limit | Cycles per element-milestone, per SHAVE | Chip | TMAC/s |
 |-------|------------------------------------------|------|--------|
@@ -178,8 +178,8 @@ The SHAVEs set the pace, so anything else they run comes straight off the hashra
 1,500 cycles per 4 tiles (one BLAKE3 compression), which costs 9%. The host side has plenty of slack: one thread
 spends about 15% of the scan on the jackpot.
 
-The VAU floor of 2.3 TOPS (1.15 TMAC/s) is the hard ceiling of this design on NPU3720; the benchmark puts a
-realistic target at about 1.8 TOPS (0.9 TMAC/s). Getting there is compiler and runtime work rather than kernel
+The VAU floor of 2.3 TOPS (1.15 TMAC/s) is the hard ceiling of this design on NPU3720; a realistic target is
+about 1.8 TOPS (0.9 TMAC/s). Getting there is compiler and runtime work rather than kernel
 work:
 - an in-place accumulator, to free a 64–128 KiB buffer per op so chains can interleave at 1024 × 64 blocks
   (~1.7 TOPS);
@@ -187,6 +187,38 @@ work:
 - kernel parameters in CMX, worth about 8% of task time.
 
 The kernel itself has nothing obvious left.
+
+## SHAVE kernels
+
+The miner ships the kernels prebuilt (`kernels/*.elf`, copied next to `cppminer.exe` as `kernels/intel_npu/`), so
+mining needs nothing below. The checked-in ELFs are the reference copies: the toolchain that builds them is not
+publicly distributed (see below), so do not delete them on the assumption that they can always be regenerated.
+
+| File | Contents |
+|------|----------|
+| `kernels/src/tile_xor_acc.c` | `TileXorAcc` kernel: parameter block parsing (the compiler's MemRef records), the split over the tile's ACT SHAVEs, dispatch to the assembly routines, plain C loops for other partial counts and tile heights |
+| `kernels/src/gen_tile_xor_asm.py` | Generator of the hand-scheduled routines (`tx_strips_g8`, `tx_strips_g8_r16`, `tx_strips_g4`, `tx_xor_strips`), with the NPU3720 SHAVE rules they obey and checkers for the hazards that hang the device |
+| `kernels/src/tile_jackpot.c` | `TileJackpot` kernel: fold, keyed BLAKE3 (4 tiles per 128-bit vector) and bound compare, in C |
+| `kernels/src/movi.py` | Drives the MoviTools compiler, assembler and linker DLLs directly (`-O3`, the compiler's own kernel flags and linker script, both the plain and the `_lsu0_wo` variant) |
+| `kernels/src/asm_cycles.py` | Static cycle estimate per basic block of the generated assembly |
+| `kernels/build_kernels.ps1` | Builds both kernels into `kernels/` (`-OutDir` elsewhere, `-KeepAsm` keeps the `.s` files) |
+
+The build is deterministic: from these sources it reproduces the checked-in ELFs byte for byte.
+
+```powershell
+$env:MOVITOOLS_DIR = 'C:\path\to\MVC_DEPEND'          # the MoviTools directory, see below
+$env:NPU_COMPILER_SRC = 'C:\path\to\npu_compiler'      # default: third_party\npu_compiler-src (the prepare script's)
+powershell -ExecutionPolicy Bypass -File src\pearl\intel_npu\kernels\build_kernels.ps1
+```
+
+**MoviTools.** The SHAVE compiler, assembler and linker (`moviCompile64.dll`, `moviAsm64.dll`, `moviLLD64.dll` and
+the `lib\` archives) are proprietary and not published by Intel on their own. The known source is the `MVC_DEPEND`
+directory of an older Intel NPU driver package that Lenovo still hosts: `r2gvp04w_v2.exe`, version `31.0.100.1688`,
+SHA-256 `CF767EEA31DEBAA199B084CCE06EB82443AA251D5963EF97030F5219B9FE28DB`. npunlock's `wiki/GET_MOVITOOLS.md`
+gives the download links and how to extract the package without installing it (do not install that driver). It
+may disappear from Lenovo's site some day, and its license does not allow redistributing it here; keep a private
+copy if you plan to change the kernels. The build also needs Python 3 (standard library only) and the
+`npu_compiler` checkout, for `sw_runtime_kernels/kernels/prebuild/shave_kernel.ld`.
 
 ## Acknowledgements
 
@@ -199,6 +231,6 @@ reconstructed how to compile C into runnable NPU3720 SHAVE kernels:
   establish how a SHAVE kernel image is laid out (`.text` at `0x1d000000`, `.arg.data` at `0x1e000000`, entry from
   `e_entry`) and how the firmware invokes it with a parameter block.
 
-Neither the miner nor its build uses npunlock's code: `kernels/tile_xor_acc.3720xx*.elf` are prebuilt, follow the NPU
-compiler's own kernel ABI, and are loaded by the patched compiler. npunlock and MoviTools are only needed to rebuild
-the kernel (see `gemm_xor_benchmark/npu`).
+Neither the miner nor the kernel build uses npunlock's code: the kernels follow the NPU compiler's own kernel ABI
+(the parameter block of `sw_runtime_kernels`), are loaded by the patched compiler, and `kernels/src/movi.py` drives
+the MoviTools DLLs itself. MoviTools is only needed to rebuild the kernels (see [SHAVE kernels](#shave-kernels)).

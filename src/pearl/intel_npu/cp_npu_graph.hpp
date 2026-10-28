@@ -2,7 +2,7 @@
 /*
  * OpenVINO graph of one Intel NPU launch: the exact int8 GEMM of a panel of noisy A rows with a block
  * of noisy B columns over all of K, with the int32 accumulator XOR-reduced per 16x16 tile after every
- * K step of 128 (the pearl milestones). Built from the gemm_xor_benchmark NPU design: per-panel int32
+ * K step of 128 (the pearl milestones): per-panel int32
  * GEMMs on the DPU feed the TileXorAcc SHAVE kernel of the patched compiler, which keeps the running
  * sum and XORs every tile in one pass.
  *
