@@ -4,17 +4,20 @@
 ### New features
 - Experimental hexagon backend for qualcomm devices
 - OneDNN backend now supports Xe-HPG GPU with XMX cores with tuned performance
-- AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected) (thanks @danifest751)
-- ARM i8mm kernel (thanks @danifest751)
-- Kryptex "Pearl stratum gzip protocol" (v2): `mining.authorize` offers `"type":"v2"`; when the pool's response carries `"type":"v2"` the `plain_proof` is submitted as base64 of the gzip stream. Pools that do not answer `type v2` (LuckyPool) keep plain proofs. `--pool-pass STR` sets the authorize `password` (Kryptex custom difficulty `d=N`); on a kryptex host the wallet is also sent as `WALLET.worker` (thanks @danifest751)
+(3 features below thanks to @danifest751)
+- AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
+- ARM i8mm kernel
+- Kryptex Pearl stratum gzip protocol v2
 
 ### Fix & Enhancements
-- NEON DotProd and basic NEON kernel rewrite, reduce instruction count (thanks @danifest751)
-- OpenCL: mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8) (joint effort with @danifest751) 
-- OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
-- OpenCL: 2 launches in flight, reducing GPU idle time (thanks @danifest751)
-- Faster noisy matrix preparation (joint effort with @danifest751)
 - Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
+- OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
+(5 improvements below thanks to @danifest751)
+- NEON DotProd and basic NEON kernel rewrite, reduce instruction count
+- OpenCL: mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8)
+- OpenCL: 2 launches in flight, reducing GPU idle time
+- OpenCL: Faster noisy matrix preparation
+- Improve pool connection robustness
 
 ### Pearl Hexagon
 - DSP self-guided loop, negligible kernel launch overhead

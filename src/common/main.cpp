@@ -332,6 +332,30 @@ static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char* cur_job_key)
     return rc;
 }
 
+/* Pool reconnect backoff. Reconnecting after a session that got a job (fee switch, dropped
+ * connection) is immediate; each further attempt that gets no job (connect refused, login
+ * rejected, pool hung up) waits 5 s, doubling up to 60 s, so a failing pool is not hammered. */
+#define CP_RECONNECT_DELAY_MIN_SEC 5
+#define CP_RECONNECT_DELAY_MAX_SEC 60
+static int g_reconnect_delay_sec = 0;
+
+static void pool_reconnect_wait(void)
+{
+    const int d = g_reconnect_delay_sec;
+    if(d > 0){
+        printf("[main] Reconnecting in %d sec...\n", d);
+        fflush(stdout);
+        cp_sleep(d);
+    }
+    g_reconnect_delay_sec = d == 0 ? CP_RECONNECT_DELAY_MIN_SEC
+                          : (d * 2 < CP_RECONNECT_DELAY_MAX_SEC ? d * 2 : CP_RECONNECT_DELAY_MAX_SEC);
+}
+
+static void pool_session_ok(void)
+{
+    g_reconnect_delay_sec = 0;
+}
+
 static int run_quantus_pool(const char* pool_host, int pool_port)
 {
     char cur_job_key[160] = {0};
@@ -350,12 +374,11 @@ reconnect:
     cp_qpow_pool_clear();
     cur_job_key[0] = 0;
 
-    printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
     while(1){
-        if(cp_pool_connect(pool_host, pool_port)) break;
-        printf("[main] Reconnecting in 5 sec...\n");
+        pool_reconnect_wait();
+        printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
         fflush(stdout);
-        cp_sleep(5);
+        if(cp_pool_connect(pool_host, pool_port)) break;
     }
 
     if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), worker_global, agent_global))
@@ -378,9 +401,9 @@ reconnect:
                                         &first_job)){
         printf("[net] login parse failed: %s\n", login_line);
         fflush(stdout);
-        cp_sleep(3);
         goto reconnect;
     }
+    pool_session_ok();
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
@@ -1745,11 +1768,10 @@ reconnect:
     cp_pool_inbox_clear();
     cur_job_key[0] = 0;
 
-    printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
     while(1){
+        pool_reconnect_wait();
+        printf("[main] Connecting to %s:%d...\n", pool_host, pool_port); fflush(stdout);
         if(cp_pool_connect(pool_host, pool_port)) break;
-        printf("[main] Reconnecting in 5 sec...\n"); fflush(stdout);
-        cp_sleep(5);
     }
 
     if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global,
@@ -1776,6 +1798,7 @@ reconnect:
         if(got == 0) continue;
 
         if(strstr(line_buf, "mining.notify")){
+            pool_session_ok();
             int rc = handle_notify_line(line_buf, &msg_id, cur_job_key);
             if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
