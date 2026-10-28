@@ -29,6 +29,9 @@
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
 #include "cp_pearl_hexagon_worker.h"
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+#include "cp_pearl_npu_worker.h"
+#endif
 
 static CpBackendId g_backend = CP_BACKEND_NONE;
 /* 0 = pearl, 1 = quantus (matches CpAlgoId). */
@@ -98,6 +101,15 @@ extern "C" int cp_worker_has_hexagon(void)
 #endif
 }
 
+extern "C" int cp_worker_has_intel_npu(void)
+{
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static CpBackendId default_backend(void)
 {
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -112,6 +124,8 @@ static CpBackendId default_backend(void)
     return CP_BACKEND_WGPU;
 #elif defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     return CP_BACKEND_HEXAGON;
+#elif defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    return CP_BACKEND_INTEL_NPU;
 #else
     return CP_BACKEND_NONE;
 #endif
@@ -151,6 +165,11 @@ extern "C" int cp_worker_select(CpBackendId id)
         g_backend = CP_BACKEND_HEXAGON;
         return 0;
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
+        g_backend = CP_BACKEND_INTEL_NPU;
+        return 0;
+#endif
     default:
         fprintf(stderr, "[worker] backend %d not built into this binary\n", (int)id);
         return -1;
@@ -173,6 +192,7 @@ extern "C" const char* cp_worker_backend_name(void)
     case CP_BACKEND_ONEDNN: return "onednn";
     case CP_BACKEND_WGPU: return "wgpu";
     case CP_BACKEND_HEXAGON: return "hexagon";
+    case CP_BACKEND_INTEL_NPU: return "intel_npu";
     default: return "none";
     }
 }
@@ -217,6 +237,11 @@ extern "C" void cp_worker_init(int* devices, int ndev)
         cp_pearl_hexagon_worker_init();
         return;
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
+        cp_pearl_npu_worker_init(devices, ndev);
+        return;
+#endif
     default:
         fprintf(stderr, "[worker] no backend available\n");
         break;
@@ -245,6 +270,10 @@ extern "C" int cp_worker_is_ready(void)
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     case CP_BACKEND_HEXAGON:
         return cp_pearl_hexagon_worker_is_ready();
+#endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
+        return cp_pearl_npu_worker_is_ready();
 #endif
     default:
         return 1;
@@ -382,6 +411,35 @@ extern "C" void cp_worker_set_hexagon_launch(int row_macros, int col_macros)
 #endif
 }
 
+extern "C" void cp_worker_set_intel_npu_launch(int row_macros, int col_macros)
+{
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    cp_pearl_npu_worker_set_launch(row_macros, col_macros);
+#else
+    (void)row_macros;
+    (void)col_macros;
+#endif
+}
+
+extern "C" void cp_worker_intel_npu_launch_shape(int* rows, int* cols)
+{
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    cp_pearl_npu_worker_launch_shape(rows, cols);
+#else
+    *rows = 0;
+    *cols = 0;
+#endif
+}
+
+extern "C" void cp_worker_set_intel_npu_fused_jackpot(int on)
+{
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    cp_pearl_npu_worker_set_fused_jackpot(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_set_hexagon_fused_jackpot(int on)
 {
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
@@ -427,6 +485,10 @@ extern "C" int cp_worker_list_devices(void)
     case CP_BACKEND_HEXAGON:
         return cp_pearl_hexagon_worker_list_devices();
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
+        return cp_pearl_npu_worker_list_devices();
+#endif
     case CP_BACKEND_CPU:
         printf("[cpu] host CPU backend (no device list)\n");
         return 0;
@@ -462,6 +524,9 @@ extern "C" void cp_worker_shutdown(void)
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     case CP_BACKEND_HEXAGON: cp_pearl_hexagon_worker_shutdown(); break;
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU: cp_pearl_npu_worker_shutdown(); break;
+#endif
     default: break;
     }
 }
@@ -487,6 +552,13 @@ extern "C" void cp_worker_apply_backend_defaults(void)
         /* 4x64 hash tile: half of the 4x128 HVX register tile. */
         cp_pp_set_hash_tile(4, 64);
         pearl_set_contiguous_tile_shape(4, 64);
+    }
+#endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU) {
+        /* 16x16 hash tile: the TileXorAcc kernel's tile (cp_npu::kTileRows x kTileCols). */
+        cp_pp_set_hash_tile(16, 16);
+        pearl_set_contiguous_tile_shape(16, 16);
     }
 #endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -642,7 +714,8 @@ extern "C" int cp_worker_prefers_host_matrices(void)
 
 extern "C" int cp_worker_writes_host_signal_a(void)
 {
-    if(cp_worker_backend_id() == CP_BACKEND_CPU || cp_worker_backend_id() == CP_BACKEND_HEXAGON)
+    if(cp_worker_backend_id() == CP_BACKEND_CPU || cp_worker_backend_id() == CP_BACKEND_HEXAGON ||
+       cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)
         return 1;
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
@@ -697,6 +770,10 @@ extern "C" int cp_worker_worker_handles_matrix_prep(void)
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
         return 1;
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)
+        return 1;
+#endif
     return 0;
 }
 
@@ -727,6 +804,10 @@ extern "C" void cp_worker_begin_job(const uint8_t job_key[32], int m, int n,
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
         cp_pearl_hexagon_worker_begin_job(job_key, m, n, cert_version);
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)
+        cp_pearl_npu_worker_begin_job(job_key, m, n, cert_version);
+#endif
     (void)job_key;
     (void)m;
     (void)n;
@@ -749,6 +830,8 @@ extern "C" int cp_worker_default_tile_layout(void)
         return CP_TILE_LAYOUT_CONTIGUOUS;
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
         return CP_TILE_LAYOUT_CONTIGUOUS_4x64;
+    if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)
+        return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN) {
         /* The kernel selection only accepts provable hash tiles (cp_onednn_worker.cpp). */
@@ -840,6 +923,13 @@ extern "C" int cp_worker_mine_attempt(
             h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
             out_t_rows, out_t_cols, out_tiles_scanned);
 #endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
+        return cp_pearl_npu_worker_mine_attempt(
+            ab_seed, ab_seed_len, job_key, pool_tgt, m, n, cpu_matrices,
+            h_A_noisy, h_B_noisy, a_key, h_A_sig, h_Bt_sig,
+            out_t_rows, out_t_cols, out_tiles_scanned);
+#endif
     default:
         fprintf(stderr, "[worker] mine_attempt: no backend\n");
         return -1;
@@ -857,6 +947,12 @@ extern "C" int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     case CP_BACKEND_HEXAGON:
+        (void)h_A_sig;
+        (void)h_Bt_sig;
+        return 0; /* signal A is written on the host */
+#endif
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    case CP_BACKEND_INTEL_NPU:
         (void)h_A_sig;
         (void)h_Bt_sig;
         return 0; /* signal A is written on the host */
@@ -910,11 +1006,11 @@ extern "C" int cp_worker_supports_share_witness(void)
 
 extern "C" int cp_worker_needs_host_bt(void)
 {
-    /* The CPU, OpenCL, oneDNN, wgpu and Hexagon workers build noisy B from the zero-B seed and never
-     * write signal B^T, even with --cpu-gen. */
+    /* The CPU, OpenCL, oneDNN, wgpu, Hexagon and Intel NPU workers build noisy B from the zero-B seed
+     * and never write signal B^T, even with --cpu-gen. */
     const int backend = cp_worker_backend_id();
     if(backend == CP_BACKEND_CPU || backend == CP_BACKEND_OPENCL || backend == CP_BACKEND_ONEDNN ||
-       backend == CP_BACKEND_WGPU || backend == CP_BACKEND_HEXAGON)
+       backend == CP_BACKEND_WGPU || backend == CP_BACKEND_HEXAGON || backend == CP_BACKEND_INTEL_NPU)
         return 0;
     return !cp_worker_supports_share_witness();
 }

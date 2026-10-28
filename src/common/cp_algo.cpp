@@ -45,6 +45,7 @@ int cp_algo_supports(CpAlgoId algo, CpBackendId backend)
     case CP_BACKEND_OPENCL: return cp_worker_has_opencl();
     case CP_BACKEND_ONEDNN: return cp_worker_has_onednn();
     case CP_BACKEND_HEXAGON: return cp_worker_has_hexagon();
+    case CP_BACKEND_INTEL_NPU: return cp_worker_has_intel_npu();
     default: return 0;
     }
 }
@@ -56,10 +57,10 @@ void cp_algo_format_backends(CpAlgoId algo, char* buf, int buf_len)
     int first = 1;
     const CpBackendId ids[] = {
         CP_BACKEND_CPU, CP_BACKEND_CUDA, CP_BACKEND_OPENCL, CP_BACKEND_ONEDNN,
-        CP_BACKEND_WGPU, CP_BACKEND_HEXAGON
+        CP_BACKEND_WGPU, CP_BACKEND_HEXAGON, CP_BACKEND_INTEL_NPU
     };
-    const char* names[] = { "cpu", "cuda", "opencl", "onednn", "wgpu", "hexagon" };
-    for(int i = 0; i < 6; i++){
+    const char* names[] = { "cpu", "cuda", "opencl", "onednn", "wgpu", "hexagon", "intel_npu" };
+    for(int i = 0; i < 7; i++){
         if(!cp_algo_supports(algo, ids[i])) continue;
         int n = (int)strlen(buf);
         snprintf(buf + n, (size_t)(buf_len - n), "%s%s", first ? "" : "|", names[i]);

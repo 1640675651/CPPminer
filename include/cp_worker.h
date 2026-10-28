@@ -16,7 +16,8 @@ typedef enum {
     CP_BACKEND_OPENCL = 3,
     CP_BACKEND_ONEDNN = 4,
     CP_BACKEND_WGPU   = 5,
-    CP_BACKEND_HEXAGON = 6
+    CP_BACKEND_HEXAGON = 6,
+    CP_BACKEND_INTEL_NPU = 7
 } CpBackendId;
 
 /* Compile-time availability (1 if linked). */
@@ -26,6 +27,7 @@ int cp_worker_has_opencl(void);
 int cp_worker_has_onednn(void);
 int cp_worker_has_wgpu(void);
 int cp_worker_has_hexagon(void);
+int cp_worker_has_intel_npu(void);
 
 const char* cp_worker_backend_name(void);
 CpBackendId cp_worker_backend_id(void);
@@ -74,6 +76,12 @@ void cp_worker_set_wgpu_tile(int mr, int nr);
 void cp_worker_set_wgpu_macro(int macro_m, int macro_n);
 /* hexagon-only: DSP launch in 128x128 macro blocks, rows x columns (<= 0 = default 32). */
 void cp_worker_set_hexagon_launch(int row_macros, int col_macros);
+/* intel_npu-only: launch in 128x128 macro blocks, rows x columns (<= 0 = default
+ * CP_INTEL_NPU_ROW_MACROS_DEFAULT x CP_INTEL_NPU_COL_MACROS_DEFAULT); the launch in rows x columns. */
+void cp_worker_set_intel_npu_launch(int row_macros, int col_macros);
+void cp_worker_intel_npu_launch_shape(int* rows, int* cols);
+/* intel_npu-only: --fused-jackpot, the jackpot on the NPU's SHAVEs instead of the host. */
+void cp_worker_set_intel_npu_fused_jackpot(int on);
 /* hexagon-only: --fused-jackpot, the jackpot on the DSP instead of the host. */
 void cp_worker_set_hexagon_fused_jackpot(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */
