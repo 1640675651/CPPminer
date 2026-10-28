@@ -13,11 +13,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,9 +32,9 @@
  *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs; then the matrix
  *            is scanned in launches of rows x columns x K (one compiled graph, cp_npu_graph.cpp; the
  *            shape in 128x128 macros from --row-period-batch x --col-period-batch).
- *            A prep thread builds each row panel of noisy A ahead of its launches; each of the
- *            lanes (one infer request and one host thread each, 4 by default) runs launches back to
- *            back and checks the jackpot of its own output while the NPU runs the other lanes'.
+ *            A prep thread builds each row panel of noisy A ahead of its launches; the calling thread
+ *            keeps one launch per infer request (4 by default) queued on the NPU and checks the
+ *            jackpot of each output as it completes, while the NPU runs the launches queued behind it.
  * Hash tile: 8 rows x 16 columns (proof layout CP_TILE_LAYOUT_CONTIGUOUS). A hit is recomputed on the
  * host from the seeds before it can become a share.
  */
@@ -53,7 +53,7 @@ constexpr int kRowBlock = 512;     /* rows per accumulator chain; launches above
 constexpr int kPanelSlots = 3; /* A panels in flight: the one being scanned, the next, one spare */
 
 cp_npu::Engine* g_eng = nullptr;
-int g_lanes = 4;
+int g_requests = 4;
 int g_row_macros = 0; /* <= 0: CP_INTEL_NPU_ROW_MACROS_DEFAULT */
 int g_col_macros = 0; /* <= 0: CP_INTEL_NPU_COL_MACROS_DEFAULT */
 PearlMatrixHash* g_ahash = nullptr;
@@ -181,7 +181,6 @@ int prepare_job(const uint8_t job_key[32], int m, int n) {
 
 struct Hit {
     int found = 0;
-    int64_t key = 0; /* launch * tiles per launch + tile: the lowest wins, for a deterministic pick */
     int t_rows = -1;
     int t_cols = -1;
     uint32_t xor_words[kMilestones]{};
@@ -232,31 +231,21 @@ struct Scan {
     const uint32_t* a_key8 = nullptr;
     const uint32_t* bound = nullptr;
 
-    std::atomic<int> next{0};
     std::atomic<bool> stop{false};
-    std::atomic<uint64_t> tiles{0};
-    std::atomic<int> lanes_left{0};
-    std::atomic<bool> found{false};
+    uint64_t tiles = 0;
 
+    /* Shared with the prep thread. */
     std::mutex mu;
     std::condition_variable cv;
     int slot_panel[kPanelSlots] = {-1, -1, -1};
     std::vector<int> panel_done;
     ov::Tensor a[kPanelSlots];
+    double prep_busy = 0.0;
 
-    std::mutex hit_mu;
     Hit hit;
     std::string error;
-    double prep_busy = 0.0, check_busy = 0.0;
+    double check_busy = 0.0;
 
-    void fail(const std::string& msg) {
-        {
-            std::lock_guard<std::mutex> lock(hit_mu);
-            if (error.empty())
-                error = msg;
-        }
-        halt();
-    }
     void halt() {
         stop.store(true);
         std::lock_guard<std::mutex> lock(mu);
@@ -264,7 +253,7 @@ struct Scan {
     }
 };
 
-/* Builds the panels of noisy A in order, each into a free slot, ahead of the lanes. */
+/* Builds the panels of noisy A in order, each into a free slot, ahead of the launches. */
 void prep_panels(Scan& s, int gen_threads) {
     for (int r = 0; r < s.panels; ++r) {
         const int slot = r % kPanelSlots;
@@ -293,70 +282,107 @@ void prep_panels(Scan& s, int gen_threads) {
     }
 }
 
-/* One lane: launches back to back on its own infer request, checking each output's jackpot. */
-void run_lane(Scan& s, int lane) {
-    ov::InferRequest& req = g_eng->request(lane);
+/* Launch l's jackpot over every tile of its output; the first hit (launches are checked in order). */
+void check_launch(Scan& s, ov::InferRequest& req, int l) {
     const cp_npu::LaunchShape& shape = g_eng->shape();
     const std::vector<int>& wi = g_eng->word_index();
     const int tile_rows = shape.tile_rows(), tile_cols = shape.tile_cols(), row_words = shape.row_words();
-    const int tiles_per_launch = tile_rows * tile_cols;
-    double check = 0.0;
-    for (;;) {
-        if (s.stop.load())
-            break;
-        const int l = s.next.fetch_add(1);
-        if (l >= s.launches)
-            break;
-        const int r = l / s.nb, cb = l % s.nb, slot = r % kPanelSlots;
-        {
-            std::unique_lock<std::mutex> lock(s.mu);
-            s.cv.wait(lock, [&] { return s.stop.load() || s.slot_panel[slot] == r; });
-            if (s.stop.load())
+    const uint32_t* out = reinterpret_cast<const uint32_t*>(req.get_output_tensor(0).data());
+    uint32_t words[kMilestones];
+    for (int tr = 0; tr < tile_rows; ++tr) {
+        const uint32_t* row = out + size_t(tr) * row_words;
+        for (int tc = 0; tc < tile_cols; ++tc) {
+            const int* idx = &wi[size_t(tc) * kMilestones];
+            for (int ms = 0; ms < kMilestones; ++ms)
+                words[ms] = row[idx[ms]];
+            if (!cp_jackpot::tile_beats_target(words, kMilestones, s.a_key8, s.bound))
+                continue;
+            s.hit.found = 1;
+            s.hit.t_rows = (l / s.nb) * shape.rows + tr * kTileRows;
+            s.hit.t_cols = (l % s.nb) * shape.cols + tc * kTileCols;
+            memcpy(s.hit.xor_words, words, sizeof(words));
+            return;
+        }
+    }
+}
+
+/* Runs the scan from the calling thread: up to one launch per infer request queued on the NPU; the
+ * oldest is waited for and its jackpot checked (while the NPU runs the rest) before its request takes
+ * the next launch. */
+void drive_scan(Scan& s, double scan_t0, uint64_t total_tiles) {
+    const int tiles_per_launch = g_eng->shape().tile_rows() * g_eng->shape().tile_cols();
+    std::vector<int> idle;
+    for (int i = g_eng->requests() - 1; i >= 0; --i)
+        idle.push_back(i);
+    std::deque<std::pair<int, int>> queued; /* (request, launch), oldest first */
+    int next = 0;
+    double last_report = scan_t0;
+    try {
+        while (!s.stop.load()) {
+            if (cp_job_should_cancel()) {
+                s.halt();
                 break;
-        }
-        try {
-            g_eng->set_inputs(lane, s.a[slot], g_job.bt[size_t(cb)]);
-            req.infer();
-        } catch (const std::exception& e) {
-            s.fail(std::string("NPU inference failed: ") + e.what());
-            break;
-        }
-        const double t = cp_now_sec();
-        const uint32_t* out = reinterpret_cast<const uint32_t*>(req.get_output_tensor(0).data());
-        uint32_t words[kMilestones];
-        for (int tr = 0; tr < tile_rows; ++tr) {
-            const uint32_t* row = out + size_t(tr) * row_words;
-            for (int tc = 0; tc < tile_cols; ++tc) {
-                const int* idx = &wi[size_t(tc) * kMilestones];
-                for (int ms = 0; ms < kMilestones; ++ms)
-                    words[ms] = row[idx[ms]];
-                if (!cp_jackpot::tile_beats_target(words, kMilestones, s.a_key8, s.bound))
+            }
+            /* Queue the next launch once its A panel is built; wait for the panel only with nothing
+             * queued (the prep thread may be waiting for a queued launch to free a panel slot). */
+            if (next < s.launches && !idle.empty()) {
+                const int r = next / s.nb, slot = r % kPanelSlots;
+                bool ready;
+                {
+                    std::unique_lock<std::mutex> lock(s.mu);
+                    if (queued.empty())
+                        s.cv.wait(lock, [&] { return s.stop.load() || s.slot_panel[slot] == r; });
+                    ready = s.slot_panel[slot] == r;
+                }
+                if (ready) {
+                    const int i = idle.back();
+                    idle.pop_back();
+                    g_eng->set_inputs(i, s.a[slot], g_job.bt[size_t(next % s.nb)]);
+                    g_eng->request(i).start_async();
+                    queued.emplace_back(i, next++);
                     continue;
-                const int64_t key = int64_t(l) * tiles_per_launch + tr * tile_cols + tc;
-                std::lock_guard<std::mutex> lock(s.hit_mu);
-                if (!s.hit.found || key < s.hit.key) {
-                    s.hit.found = 1;
-                    s.hit.key = key;
-                    s.hit.t_rows = r * shape.rows + tr * kTileRows;
-                    s.hit.t_cols = cb * shape.cols + tc * kTileCols;
-                    memcpy(s.hit.xor_words, words, sizeof(words));
-                    s.found.store(true);
                 }
             }
+            if (queued.empty())
+                break;
+            const auto [i, l] = queued.front();
+            queued.pop_front();
+            ov::InferRequest& req = g_eng->request(i);
+            req.wait();
+            const double t = cp_now_sec();
+            check_launch(s, req, l);
+            s.check_busy += cp_now_sec() - t;
+            idle.push_back(i);
+            s.tiles += uint64_t(tiles_per_launch);
+            {
+                std::lock_guard<std::mutex> lock(s.mu);
+                s.panel_done[size_t(l / s.nb)]++;
+                s.cv.notify_all();
+            }
+            if (s.hit.found)
+                s.halt();
+            const double now = cp_now_sec();
+            if (now - last_report >= 5.0) {
+                char mac_buf[32];
+                cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(s.tiles, now - scan_t0), mac_buf, sizeof(mac_buf));
+                printf("[intel-npu] plain_proof progress: tiles %llu/%llu (%.1f%%) %s\n", (unsigned long long)s.tiles,
+                       (unsigned long long)total_tiles, total_tiles ? 100.0 * double(s.tiles) / double(total_tiles) : 0.0,
+                       mac_buf);
+                fflush(stdout);
+                last_report = now;
+            }
         }
-        check += cp_now_sec() - t;
-        s.tiles.fetch_add(uint64_t(tiles_per_launch));
-        {
-            std::lock_guard<std::mutex> lock(s.mu);
-            s.panel_done[size_t(r)]++;
-            s.cv.notify_all();
-        }
-        if (s.found.load())
-            s.halt();
+    } catch (const std::exception& e) {
+        s.error = std::string("NPU inference failed: ") + e.what();
+        s.halt();
     }
-    std::lock_guard<std::mutex> lock(s.hit_mu);
-    s.check_busy += check;
-    s.lanes_left.fetch_sub(1);
+    /* The panels go away with the scan: let every queued launch finish first. */
+    for (const auto& q : queued) {
+        try {
+            g_eng->request(q.first).wait();
+        } catch (const std::exception&) {
+        }
+    }
 }
 
 } /* namespace */
@@ -380,7 +406,7 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     (void)ndev;
     if (g_eng && g_eng->ready())
         return;
-    g_lanes = env_int("CP_NPU_LANES", 4, 1, 16);
+    g_requests = env_int("CP_NPU_REQUESTS", 4, 1, 16);
     cp_npu::LaunchShape shape;
     pick_launch(g_row_macros, g_col_macros, g_m_active, g_n_active, &shape.rows, &shape.cols);
     shape.chunk_m = std::min(shape.rows, kRowBlock);
@@ -401,7 +427,7 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     fflush(stdout);
     g_eng = new cp_npu::Engine();
     std::string err;
-    if (g_eng->init(shape, kernel_dir, cache_root, g_lanes, &err) != 0) {
+    if (g_eng->init(shape, kernel_dir, cache_root, g_requests, &err) != 0) {
         fprintf(stderr, "[intel-npu] init failed: %s\n", err.c_str());
         fprintf(stderr, "[intel-npu] needs the patched in-plugin NPU compiler next to openvino.dll "
                         "(src/pearl/intel_npu/prepare_intel_npu_deps.ps1) and the TileXorAcc kernel in %s\n",
@@ -413,8 +439,8 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     cp_pp_set_hash_tile(kTileRows, kTileCols);
     pearl_set_contiguous_tile_shape(kTileRows, kTileCols);
     printf("[intel-npu] %s: fused int8 GEMM + 8x16 tile XOR, launch %dx%d (K=%d, %d milestones), compile/load "
-           "%.1fs, %d lanes, %s inputs\n",
-           g_eng->device_name().c_str(), shape.rows, shape.cols, shape.k, kMilestones, g_eng->compile_sec(), g_lanes,
+           "%.1fs, %d infer requests, %s inputs\n",
+           g_eng->device_name().c_str(), shape.rows, shape.cols, shape.k, kMilestones, g_eng->compile_sec(), g_requests,
            g_eng->zero_copy() ? "zero-copy" : "copied");
     printf("[intel-npu] jackpot scale tile %dx%d factor=%llu\n", cp_pp_hash_tile_h(), cp_pp_hash_tile_w(),
            (unsigned long long)cp_jackpot_scale_factor());
@@ -559,42 +585,18 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     fflush(stdout);
 
     const double scan_t0 = cp_now_sec();
-    const int gen_threads = std::max(1, std::min(8, hw_threads() - g_lanes));
-    s.lanes_left.store(g_lanes);
+    const int gen_threads = std::max(1, std::min(8, hw_threads() - 1));
     std::thread prep([&] { prep_panels(s, gen_threads); });
-    std::vector<std::thread> lanes;
-    for (int i = 0; i < g_lanes; ++i)
-        lanes.emplace_back([&, i] { run_lane(s, i); });
-
-    double last_report = scan_t0;
-    while (s.lanes_left.load() > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        if (cp_job_should_cancel())
-            s.halt();
-        const double now = cp_now_sec();
-        if (now - last_report >= 5.0) {
-            const uint64_t cur = s.tiles.load();
-            char mac_buf[32];
-            cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(cur, now - scan_t0), mac_buf, sizeof(mac_buf));
-            printf("[intel-npu] plain_proof progress: tiles %llu/%llu (%.1f%%) %s\n", (unsigned long long)cur,
-                   (unsigned long long)total_tiles, total_tiles ? 100.0 * double(cur) / double(total_tiles) : 0.0,
-                   mac_buf);
-            fflush(stdout);
-            last_report = now;
-        }
-    }
-    for (auto& t : lanes)
-        t.join();
-    s.halt(); /* releases the prep thread if the lanes stopped early */
+    drive_scan(s, scan_t0, total_tiles);
+    s.halt(); /* releases the prep thread if the scan stopped early */
     prep.join();
 
     const double scan_sec = cp_now_sec() - scan_t0;
-    const uint64_t tiles_done = s.tiles.load();
+    const uint64_t tiles_done = s.tiles;
     if (out_tiles_scanned)
         *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("intel-npu", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[intel-npu] scan %.3fs: host A prep %.3fs, jackpot %.3fs (summed over %d lanes)\n", scan_sec,
-           s.prep_busy, s.check_busy, g_lanes);
+    printf("[intel-npu] scan %.3fs: host A prep %.3fs, jackpot %.3fs\n", scan_sec, s.prep_busy, s.check_busy);
     fflush(stdout);
     if (!s.error.empty()) {
         fprintf(stderr, "[intel-npu] %s\n", s.error.c_str());

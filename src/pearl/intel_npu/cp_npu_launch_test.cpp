@@ -139,19 +139,22 @@ int main(int argc, char** argv) {
     if (bad)
         return 1;
 
-    /* Throughput: one host thread per request, each running launches back to back. */
-    std::atomic<int> next{0};
-    std::vector<std::thread> lanes;
+    /* Throughput: one thread keeps every request queued, resubmitting each as it completes (in order). */
+    const int nreq = eng.requests();
+    for (int i = 0; i < nreq; ++i)
+        eng.set_inputs(i, ta, tb);
     const auto t0 = std::chrono::steady_clock::now();
-    for (int l = 0; l < eng.requests(); ++l)
-        lanes.emplace_back([&, l] {
-            ov::InferRequest& r = eng.request(l);
-            eng.set_inputs(l, ta, tb);
-            while (next++ < launches)
-                r.infer();
-        });
-    for (auto& t : lanes)
-        t.join();
+    int submitted = 0;
+    for (; submitted < std::min(nreq, launches); ++submitted)
+        eng.request(submitted).start_async();
+    for (int done = 0; done < launches; ++done) {
+        ov::InferRequest& r = eng.request(done % nreq);
+        r.wait();
+        if (submitted < launches) {
+            r.start_async();
+            ++submitted;
+        }
+    }
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const double ops = 2.0 * s.rows * s.cols * s.k * launches;
     std::printf("throughput: %d launches in %.3f s, %.3f ms per launch, %.3f TOPS (%d requests)\n", launches,

@@ -129,8 +129,8 @@ static void print_usage(void)
     printf("                     8x16 hash tiles; launch = --row-period-batch x --batch-size 128x128\n");
     printf("                     macro blocks (default %d x %d, columns <= 4, rows above 4 in\n",
            CP_INTEL_NPU_ROW_MACROS_DEFAULT, CP_INTEL_NPU_COL_MACROS_DEFAULT);
-    printf("                     steps of 4; each new shape compiles once); CP_NPU_LANES = requests\n");
-    printf("                     in flight (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
+    printf("                     steps of 4; each new shape compiles once); CP_NPU_REQUESTS =\n");
+    printf("                     launches queued (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
     printf("  hexagon (pearl): Snapdragon cDSP HVX, 4x64 hash tiles; needs about m*k + n*k\n");
