@@ -5,20 +5,22 @@ Lake). The NPU runs the exact int8 GEMM and the per-tile milestone XOR; the host
 runs the BLAKE3 jackpot. The design comes from `gemm_xor_benchmark/npu` (Case 3.4 on the NPU), which has the full
 measurements and the reasoning behind each choice.
 
-Arrow Lake Core Ultra 9 275HX: about **0.80 TMAC/s** (800 GH/s) with the default 2048 × 512 launch, mock shares
+Arrow Lake Core Ultra 9 275HX: about **0.81 TMAC/s** (810 GH/s) with the default 2048 × 512 launch, mock shares
 verify at 8192² and 131072².
 
 ## How it works
 
 | Piece | Where | Role |
 |-------|-------|------|
-| Launch graph | `cp_npu_graph.cpp` | One OpenVINO model per launch shape (rows × cols × 4096, in 128 × 128 macros): per row block of 512 and K panel of 128, an int32 GEMM on the DPU of the A panel with a 64-column block of B, then the `TileXorAcc` op (8 panels per op) keeps the running sum and XORs every 8 × 16 tile on the SHAVEs. The column chains of a row block run in lockstep so each A panel leaves CMX after its last use. |
+| Launch graph | `cp_npu_graph.cpp` | One OpenVINO model per launch shape (rows × cols × 4096, in 128 × 128 macros): per row block of 512 and K panel of 128, an int32 GEMM on the DPU of the A panel with a 64-column block of B, then the `TileXorAcc` op (8 panels per op) keeps the running sum and XORs every 16 × 16 tile on the SHAVEs. The column chains of a row block run in lockstep so each A panel leaves CMX after its last use. |
 | Engine | `cp_npu_engine.cpp` | The patched compiler's switches, the compiled-graph cache (`npu_cache/`, keyed by the kernel ELFs and the compiler DLL), infer requests, NPU-visible host tensors (inputs are read in place). |
 | Worker | `cp_pearl_npu_worker.cpp` | Zero-B like the CPU and Hexagon workers. Per job: noisy B built on the host and packed per launch column block. Per attempt: the sparse signal A, its incremental hash, the seeds; a prep thread packs each launch row panel of noisy A ahead of its launches; the calling thread keeps 4 launches queued (one per infer request, `start_async`), and as each completes it checks that output's jackpot and queues the next launch on that request. A hit is recomputed on the host before it becomes a share. |
-| SHAVE kernel | `kernels/tile_xor_acc.3720xx*.elf` | Prebuilt hand-scheduled `TileXorAcc` kernel. Source and generator: `gemm_xor_benchmark/npu/kernels` and `tools/gen_tile_xor_asm.py` (needs MoviTools to rebuild). |
-| Compiler patch | `patches/npu_compiler_all.diff` | Against `openvinotoolkit/npu_compiler` at `patches/NPU_COMPILER_COMMIT`: int32 DPU output (`NPU_EXPERIMENTAL_I32_DPU_OUTPUT=1`), the `TileXorAcc` op from the frontend to the SHAVE kernel call, loading external SHAVE kernels (`NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR`), the tile-word layout and cycle costs. The miner sets both variables itself. |
+| SHAVE kernel | `kernels/tile_xor_acc.3720xx*.elf` | Prebuilt hand-scheduled `TileXorAcc` kernel; it takes the tile height (8 or 16 rows) from its tensors. Source and generator: `gemm_xor_benchmark/npu/kernels` and `tools/gen_tile_xor_asm.py` (needs MoviTools to rebuild). |
+| Compiler patch | `patches/npu_compiler_all.diff` | Against `openvinotoolkit/npu_compiler` at `patches/NPU_COMPILER_COMMIT`: int32 DPU output (`NPU_EXPERIMENTAL_I32_DPU_OUTPUT=1`), the `TileXorAcc` op from the frontend to the SHAVE kernel call, its tile height (`NPU_EXPERIMENTAL_TILE_XOR_ROWS`, 8 by default), loading external SHAVE kernels (`NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR`), the tile-word layout and cycle costs. The miner sets all three variables itself. |
 
-Hash tile 8 × 16 (proof layout `CP_TILE_LAYOUT_CONTIGUOUS`, the same as the CPU worker). A and B go to the NPU as
+Hash tile 16 × 16 (proof layout `CP_TILE_LAYOUT_CONTIGUOUS_16x16`). The SHAVE work is the same as with 8 × 16 tiles,
+but the NPU writes half the tile words (512 KiB per 2048 × 512 launch) and the host hashes half as many tiles: at
+131072², 0.81 TMAC/s and 13.4 s of jackpot per attempt against 0.80 TMAC/s and 25.5 s. A and B go to the NPU as
 u8 holding value + 128, which the compiler folds into a cast; B is fed as rows of B^T (the form the int32 DPU path
 computes exactly). Each row block of a launch reads B through its own graph input, all bound to the same host
 tensor: the compiler merges identical slices of one input, so a B block shared by the row blocks would stay in CMX
@@ -87,13 +89,14 @@ selects a new cache subdirectory.
 
 | Environment | Default | Effect |
 |-------------|---------|--------|
-| `CP_NPU_REQUESTS` | 4 | Launches queued on the NPU (infer requests), all driven by one host thread. 2, 4 and 8 measured the same in `cp_npu_launch_test` (2048 × 512: 1.58–1.62 TOPS); with 1 the NPU idles while each output is returned and the next launch submitted (1.49 TOPS). In the miner a request also stays out of the queue while its output is hashed (about 1.5 ms per 5.4 ms launch), so use at least 2. |
+| `CP_NPU_REQUESTS` | 4 | Launches queued on the NPU (infer requests), all driven by one host thread. 2, 4 and 8 measured the same in `cp_npu_launch_test` (2048 × 512: 1.58–1.62 TOPS); with 1 the NPU idles while each output is returned and the next launch submitted (1.49 TOPS). In the miner a request also stays out of the queue while its output is hashed (about 0.8 ms per 5.3 ms launch; 1.5 ms with 8 × 16 tiles, where 1 request gave 0.55 TMAC/s at 131072² and 2 already the full rate). |
 | `CP_NPU_CACHE_DIR` | `npu_cache` next to the exe | Compiled-graph cache root. |
 | `NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR` | `kernels/intel_npu` next to the exe | Where the compiler loads `tile_xor_acc` from (set by the miner unless already set). |
 
 ## Measurements (Core Ultra 9 275HX, NPU 2 tiles)
 
-Launch shapes, `cp_npu_launch_test --rows R --cols C` (K = 4096, 4 requests, every shape bit-exact against the host):
+Launch shapes, `cp_npu_launch_test --rows R --cols C` (K = 4096, 4 requests, every shape bit-exact against the host;
+measured with 8 × 16 tiles, 16 × 16 tiles give 512 × 512 1.495 and 2048 × 512 1.61 TOPS):
 
 | Launch (macros) | Row blocks | First compile | Per launch | TOPS |
 |-----------------|------------|---------------|------------|------|
@@ -112,14 +115,16 @@ schedules slightly worse.
 
 | Mining run | Result |
 |------------|--------|
-| Mock, default 131072², 2048 × 512 (16384 launches per attempt) | 87.4–88.0 s per attempt, 0.80 TMAC/s; job setup 0.57 s (B seed 0.51 s, noisy B 0.06 s); share and proof verify |
-| Mock, default 131072², `--row-period-batch 4 --col-period-batch 4` (65536 launches) | 93.4 s per attempt, 0.75 TMAC/s |
-| Mock, `--m 8 --n 8`, 2048 × 512 (64 launches per attempt) | 0.37 s per attempt, 0.65–0.75 TMAC/s; share and proof verify |
+| Mock, default 131072², 2048 × 512 (16384 launches per attempt) | 86.7 s per attempt, 0.81 TMAC/s; job setup 0.58 s (B seed 0.52 s, noisy B 0.05 s); share and proof verify |
+| Same, 8 × 16 tiles | 87.4–88.0 s per attempt, 0.80 TMAC/s |
+| Mock, default 131072², `--row-period-batch 4 --col-period-batch 4` (65536 launches, 8 × 16 tiles) | 93.4 s per attempt, 0.75 TMAC/s |
+| Mock, `--m 8 --n 8`, 2048 × 512 (64 launches per attempt) | 0.35 s per attempt, 0.65–0.75 TMAC/s; share and 16 × 16 proof verify |
 
-Per full-size attempt the host spends about 0.3 s building noisy A panels and 25 s of jackpot, all on the driving
-thread while the NPU runs the queued launches (it is busy 29% of the attempt; four driving threads, one per
-request, measured the same 0.80 TMAC/s). At 8192² an attempt is only 16 rounds of 4 launches, so filling and
-draining the queue (one launch latency, about 21 ms with 2048 rows) costs as much as the larger launch gains.
+Per full-size attempt the host spends about 0.3 s building noisy A panels and 13.4 s of jackpot, all on the driving
+thread while the NPU runs the queued launches (it is busy 15% of the attempt; with 8 × 16 tiles 25 s, and four
+driving threads, one per request, measured the same rate). At 8192² an attempt is only 16 rounds of 4 launches, so
+filling and draining the queue (one launch latency, about 21 ms with 2048 rows) costs as much as the larger launch
+gains.
 
 ## Acknowledgements
 

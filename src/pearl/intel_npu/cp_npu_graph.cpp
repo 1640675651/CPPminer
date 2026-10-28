@@ -28,7 +28,8 @@ using ov::op::v0::Constant;
  * bool attributes has_acc and dep_acc (the compiler deserializes it with its own copy of this class,
  * vpux/compiler/frontend/tile_xor_acc.hpp). Inputs int32 [1, 1, H, W]: with has_acc the first is the
  * running accumulator, the others are partial sums. Outputs: the updated accumulator and the tile
- * words [1, 1, H/8, G * W/16] (partial-major within a tile row).
+ * words [1, 1, H/kTileRows, G * W/16] (partial-major within a tile row); the compiler takes the tile
+ * height from NPU_EXPERIMENTAL_TILE_XOR_ROWS.
  */
 class TileXorAcc : public ov::op::Op {
 public:
@@ -105,7 +106,7 @@ const char* launch_shape_error(const LaunchShape& s) {
     if (s.k % kKr)
         return "K must be a multiple of 128";
     if (s.chunk_m % (2 * kTileRows) || s.rows % s.chunk_m)
-        return "rows must be a multiple of the row block (chunk_m, itself a multiple of 16)";
+        return "rows must be a multiple of the row block (chunk_m, itself a multiple of two tile rows)";
     if (s.chunk_n % kTileCols || s.cols % s.chunk_n)
         return "cols must be a multiple of the column chain (chunk_n, itself a multiple of 16)";
     if (s.cols / s.chunk_n > 8)

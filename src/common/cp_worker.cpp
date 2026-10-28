@@ -547,9 +547,9 @@ extern "C" void cp_worker_apply_backend_defaults(void)
 #endif
 #if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
     if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU) {
-        /* 8x16 hash tile: the TileXorAcc kernel's tile. */
-        cp_pp_set_hash_tile(8, 16);
-        pearl_set_contiguous_tile_shape(8, 16);
+        /* 16x16 hash tile: the TileXorAcc kernel's tile (cp_npu::kTileRows x kTileCols). */
+        cp_pp_set_hash_tile(16, 16);
+        pearl_set_contiguous_tile_shape(16, 16);
     }
 #endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
@@ -822,7 +822,7 @@ extern "C" int cp_worker_default_tile_layout(void)
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
         return CP_TILE_LAYOUT_CONTIGUOUS_4x64;
     if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)
-        return CP_TILE_LAYOUT_CONTIGUOUS;
+        return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN) {
         /* The kernel selection only accepts provable hash tiles (cp_onednn_worker.cpp). */

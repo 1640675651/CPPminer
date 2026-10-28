@@ -112,10 +112,10 @@ index d2932d3..c30a1e5 100644
      mlir::Operation* parseNode(mlir::OpBuilder& builder, const std::shared_ptr<ov::opset10::IsNaN>& origNode);
 diff --git a/src/vpux_compiler/include/vpux/compiler/frontend/tile_xor_acc.hpp b/src/vpux_compiler/include/vpux/compiler/frontend/tile_xor_acc.hpp
 new file mode 100644
-index 0000000..3ffbdd9
+index 0000000..a859f5e
 --- /dev/null
 +++ b/src/vpux_compiler/include/vpux/compiler/frontend/tile_xor_acc.hpp
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,96 @@
 +//
 +// Copyright (C) 2026 Intel Corporation
 +// SPDX-License-Identifier: Apache-2.0
@@ -126,14 +126,25 @@ index 0000000..3ffbdd9
 +#include <openvino/core/attribute_visitor.hpp>
 +#include <openvino/op/op.hpp>
 +
++#include <cstdlib>
++#include <cstring>
++
 +namespace vpux::frontend {
++
++/// Rows of a TileXorAcc XOR tile: 8, or 16 with NPU_EXPERIMENTAL_TILE_XOR_ROWS=16. The kernel takes the tile
++/// height from its tensors (accumulator rows / tile-word rows), so only the shapes depend on this.
++inline int64_t tileXorRows() {
++    const char* rows = std::getenv("NPU_EXPERIMENTAL_TILE_XOR_ROWS");
++    return rows != nullptr && std::strcmp(rows, "16") == 0 ? 16 : 8;
++}
 +
 +/// \brief Experimental running int32 accumulation with a per-tile XOR reduction.
 +///
 +/// Inputs are int32 tensors of identical shape [1, 1, H, W]. With has_acc = true, input 0 is a running
 +/// accumulator and inputs 1..G are partial sums; otherwise inputs 0..G-1 are partial sums and the accumulator
 +/// starts at zero. For each partial sum g (in order) the accumulator is updated (acc += partial_g) and every
-+/// 8x16 tile of it is reduced by XOR into xor_output[0, g, H/8, W/16]. acc_output is the final accumulator.
++/// R x 16 tile of it (R = tileXorRows()) is reduced by XOR into xor_output[0, 0, H/R, G * W/16].
++/// acc_output is the final accumulator.
 +///
 +/// With dep_acc = true (and has_acc), input 0 is only a scheduling dependency: its values are ignored and the
 +/// accumulator starts at zero. This lets a graph order independent accumulator chains.
@@ -146,7 +157,6 @@ index 0000000..3ffbdd9
 +public:
 +    OPENVINO_OP("TileXorAcc", "extension", ov::op::Op);
 +
-+    static constexpr int64_t TILE_ROWS = 8;
 +    static constexpr int64_t TILE_COLS = 16;
 +
 +    TileXorAcc() = default;
@@ -163,17 +173,18 @@ index 0000000..3ffbdd9
 +        NODE_VALIDATION_CHECK(this, shape.is_static() && shape.rank().get_length() == 4,
 +                              "TileXorAcc expects static rank-4 inputs");
 +        const auto dims = shape.to_shape();
-+        NODE_VALIDATION_CHECK(this, dims[0] == 1 && dims[1] == 1 && dims[2] % TILE_ROWS == 0 && dims[3] % TILE_COLS == 0,
-+                              "TileXorAcc expects [1, 1, 8*a, 16*b] inputs");
++        const auto tileRows = tileXorRows();
++        NODE_VALIDATION_CHECK(this, dims[0] == 1 && dims[1] == 1 && dims[2] % tileRows == 0 && dims[3] % TILE_COLS == 0,
++                              "TileXorAcc expects [1, 1, R*a, 16*b] inputs (R = tile rows)");
 +        for (size_t i = 0; i < get_input_size(); ++i) {
 +            NODE_VALIDATION_CHECK(this, get_input_element_type(i) == ov::element::i32,
 +                                  "TileXorAcc inputs must be i32");
 +            NODE_VALIDATION_CHECK(this, get_input_partial_shape(i) == shape, "TileXorAcc inputs must match");
 +        }
 +        set_output_type(0, ov::element::i32, shape);
-+        // Tile words: [1, 1, H/8, G * W/16], partial-major within a tile row.
++        // Tile words: [1, 1, H/R, G * W/16], partial-major within a tile row.
 +        set_output_type(1, ov::element::i32,
-+                        ov::PartialShape{1, 1, static_cast<int64_t>(dims[2]) / TILE_ROWS,
++                        ov::PartialShape{1, 1, static_cast<int64_t>(dims[2]) / tileRows,
 +                                         numPartials * (static_cast<int64_t>(dims[3]) / TILE_COLS)});
 +    }
 +
@@ -443,10 +454,10 @@ index f4c11d1..9093b75 100644
              return false;
 diff --git a/src/vpux_compiler/src/dialect/IE/IR/ops/tile_xor_acc.cpp b/src/vpux_compiler/src/dialect/IE/IR/ops/tile_xor_acc.cpp
 new file mode 100644
-index 0000000..12e32e2
+index 0000000..afcff85
 --- /dev/null
 +++ b/src/vpux_compiler/src/dialect/IE/IR/ops/tile_xor_acc.cpp
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,58 @@
 +//
 +// Copyright (C) 2026 Intel Corporation
 +// SPDX-License-Identifier: Apache-2.0
@@ -455,13 +466,13 @@ index 0000000..12e32e2
 +#include "vpux/compiler/dialect/IE/IR/ops/bitwise.hpp"
 +#include "vpux/compiler/core/attributes/shape.hpp"
 +#include "vpux/compiler/core/layers.hpp"
++#include "vpux/compiler/frontend/tile_xor_acc.hpp"
 +#include "vpux/compiler/utils/error.hpp"
 +
 +using namespace vpux;
 +
 +namespace {
 +
-+constexpr int64_t TILE_ROWS = 8;
 +constexpr int64_t TILE_COLS = 16;
 +
 +}  // namespace
@@ -473,8 +484,9 @@ index 0000000..12e32e2
 +    }
 +    const auto shape = getShape(getInputs().front());
 +    if (shape.size() != 4 || shape[Dims4D::Act::N] != 1 || shape[Dims4D::Act::C] != 1 ||
-+        shape[Dims4D::Act::H] % TILE_ROWS != 0 || shape[Dims4D::Act::W] % TILE_COLS != 0) {
-+        return errorAt(*this, "TileXorAcc expects [1, 1, 8*a, 16*b] inputs, got {0}", shape);
++        shape[Dims4D::Act::H] % frontend::tileXorRows() != 0 || shape[Dims4D::Act::W] % TILE_COLS != 0) {
++        return errorAt(*this, "TileXorAcc expects [1, 1, {0}*a, 16*b] inputs, got {1}", frontend::tileXorRows(),
++                       shape);
 +    }
 +    for (auto input : getInputs()) {
 +        if (getShape(input) != shape) {
@@ -500,7 +512,7 @@ index 0000000..12e32e2
 +    const auto numPartials = static_cast<int64_t>(op.getInputs().size()) - (op.getHasAcc() ? 1 : 0);
 +
 +    inferredReturnShapes.emplace_back(shape, inType.getElementType());
-+    const SmallVector<int64_t> xorShape{1, 1, shape[2] / TILE_ROWS, numPartials * (shape[3] / TILE_COLS)};
++    const SmallVector<int64_t> xorShape{1, 1, shape[2] / frontend::tileXorRows(), numPartials * (shape[3] / TILE_COLS)};
 +    inferredReturnShapes.emplace_back(xorShape, inType.getElementType());
 +    return mlir::success();
 +}
@@ -717,10 +729,10 @@ index 0d5eabf..ab01e77 100644
                             srcBitSize, dstBitSize);
 diff --git a/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_xor_acc.cpp b/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_xor_acc.cpp
 new file mode 100644
-index 0000000..6c6e369
+index 0000000..2d4b925
 --- /dev/null
 +++ b/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_xor_acc.cpp
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,176 @@
 +//
 +// Copyright (C) 2026 Intel Corporation
 +// SPDX-License-Identifier: Apache-2.0
@@ -732,16 +744,17 @@ index 0000000..6c6e369
 +#include "vpux/compiler/dialect/VPU/utils/const_utils.hpp"
 +#include "vpux/compiler/dialect/VPU/utils/explicit_distribution_utils.hpp"
 +#include "vpux/compiler/dialect/config/IR/utils.hpp"
++#include "vpux/compiler/frontend/tile_xor_acc.hpp"
 +
 +using namespace vpux;
 +
 +namespace {
 +
-+// The tile words are laid out [1, 1, H/8, G * W/16] (partial-major within a tile row), so that a row split over
-+// clusters leaves every cluster's share contiguous in memory and its copy to DDR is one 2D DMA.
++// The tile words are laid out [1, 1, H/R, G * W/16] (R = frontend::tileXorRows(), partial-major within a tile
++// row), so that a row split over clusters leaves every cluster's share contiguous in memory and its copy to DDR is one 2D DMA.
 +vpux::NDTypeInterface getXorType(vpux::NDTypeInterface accType, int64_t numPartials) {
 +    const auto shape = accType.getShape();
-+    const Shape xorShape{1, 1, shape[Dims4D::Act::H] / VPU::TileXorAccOp::TILE_ROWS,
++    const Shape xorShape{1, 1, shape[Dims4D::Act::H] / frontend::tileXorRows(),
 +                         numPartials * (shape[Dims4D::Act::W] / VPU::TileXorAccOp::TILE_COLS)};
 +    return accType.changeShape(xorShape);
 +}
@@ -749,9 +762,9 @@ index 0000000..6c6e369
 +// Output tile of the xor result that corresponds to a tile of the accumulator.
 +TileInfo getXorTile(const TileInfo& accTile, int64_t numPartials) {
 +    TileInfo xorTile(accTile.shape.size());
-+    xorTile.shape = Shape{1, 1, accTile.shape[Dims4D::Act::H] / VPU::TileXorAccOp::TILE_ROWS,
++    xorTile.shape = Shape{1, 1, accTile.shape[Dims4D::Act::H] / frontend::tileXorRows(),
 +                          numPartials * (accTile.shape[Dims4D::Act::W] / VPU::TileXorAccOp::TILE_COLS)};
-+    xorTile.offsets = Shape{0, 0, accTile.offsets[Dims4D::Act::H] / VPU::TileXorAccOp::TILE_ROWS,
++    xorTile.offsets = Shape{0, 0, accTile.offsets[Dims4D::Act::H] / frontend::tileXorRows(),
 +                            numPartials * (accTile.offsets[Dims4D::Act::W] / VPU::TileXorAccOp::TILE_COLS)};
 +    xorTile.axis = accTile.axis;
 +    xorTile.isCompletedTile = accTile.isCompletedTile;
@@ -806,9 +819,9 @@ index 0000000..6c6e369
 +                                                          vpux::Logger) {
 +    TileInfo accTile(secondaryOutputTile.shape.size());
 +    const auto numPartials = getNumPartials();
-+    accTile.shape = Shape{1, 1, secondaryOutputTile.shape[Dims4D::Act::H] * TILE_ROWS,
++    accTile.shape = Shape{1, 1, secondaryOutputTile.shape[Dims4D::Act::H] * frontend::tileXorRows(),
 +                          secondaryOutputTile.shape[Dims4D::Act::W] / numPartials * TILE_COLS};
-+    accTile.offsets = Shape{0, 0, secondaryOutputTile.offsets[Dims4D::Act::H] * TILE_ROWS,
++    accTile.offsets = Shape{0, 0, secondaryOutputTile.offsets[Dims4D::Act::H] * frontend::tileXorRows(),
 +                            secondaryOutputTile.offsets[Dims4D::Act::W] / numPartials * TILE_COLS};
 +    accTile.axis = secondaryOutputTile.axis;
 +    accTile.isCompletedTile = secondaryOutputTile.isCompletedTile;
@@ -819,10 +832,10 @@ index 0000000..6c6e369
 +}
 +
 +mlir::FailureOr<OutputTiling> vpux::VPU::TileXorAccOp::getTilingStrategy(TilingMode tilingMode, Logger log) {
-+    // Split rows only, in whole 8-row tile groups, so every tile sees complete 8x16 XOR tiles.
++    // Split rows only, in whole tile-row groups, so every tile sees complete XOR tiles.
 +    auto tilingInfo = mlir::cast<VPU::TilingInfoOpInterface>(getOperation());
 +    const auto outputShape = getShape(getAccOutput());
-+    const auto tileGroups = outputShape[Dims4D::Act::H] / TILE_ROWS;
++    const auto tileGroups = outputShape[Dims4D::Act::H] / frontend::tileXorRows();
 +    for (int64_t numTiles = 1; numTiles <= tileGroups; ++numTiles) {
 +        if (tileGroups % numTiles != 0) {
 +            continue;
@@ -854,9 +867,9 @@ index 0000000..6c6e369
 +        return true;
 +    }
 +    if (strategy == VPU::MultiClusterStrategy::SplitOverHeight) {
-+        // Every cluster must get whole 8-row tile groups of the same count.
++        // Every cluster must get whole tile-row groups of the same count.
 +        const auto rows = getShape(getAccOutput())[Dims4D::Act::H];
-+        return numTiles > 1 && rows % (TILE_ROWS * static_cast<int64_t>(numTiles)) == 0;
++        return numTiles > 1 && rows % (frontend::tileXorRows() * static_cast<int64_t>(numTiles)) == 0;
 +    }
 +    return false;
 +}

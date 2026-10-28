@@ -1616,7 +1616,7 @@ int main(int argc, char** argv)
                    lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
             printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU){
-            printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 8x16 tile XOR (SHAVE) + host jackpot\n");
+            printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 16x16 tile XOR (SHAVE) + host jackpot\n");
             int lrows = 0, lcols = 0;
             cp_worker_intel_npu_launch_shape(&lrows, &lcols);
             printf("[mode] NPU launch: %dx%d macro blocks of 128x128 = %dx%d (K=%d, --row-period-batch x "

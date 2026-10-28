@@ -1,7 +1,7 @@
 #pragma once
 /*
  * OpenVINO graph of one Intel NPU launch: the exact int8 GEMM of a panel of noisy A rows with a block
- * of noisy B columns over all of K, with the int32 accumulator XOR-reduced per 8x16 tile after every
+ * of noisy B columns over all of K, with the int32 accumulator XOR-reduced per 16x16 tile after every
  * K step of 128 (the pearl milestones). Built from the gemm_xor_benchmark NPU design: per-panel int32
  * GEMMs on the DPU feed the TileXorAcc SHAVE kernel of the patched compiler, which keeps the running
  * sum and XORs every tile in one pass.
@@ -10,7 +10,7 @@
  *   0       a_panels   [K/128, rows, 128]   A rows of the launch, one 128-wide K panel after another
  *   1 .. b  bt_panels  [K/128, cols, 128]   B columns (rows of B^T), same panel order; b_inputs()
  *                                           copies that the caller binds to the same tensor
- * Output: int32 [rows/8, (K/128) * cols/16], the tile words of each tile row in launch order;
+ * Output: int32 [rows/16, (K/128) * cols/16], the tile words of each tile row in launch order;
  * word_index() maps (tile column, milestone) to the word's position within a tile row.
  */
 
@@ -21,7 +21,9 @@
 
 namespace cp_npu {
 
-constexpr int kTileRows = 8;
+/* Hash tile. The compiler and kernel also do 8-row tiles; NPU_EXPERIMENTAL_TILE_XOR_ROWS selects the height
+ * (set_compiler_environment). 16 halves the tile words the NPU writes and the host hashes. */
+constexpr int kTileRows = 16;
 constexpr int kTileCols = 16;
 constexpr int kKr = 128;
 

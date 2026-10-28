@@ -106,8 +106,10 @@ std::string cache_subdir(const std::string& root, const std::string& kernel_dir)
     if (!ov.empty() && fs::exists(compiler, ec))
         h.update(std::to_string(fs::file_size(compiler, ec)) + ":" +
                  std::to_string(fs::last_write_time(compiler, ec).time_since_epoch().count()));
-    const char* i32 = std::getenv("NPU_EXPERIMENTAL_I32_DPU_OUTPUT");
-    h.update(i32 ? i32 : "");
+    for (const char* var : {"NPU_EXPERIMENTAL_I32_DPU_OUTPUT", "NPU_EXPERIMENTAL_TILE_XOR_ROWS"}) {
+        const char* v = std::getenv(var);
+        h.update(v ? v : "");
+    }
     char hex[17];
     std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(h.h));
     const fs::path dir = fs::path(root) / std::string(hex, 12);
@@ -119,6 +121,7 @@ std::string cache_subdir(const std::string& root, const std::string& kernel_dir)
 
 void set_compiler_environment(const std::string& kernel_dir) {
     set_env("NPU_EXPERIMENTAL_I32_DPU_OUTPUT", "1");
+    set_env("NPU_EXPERIMENTAL_TILE_XOR_ROWS", std::to_string(kTileRows));
     if (!std::getenv("NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR"))
         set_env("NPU_EXPERIMENTAL_SHAVE_KERNEL_DIR", kernel_dir);
 }
