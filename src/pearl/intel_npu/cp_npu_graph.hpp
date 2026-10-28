@@ -6,12 +6,16 @@
  * GEMMs on the DPU feed the TileXorAcc SHAVE kernel of the patched compiler, which keeps the running
  * sum and XORs every tile in one pass.
  *
- * Inputs (u8, value + 128, which the compiler folds into a cast to int8):
+ * Inputs (A and B as u8, value + 128, which the compiler folds into a cast to int8):
  *   0       a_panels   [K/128, rows, 128]   A rows of the launch, one 128-wide K panel after another
  *   1 .. b  bt_panels  [K/128, cols, 128]   B columns (rows of B^T), same panel order; b_inputs()
  *                                           copies that the caller binds to the same tensor
+ *   b + 1   jackpot_params, int32 [1, 1, chunk_m/16, 16], fused_jackpot only: every row the 8 key and
+ *           8 bound words of the attempt
  * Output: int32 [rows/16, (K/128) * cols/16], the tile words of each tile row in launch order;
  * word_index() maps (tile column, milestone) to the word's position within a tile row.
+ * With fused_jackpot the TileJackpot SHAVE op hashes the tile words on the NPU instead, and the output
+ * is int32 [rows/16]: per tile row 1 + the lowest tile column that beats the bound, or 0.
  */
 
 #include <memory>
@@ -26,6 +30,7 @@ namespace cp_npu {
 constexpr int kTileRows = 16;
 constexpr int kTileCols = 16;
 constexpr int kKr = 128;
+constexpr int kJackpotParamWords = 16; /* key[8], bound[8] */
 
 struct LaunchShape {
     int rows = 512;     /* row blocks of chunk_m, one after another */
@@ -37,6 +42,7 @@ struct LaunchShape {
     int group = 8;      /* panel GEMMs per TileXorAcc op */
     bool split_b = true; /* one B input per row block: the compiler merges identical slices of one input,
                             so a shared B block would stay in CMX across all row blocks */
+    bool fused_jackpot = false; /* BLAKE3 jackpot on the SHAVEs: one hit word per tile row comes back */
 
     int milestones() const { return k / kKr; }
     int tile_rows() const { return rows / kTileRows; }
@@ -44,6 +50,7 @@ struct LaunchShape {
     int row_words() const { return milestones() * tile_cols(); }
     int row_blocks() const { return rows / chunk_m; }
     int b_inputs() const { return split_b ? row_blocks() : 1; }
+    int jackpot_input() const { return 1 + b_inputs(); } /* index of jackpot_params (fused_jackpot) */
 };
 
 /* Why a shape cannot be built, or nullptr. */

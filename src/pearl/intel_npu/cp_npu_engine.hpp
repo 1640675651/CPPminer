@@ -18,10 +18,10 @@ namespace cp_npu {
 class Engine {
 public:
     /* Compiles (or loads from the cache) the launch graph and creates `requests` infer requests.
-     * kernel_dir holds tile_xor_acc.3720xx*.elf; cache_root gets one subdirectory per kernel and
-     * compiler build. Returns 0, or -1 with a message in *err. */
+     * kernel_dir holds tile_xor_acc.3720xx*.elf (and tile_jackpot.3720xx*.elf); cache_root gets one
+     * subdirectory per kernel and compiler build. Returns 0, or -1 with a message in *err. */
     int init(const LaunchShape& shape, const std::string& kernel_dir, const std::string& cache_root,
-             int requests, std::string* err);
+             int requests, std::string* err, const ov::AnyMap& extra_config = {});
     void shutdown();
     bool ready() const { return m_ready; }
 
@@ -31,6 +31,9 @@ public:
     ov::InferRequest& request(int i) { return m_requests[size_t(i)]; }
     /* Binds request i's inputs: the A panels, and the B^T panels to every B input of the graph. */
     void set_inputs(int i, const ov::Tensor& a, const ov::Tensor& bt);
+    /* fused_jackpot: the [chunk_m/16, 16] int32 key and bound rows, bound to every request at init;
+     * write them while no launch is in flight. */
+    ov::Tensor& jackpot_params() { return m_jackpot; }
 
     /* A host tensor for input `index` (0: A panels, 1: B^T panels) that the NPU reads in place
      * (the plugin's host allocation); a plain tensor if the plugin offers none. */
@@ -45,6 +48,7 @@ private:
     ov::Core m_core;
     ov::CompiledModel m_compiled;
     std::vector<ov::InferRequest> m_requests;
+    ov::Tensor m_jackpot;
     LaunchShape m_shape;
     std::vector<int> m_word_index;
     std::string m_cache_dir;

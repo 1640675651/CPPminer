@@ -65,6 +65,40 @@ private:
     bool m_dep_acc = false;
 };
 
+/*
+ * The patched compiler's jackpot op, serialized as type "TileJackpot", version "extension", attribute
+ * chains (vpux/compiler/frontend/tile_jackpot.hpp). Input 0: int32 [1, 1, T, 16], every row the key
+ * and bound words; inputs 1..n: the tile words of TileXorAcc ops [1, 1, T, G * 4], n = steps * chains
+ * in step-major order. Output int32 [1, 1, T, 1]: per tile row 1 + the lowest tile column whose keyed
+ * BLAKE3 digest of the folded milestones beats the bound, or 0.
+ */
+class TileJackpot : public ov::op::Op {
+public:
+    OPENVINO_OP("TileJackpot", "extension", ov::op::Op);
+
+    TileJackpot() = default;
+    TileJackpot(const ov::OutputVector& inputs, int64_t chains) : ov::op::Op(inputs), m_chains(chains) {
+        constructor_validate_and_infer_types();
+    }
+
+    void validate_and_infer_types() override {
+        const auto dims = get_input_partial_shape(0).to_shape();
+        set_output_type(0, ov::element::i32, ov::PartialShape{1, 1, static_cast<int64_t>(dims[2]), 1});
+    }
+
+    std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& args) const override {
+        return std::make_shared<TileJackpot>(args, m_chains);
+    }
+
+    bool visit_attributes(ov::AttributeVisitor& visitor) override {
+        visitor.on_attribute("chains", m_chains);
+        return true;
+    }
+
+private:
+    int64_t m_chains = 1;
+};
+
 Out i64s(const std::vector<int64_t>& v) {
     return Constant::create(ov::element::i64, ov::Shape{v.size()}, v);
 }
@@ -116,6 +150,9 @@ const char* launch_shape_error(const LaunchShape& s) {
     const int tail = s.milestones() % s.group;
     if (s.group < 4 || s.group > 8 || (tail && tail < 3))
         return "group must be 4..8 and leave a last group of at least 3 panels";
+    /* The TileJackpot kernel: 32 milestones in equal steps, 4 tile columns (one vector) per chain. */
+    if (s.fused_jackpot && (s.milestones() != 32 || tail || s.chunk_n != 4 * kTileCols))
+        return "the fused jackpot needs K = 4096, a group dividing 32 and 64-column chains";
     return nullptr;
 }
 
@@ -132,6 +169,13 @@ std::shared_ptr<ov::Model> build_launch_model(const LaunchShape& s, std::vector<
         auto bt = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::Shape{size_t(ms), size_t(cols), size_t(kKr)});
         bt->set_friendly_name(i ? "bt_panels_" + std::to_string(i) : std::string("bt_panels"));
         params.push_back(bt);
+    }
+    std::shared_ptr<ov::op::v0::Parameter> jackpot;
+    if (s.fused_jackpot) {
+        jackpot = std::make_shared<ov::op::v0::Parameter>(
+                ov::element::i32, ov::Shape{1, 1, size_t(chunk_m / kTileRows), size_t(kJackpotParamWords)});
+        jackpot->set_friendly_name("jackpot_params");
+        params.push_back(jackpot);
     }
 
     ov::OutputVector block_words;
@@ -188,9 +232,17 @@ std::shared_ptr<ov::Model> build_launch_model(const LaunchShape& s, std::vector<
                             offset + int(i * words_per_chain + t);
                 offset += int(st.count * words_per_chain);
             }
-        block_words.push_back(concat(words, 3)); /* [1, 1, chunk_m/8, ms * cols/16] */
+        if (s.fused_jackpot) {
+            /* The words stay on the NPU: the jackpot op takes them in this same step-major order. */
+            ov::OutputVector inputs{jackpot};
+            inputs.insert(inputs.end(), words.begin(), words.end());
+            block_words.push_back(std::make_shared<TileJackpot>(inputs, chains)->output(0)); /* [1, 1, chunk_m/16, 1] */
+        } else {
+            block_words.push_back(concat(words, 3)); /* [1, 1, chunk_m/16, ms * cols/16] */
+        }
     }
-    Out out = reshape(concat(block_words, 2), {s.rows / kTileRows, ms * (cols / kTileCols)});
+    Out out = s.fused_jackpot ? reshape(concat(block_words, 2), {s.rows / kTileRows})
+                              : reshape(concat(block_words, 2), {s.rows / kTileRows, ms * (cols / kTileCols)});
     return std::make_shared<ov::Model>(ov::OutputVector{out}, params, "pearl_npu_launch");
 }
 

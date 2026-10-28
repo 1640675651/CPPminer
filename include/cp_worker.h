@@ -80,6 +80,8 @@ void cp_worker_set_hexagon_launch(int row_macros, int col_macros);
  * CP_INTEL_NPU_ROW_MACROS_DEFAULT x CP_INTEL_NPU_COL_MACROS_DEFAULT); the launch in rows x columns. */
 void cp_worker_set_intel_npu_launch(int row_macros, int col_macros);
 void cp_worker_intel_npu_launch_shape(int* rows, int* cols);
+/* intel_npu-only: --fused-jackpot, the jackpot on the NPU's SHAVEs instead of the host. */
+void cp_worker_set_intel_npu_fused_jackpot(int on);
 /* hexagon-only: --fused-jackpot, the jackpot on the DSP instead of the host. */
 void cp_worker_set_hexagon_fused_jackpot(int on);
 /* OpenCL-only: resolve tile size for device before init or align tests. */

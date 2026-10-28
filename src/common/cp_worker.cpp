@@ -431,6 +431,15 @@ extern "C" void cp_worker_intel_npu_launch_shape(int* rows, int* cols)
 #endif
 }
 
+extern "C" void cp_worker_set_intel_npu_fused_jackpot(int on)
+{
+#if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
+    cp_pearl_npu_worker_set_fused_jackpot(on);
+#else
+    (void)on;
+#endif
+}
+
 extern "C" void cp_worker_set_hexagon_fused_jackpot(int on)
 {
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON

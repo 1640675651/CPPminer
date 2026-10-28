@@ -505,8 +505,10 @@ if(CP_ENABLE_INTEL_NPU)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx.elf"
             "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx_lsu0_wo.elf"
+            "${_CP_NPU_DIR}/kernels/tile_jackpot.3720xx.elf"
+            "${_CP_NPU_DIR}/kernels/tile_jackpot.3720xx_lsu0_wo.elf"
             "$<TARGET_FILE_DIR:cppminer>/kernels/intel_npu/"
-        COMMENT "Copy the Intel NPU TileXorAcc kernel next to cppminer")
+        COMMENT "Copy the Intel NPU TileXorAcc and TileJackpot kernels next to cppminer")
     if(CP_INTEL_NPU_OPENVINO_BIN_DIR)
         set(_cp_npu_runtime)
         foreach(_f openvino.dll openvino_intel_npu_plugin.dll openvino_intel_npu_compiler.dll
@@ -527,7 +529,7 @@ if(CP_ENABLE_INTEL_NPU)
         src/pearl/intel_npu/cp_npu_launch_test.cpp
         src/pearl/intel_npu/cp_npu_engine.cpp
         src/pearl/intel_npu/cp_npu_graph.cpp)
-    target_include_directories(cp_npu_launch_test PRIVATE ${_CP_NPU_DIR})
+    target_include_directories(cp_npu_launch_test PRIVATE ${_CP_NPU_DIR} ${CMAKE_SOURCE_DIR}/src/cpu)
     target_link_libraries(cp_npu_launch_test PRIVATE openvino::runtime)
     target_compile_definitions(cp_npu_launch_test PRIVATE "CP_INTEL_NPU_SOURCE_KERNEL_DIR=\"${_CP_NPU_DIR}/kernels\"")
 endif()

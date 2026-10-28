@@ -16,7 +16,7 @@ index bafb03a..33bf805 100644
      ShaveBinaryResources(ShaveBinaryResources const&) = delete;
      void operator=(ShaveBinaryResources const&) = delete;
 diff --git a/src/vpux_compiler/include/vpux/compiler/conversion/passes/IE2VPU/convert_layers_to_VPU.hpp b/src/vpux_compiler/include/vpux/compiler/conversion/passes/IE2VPU/convert_layers_to_VPU.hpp
-index 4d965a8..d5f1fb1 100644
+index 4d965a8..59cf1a6 100644
 --- a/src/vpux_compiler/include/vpux/compiler/conversion/passes/IE2VPU/convert_layers_to_VPU.hpp
 +++ b/src/vpux_compiler/include/vpux/compiler/conversion/passes/IE2VPU/convert_layers_to_VPU.hpp
 @@ -6,6 +6,7 @@
@@ -27,7 +27,7 @@ index 4d965a8..d5f1fb1 100644
  #include "vpux/compiler/dialect/IE/IR/ops/control_flow.hpp"
  #include "vpux/compiler/dialect/IE/IR/ops/convolution.hpp"
  #include "vpux/compiler/dialect/IE/IR/ops/data_movement.hpp"
-@@ -157,6 +158,22 @@ private:
+@@ -157,6 +158,38 @@ private:
      Logger _log;
  };
  
@@ -42,6 +42,22 @@ index 4d965a8..d5f1fb1 100644
 +
 +public:
 +    mlir::LogicalResult matchAndRewrite(IE::TileXorAccOp origOp, mlir::PatternRewriter& rewriter) const final;
++
++private:
++    Logger _log;
++};
++
++//
++// TileJackpotRewrite
++//
++
++class TileJackpotRewrite final : public mlir::OpRewritePattern<IE::TileJackpotOp> {
++public:
++    TileJackpotRewrite(mlir::MLIRContext* ctx, Logger log): mlir::OpRewritePattern<IE::TileJackpotOp>(ctx), _log(log) {
++    }
++
++public:
++    mlir::LogicalResult matchAndRewrite(IE::TileJackpotOp origOp, mlir::PatternRewriter& rewriter) const final;
 +
 +private:
 +    Logger _log;
@@ -90,23 +106,26 @@ index 9b5bd26..614518e 100644
              const QuantizationApproximation scaleApproximation(quantScale);
              auto multShift = ppeConverter(checked_cast<uint8_t>(scaleApproximation.shift()),
 diff --git a/src/vpux_compiler/include/vpux/compiler/frontend/IE.hpp b/src/vpux_compiler/include/vpux/compiler/frontend/IE.hpp
-index d2932d3..c30a1e5 100644
+index d2932d3..244fd39 100644
 --- a/src/vpux_compiler/include/vpux/compiler/frontend/IE.hpp
 +++ b/src/vpux_compiler/include/vpux/compiler/frontend/IE.hpp
-@@ -44,6 +44,7 @@
+@@ -44,6 +44,8 @@
  #include <openvino/op/gated_delta_net.hpp>
  
  #include <intel_npu/ops/flash_attention_tile.hpp>
++#include "vpux/compiler/frontend/tile_jackpot.hpp"
 +#include "vpux/compiler/frontend/tile_xor_acc.hpp"
  
  namespace vpux {
  namespace IE {
-@@ -328,6 +329,8 @@ private:
+@@ -328,6 +330,10 @@ private:
                                 const std::shared_ptr<ov::opset13::ScaledDotProductAttention>& origNode);
      mlir::Operation* parseNode(mlir::OpBuilder& builder,
                                 const std::shared_ptr<ov::intel_npu::op::FlashAttentionTile>& origNode);
 +    mlir::Operation* parseNode(mlir::OpBuilder& builder,
 +                               const std::shared_ptr<vpux::frontend::TileXorAcc>& origNode);
++    mlir::Operation* parseNode(mlir::OpBuilder& builder,
++                               const std::shared_ptr<vpux::frontend::TileJackpot>& origNode);
      mlir::Operation* parseNode(mlir::OpBuilder& builder, const std::shared_ptr<ov::op::v16::Identity>& origNode);
      mlir::Operation* parseNode(mlir::OpBuilder& builder, const std::shared_ptr<ov::op::Op>& origNode);
      mlir::Operation* parseNode(mlir::OpBuilder& builder, const std::shared_ptr<ov::opset10::IsNaN>& origNode);
@@ -213,22 +232,24 @@ index 0000000..a859f5e
 +
 +}  // namespace vpux::frontend
 diff --git a/src/vpux_compiler/src/NPU37XX/dialect/VPU/IR/layout_info.cpp b/src/vpux_compiler/src/NPU37XX/dialect/VPU/IR/layout_info.cpp
-index 1bdda82..95cb41c 100644
+index 1bdda82..06b839f 100644
 --- a/src/vpux_compiler/src/NPU37XX/dialect/VPU/IR/layout_info.cpp
 +++ b/src/vpux_compiler/src/NPU37XX/dialect/VPU/IR/layout_info.cpp
-@@ -606,6 +606,7 @@ void redirectLayoutOpInterfacesForVPU(mlir::DialectRegistry& registry) {
+@@ -606,6 +606,8 @@ void redirectLayoutOpInterfacesForVPU(mlir::DialectRegistry& registry) {
          VPU::AffineReshapeOp::attachInterface<vpux::VPU::AffineReshapeDimsOrderOpModelForSW>(*ctx);
  
          VPU::TopKOp::attachInterface<vpux::VPU::TopKSameInOutDimsOrderOpModelForSW>(*ctx);
 +        VPU::TileXorAccOp::attachInterface<vpux::VPU::DefaultDimsOrderOpModelForSW>(*ctx);
++        VPU::TileJackpotOp::attachInterface<vpux::VPU::DefaultDimsOrderOpModelForSW>(*ctx);
  
          VPU::QuantizeOp::attachInterface<vpux::VPU::SameAnyDimsOrderOpModelForSW>(*ctx);
  
-@@ -809,6 +810,7 @@ void redirectLayoutOpInterfacesForIE(mlir::DialectRegistry& registry) {
+@@ -809,6 +811,8 @@ void redirectLayoutOpInterfacesForIE(mlir::DialectRegistry& registry) {
          IE::AffineReshapeOp::attachInterface<vpux::VPU::AffineReshapeDimsOrderOpModelForSW>(*ctx);
  
          IE::TopKOp::attachInterface<vpux::VPU::TopKSameInOutDimsOrderOpModelForSW>(*ctx);
 +        IE::TileXorAccOp::attachInterface<vpux::VPU::DefaultDimsOrderOpModelForSW>(*ctx);
++        IE::TileJackpotOp::attachInterface<vpux::VPU::DefaultDimsOrderOpModelForSW>(*ctx);
  
          IE::QuantizeOp::attachInterface<vpux::VPU::SameAnyDimsOrderOpModelForSW>(*ctx);
  
@@ -290,10 +311,10 @@ index d023d15..881da13 100644
      return getCache<ShaveBinaryResourcesCache, vpux::Core::CoreDialect>(ctx).getResources();
  }
 diff --git a/src/vpux_compiler/src/conversion/passes/IE2VPU/convert_layers_to_VPU.cpp b/src/vpux_compiler/src/conversion/passes/IE2VPU/convert_layers_to_VPU.cpp
-index f80f56e..ec932aa 100644
+index f80f56e..1dd3f43 100644
 --- a/src/vpux_compiler/src/conversion/passes/IE2VPU/convert_layers_to_VPU.cpp
 +++ b/src/vpux_compiler/src/conversion/passes/IE2VPU/convert_layers_to_VPU.cpp
-@@ -354,6 +354,14 @@ mlir::LogicalResult InterpolateRewrite::matchAndRewrite(IE::InterpolateOp origOp
+@@ -354,6 +354,21 @@ mlir::LogicalResult InterpolateRewrite::matchAndRewrite(IE::InterpolateOp origOp
  // TopKRewrite
  //
  
@@ -305,34 +326,43 @@ index f80f56e..ec932aa 100644
 +    return mlir::success();
 +}
 +
++mlir::LogicalResult TileJackpotRewrite::matchAndRewrite(IE::TileJackpotOp origOp,
++                                                        mlir::PatternRewriter& rewriter) const {
++    _log.trace("Found TileJackpot Operation '{0}'", origOp->getLoc());
++    rewriter.replaceOpWithNewOp<VPU::TileJackpotOp>(origOp, origOp.getInputs(), origOp.getChainsAttr());
++    return mlir::success();
++}
++
  mlir::LogicalResult TopKRewrite::matchAndRewrite(IE::TopKOp origOp, mlir::PatternRewriter& rewriter) const {
      _log.trace("Found TopK Operation '{0}'", origOp->getLoc());
  
-@@ -855,6 +863,7 @@ void ConvertLayers2VPUPass::safeRunOnFunc() {
+@@ -855,6 +870,8 @@ void ConvertLayers2VPUPass::safeRunOnFunc() {
      patterns.add<GRUCellRewrite>(&ctx, _log);
      patterns.add<ExperimentalDetectronROIFeatureExtractorRewrite>(&ctx, _log);
      patterns.add<TopKRewrite>(&ctx, _log);
 +    patterns.add<TileXorAccRewrite>(&ctx, _log);
++    patterns.add<TileJackpotRewrite>(&ctx, _log);
      patterns.add<GatedDeltaNetRewrite>(&ctx, _log);
      patterns.add<AtanRewrite>(&ctx, _log);
      patterns.add<ScatterUpdateRewrite>(&ctx, _log);
 diff --git a/src/vpux_compiler/src/conversion/passes/VPU2VPUIP/bufferize_sw_ops_interface.cpp b/src/vpux_compiler/src/conversion/passes/VPU2VPUIP/bufferize_sw_ops_interface.cpp
-index 774fbdd..80d7913 100644
+index 774fbdd..6c47162 100644
 --- a/src/vpux_compiler/src/conversion/passes/VPU2VPUIP/bufferize_sw_ops_interface.cpp
 +++ b/src/vpux_compiler/src/conversion/passes/VPU2VPUIP/bufferize_sw_ops_interface.cpp
-@@ -456,6 +456,7 @@ void vpux::registerSoftwareLayerBufferizableOpInterfaces(mlir::DialectRegistry&
+@@ -456,6 +456,8 @@ void vpux::registerSoftwareLayerBufferizableOpInterfaces(mlir::DialectRegistry&
          VPU::BitwiseAndOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseAndOp>>(*ctx);
          VPU::BitwiseOrOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseOrOp>>(*ctx);
          VPU::BitwiseXorOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseXorOp>>(*ctx);
 +        VPU::TileXorAccOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::TileXorAccOp>>(*ctx);
++        VPU::TileJackpotOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::TileJackpotOp>>(*ctx);
          VPU::BitwiseNotOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseNotOp>>(*ctx);
          VPU::BitwiseRightShiftOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseRightShiftOp>>(*ctx);
          VPU::BitwiseLeftShiftOp::attachInterface<SoftwareLayerOpBufferizeModel<VPU::BitwiseLeftShiftOp>>(*ctx);
 diff --git a/src/vpux_compiler/src/core/cost_model_utils.cpp b/src/vpux_compiler/src/core/cost_model_utils.cpp
-index 5e4832b..7ef9a39 100644
+index 5e4832b..3787636 100644
 --- a/src/vpux_compiler/src/core/cost_model_utils.cpp
 +++ b/src/vpux_compiler/src/core/cost_model_utils.cpp
-@@ -878,6 +878,27 @@ std::unique_ptr<VPUNN::SHAVEWorkload> vpux::getVPUNNSWKernelOp(VPU::SWOpInterfac
+@@ -878,6 +878,34 @@ std::unique_ptr<VPUNN::SHAVEWorkload> vpux::getVPUNNSWKernelOp(VPU::SWOpInterfac
      return getShaveWorkloadFunction(operation, inputTensors, outputTensors);
  }
  
@@ -341,18 +371,25 @@ index 5e4832b..7ef9a39 100644
 +// VPUNN has no SI32 SHAVE models. The experimental TileXorAcc kernel costs about 0.63 SHAVE cycles per input
 +// element in a loaded graph (measured on NPU37XX: 39 us for 9 x 256 x 64 elements on 2 SHAVEs, 17 us for 4 x 256
 +// x 64); split over the kernel runs that execute in parallel on the ACT SHAVEs. Other SI32 kernels keep cost 1.
++// The experimental TileJackpot kernel hashes 4 tiles per vector BLAKE3 compression: about TILE_JACKPOT_CYCLES_PER_TILE
++// per tile (one tile per 32 milestone words of its tile-word inputs).
++constexpr int64_t TILE_JACKPOT_CYCLES_PER_TILE = 400;
++constexpr int64_t TILE_JACKPOT_WORDS_PER_TILE = 32;
++
 +size_t estimateI32SwKernelCost(VPUIP::SwKernelOp swKernelOp) {
 +    const auto kernelName = swKernelOp.getKernelFunction().getLeafReference().str();
-+    if (!llvm::StringRef(kernelName).contains("TileXorAcc")) {
++    const bool jackpot = llvm::StringRef(kernelName).contains("TileJackpot");
++    if (!jackpot && !llvm::StringRef(kernelName).contains("TileXorAcc")) {
 +        return 1;
 +    }
 +    int64_t elems = 0;
 +    for (auto input : swKernelOp.getInputs()) {
 +        elems += mlir::cast<vpux::NDTypeInterface>(input.getType()).getShape().totalSize();
 +    }
-+    const auto runs = std::distance(swKernelOp.getBody().getOps<VPUIP::SwKernelRun>().begin(),
-+                                    swKernelOp.getBody().getOps<VPUIP::SwKernelRun>().end());
-+    return static_cast<size_t>(std::max<int64_t>(1, elems * 5 / 8 / std::max<int64_t>(1, runs)));
++    const auto runs = std::max<int64_t>(1, std::distance(swKernelOp.getBody().getOps<VPUIP::SwKernelRun>().begin(),
++                                                         swKernelOp.getBody().getOps<VPUIP::SwKernelRun>().end()));
++    const auto cycles = jackpot ? elems / TILE_JACKPOT_WORDS_PER_TILE * TILE_JACKPOT_CYCLES_PER_TILE : elems * 5 / 8;
++    return static_cast<size_t>(std::max<int64_t>(1, cycles / runs));
 +}
 +
 +}  // namespace
@@ -360,7 +397,7 @@ index 5e4832b..7ef9a39 100644
  size_t vpux::calculateShaveActCycles(VPUIP::SwKernelOp swKernelOp,
                                       const std::shared_ptr<VPUNN::VPUCostModel>& costModel) {
      if (swKernelOp.getInputs().empty() || swKernelOp.getOutputBuffs().empty()) {
-@@ -894,7 +915,7 @@ size_t vpux::calculateShaveActCycles(VPUIP::SwKernelOp swKernelOp,
+@@ -894,7 +922,7 @@ size_t vpux::calculateShaveActCycles(VPUIP::SwKernelOp swKernelOp,
          return 1;
      }
      if (inputElemType.isSignedInteger(32) || outputElemType.isSignedInteger(32)) {
@@ -369,7 +406,7 @@ index 5e4832b..7ef9a39 100644
      }
  
      auto inputs = to_small_vector(swKernelOp.getInputs());
-@@ -925,6 +946,37 @@ size_t vpux::calculateShaveActCycles(VPUIP::SwKernelOp swKernelOp,
+@@ -925,6 +953,37 @@ size_t vpux::calculateShaveActCycles(VPUIP::SwKernelOp swKernelOp,
                                             costModel);
  }
  
@@ -407,7 +444,7 @@ index 5e4832b..7ef9a39 100644
  size_t vpux::getDPUTaskOpCost(VPUIP::DPUTaskOp dpuTaskOp, const std::shared_ptr<VPUNN::VPUCostModel>& costModel,
                                config::ArchKind arch, vpux::Logger log) {
      auto nceOp = dpuTaskOp->getParentOfType<VPUIP::NCEClusterTaskOp>();
-@@ -940,9 +992,14 @@ size_t vpux::getDPUTaskOpCost(VPUIP::DPUTaskOp dpuTaskOp, const std::shared_ptr<
+@@ -940,9 +999,14 @@ size_t vpux::getDPUTaskOpCost(VPUIP::DPUTaskOp dpuTaskOp, const std::shared_ptr<
      if (inputElemType.isF32() || outputElemType.isF32()) {
          return 1;
      }
@@ -910,14 +947,15 @@ index 0000000..2d4b925
 +    return false;
 +}
 diff --git a/src/vpux_compiler/src/dialect/VPU/IR/ops_interfaces.cpp b/src/vpux_compiler/src/dialect/VPU/IR/ops_interfaces.cpp
-index 090e727..8b0786a 100644
+index 090e727..286b745 100644
 --- a/src/vpux_compiler/src/dialect/VPU/IR/ops_interfaces.cpp
 +++ b/src/vpux_compiler/src/dialect/VPU/IR/ops_interfaces.cpp
-@@ -470,6 +470,7 @@ void vpux::VPU::registerSWTilingInfoOpInterfaceCommon(mlir::DialectRegistry& reg
+@@ -470,6 +470,8 @@ void vpux::VPU::registerSWTilingInfoOpInterfaceCommon(mlir::DialectRegistry& reg
          VPU::LogSoftmaxTopKOp::attachInterface<SwLayerTilingInfoOpModel<VPU::LogSoftmaxTopKOp>>(*ctx);
          VPU::LogSoftmaxPeakOp::attachInterface<SwLayerTilingInfoOpModel<VPU::LogSoftmaxPeakOp>>(*ctx);
          VPU::TopKOp::attachInterface<SwLayerTilingInfoOpModel<VPU::TopKOp>>(*ctx);
 +        VPU::TileXorAccOp::attachInterface<SwLayerTilingInfoOpModel<VPU::TileXorAccOp>>(*ctx);
++        VPU::TileJackpotOp::attachInterface<SwLayerTilingInfoOpModel<VPU::TileJackpotOp>>(*ctx);
          VPU::StridedSliceOp::attachInterface<SwLayerTilingInfoOpModel<VPU::StridedSliceOp>>(*ctx);
          VPU::SpaceToDepthOp::attachInterface<SwLayerTilingInfoOpModel<VPU::SpaceToDepthOp>>(*ctx);
          VPU::DepthToSpaceOp::attachInterface<SwLayerTilingInfoOpModel<VPU::DepthToSpaceOp>>(*ctx);
@@ -972,20 +1010,23 @@ index 46f3ded..4ffa872 100644
          if (cost.costWithoutPrefetching >= INVALID_COST_BASE || cost.costWithPrefetching >= INVALID_COST_BASE) {
              tilingStrategiesWithCost.clear();
 diff --git a/src/vpux_compiler/src/dialect/VPU/utils/sw_utils.cpp b/src/vpux_compiler/src/dialect/VPU/utils/sw_utils.cpp
-index 86318ac..c37f080 100644
+index 86318ac..4d49f52 100644
 --- a/src/vpux_compiler/src/dialect/VPU/utils/sw_utils.cpp
 +++ b/src/vpux_compiler/src/dialect/VPU/utils/sw_utils.cpp
-@@ -888,6 +888,9 @@ DistributionMode vpux::VPU::getSWInputTensorDistributionMode(VPU::ClusteredOpInt
+@@ -888,6 +888,12 @@ DistributionMode vpux::VPU::getSWInputTensorDistributionMode(VPU::ClusteredOpInt
              .Case<VPU::TopKOp>([&](VPU::TopKOp op) {
                  return getSWInputTensorDistributionMode(op, strategy, operand);
              })
 +            .Case<VPU::TileXorAccOp>([&](VPU::TileXorAccOp) {
 +                return getSWInputTensorDistributionMode(strategy);
 +            })
++            .Case<VPU::TileJackpotOp>([&](VPU::TileJackpotOp) {
++                return getSWInputTensorDistributionMode(strategy);
++            })
              .Case<VPU::DynamicQuantizeOp>([&](VPU::DynamicQuantizeOp op) {
                  return getSWInputTensorDistributionMode(op, strategy, operand);
              })
-@@ -1889,6 +1892,10 @@ SmallVector<int64_t> vpux::VPU::getSWInputTensorNumTiles(VPU::ClusteredOpInterfa
+@@ -1889,6 +1895,14 @@ SmallVector<int64_t> vpux::VPU::getSWInputTensorNumTiles(VPU::ClusteredOpInterfa
              .Case<VPU::TopKOp>([&](VPU::TopKOp op) {
                  return getSWInputTensorNumTiles(op, numClustersAvailableForCompilation, strategy, operand);
              })
@@ -993,26 +1034,31 @@ index 86318ac..c37f080 100644
 +                return getSWInputTensorNumTiles(mlir::cast<VPU::ClusteredOpInterface>(op.getOperation()),
 +                                                numClustersAvailableForCompilation, strategy);
 +            })
++            .Case<VPU::TileJackpotOp>([&](VPU::TileJackpotOp op) {
++                return getSWInputTensorNumTiles(mlir::cast<VPU::ClusteredOpInterface>(op.getOperation()),
++                                                numClustersAvailableForCompilation, strategy);
++            })
              .Case<VPU::ReverseOp>([&](VPU::ReverseOp op) {
                  return getSWInputTensorNumTiles(op, numClustersAvailableForCompilation, strategy);
              })
 diff --git a/src/vpux_compiler/src/dialect/VPUIP/IR/ops.cpp b/src/vpux_compiler/src/dialect/VPUIP/IR/ops.cpp
-index 87eb668..6ceac8a 100644
+index 87eb668..9890815 100644
 --- a/src/vpux_compiler/src/dialect/VPUIP/IR/ops.cpp
 +++ b/src/vpux_compiler/src/dialect/VPUIP/IR/ops.cpp
-@@ -875,6 +875,7 @@ void vpux::VPUIP::VPUIPDialect::setupExtraInterfaces(mlir::DialectRegistry& regi
+@@ -875,6 +875,8 @@ void vpux::VPUIP::VPUIPDialect::setupExtraInterfaces(mlir::DialectRegistry& regi
          VPU::BitwiseAndOp::attachInterface<SoftwareLayerOpModel>(*ctx);
          VPU::BitwiseOrOp::attachInterface<SoftwareLayerOpModel>(*ctx);
          VPU::BitwiseXorOp::attachInterface<SoftwareLayerOpModel>(*ctx);
 +        VPU::TileXorAccOp::attachInterface<SoftwareLayerOpModel>(*ctx);
++        VPU::TileJackpotOp::attachInterface<SoftwareLayerOpModel>(*ctx);
          VPU::BitwiseNotOp::attachInterface<SoftwareLayerOpModel>(*ctx);
          VPU::BitwiseRightShiftOp::attachInterface<SoftwareLayerOpModel>(*ctx);
          VPU::BitwiseLeftShiftOp::attachInterface<SoftwareLayerOpModel>(*ctx);
 diff --git a/src/vpux_compiler/src/dialect/VPUIP/IR/ops/sw_kernel.cpp b/src/vpux_compiler/src/dialect/VPUIP/IR/ops/sw_kernel.cpp
-index a047cec..4c1da74 100644
+index a047cec..0427fe9 100644
 --- a/src/vpux_compiler/src/dialect/VPUIP/IR/ops/sw_kernel.cpp
 +++ b/src/vpux_compiler/src/dialect/VPUIP/IR/ops/sw_kernel.cpp
-@@ -1553,6 +1553,13 @@ VPUIP::KernelInfo SwKernelOp::getKernelInfo(mlir::Operation* origOp) {
+@@ -1553,6 +1553,19 @@ VPUIP::KernelInfo SwKernelOp::getKernelInfo(mlir::Operation* origOp) {
              .Case<VPU::BitwiseXorOp>([&](VPU::BitwiseXorOp) {
                  return VPUIP::KernelInfo{SmallVector<mlir::Attribute>{}, {"eltwise_bitwise_xor"}};
              })
@@ -1022,6 +1068,12 @@ index a047cec..4c1da74 100644
 +                const int64_t accMode = op.getHasAcc() ? (op.getDepAcc() ? 2 : 1) : (op.getDepAcc() ? 3 : 0);
 +                return VPUIP::KernelInfo{SmallVector<mlir::Attribute>{getIntAttr(ctx, accMode)},
 +                                         {"tile_xor_acc"}};
++            })
++            .Case<VPU::TileJackpotOp>([&](VPU::TileJackpotOp op) {
++                // The chain count orders the tile-word inputs (step-major); it also marks the end of the records.
++                return VPUIP::KernelInfo{
++                        SmallVector<mlir::Attribute>{getIntAttr(ctx, static_cast<int64_t>(op.getChains()))},
++                        {"tile_jackpot"}};
 +            })
              .Case<VPU::BitwiseNotOp>([&](VPU::BitwiseNotOp) {
                  return VPUIP::KernelInfo{SmallVector<mlir::Attribute>{}, {"eltwise_bitwise_not"}};
@@ -1126,10 +1178,18 @@ index 226b35e..fdd1bca 100644
      if (mlir::failed(mlir::applyPatternsGreedily(func, std::move(patterns), getDefaultGreedyRewriteConfig()))) {
          signalPassFailure();
 diff --git a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/tile_act_shave_kernel_task.cpp b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/tile_act_shave_kernel_task.cpp
-index 968a425..0fc4c65 100644
+index 968a425..18b8183 100644
 --- a/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/tile_act_shave_kernel_task.cpp
 +++ b/src/vpux_compiler/src/dialect/VPUIP/transforms/passes/tile_act_shave_kernel_task.cpp
-@@ -274,7 +274,8 @@ Dim getSwKernelTileDim(VPUIP::SwKernelOp swKernelOp) {
+@@ -269,12 +269,16 @@ Dim getSwKernelTileDim(VPUIP::SwKernelOp swKernelOp) {
+         }
+     } else if (kernelEntryName == "lstm_gates") {
+         return Dims4D::Act::H;
++    } else if (kernelEntryName == "tile_jackpot") {
++        // One word per tile row: the ACT SHAVEs share the rows (the output's W is 1).
++        return Dims4D::Act::H;
+     } else if (kernelEntryName == "lstm_cell") {
+         const auto tileDim =
                  (mlir::cast<vpux::NDTypeInterface>(swKernelOp->getResult(0).getType())).getShape().size() - 1;
          return Dim(tileDim);
      } else if (kernelEntryName == "lstm_sequence" || (kernelEntryName == "attention") ||
@@ -1139,7 +1199,7 @@ index 968a425..0fc4c65 100644
          const auto tileDim =
                  (mlir::cast<vpux::NDTypeInterface>(swKernelOp->getResult(0).getType())).getShape().size() - 1;
          return Dim(tileDim);
-@@ -551,6 +552,12 @@ bool doesSwKernelSupportTiling(VPUIP::SwKernelOp swKernelOp, vpux::Logger log) {
+@@ -551,6 +555,17 @@ bool doesSwKernelSupportTiling(VPUIP::SwKernelOp swKernelOp, vpux::Logger log) {
          return true;
      }
  
@@ -1149,19 +1209,24 @@ index 968a425..0fc4c65 100644
 +        return getShape(swKernelOp->getResult(1))[Dims4D::Act::H] >= 2;
 +    }
 +
++    if (kernelEntryName == "tile_jackpot") {
++        // As tile_xor_acc: every ACT SHAVE takes its own share of the tile rows.
++        return getShape(swKernelOp->getResult(0))[Dims4D::Act::H] >= 2;
++    }
++
      if (kernelEntryName == "gated_delta_net") {
          for (auto value : llvm::concat<mlir::Value>(swKernelOp.getInputs(), swKernelOp.getOutputs())) {
              if (mlir::cast<mlir::ShapedType>(value.getType()).getNumDynamicDims() > 0) {
-@@ -888,7 +895,7 @@ mlir::FailureOr<OutputTiling> getSwKernelOutputTiling(VPUIP::SwKernelOp swKernel
+@@ -888,7 +903,7 @@ mlir::FailureOr<OutputTiling> getSwKernelOutputTiling(VPUIP::SwKernelOp swKernel
                                                        int64_t maxNumTiles, bool insertSubview, vpux::Logger log) {
      auto kernelEntryName = getSwKernelEntryName(swKernelOp);
      if (kernelEntryName == "lstm_sequence" || kernelEntryName == "attention" || kernelEntryName == "flash_sdpa" ||
 -        kernelEntryName == "gated_delta_net") {
-+        kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc") {
++        kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc" || kernelEntryName == "tile_jackpot") {
          OutputTiling dividedTiles;
          TileInfo tileFullOutput(outputShape);
          log.trace("{0} no tiles is {1}", kernelEntryName, maxNumTiles);
-@@ -1076,7 +1083,7 @@ static OutputTiling computeOutputTiling(VPUIP::SwKernelOp swKernelOp, const Smal
+@@ -1076,7 +1091,7 @@ static OutputTiling computeOutputTiling(VPUIP::SwKernelOp swKernelOp, const Smal
          return {firstOutputTile, firstOutputTile};
      } else if (kernelEntryName == "lstm_sequence") {
          return vpux::VPU::lstmSequenceOutputTiling(firstOutputTile);
@@ -1170,20 +1235,22 @@ index 968a425..0fc4c65 100644
          OutputTiling tiles;
          tiles.push_back(firstOutputTile);
          tiles.push_back(TileInfo(getShape(swKernelOp->getResult(1))));
-@@ -1310,7 +1317,7 @@ bool SwKernelRewriterBase::needInsertSubviewOnly(VPUIP::SwKernelOp swKernelOp) c
+@@ -1310,7 +1325,8 @@ bool SwKernelRewriterBase::needInsertSubviewOnly(VPUIP::SwKernelOp swKernelOp) c
          return isTopKOpTileAtHighestDim(swKernelOp);
      }
  
 -    if (kernelEntryName == "flash_sdpa" || kernelEntryName == "gated_delta_net") {
-+    if (kernelEntryName == "flash_sdpa" || kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc") {
++    if (kernelEntryName == "flash_sdpa" || kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc" ||
++        kernelEntryName == "tile_jackpot") {
          return true;
      }
  
-@@ -1343,6 +1350,16 @@ SmallVector<mlir::Attribute> SwKernelRewriterBase::updateSwKernelAttrs(VPUIP::Sw
+@@ -1343,6 +1359,17 @@ SmallVector<mlir::Attribute> SwKernelRewriterBase::updateSwKernelAttrs(VPUIP::Sw
          return {};
      }
  
-+    if (VPUIP::getSwKernelEntryName(swKernelOp) == "tile_xor_acc") {
++    if (VPUIP::getSwKernelEntryName(swKernelOp) == "tile_xor_acc" ||
++        VPUIP::getSwKernelEntryName(swKernelOp) == "tile_jackpot") {
 +        auto origAttr = swKernelRun.getAttrs().value();
 +        SmallVector<mlir::Attribute> attrs(origAttr.begin(), origAttr.end());
 +        const auto numShaves = static_cast<int64_t>(getOuterMostOutputTiling(swKernelOp).size());
@@ -1197,20 +1264,21 @@ index 968a425..0fc4c65 100644
      const auto inputTiles = getOuterMostInputTiling(swKernelOp, outTileIndexInsideCluster);
      auto origAttr = swKernelRun.getAttrs().value();
 diff --git a/src/vpux_compiler/src/dialect/VPUIP/utils/sw_utils.cpp b/src/vpux_compiler/src/dialect/VPUIP/utils/sw_utils.cpp
-index fdc62c4..8348163 100644
+index fdc62c4..9306893 100644
 --- a/src/vpux_compiler/src/dialect/VPUIP/utils/sw_utils.cpp
 +++ b/src/vpux_compiler/src/dialect/VPUIP/utils/sw_utils.cpp
-@@ -2240,7 +2240,7 @@ InputTiling backInferSwKernelInputTile(VPUIP::SwKernelOp swKernelOp, const Small
+@@ -2240,7 +2240,8 @@ InputTiling backInferSwKernelInputTile(VPUIP::SwKernelOp swKernelOp, const Small
          return backInferSDPASwKernelInputTile(swKernelOp, outputTile, log);
      } else if (kernelEntryName == "attention") {
          return backInferAttentionSwKernelInputTile(swKernelOp, outputTile, log);
 -    } else if (kernelEntryName == "gated_delta_net") {
-+    } else if (kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc") {
++    } else if (kernelEntryName == "gated_delta_net" || kernelEntryName == "tile_xor_acc" ||
++               kernelEntryName == "tile_jackpot") {
          return backInferGatedDeltaNetSwKernelInputTile(swKernelOp, outputTile, log);
      } else if (kernelEntryName == "pad") {
          return backInferPadSwKernelInputTile(swKernelOp, outputTile, log);
 diff --git a/src/vpux_compiler/src/frontend/IE.cpp b/src/vpux_compiler/src/frontend/IE.cpp
-index a4a9654..68c5218 100644
+index a4a9654..5d79951 100644
 --- a/src/vpux_compiler/src/frontend/IE.cpp
 +++ b/src/vpux_compiler/src/frontend/IE.cpp
 @@ -4,6 +4,7 @@
@@ -1221,15 +1289,16 @@ index a4a9654..68c5218 100644
  #include "vpux/compiler/core/attributes/dims_order.hpp"
  #include "vpux/compiler/core/types/quantile_float/dialect.hpp"
  #include "vpux/compiler/core/types/quantile_float/types.hpp"
-@@ -590,6 +591,7 @@ NGraphImporter::Callback NGraphImporter::getParser(const std::shared_ptr<ov::Nod
+@@ -590,6 +591,8 @@ NGraphImporter::Callback NGraphImporter::getParser(const std::shared_ptr<ov::Nod
              MAP_ENTRY(ov::opset10::IsInf),
              MAP_ENTRY(ov::opset10::IsFinite),
              MAP_ENTRY(ov::intel_npu::op::FlashAttentionTile),
 +            MAP_ENTRY(vpux::frontend::TileXorAcc),
++            MAP_ENTRY(vpux::frontend::TileJackpot),
      };
  
  #undef MAP_ENTRY
-@@ -3966,6 +3968,16 @@ mlir::Operation* NGraphImporter::parseNode(mlir::OpBuilder& builder,
+@@ -3966,6 +3969,25 @@ mlir::Operation* NGraphImporter::parseNode(mlir::OpBuilder& builder,
      return op;
  }
  
@@ -1243,36 +1312,47 @@ index a4a9654..68c5218 100644
 +    return op;
 +}
 +
++mlir::Operation* NGraphImporter::parseNode(mlir::OpBuilder& builder,
++                                           const std::shared_ptr<vpux::frontend::TileJackpot>& origNode) {
++    const auto inputs = getInputs(origNode);
++    auto op = builder.create<IE::TileJackpotOp>(createLocation(origNode), inputs,
++                                                getIntAttr(_ctx, origNode->chains()));
++    addOutputs(origNode, op);
++    return op;
++}
++
  mlir::Operation* NGraphImporter::parseNode(mlir::OpBuilder& builder,
                                             const std::shared_ptr<ov::intel_npu::op::FlashAttentionTile>& origNode) {
      static_assert(std::is_same<std::decay<decltype(*origNode)>::type, ov::intel_npu::op::FlashAttentionTile>::value,
 diff --git a/src/vpux_compiler/src/frontend/model_preprocessor.cpp b/src/vpux_compiler/src/frontend/model_preprocessor.cpp
-index fa659b4..6a56445 100644
+index fa659b4..5383862 100644
 --- a/src/vpux_compiler/src/frontend/model_preprocessor.cpp
 +++ b/src/vpux_compiler/src/frontend/model_preprocessor.cpp
-@@ -22,6 +22,7 @@
+@@ -22,6 +22,8 @@
  #include <ov_ops/rotary_positional_embeddings.hpp>
  
  #include <intel_npu/ops/flash_attention_tile.hpp>
++#include "vpux/compiler/frontend/tile_jackpot.hpp"
 +#include "vpux/compiler/frontend/tile_xor_acc.hpp"
  
  #include <regex>
  #include <utility>
-@@ -588,7 +589,8 @@ std::shared_ptr<ov::Model> prepareModel(const uint8_t* modelIR, uint64_t modelIR
+@@ -588,7 +590,9 @@ std::shared_ptr<ov::Model> prepareModel(const uint8_t* modelIR, uint64_t modelIR
              std::make_shared<ov::OpExtension<ov::op::internal::RoPE>>(),
              std::make_shared<ov::OpExtension<ov::op::internal::GroupQueryAttention>>(),
              std::make_shared<ov::OpExtension<ov::op::internal::GatedDeltaNet>>(),
 -            std::make_shared<ov::OpExtension<ov::intel_npu::op::FlashAttentionTile>>()};
 +            std::make_shared<ov::OpExtension<ov::intel_npu::op::FlashAttentionTile>>(),
-+            std::make_shared<ov::OpExtension<vpux::frontend::TileXorAcc>>()};
++            std::make_shared<ov::OpExtension<vpux::frontend::TileXorAcc>>(),
++            std::make_shared<ov::OpExtension<vpux::frontend::TileJackpot>>()};
  
      if (!config.has<vpux::OV::MODEL_SERIALIZER_VERSION>()) {
          // Plugin versions older than the "model_serializer_version" config option won't specify a serialization
 diff --git a/src/vpux_compiler/tblgen/vpux/compiler/dialect/IE/ops/bitwise.td b/src/vpux_compiler/tblgen/vpux/compiler/dialect/IE/ops/bitwise.td
-index 9221361..80b831d 100644
+index 9221361..48cdecb 100644
 --- a/src/vpux_compiler/tblgen/vpux/compiler/dialect/IE/ops/bitwise.td
 +++ b/src/vpux_compiler/tblgen/vpux/compiler/dialect/IE/ops/bitwise.td
-@@ -144,4 +144,33 @@ def IE_BitwiseLeftShiftOp :
+@@ -144,4 +144,58 @@ def IE_BitwiseLeftShiftOp :
      );
  }
  
@@ -1305,12 +1385,37 @@ index 9221361..80b831d 100644
 +    let hasVerifier = 1;
 +}
 +
++def IE_TileJackpotOp :
++        IE_LayerOp<
++            "TileJackpot"
++        > {
++    let summary = "Keyed BLAKE3 jackpot over TileXorAcc tile words (experimental)";
++
++    let description = [{
++        Input 0 is int32 [1, 1, T, 16], every row the 8 key and 8 bound words. Inputs 1..n are the tile words of
++        TileXorAcc ops, [1, 1, T, G * C] each, n = steps * chains in step-major order. Per tile the milestone words
++        are folded into 16 words, hashed by one keyed BLAKE3 compression and compared with the bound. Output
++        [1, 1, T, 1]: per tile row 1 + the lowest tile column that beats the bound, or 0.
++    }];
++
++    let arguments = (ins
++        Variadic<RankedTensorOf<[SI32, I32]>>:$inputs,
++        I64Attr:$chains
++    );
++
++    let results = (outs
++        RankedTensorOf<[SI32, I32]>:$output
++    );
++
++    let hasVerifier = 1;
++}
++
  #endif
 diff --git a/src/vpux_compiler/tblgen/vpux/compiler/dialect/VPU/ops/bitwise.td b/src/vpux_compiler/tblgen/vpux/compiler/dialect/VPU/ops/bitwise.td
-index 0cb4676..bd201bc 100644
+index 0cb4676..7d66bcc 100644
 --- a/src/vpux_compiler/tblgen/vpux/compiler/dialect/VPU/ops/bitwise.td
 +++ b/src/vpux_compiler/tblgen/vpux/compiler/dialect/VPU/ops/bitwise.td
-@@ -266,4 +266,52 @@ def VPU_BitwiseLeftShiftOp :
+@@ -266,4 +266,90 @@ def VPU_BitwiseLeftShiftOp :
      let elemComparisonModes = [IE_TypeComparisonMode_ALLOW_DISTRIBUTED_OUTPUT];
  }
  
@@ -1362,4 +1467,330 @@ index 0cb4676..bd201bc 100644
 +    let elemComparisonModes = [IE_TypeComparisonMode_ALLOW_DISTRIBUTED_OUTPUT];
 +}
 +
++def VPU_TileJackpotOp :
++        VPU_LayerOp<
++            "TileJackpot",
++            [
++                DeclareOpInterfaceMethods<VPU_TilingBuilderOpInterface>,
++                DeclareOpInterfaceMethods<VPU_SWOpInterface>,
++                DeclareOpInterfaceMethods<VPU_ClusteredOpInterface>
++            ]
++        > {
++    let summary = "Keyed BLAKE3 jackpot over TileXorAcc tile words (experimental)";
++
++    let arguments = (ins
++        Variadic<AnyTypeOf<[RankedTensorOf<[SI32, I32]>, VPU_DistributedTensor]>>:$inputs,
++        I64Attr:$chains,
++
++        OptionalAttr<VPU_MultiClusterStrategyAttr>:$multiClusterStrategy
++    );
++
++    let results = (outs
++        AnyTypeOf<[RankedTensorOf<[SI32, I32]>, VPU_DistributedTensor]>:$output
++    );
++
++    let builders = [
++        OpBuilder<(ins
++            "::mlir::ValueRange":$inputs,
++            "::mlir::IntegerAttr":$chains
++        )>
++    ];
++
++    let extraClassDeclaration = [{
++        bool fitIntoCMX(::llvm::ArrayRef<vpux::NDTypeInterface> buffers, Byte reservedMem);
++
++        bool fitIntoCMX(::llvm::ArrayRef<vpux::NDTypeInterface> buffers);
++    }] # baseExtraClassDeclaration;
++
++    let elemComparisonModes = [IE_TypeComparisonMode_ALLOW_DISTRIBUTED_OUTPUT];
++}
++
  #endif
+diff --git a/src/vpux_compiler/include/vpux/compiler/frontend/tile_jackpot.hpp b/src/vpux_compiler/include/vpux/compiler/frontend/tile_jackpot.hpp
+new file mode 100644
+index 0000000..e68e81e
+--- /dev/null
++++ b/src/vpux_compiler/include/vpux/compiler/frontend/tile_jackpot.hpp
+@@ -0,0 +1,78 @@
++//
++// Copyright (C) 2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <openvino/core/attribute_visitor.hpp>
++#include <openvino/op/op.hpp>
++
++namespace vpux::frontend {
++
++/// \brief Experimental keyed BLAKE3 jackpot over the tile words of TileXorAcc ops.
++///
++/// Input 0 (params) is int32 [1, 1, T, 16]: every row holds the 8 key words and then the 8 bound words (the rows
++/// repeat, so a row split leaves every part a copy). Inputs 1..n are TileXorAcc tile words, int32 [1, 1, T, G * C]
++/// each (T tile rows, G milestones of C tile columns, partial-major within a tile row), n = steps * chains in
++/// step-major order: input 1 + s * chains + c holds milestones s*G .. s*G+G-1 of chain c. Per tile the steps * G
++/// milestone words are folded into 16 words (word t = rotl(word t, 13) ^ milestone, t = milestone % 16), hashed by
++/// one keyed BLAKE3 compression and compared with the bound (most significant word 7 first, ties beat it).
++/// Output: int32 [1, 1, T, 1], per tile row 1 + the lowest tile column (c * C + j) that beats the bound, or 0.
++///
++/// The op is serialized as type "TileJackpot", version "extension".
++class TileJackpot : public ov::op::Op {
++public:
++    OPENVINO_OP("TileJackpot", "extension", ov::op::Op);
++
++    static constexpr int64_t PARAM_WORDS = 16;
++
++    TileJackpot() = default;
++
++    TileJackpot(const ov::OutputVector& inputs, int64_t chains): ov::op::Op(inputs), _chains(chains) {
++        constructor_validate_and_infer_types();
++    }
++
++    void validate_and_infer_types() override {
++        const auto numWords = static_cast<int64_t>(get_input_size()) - 1;
++        NODE_VALIDATION_CHECK(this, numWords >= 1 && _chains >= 1 && numWords % _chains == 0,
++                              "TileJackpot needs params and steps * chains tile-word inputs");
++        const auto& params = get_input_partial_shape(0);
++        const auto& words = get_input_partial_shape(1);
++        NODE_VALIDATION_CHECK(this, params.is_static() && words.is_static() && params.rank().get_length() == 4 &&
++                                            words.rank().get_length() == 4,
++                              "TileJackpot expects static rank-4 inputs");
++        const auto p = params.to_shape();
++        const auto w = words.to_shape();
++        NODE_VALIDATION_CHECK(this, p[0] == 1 && p[1] == 1 && p[3] == PARAM_WORDS && w[0] == 1 && w[1] == 1 &&
++                                            w[2] == p[2],
++                              "TileJackpot expects params [1, 1, T, 16] and tile words [1, 1, T, W]");
++        for (size_t i = 0; i < get_input_size(); ++i) {
++            NODE_VALIDATION_CHECK(this, get_input_element_type(i) == ov::element::i32,
++                                  "TileJackpot inputs must be i32");
++            if (i > 0) {
++                NODE_VALIDATION_CHECK(this, get_input_partial_shape(i) == words,
++                                      "TileJackpot tile-word inputs must match");
++            }
++        }
++        set_output_type(0, ov::element::i32, ov::PartialShape{1, 1, static_cast<int64_t>(p[2]), 1});
++    }
++
++    std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& newArgs) const override {
++        return std::make_shared<TileJackpot>(newArgs, _chains);
++    }
++
++    bool visit_attributes(ov::AttributeVisitor& visitor) override {
++        visitor.on_attribute("chains", _chains);
++        return true;
++    }
++
++    int64_t chains() const {
++        return _chains;
++    }
++
++private:
++    int64_t _chains = 1;
++};
++
++}  // namespace vpux::frontend
+diff --git a/src/vpux_compiler/src/dialect/IE/IR/ops/tile_jackpot.cpp b/src/vpux_compiler/src/dialect/IE/IR/ops/tile_jackpot.cpp
+new file mode 100644
+index 0000000..d93de8c
+--- /dev/null
++++ b/src/vpux_compiler/src/dialect/IE/IR/ops/tile_jackpot.cpp
+@@ -0,0 +1,54 @@
++//
++// Copyright (C) 2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "vpux/compiler/core/attributes/shape.hpp"
++#include "vpux/compiler/core/layers.hpp"
++#include "vpux/compiler/dialect/IE/IR/ops/bitwise.hpp"
++#include "vpux/compiler/frontend/tile_jackpot.hpp"
++#include "vpux/compiler/utils/error.hpp"
++
++using namespace vpux;
++
++mlir::LogicalResult vpux::IE::TileJackpotOp::verify() {
++    const auto numWords = static_cast<int64_t>(getInputs().size()) - 1;
++    const auto chains = static_cast<int64_t>(getChains());
++    if (numWords < 1 || chains < 1 || numWords % chains != 0) {
++        return errorAt(*this, "TileJackpot needs params and steps * chains tile-word inputs, got {0} inputs for {1} "
++                              "chains",
++                       getInputs().size(), chains);
++    }
++    const auto params = getShape(getInputs().front());
++    const auto words = getShape(getInputs()[1]);
++    if (params.size() != 4 || words.size() != 4 || params[Dims4D::Act::N] != 1 || params[Dims4D::Act::C] != 1 ||
++        params[Dims4D::Act::W] != frontend::TileJackpot::PARAM_WORDS || words[Dims4D::Act::N] != 1 ||
++        words[Dims4D::Act::C] != 1 || words[Dims4D::Act::H] != params[Dims4D::Act::H]) {
++        return errorAt(*this, "TileJackpot expects params [1, 1, T, 16] and tile words [1, 1, T, W], got {0}, {1}",
++                       params, words);
++    }
++    for (auto input : getInputs().drop_front()) {
++        if (getShape(input) != words) {
++            return errorAt(*this, "TileJackpot tile-word inputs must have identical shapes");
++        }
++    }
++    return mlir::success();
++}
++
++mlir::LogicalResult vpux::IE::TileJackpotOp::inferReturnTypeComponents(
++        mlir::MLIRContext* ctx, std::optional<mlir::Location> optLoc, mlir::ValueShapeRange operands,
++        mlir::DictionaryAttr attrs, mlir::OpaqueProperties prop, mlir::RegionRange,
++        SmallVectorImpl<mlir::ShapedTypeComponents>& inferredReturnShapes) {
++    const auto loc = optLoc.value_or(mlir::UnknownLoc::get(ctx));
++
++    IE::TileJackpotOpAdaptor op(operands, attrs, prop);
++    if (mlir::failed(op.verify(loc))) {
++        return mlir::failure();
++    }
++
++    const auto inType = mlir::cast<mlir::ShapedType>(op.getInputs().front().getType());
++    const auto shape = inType.getShape();
++    const SmallVector<int64_t> outShape{1, 1, shape[2], 1};
++    inferredReturnShapes.emplace_back(outShape, inType.getElementType());
++    return mlir::success();
++}
+diff --git a/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_jackpot.cpp b/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_jackpot.cpp
+new file mode 100644
+index 0000000..d513efb
+--- /dev/null
++++ b/src/vpux_compiler/src/dialect/VPU/IR/ops/tile_jackpot.cpp
+@@ -0,0 +1,138 @@
++//
++// Copyright (C) 2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "vpux/compiler/core/layers.hpp"
++#include "vpux/compiler/core/tiling.hpp"
++#include "vpux/compiler/dialect/VPU/IR/ops/bitwise.hpp"
++#include "vpux/compiler/dialect/VPU/utils/const_utils.hpp"
++#include "vpux/compiler/dialect/VPU/utils/explicit_distribution_utils.hpp"
++#include "vpux/compiler/dialect/config/IR/utils.hpp"
++
++using namespace vpux;
++
++void vpux::VPU::TileJackpotOp::build(::mlir::OpBuilder& odsBuilder, ::mlir::OperationState& odsState,
++                                     ::mlir::ValueRange inputs, ::mlir::IntegerAttr chains) {
++    build(odsBuilder, odsState, inputs, chains, nullptr);
++}
++
++mlir::LogicalResult vpux::VPU::TileJackpotOp::inferReturnTypes(mlir::MLIRContext* ctx,
++                                                               std::optional<mlir::Location> optLoc,
++                                                               mlir::ValueRange operands, mlir::DictionaryAttr attrs,
++                                                               mlir::OpaqueProperties prop,
++                                                               mlir::RegionRange /*regions*/,
++                                                               mlir::SmallVectorImpl<mlir::Type>& inferredReturnTypes) {
++    const auto loc = optLoc.value_or(mlir::UnknownLoc::get(ctx));
++
++    VPU::TileJackpotOpAdaptor op(operands, attrs, prop);
++    if (mlir::failed(op.verify(loc))) {
++        return mlir::failure();
++    }
++
++    auto inType = mlir::cast<vpux::NDTypeInterface>(op.getInputs().front().getType());
++    if (auto distributed = mlir::dyn_cast<VPU::DistributedTensorType>(inType)) {
++        inType = mlir::cast<vpux::NDTypeInterface>(distributed.getCompactType());
++    }
++    const Shape outShape{1, 1, inType.getShape()[Dims4D::Act::H], 1};
++    inferredReturnTypes.push_back(inType.changeShape(outShape));
++    return mlir::success();
++}
++
++//
++// TilingBuilderOpInterface
++//
++
++// Every input is split by tile rows like the output; the params and tile-word columns stay whole.
++vpux::InputTiling vpux::VPU::TileJackpotOp::backInferTileInfo(const vpux::TileInfo& outputTile, vpux::Logger) {
++    SmallVector<TileInfo> tiles;
++    for (auto input : getInputs()) {
++        TileInfo tile(getShape(input));
++        tile.shape[Dims4D::Act::H] = outputTile.shape[Dims4D::Act::H];
++        tile.offsets[Dims4D::Act::H] = outputTile.offsets[Dims4D::Act::H];
++        tile.axis[Dims4D::Act::H] = outputTile.axis[Dims4D::Act::H];
++        tiles.push_back(tile);
++    }
++    return TilingInfo(tiles);
++}
++
++void vpux::VPU::TileJackpotOp::adjustAttrs(const TilingInfo&, const TileInfo&) {
++}
++
++mlir::FailureOr<OutputTiling> vpux::VPU::TileJackpotOp::getTilingStrategy(TilingMode tilingMode, Logger log) {
++    // Split tile rows only.
++    auto tilingInfo = mlir::cast<VPU::TilingInfoOpInterface>(getOperation());
++    const auto outputShape = getShape(getOutput());
++    const auto rows = outputShape[Dims4D::Act::H];
++    for (int64_t numTiles = 1; numTiles <= rows; ++numTiles) {
++        if (rows % numTiles != 0) {
++            continue;
++        }
++        OutputTiling tiles;
++        for (int64_t i = 0; i < numTiles; ++i) {
++            TileInfo tile(outputShape);
++            tile.shape[Dims4D::Act::H] = rows / numTiles;
++            tile.offsets[Dims4D::Act::H] = i * (rows / numTiles);
++            tile.axis[Dims4D::Act::H] = numTiles;
++            tile.isCompletedTile = true;
++            tiles.push_back(tile);
++        }
++        if (tilingInfo.isSupportedTiling(tiles, tilingMode, log)) {
++            log.trace("TileJackpot tiling: {0} row tiles", numTiles);
++            return tiles;
++        }
++    }
++    return mlir::failure();
++}
++
++//
++// ClusteredOpInterface
++//
++
++bool vpux::VPU::TileJackpotOp::checkStrategyCompatibility(VPU::MultiClusterStrategy strategy, size_t numTiles) {
++    if (strategy == VPU::MultiClusterStrategy::Clustering) {
++        return true;
++    }
++    if (strategy == VPU::MultiClusterStrategy::SplitOverHeight) {
++        // Every cluster gets the same number of tile rows, the same split as the TileXorAcc ops feeding it.
++        const auto rows = getShape(getOutput())[Dims4D::Act::H];
++        return numTiles > 1 && rows % static_cast<int64_t>(numTiles) == 0;
++    }
++    return false;
++}
++
++vpux::VPU::DistributionInfo vpux::VPU::TileJackpotOp::getExplicitDistributionInfoAttr(
++        vpux::ShapeRef shape, vpux::VPU::DistributionMode distributionMode, ArrayRef<int64_t> numTiles,
++        const int64_t numClusters, ArrayRef<int64_t> alignment, const bool uniformDistributedSegments,
++        const vpux::VPU::OverlapDistributionParams& overlapParams,
++        const std::optional<ArrayRef<int64_t>> /* memoryNumTiles */) {
++    return VPU::getSWExplicitDistributionInfo(mlir::cast<VPU::SWOpInterface>(getOperation()), shape,
++                                              distributionMode, numTiles, numClusters, alignment,
++                                              uniformDistributedSegments, overlapParams);
++}
++
++//
++// SWOpInterface
++//
++
++bool vpux::VPU::TileJackpotOp::fitIntoCMX(llvm::ArrayRef<vpux::NDTypeInterface> buffers, Byte reservedMem) {
++    SmallVector<Byte> buffersSize;
++    std::transform(buffers.begin(), buffers.end(), std::back_inserter(buffersSize), [](const auto buffer) {
++        return buffer.getTotalAllocSize();
++    });
++
++    auto totalAvailableCMXSize = reservedMem.count() == 0 ? getTotalCMXSize(getOperation()).count()
++                                                          : getTotalCMXFragmentationAwareSize(getOperation()).count();
++
++    return vpux::VPU::calculateAlignedBuffersMemoryRequirement(config::getArch(getOperation()), buffersSize).count() +
++                   reservedMem.count() <=
++           totalAvailableCMXSize;
++}
++
++bool vpux::VPU::TileJackpotOp::fitIntoCMX(llvm::ArrayRef<vpux::NDTypeInterface> buffers) {
++    return fitIntoCMX(buffers, Byte(0));
++}
++
++bool vpux::VPU::TileJackpotOp::supportCycleCostCalculation() {
++    return false;
++}

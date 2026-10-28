@@ -126,10 +126,11 @@ static void print_usage(void)
 #endif
 #if defined(CP_ENABLE_INTEL_NPU) && CP_ENABLE_INTEL_NPU
     printf("  intel_npu (pearl): Intel NPU (Core Ultra) via OpenVINO and the patched NPU compiler,\n");
-    printf("                     8x16 hash tiles; launch = --row-period-batch x --batch-size 128x128\n");
+    printf("                     16x16 hash tiles; launch = --row-period-batch x --batch-size 128x128\n");
     printf("                     macro blocks (default %d x %d, columns <= 4, rows above 4 in\n",
            CP_INTEL_NPU_ROW_MACROS_DEFAULT, CP_INTEL_NPU_COL_MACROS_DEFAULT);
-    printf("                     steps of 4; each new shape compiles once); CP_NPU_REQUESTS =\n");
+    printf("                     steps of 4; each new shape compiles once); --fused-jackpot runs the\n");
+    printf("                     jackpot on the NPU's SHAVEs (almost no CPU); CP_NPU_REQUESTS =\n");
     printf("                     launches queued (default 4), CP_NPU_CACHE_DIR = compiled-graph cache\n");
 #endif
 #if defined(CP_ENABLE_HEXAGON) && CP_ENABLE_HEXAGON
@@ -484,7 +485,7 @@ int main(int argc, char** argv)
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
-    int fused_jackpot = -1;   /* unset: on for --backend onednn, off for hexagon */
+    int fused_jackpot = -1;   /* unset: on for --backend onednn, off for hexagon and intel_npu */
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
     CpSimdIsa simd_isa = CP_SIMD_AUTO;
@@ -1471,6 +1472,7 @@ int main(int argc, char** argv)
         /* Launch = row x col 128x128 macro blocks; unset means the measured default. */
         cp_worker_set_intel_npu_launch(row_period_batch_set ? row_period_batch : 0,
                                        batch_size_set ? batch_size : 0);
+        cp_worker_set_intel_npu_fused_jackpot(fused_jackpot);
     }
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     /* Kernel select + JIT before mode banner so hash tile / proof layout match gemmstone.
@@ -1616,7 +1618,8 @@ int main(int argc, char** argv)
                    lrows / 128, lcols / 128, lrows, lcols, (lrows / 4) * (lcols / 64));
             printf("[mode] noisy B packed in DSP memory; each row panel of A packed once\n");
         } else if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU){
-            printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 16x16 tile XOR (SHAVE) + host jackpot\n");
+            printf("[mode] scan: Intel NPU fused int8 GEMM (DPU) + 16x16 tile XOR (SHAVE) + %s\n",
+                   fused_jackpot ? "BLAKE3 jackpot on the SHAVEs (--fused-jackpot)" : "host jackpot");
             int lrows = 0, lcols = 0;
             cp_worker_intel_npu_launch_shape(&lrows, &lcols);
             printf("[mode] NPU launch: %dx%d macro blocks of 128x128 = %dx%d (K=%d, --row-period-batch x "

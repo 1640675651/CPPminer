@@ -227,7 +227,7 @@ CUTLASS fused needs no C buffer; `--cublas-period` sizes a period GEMM / C windo
 
 Same flags as CUDA row/col batching, but counts **hash tiles** (gemmstone logical unroll grid, e.g. 16×16 → 8192×8192 tiles at `m=n=131072`). Each panel = one gemmstone GEMM launch (+ separate jackpot kernel unless `--fused-jackpot`).
 
-`--fused-jackpot` also applies to `--backend hexagon`: the jackpot runs on the DSP instead of the host CPU, ~1% slower with almost no CPU use (see [the Hexagon README](src/pearl/hexagon/README.md)).
+`--fused-jackpot` also applies to `--backend hexagon`: the jackpot runs on the DSP instead of the host CPU, ~1% slower with almost no CPU use (see [the Hexagon README](src/pearl/hexagon/README.md)). With `--backend intel_npu` it runs on the NPU's SHAVEs: ~9% slower, 0.08 instead of 0.20 cores and 512 B instead of 512 KiB of tile words per launch through DRAM (see [the Intel NPU README](src/pearl/intel_npu/README.md)). Off by default for both.
 
 | Flag | Role | Default |
 |------|------|---------|
@@ -292,7 +292,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | Hashrate |
 |--------|----------|
-| NPU3720 (Core Ultra 9 275HX, 2 tiles) | 810 GH/s |
+| NPU3720 (Core Ultra 9 275HX, 2 compute tiles) | 800 GH/s |
 
 ### Hexagon DSP
 

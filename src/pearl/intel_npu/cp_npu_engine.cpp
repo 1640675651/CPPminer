@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -139,7 +140,7 @@ std::string default_cache_root() {
 }
 
 int Engine::init(const LaunchShape& shape, const std::string& kernel_dir, const std::string& cache_root,
-                 int requests, std::string* err) {
+                 int requests, std::string* err, const ov::AnyMap& extra_config) {
     try {
         shutdown();
         m_shape = shape;
@@ -149,6 +150,10 @@ int Engine::init(const LaunchShape& shape, const std::string& kernel_dir, const 
             *err = "TileXorAcc kernel not found in " + kernel_dir;
             return -1;
         }
+        if (shape.fused_jackpot && !fs::exists(fs::path(kernel_dir) / "tile_jackpot.3720xx.elf", ec)) {
+            *err = "TileJackpot kernel not found in " + kernel_dir;
+            return -1;
+        }
         /* The cache key needs the loaded runtime's directory: query a property first. */
         (void)m_core.get_available_devices();
         if (!cache_root.empty()) {
@@ -156,12 +161,20 @@ int Engine::init(const LaunchShape& shape, const std::string& kernel_dir, const 
             m_core.set_property(ov::cache_dir(m_cache_dir));
         }
         auto model = build_launch_model(shape, &m_word_index);
-        const ov::AnyMap config{{"NPU_COMPILER_TYPE", "PLUGIN"}};
+        ov::AnyMap config{{"NPU_COMPILER_TYPE", "PLUGIN"}};
+        config.insert(extra_config.begin(), extra_config.end());
         const auto t0 = std::chrono::steady_clock::now();
         m_compiled = m_core.compile_model(model, "NPU", config);
         m_compile_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (int i = 0; i < requests; ++i)
             m_requests.push_back(m_compiled.create_infer_request());
+        if (shape.fused_jackpot) {
+            /* One parameter tensor, bound once to every request. */
+            m_jackpot = host_tensor(shape.jackpot_input());
+            std::memset(m_jackpot.data(), 0, m_jackpot.get_byte_size());
+            for (auto& req : m_requests)
+                req.set_input_tensor(size_t(shape.jackpot_input()), m_jackpot);
+        }
         m_ready = true;
         return 0;
     } catch (const std::exception& e) {
@@ -173,6 +186,7 @@ int Engine::init(const LaunchShape& shape, const std::string& kernel_dir, const 
 
 void Engine::shutdown() {
     m_requests.clear();
+    m_jackpot = ov::Tensor();
     m_compiled = ov::CompiledModel();
     m_ready = false;
 }

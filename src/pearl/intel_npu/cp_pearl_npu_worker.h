@@ -14,6 +14,8 @@ extern "C" {
 void cp_pearl_npu_worker_set_launch(int row_macros, int col_macros);
 /* The launch in rows x columns: the compiled one after init, else the one init will pick. */
 void cp_pearl_npu_worker_launch_shape(int *rows, int *cols);
+/* --fused-jackpot: the BLAKE3 jackpot on the NPU's SHAVEs; one hit word per tile row comes back. Before init. */
+void cp_pearl_npu_worker_set_fused_jackpot(int on);
 void cp_pearl_npu_worker_init(int *devices, int ndev);
 void cp_pearl_npu_worker_shutdown(void);
 int cp_pearl_npu_worker_is_ready(void);

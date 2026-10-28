@@ -54,6 +54,7 @@ constexpr int kPanelSlots = 3; /* A panels in flight: the one being scanned, the
 
 cp_npu::Engine* g_eng = nullptr;
 int g_requests = 4;
+bool g_fused_jackpot = false; /* --fused-jackpot: BLAKE3 jackpot on the SHAVEs (TileJackpot) */
 int g_row_macros = 0; /* <= 0: CP_INTEL_NPU_ROW_MACROS_DEFAULT */
 int g_col_macros = 0; /* <= 0: CP_INTEL_NPU_COL_MACROS_DEFAULT */
 PearlMatrixHash* g_ahash = nullptr;
@@ -183,11 +184,12 @@ struct Hit {
     int found = 0;
     int t_rows = -1;
     int t_cols = -1;
-    uint32_t xor_words[kMilestones]{};
+    uint32_t xor_words[kMilestones]{}; /* the NPU's tile words (not with the fused jackpot) */
 };
 
 /* Recompute a hit tile on the host: its A rows from signal A and B columns from the job seed, with
- * the host's noise code. A device fault can therefore never turn into an invalid share. */
+ * the host's noise code. A device fault can therefore never turn into an invalid share. With the fused
+ * jackpot there are no NPU words to compare: the recompute must beat the target itself. */
 int verify_hit(const Hit& hit, const int8_t* a_sig, const uint8_t a_seed[32], const uint32_t* pairs_a,
                const uint32_t a_key8[8], const uint32_t bound[8]) {
     std::vector<int8_t> arow(size_t(kTileRows) * K_DIM), bcol(size_t(kTileCols) * K_DIM);
@@ -212,12 +214,18 @@ int verify_hit(const Hit& hit, const int8_t* a_sig, const uint8_t a_seed[32], co
             }
         }
     }
-    if (memcmp(ref, hit.xor_words, sizeof(ref)) != 0) {
+    if (!g_eng->shape().fused_jackpot && memcmp(ref, hit.xor_words, sizeof(ref)) != 0) {
         fprintf(stderr, "[intel-npu] NPU tile XOR differs from the host recompute at t_rows=%d t_cols=%d; "
                         "share dropped\n", hit.t_rows, hit.t_cols);
         return -1;
     }
-    return cp_jackpot::tile_beats_target(ref, kMilestones, a_key8, bound) ? 0 : -1;
+    if (!cp_jackpot::tile_beats_target(ref, kMilestones, a_key8, bound)) {
+        if (g_eng->shape().fused_jackpot)
+            fprintf(stderr, "[intel-npu] NPU jackpot hit at t_rows=%d t_cols=%d fails the host recompute; share "
+                            "dropped\n", hit.t_rows, hit.t_cols);
+        return -1;
+    }
+    return 0;
 }
 
 /* One attempt's scan over all launches. */
@@ -282,12 +290,24 @@ void prep_panels(Scan& s, int gen_threads) {
     }
 }
 
-/* Launch l's jackpot over every tile of its output; the first hit (launches are checked in order). */
+/* Launch l's jackpot over every tile of its output; the first hit (launches are checked in order). With
+ * the fused jackpot the NPU already did it: one word per tile row, 1 + the first hit's tile column. */
 void check_launch(Scan& s, ov::InferRequest& req, int l) {
     const cp_npu::LaunchShape& shape = g_eng->shape();
     const std::vector<int>& wi = g_eng->word_index();
     const int tile_rows = shape.tile_rows(), tile_cols = shape.tile_cols(), row_words = shape.row_words();
     const uint32_t* out = reinterpret_cast<const uint32_t*>(req.get_output_tensor(0).data());
+    if (shape.fused_jackpot) {
+        for (int tr = 0; tr < tile_rows; ++tr) {
+            if (out[tr] == 0)
+                continue;
+            s.hit.found = 1;
+            s.hit.t_rows = (l / s.nb) * shape.rows + tr * kTileRows;
+            s.hit.t_cols = (l % s.nb) * shape.cols + int(out[tr] - 1) * kTileCols;
+            return;
+        }
+        return;
+    }
     uint32_t words[kMilestones];
     for (int tr = 0; tr < tile_rows; ++tr) {
         const uint32_t* row = out + size_t(tr) * row_words;
@@ -392,6 +412,14 @@ extern "C" void cp_pearl_npu_worker_set_launch(int row_macros, int col_macros) {
     g_col_macros = col_macros;
 }
 
+extern "C" void cp_pearl_npu_worker_set_fused_jackpot(int on) {
+    if (g_eng && g_eng->ready()) {
+        fprintf(stderr, "[intel-npu] set_fused_jackpot ignored after init\n");
+        return;
+    }
+    g_fused_jackpot = on != 0;
+}
+
 extern "C" void cp_pearl_npu_worker_launch_shape(int* rows, int* cols) {
     if (g_eng && g_eng->ready()) {
         *rows = g_eng->shape().rows;
@@ -411,6 +439,7 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     pick_launch(g_row_macros, g_col_macros, g_m_active, g_n_active, &shape.rows, &shape.cols);
     shape.chunk_m = std::min(shape.rows, kRowBlock);
     shape.k = K_DIM;
+    shape.fused_jackpot = g_fused_jackpot;
     if ((g_row_macros > 0 && shape.rows != g_row_macros * kMacro) ||
         (g_col_macros > 0 && shape.cols != g_col_macros * kMacro))
         printf("[intel-npu] launch %dx%d macros requested; using %dx%d (rows a multiple of %d above it and "
@@ -438,10 +467,11 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     }
     cp_pp_set_hash_tile(kTileRows, kTileCols);
     pearl_set_contiguous_tile_shape(kTileRows, kTileCols);
-    printf("[intel-npu] %s: fused int8 GEMM + 8x16 tile XOR, launch %dx%d (K=%d, %d milestones), compile/load "
+    printf("[intel-npu] %s: fused int8 GEMM + %dx%d tile XOR%s, launch %dx%d (K=%d, %d milestones), compile/load "
            "%.1fs, %d infer requests, %s inputs\n",
-           g_eng->device_name().c_str(), shape.rows, shape.cols, shape.k, kMilestones, g_eng->compile_sec(), g_requests,
-           g_eng->zero_copy() ? "zero-copy" : "copied");
+           g_eng->device_name().c_str(), kTileRows, kTileCols,
+           shape.fused_jackpot ? " + BLAKE3 jackpot on the SHAVEs (--fused-jackpot)" : "", shape.rows, shape.cols,
+           shape.k, kMilestones, g_eng->compile_sec(), g_requests, g_eng->zero_copy() ? "zero-copy" : "copied");
     printf("[intel-npu] jackpot scale tile %dx%d factor=%llu\n", cp_pp_hash_tile_h(), cp_pp_hash_tile_w(),
            (unsigned long long)cp_jackpot_scale_factor());
     fflush(stdout);
@@ -557,6 +587,15 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     cp_scale_jackpot_target(pool_tgt, bound);
     uint32_t a_key8[8];
     memcpy(a_key8, a_seed, 32);
+    if (g_eng->shape().fused_jackpot) {
+        /* Every row of the NPU's jackpot parameters: key, bound. No launch is in flight between attempts. */
+        ov::Tensor& params = g_eng->jackpot_params();
+        uint32_t* p = params.data<uint32_t>();
+        for (size_t row = 0; row < params.get_size() / cp_npu::kJackpotParamWords; ++row) {
+            memcpy(p + row * cp_npu::kJackpotParamWords, a_key8, sizeof(a_key8));
+            memcpy(p + row * cp_npu::kJackpotParamWords + 8, bound, sizeof(bound));
+        }
+    }
 
     const int rows = g_eng->shape().rows, cols = g_eng->shape().cols;
     Scan s;
@@ -596,7 +635,8 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     if (out_tiles_scanned)
         *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("intel-npu", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[intel-npu] scan %.3fs: host A prep %.3fs, jackpot %.3fs\n", scan_sec, s.prep_busy, s.check_busy);
+    printf("[intel-npu] scan %.3fs: host A prep %.3fs, %s %.3fs\n", scan_sec, s.prep_busy,
+           g_eng->shape().fused_jackpot ? "hit check" : "jackpot", s.check_busy);
     fflush(stdout);
     if (!s.error.empty()) {
         fprintf(stderr, "[intel-npu] %s\n", s.error.c_str());
