@@ -12,6 +12,7 @@
 ### Fix & Enhancements
 - Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
 - OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
+- Fix Pearl wgpu hang on AMD Metal
 (5 improvements below thanks to @danifest751)
 - NEON DotProd and basic NEON kernel rewrite, reduce instruction count
 - OpenCL: mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8)
@@ -72,7 +73,6 @@
 - Quantus wgpu backend via quantus-miner GpuEngine FFI
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl
 - Optimized CPU backend with scalar + AVX2 hybrid ISA
-
 ## v0.4
 - ARM CPU + NEON support.
 - AVX-VNNI support.

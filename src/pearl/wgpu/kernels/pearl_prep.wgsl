@@ -157,33 +157,26 @@ fn d_b3_g(s: ptr<function, array<u32, 16>>, a: i32, b: i32, c: i32, d: i32, x: u
     (*s)[b] = d_b3_rotr32((*s)[b] ^ (*s)[c], 7u);
 }
 
-fn d_b3_msg_schedule(round: i32, i: i32) -> i32 {
-    // D_B3_MSG_SCHEDULE[7][16] from OpenCL
-    let r0 = array<i32, 16>(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let r1 = array<i32, 16>(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-    let r2 = array<i32, 16>(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-    let r3 = array<i32, 16>(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-    let r4 = array<i32, 16>(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-    let r5 = array<i32, 16>(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-    let r6 = array<i32, 16>(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
-    if (round == 0) { return r0[i]; }
-    if (round == 1) { return r1[i]; }
-    if (round == 2) { return r2[i]; }
-    if (round == 3) { return r3[i]; }
-    if (round == 4) { return r4[i]; }
-    if (round == 5) { return r5[i]; }
-    return r6[i];
+// Each round reads m in fixed order and then permutes it (BLAKE3 reference form), so every
+// message index is static. A per-round schedule table indexed at runtime hangs the AMD Metal
+// compiler's output (Radeon Pro 5500M) once the hash sits inside a loop.
+fn d_b3_round(s: ptr<function, array<u32, 16>>, m: ptr<function, array<u32, 16>>) {
+    d_b3_g(s, 0, 4, 8, 12, (*m)[0], (*m)[1]);
+    d_b3_g(s, 1, 5, 9, 13, (*m)[2], (*m)[3]);
+    d_b3_g(s, 2, 6, 10, 14, (*m)[4], (*m)[5]);
+    d_b3_g(s, 3, 7, 11, 15, (*m)[6], (*m)[7]);
+    d_b3_g(s, 0, 5, 10, 15, (*m)[8], (*m)[9]);
+    d_b3_g(s, 1, 6, 11, 12, (*m)[10], (*m)[11]);
+    d_b3_g(s, 2, 7, 8, 13, (*m)[12], (*m)[13]);
+    d_b3_g(s, 3, 4, 9, 14, (*m)[14], (*m)[15]);
 }
 
-fn d_b3_round(s: ptr<function, array<u32, 16>>, m: ptr<function, array<u32, 16>>, round: i32) {
-    d_b3_g(s, 0, 4, 8, 12, (*m)[d_b3_msg_schedule(round, 0)], (*m)[d_b3_msg_schedule(round, 1)]);
-    d_b3_g(s, 1, 5, 9, 13, (*m)[d_b3_msg_schedule(round, 2)], (*m)[d_b3_msg_schedule(round, 3)]);
-    d_b3_g(s, 2, 6, 10, 14, (*m)[d_b3_msg_schedule(round, 4)], (*m)[d_b3_msg_schedule(round, 5)]);
-    d_b3_g(s, 3, 7, 11, 15, (*m)[d_b3_msg_schedule(round, 6)], (*m)[d_b3_msg_schedule(round, 7)]);
-    d_b3_g(s, 0, 5, 10, 15, (*m)[d_b3_msg_schedule(round, 8)], (*m)[d_b3_msg_schedule(round, 9)]);
-    d_b3_g(s, 1, 6, 11, 12, (*m)[d_b3_msg_schedule(round, 10)], (*m)[d_b3_msg_schedule(round, 11)]);
-    d_b3_g(s, 2, 7, 8, 13, (*m)[d_b3_msg_schedule(round, 12)], (*m)[d_b3_msg_schedule(round, 13)]);
-    d_b3_g(s, 3, 4, 9, 14, (*m)[d_b3_msg_schedule(round, 14)], (*m)[d_b3_msg_schedule(round, 15)]);
+fn d_b3_permute(m: ptr<function, array<u32, 16>>) {
+    let t = *m;
+    *m = array<u32, 16>(
+        t[2], t[6], t[3], t[10], t[7], t[0], t[4], t[13],
+        t[1], t[11], t[12], t[5], t[9], t[14], t[15], t[8]
+    );
 }
 
 fn d_b3_iv(i: i32) -> u32 {
@@ -252,9 +245,11 @@ fn d_b3_compress_pre(
     (*s)[13] = counter_hi;
     (*s)[14] = block_len;
     (*s)[15] = flags;
-    for (var r = 0; r < 7; r = r + 1) {
-        d_b3_round(s, &m, r);
+    for (var r = 0; r < 6; r = r + 1) {
+        d_b3_round(s, &m);
+        d_b3_permute(&m);
     }
+    d_b3_round(s, &m);
 }
 
 fn d_b3_compress_in_place(

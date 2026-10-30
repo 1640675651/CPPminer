@@ -94,7 +94,9 @@ fn prep_wgsl(tile: &TileConfig) -> String {
 
 /// Tile constants plus per-tile accumulator code. The accumulator is named vec4<i32> fields
 /// (cJ_I = A rows 4I..4I+3 x B col J), not array<i32, MR*NR>: Intel IGC spills the array.
-fn gemm_wgsl(tile: &TileConfig) -> String {
+/// `f32_dot` replaces dot4I8Packed with f32 dot products summed per k-block (Metal: the AMD
+/// Metal compiler miscompiles naga's packed_char4 dot on Radeon Pro 5500M).
+fn gemm_wgsl(tile: &TileConfig, f32_dot: bool) -> String {
     use std::fmt::Write;
     let (mr, nr, hash_nr, m) = (tile.mr, tile.nr, tile.hash_nr(), tile.macro_mn);
     let av = (mr / 4) as usize;
@@ -113,6 +115,19 @@ fn gemm_wgsl(tile: &TileConfig) -> String {
     let _ = writeln!(s, "struct Acc {{");
     for f in &fields {
         let _ = writeln!(s, "    {f}: vec4<i32>,");
+        if f32_dot {
+            let _ = writeln!(s, "    f{f}: vec4<f32>,");
+        }
+    }
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s);
+    // f32 path: fold the k-block's f32 partial sums into the i32 accumulator before the milestone.
+    let _ = writeln!(s, "fn acc_kb_end(acc: ptr<function, Acc>) {{");
+    if f32_dot {
+        for f in &fields {
+            let _ = writeln!(s, "    (*acc).{f} += vec4<i32>((*acc).f{f});");
+            let _ = writeln!(s, "    (*acc).f{f} = vec4<f32>();");
+        }
     }
     let _ = writeln!(s, "}}");
     let _ = writeln!(s);
@@ -125,14 +140,38 @@ fn gemm_wgsl(tile: &TileConfig) -> String {
         a_params.join(", "),
         b_params.join(", ")
     );
-    // Every dot4I8Packed operand is written out fresh: naga's MSL backend names the packed_char4
-    // temp after the argument expression, so reusing one (e.g. a helper's `b` param) redefines it.
-    for j in 0..nr as usize {
-        let b = format!("b{}.{}", j / 4, lanes[j % 4]);
+    if f32_dot {
+        // Sign-extend each s8 once per k-group; products and one k-block's sums (<= 128*128*128)
+        // are exact in f32, and f32 FMA is full rate where 32-bit integer multiply is not.
+        let unpack = |w: &str| {
+            format!("vec4<f32>(bitcast<vec4<i32>>(vec4<u32>({w}) << sh) >> vec4<u32>(24u))")
+        };
+        let _ = writeln!(s, "    let sh = vec4<u32>(24u, 16u, 8u, 0u);");
         for i in 0..av {
-            let dots: Vec<String> =
-                lanes.iter().map(|l| format!("dot4I8Packed(a{i}.{l}, {b})")).collect();
-            let _ = writeln!(s, "    (*acc).c{j}_{i} += vec4<i32>({});", dots.join(", "));
+            for l in lanes {
+                let _ = writeln!(s, "    let ua{i}{l} = {};", unpack(&format!("a{i}.{l}")));
+            }
+        }
+        for j in 0..nr as usize {
+            let _ = writeln!(s, "    let ub{j} = {};", unpack(&format!("b{}.{}", j / 4, lanes[j % 4])));
+        }
+        for j in 0..nr as usize {
+            for i in 0..av {
+                let dots: Vec<String> =
+                    lanes.iter().map(|l| format!("dot(ua{i}{l}, ub{j})")).collect();
+                let _ = writeln!(s, "    (*acc).fc{j}_{i} += vec4<f32>({});", dots.join(", "));
+            }
+        }
+    } else {
+        // Every dot4I8Packed operand is written out fresh: naga's MSL backend names the packed_char4
+        // temp after the argument expression, so reusing one (e.g. a helper's `b` param) redefines it.
+        for j in 0..nr as usize {
+            let b = format!("b{}.{}", j / 4, lanes[j % 4]);
+            for i in 0..av {
+                let dots: Vec<String> =
+                    lanes.iter().map(|l| format!("dot4I8Packed(a{i}.{l}, {b})")).collect();
+                let _ = writeln!(s, "    (*acc).c{j}_{i} += vec4<i32>({});", dots.join(", "));
+            }
         }
     }
     let _ = writeln!(s, "}}");
@@ -605,6 +644,10 @@ impl PearlEngine {
             return Err(format!("prep shader: {err}"));
         }
 
+        let is_metal = info.backend == wgpu::Backend::Metal;
+        if is_metal {
+            eprintln!("[pearl-wgpu] Metal: f32 GEMM dot products instead of dot4I8Packed");
+        }
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Loop bounding blocks driver unrolling, spilling acc[]/a_pack/b_pack to local memory
         // (~36x slower on GTX 1070). All loops in this shader have fixed or uniform trip counts.
@@ -614,7 +657,7 @@ impl PearlEngine {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("pearl_gemm_xor"),
-                    source: wgpu::ShaderSource::Wgsl(gemm_wgsl(&tile).into()),
+                    source: wgpu::ShaderSource::Wgsl(gemm_wgsl(&tile, is_metal).into()),
                 },
                 gemm_checks,
             )
@@ -674,7 +717,7 @@ impl PearlEngine {
             return Err(format!("pipeline: {err}"));
         }
         // --wgpu-lds: auto = on for discrete GPUs (GTX 1070 ~3.4 -> ~4.2 TMAC/s), off otherwise
-        // (UHD 770 ~455 -> ~380 GMAC/s).
+        // (UHD 770 ~455 -> ~380 GMAC/s) and on Metal (Radeon Pro 5500M ~790 -> ~440 GMAC/s).
         let storage_limit = limits.max_compute_workgroup_storage_size;
         let lds_bytes = tile.lds_bytes();
         let lds_fits = storage_limit >= lds_bytes;
@@ -682,7 +725,7 @@ impl PearlEngine {
         let want_lds = match lds_mode {
             0 => false,
             1 => true,
-            _ => info.device_type == wgpu::DeviceType::DiscreteGpu,
+            _ => info.device_type == wgpu::DeviceType::DiscreteGpu && !is_metal,
         };
         if want_lds && !lds_fits {
             eprintln!(

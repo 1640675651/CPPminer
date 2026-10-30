@@ -124,11 +124,6 @@ fn b3_compress64(msg16: ptr<function, array<u32, 16>>, out8: ptr<function, array
         m[i] = (*msg16)[i];
     }
 
-    // BLAKE3 message permutation (same as OpenCL kPerm)
-    let kPerm = array<u32, 16>(
-        2u, 6u, 3u, 10u, 7u, 0u, 4u, 13u, 1u, 11u, 12u, 5u, 9u, 14u, 15u, 8u
-    );
-
     for (var round = 0; round < 7; round = round + 1) {
         b3_g(&v, 0, 4, 8, 12, m[0], m[1]);
         b3_g(&v, 1, 5, 9, 13, m[2], m[3]);
@@ -138,14 +133,14 @@ fn b3_compress64(msg16: ptr<function, array<u32, 16>>, out8: ptr<function, array
         b3_g(&v, 1, 6, 11, 12, m[10], m[11]);
         b3_g(&v, 2, 7, 8, 13, m[12], m[13]);
         b3_g(&v, 3, 4, 9, 14, m[14], m[15]);
+        // BLAKE3 message permutation (OpenCL kPerm) with static indices: a runtime-indexed
+        // kPerm table is miscompiled by the AMD Metal compiler (Radeon Pro 5500M).
         if (round < 6) {
-            var t: array<u32, 16>;
-            for (var i = 0; i < 16; i = i + 1) {
-                t[i] = m[kPerm[i]];
-            }
-            for (var i = 0; i < 16; i = i + 1) {
-                m[i] = t[i];
-            }
+            let t = m;
+            m = array<u32, 16>(
+                t[2], t[6], t[3], t[10], t[7], t[0], t[4], t[13],
+                t[1], t[11], t[12], t[5], t[9], t[14], t[15], t[8]
+            );
         }
     }
     for (var i = 0; i < 8; i = i + 1) {
@@ -188,8 +183,7 @@ fn finish_tile(msg: ptr<function, array<u32, 16>>, im: i32, jm: i32, tr: i32, ha
     if (exchanged.old_value != 0) {
         return;
     }
-    out_t_rows[0] = im * MACRO_M + tr * MR;
-    out_t_cols[0] = jm * MACRO_N + hash_tc * HASH_NR;
+    out_t_rows[0] = im * MACRO_M + tr * MR;    out_t_cols[0] = jm * MACRO_N + hash_tc * HASH_NR;
 }
 
 // Direct global loads: each WI reads its own A/B slices per k-group.
@@ -226,6 +220,7 @@ fn pearl_macro_gemm_xor(
             for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
                 kgroup_global(&acc, a_kb + kg * STRIP_VEC4_A, b_kb + kg * STRIP_VEC4_B);
             }
+            acc_kb_end(&acc);
             milestone_fold(acc_xor(&acc), &msg, kb);
         }
     }
@@ -284,6 +279,7 @@ fn pearl_macro_gemm_xor_lds(
             for (var kg = 0u; kg < u32(KGROUPS); kg = kg + 1u) {
                 kgroup_lds(&acc, kg * STRIP_VEC4_A + a_off, kg * STRIP_VEC4_B + b_off);
             }
+            acc_kb_end(&acc);
             milestone_fold(acc_xor(&acc), &msg, kb);
             workgroupBarrier();
         }
