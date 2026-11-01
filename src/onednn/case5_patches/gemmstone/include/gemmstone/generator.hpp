@@ -228,6 +228,9 @@ protected:
     void gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void case5FoldSubtileRows(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
                               const ngen::GRF &foldReg, int sr, int sc, int rowBegin, int rowEnd, bool init);
+    void case5FoldEmitOp(int kind, int exec, const ngen::RegData &dst, const ngen::RegData &a,
+                         const ngen::RegData &b);
+    void case5FoldEmitPending();
     bool case5TileXorFastStoreOk(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void case5FoldSubtileFull(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
                               const ngen::GRF &foldReg, int sr, int sc);

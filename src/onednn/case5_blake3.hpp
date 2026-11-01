@@ -85,8 +85,11 @@ inline void blake3_parse_key_env(uint32_t key8[kBlake3KeyWords]) {
 }
 
 // blake3_out layout: digest[spatial_id * 8 + w], w in [0,7].
+// active (optional): per-tile flag, 0 for launch-padding tiles outside M x N, whose digest the kernel may
+// leave unwritten (all zero).
 bool verify_case5_tile_blake3(const std::vector<uint32_t> &tile_xor,
                               const std::vector<uint32_t> &blake3_out, int output_ms,
-                              int tile_count, const uint32_t key8[kBlake3KeyWords]);
+                              int tile_count, const uint32_t key8[kBlake3KeyWords],
+                              const std::vector<uint8_t> *active = nullptr);
 
 } // namespace case5_ngen

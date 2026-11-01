@@ -1,7 +1,7 @@
 #pragma once
 
 // Case 5: gemmstone int8 GEMM → OpenCL binary "case5_igemm".
-// HW: Gen12LP (XeLP) or XeHPG (Core Ultra / MTL/ARL), selected at runtime.
+// HW: Gen12LP (XeLP), XeHPG (Arc A, Core Ultra MTL/ARL) or Xe2 (Arc B, Lunar Lake), selected at runtime.
 // Strategy: oneDNN kernel.db select() (gen_nocopy contract) + Case5 XOR filters + fallbacks.
 #include <cstdint>
 #include <string>
@@ -82,8 +82,11 @@ inline int pad_ld_int8(int inner) {
     return p;
 }
 
-// Gen12LP/XeLP and XeHPG (Core Ultra MTL/ARL). Xe2/LNL not supported yet.
+// Gen12LP/XeLP, XeHPG (Arc A, Core Ultra MTL/ARL) and Xe2 (Arc B, Lunar Lake).
 bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err = nullptr);
+
+// True on Xe2 (Arc B, Lunar Lake): the separate jackpot only, the fused judge is not ported there.
+bool is_xe2_device(cl_context ctx, cl_device_id device);
 
 // Optional filter on a candidate's logical hash tile (sub_m x sub_n): a candidate it rejects is skipped
 // like one that fails to build. The miner installs one that accepts only provable tile shapes.

@@ -18,6 +18,8 @@ struct Case33GemmOnednn {
     void set_row_period_batch(int batch);
     void set_col_period_batch(int batch);
     void set_fused_jackpot(bool fused);
+    // The jackpot mode in use after init_context (Xe2 falls back to the separate jackpot).
+    bool fused_jackpot() const { return fused_jackpot_; }
     void set_gemm_layout(bool a_row_major, bool b_row_major);
     int row_period_batch() const { return row_period_batch_; }
     int col_period_batch() const { return col_period_batch_; }

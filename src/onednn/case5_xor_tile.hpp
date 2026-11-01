@@ -195,19 +195,24 @@ inline void case5_native_xor_subtile_dims(int unrollM, int unrollN, XorSubtileDi
     d.split = false;
 }
 
-// Halve each unroll dimension until both <= 16.
+// Sub-tiles of at most 16 x 16: a multiple of 16 takes 16-row / 16-column sub-tiles outright (48 ->
+// 3 x 16: the GRF-row fold on Xe2 needs 16-row sub-tiles, and 12-row ones do not exist for it); any
+// other size is halved until it fits (the same result for powers of two).
 inline void case5_halve_xor_subtile_dims_both(int unrollM, int unrollN, XorSubtileDims &d) {
     d.ownedM = unrollM;
     d.ownedN = unrollN;
     d.subM = unrollM;
     d.subN = unrollN;
     d.split = true;
+    if (d.subM > 16 && d.subM % 16 == 0) d.subM = 16;
     while (d.subM > 16) {
         d.subM /= 2;
     }
     // CASE5_XOR_SUBN_MAX=8 (experiment): narrower logical tiles, e.g. 16x8 (8 per 16x64 thread block).
     int capN = 16;
     if (const char *c = std::getenv("CASE5_XOR_SUBN_MAX"); c && std::atoi(c) > 0) capN = std::atoi(c);
+    // A multiple of the cap splits straight to the cap (48 -> 3 x 16, not 24 -> 12).
+    if (d.subN > capN && d.subN % capN == 0) d.subN = capN;
     while (d.subN > capN) {
         d.subN /= 2;
     }

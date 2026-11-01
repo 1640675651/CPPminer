@@ -451,8 +451,8 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
     const bool c5XafStep = strategy.extendedAtomicFMA && !c5Boundary;
 
     for (int x = 0; x < nx; x += xinc) {
-        if (c5Interleaved && c5XafStep && x == 0)
-            gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, true, true);
+        if (c5Interleaved && x == 0)   // pre-chain hook: xaf lower rows, or CASE5_XOR_TOPAT=prechain upper rows
+            gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, true, c5XafStep);
         Subregister A0, B0, C0;
         RegData AS, BS, AS0, BS0;
         int rcount = 0, ybase = 0, hhbase = 0;

@@ -1,13 +1,14 @@
 # CPPminer
 
-Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide range of hardware. Select the algorithm at runtime with `--algo` (default `pearl`).
+Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide range of hardware. Tested with LuckyPool, Herominers, and Kryptex. 
+
+## Algorithms and Backends
+Select the algorithm and backend at runtime with `--algo` (default `pearl`) and `--backend` (default `cpu`).
 
 | Algo | Backends | PoW |
 |------|----------|-----|
 | `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu` | GEMM+XOR jackpot + `plain_proof` |
 | `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
-
-Pool / job logistics live under `src/common/`. Pearl compute backends are separate worker directories; Quantus lives under `src/qpow/`:
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
@@ -15,9 +16,9 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 | CUDA | `src/cuda/` | Pearl: Pascal CUTLASS fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
-| Pearl wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
-| Pearl Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
-| Pearl Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + 16×16 tile XOR on the SHAVEs + host jackpot ([README](src/pearl/intel_npu/README.md)) |
+| wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
+| Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
+| Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + tile XOR on the SHAVE cores ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
@@ -26,7 +27,7 @@ Pool / job logistics live under `src/common/`. Pearl compute backends are separa
 
 - MSVC + **CMake** (Windows) or GCC/Clang + CMake (Linux/macOS)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
-- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX512-VNNI/AVX-VNNI/AVX512-BW/AVX2/SSSE3/scalar and AArch64 DotProd/NEON/scalar (`--simd`)
+- **CPU build:** portable scalar baseline with runtime ISA dispatch: x86 AVX512-VNNI/AVX-VNNI/AVX512-BW/AVX2/SSSE3/scalar and AArch64 I8MM/DotProd/NEON/scalar (`--simd`)
 - **CUDA build:** NVIDIA GPU + CUDA Toolkit 12.x (+ CUTLASS, fetched by `build.ps1`).
 - **OpenCL build:** OpenCL 1.2 runtime ICD from the GPU driver. Windows builds link vendored `third_party/opencl/lib/x64/OpenCL.lib` + Khronos headers (no CUDA/oneAPI/AMD SDK). Optional `cl_khr_integer_dot_product`, `__builtin_amdgcn_sdot4`.
 - **OneDNN build:** Intel XeLP/XeHPG GPU + OpenCL + vendored oneDNN gemmstone/ngen (see `src/onednn/README.md`).
@@ -260,7 +261,7 @@ One NPU launch covers `--row-period-batch` × `--batch-size` macro blocks of 128
 
 ## Performance
 
-Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings. GPUs are tested with stock settings, no clock/power/voltage tuning unless explicitly stated. Power is readed from HWinfo64.
+Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/hashrate_calculation.md`). Figures are indicative; your results will vary with clocks, drivers, and batch settings. All devices are tested with stock settings, no clock/power/voltage tuning unless explicitly stated. Power is read from HWinfo64.
 
 ### NVIDIA GPU (CUDA)
 
@@ -288,17 +289,17 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 | Intel UHD 630 | Scalar | 4x8 | 140 GH/s |
 | Mali-G57 MC2 | DP4A | 4x8 | 115 GH/s |
 
+### Hexagon DSP
+
+| Device | Hashrate |
+|--------|----------|
+| Hexagon 686 (Snapdragon 480, v66, 2 HVX, 940MHz) | 400 GH/s |
+
 ### Intel NPU
 
 | Device | Hashrate |
 |--------|----------|
 | NPU3720 (Core Ultra 9 275HX, 2 compute tiles) | 800 GH/s |
-
-### Hexagon DSP
-
-| Device | Hashrate |
-|--------|----------|
-| Hexagon 686 (Snapdragon 480, v66, 2x HVX, 940MHz) | 400 GH/s |
 
 ### CPU
 

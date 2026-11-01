@@ -1506,6 +1506,8 @@ int main(int argc, char** argv)
             cp_onednn_worker_set_gemm_layout(onednn_layout);
         }
         cp_onednn_worker_init(devs, ndev);
+        /* The jackpot mode in use (Xe2 falls back to the separate jackpot). */
+        fused_jackpot = cp_onednn_worker_fused_jackpot();
         cp_worker_apply_backend_defaults();
         /* Init may raise unset batches for systolic kernels. */
         batch_size = cp_onednn_worker_col_period_batch();

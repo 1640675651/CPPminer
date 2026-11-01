@@ -47,7 +47,7 @@ inline std::vector<OclDeviceInfo> enumerate_intel_gpus(int platform_filter = -1)
 inline int list_intel_gpus(int platform_filter = -1) {
     const std::vector<OclDeviceInfo> devices = enumerate_intel_gpus(platform_filter);
     if (devices.empty()) {
-        std::printf("[onednn] no Intel GPU found (Case 5 needs XeLP/Gen12LP or XeHPG)\n");
+        std::printf("[onednn] no Intel GPU found (Case 5 needs XeLP/Gen12LP, XeHPG or Xe2)\n");
         return 0;
     }
 

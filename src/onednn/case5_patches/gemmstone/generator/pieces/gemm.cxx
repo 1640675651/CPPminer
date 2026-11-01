@@ -1071,7 +1071,7 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
         // Fold stays in wrap-GRF; BLAKE3 consumes it in-register. Only digests hit global.
         gemmCase5TileXorBlake3FromGrf(problem, strategy, state);
     } else if (problem.case5TileXor && problem.case5TileXorWrapGrf
-             && problem.case5TileXorWrapGrfStoreMode == 2)
+             && problem.case5TileXorWrapGrfStoreMode == 2 && !problem.case5TileXorInterleaved)   // interleaved: the final flush stored the accumulators
         gemmCase5TileXorFlushFromGrf(problem, strategy, state);
 
     if (strategy.registerOutput()) {

@@ -19,6 +19,8 @@ void cp_onednn_worker_set_auto_batch(int col_auto, int row_auto);
 int cp_onednn_worker_row_period_batch(void);
 int cp_onednn_worker_col_period_batch(void);
 void cp_onednn_worker_set_fused_jackpot(int on);
+/* Jackpot mode actually in use after init (1 fused, 0 separate; Xe2 is always separate). */
+int cp_onednn_worker_fused_jackpot(void);
 void cp_onednn_worker_set_gemm_layout(const char *name);
 void cp_onednn_worker_set_platform(int platform_index);
 int cp_onednn_worker_list_devices(void);

@@ -6,7 +6,8 @@ namespace case5_ngen {
 
 bool verify_case5_tile_blake3(const std::vector<uint32_t> &tile_xor,
                               const std::vector<uint32_t> &blake3_out, int output_ms,
-                              int tile_count, const uint32_t key8[kBlake3KeyWords]) {
+                              int tile_count, const uint32_t key8[kBlake3KeyWords],
+                              const std::vector<uint8_t> *active) {
     if (output_ms != kBlake3JackpotWords) {
         std::fprintf(stderr, "Case5.6 BLAKE3 verify: output_ms=%d (expected %d)\n", output_ms,
                      kBlake3JackpotWords);
@@ -22,7 +23,16 @@ bool verify_case5_tile_blake3(const std::vector<uint32_t> &tile_xor,
 
     uint32_t msg[kBlake3JackpotWords];
     uint32_t expect[kBlake3DigestWords];
+    size_t skipped = 0;
     for (int sid = 0; sid < tile_count; ++sid) {
+        if (active && !(*active)[static_cast<size_t>(sid)]) {
+            // A tile without any element inside M x N belongs to a thread row/column the kernel may
+            // skip entirely (gemmstone's empty-tile epilogue bypass); accept an unwritten digest there.
+            bool unwritten = true;
+            for (int w = 0; w < kBlake3DigestWords && unwritten; ++w)
+                unwritten = blake3_out[static_cast<size_t>(sid) * kBlake3DigestWords + w] == 0;
+            if (unwritten) { ++skipped; continue; }
+        }
         for (int w = 0; w < kBlake3JackpotWords; ++w) {
             // tile_xor is tile-major: the 16 folded words of a tile are contiguous.
             msg[w] = tile_xor[static_cast<size_t>(sid) * kBlake3JackpotWords + static_cast<size_t>(w)];
@@ -49,6 +59,8 @@ bool verify_case5_tile_blake3(const std::vector<uint32_t> &tile_xor,
             }
         }
     }
+    if (skipped)
+        std::fprintf(stderr, "Case5.6 BLAKE3 verify: %zu padded tiles left unwritten by the kernel (ok)%c", skipped, 10);
     return true;
 }
 

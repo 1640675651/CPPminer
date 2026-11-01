@@ -225,6 +225,10 @@ extern "C" void cp_onednn_worker_set_auto_batch(int col_auto, int row_auto) {
 extern "C" int cp_onednn_worker_row_period_batch(void) { return g_row_period_batch; }
 extern "C" int cp_onednn_worker_col_period_batch(void) { return g_col_period_batch; }
 
+extern "C" int cp_onednn_worker_fused_jackpot(void) {
+    return g_gemm.fused_jackpot() ? 1 : 0;
+}
+
 extern "C" void cp_onednn_worker_set_fused_jackpot(int on) {
     if (g_context_ready) {
         fprintf(stderr, "[onednn] set_fused_jackpot ignored after init\n");

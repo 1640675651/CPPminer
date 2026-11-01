@@ -21,15 +21,22 @@ uint32_t div_up_u64(uint64_t a, uint32_t b) {
     return static_cast<uint32_t>((a + b - 1) / b);
 }
 
+// Reciprocal for gemmstone's runtime divDown(src, divisor, recip): the kernel computes
+// (src * recip) >> 32 >> floor(log2 divisor), so recip = ceil(2^(32 + floor(log2 x)) / x) (gemmstone's own
+// constant divDown and oneDNN use bsr(x)). The previous ceil(log2 x) shift gave a wrong, 33-bit value for
+// every divisor that is not a power of two; the Hilbert walk divides by groupCountM * vd, the linear walk by
+// groupCountM/N, so on group grids where that is not a power of two (not the 64x64 grid of 16384^2 with
+// 32x64 tiles, but e.g. 3x8 or 6x16) tiles were skipped or computed twice and some group ids decoded
+// outside the grid (stray tile_xor stores, GPU faults). Same fix as hexagon_test/gemm_xor/onednn.
 uint32_t uint32_reciprocal(uint32_t x) {
     if (x == 0) {
         return 0;
     }
-    int lg = 0;
-    while ((uint64_t{1} << lg) < x) {
+    int lg = 0;   // floor(log2 x)
+    while ((uint64_t{2} << lg) <= x) {
         ++lg;
     }
-    return div_up_u64(uint64_t{0x100000000ULL} << lg, x);
+    return static_cast<uint32_t>(div_up_u64(uint64_t{0x100000000ULL} << lg, x));
 }
 
 int max_eus_per_wg(HW hw) {

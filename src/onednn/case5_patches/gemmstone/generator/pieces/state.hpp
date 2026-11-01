@@ -352,6 +352,7 @@ struct GEMMState : public CommonState {
     std::vector<ngen::GRFRange> tileXorFoldWide;            // interleaved: 2 GRF (16 lane) accumulator per sub-tile
     ngen::GRFRange tileXorLineBuf;                          // tile-major store: subGridN lines of tileXorLineBlock dwords (+1 pad GRF)
     std::vector<ngen::GRFRange> tileXorLineHdr;             // tile-major store: one A64 header per sub-tile line
+    bool tileXorLineHdrPacked = false;                      // tile-major store: the line addresses are qwords of tileXorLineHdr[0], sent via tileXorStoreHdr
     int tileXorLineBlock = 0;                               // tile-major store: milestones per flushed line (8 or 16)
     ngen::GRFRange tileXorFoldAcc;                          // fold16: 16-word folded message per sub-tile (2 GRFs each)
     ngen::Subregister tileXorLidFlat;                       // ud flat local thread id (cooperative jackpot)

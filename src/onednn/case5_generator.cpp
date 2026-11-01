@@ -54,5 +54,6 @@ constexpr typename Generator<hw>::status_stream::Endl Generator<hw>::status_stre
 
 template class Generator<HW::Gen12LP>;
 template class Generator<HW::XeHPG>;
+template class Generator<HW::Xe2>;      // Battlemage / Lunar Lake (64-byte GRFs, 16-channel dpas, LSC only)
 
 GEMMSTONE_NAMESPACE_END

@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+
 namespace gemmstone {
 const kcatalog::Catalog &case5_catalog();
 }
@@ -113,7 +114,40 @@ constexpr char kGen12LPInt8Packed[] = "ab16x2 ab8x2 ab int bm8192";
 // direction (2x2 grid per thread).
 constexpr char kXeLPGInt8Packed[] = "aB16 aB16 aB wg 4x4 cab4 ks16 nse bo sr bk0 grf256 l4";
 
+// Xe2 (Arc B580, 160 XVEs, driver 32.0.101.9150; 2026-10-31): kernel.db has no Xe2 int8 entries and the
+// XeHPC ones it inherits either need a 256..512 k-unroll (the 128-K milestone rejects them) or load B
+// with 2D block messages that gemmstone's Xe2 layout rules refuse here, so the fallback was a 16x1 tile
+// (6 TOPS). This hand strategy follows the XeHPC pattern that does build (2D transposed A, block B,
+// SLM-copied B, Hilbert walk) with k128 for the milestone. 16384^2 x 4096, 40 warm + 40 timed, pure
+// GEMM: 32x64 205 TOPS (16x64 179, 32x32 176, wg 4x8 188, without `hi pt sr br` 166; packed A/B do
+// not help on Xe2; `af` and `xaf` are equal). With the real tile XOR (2x4 grid of 16x16, interleaved
+// fold through the tile-major fast store) 190 TOPS with `af`, 185 with the hybrid `xaf` chains: on Xe2
+// the per-pass chains win, so `af` is the strategy and there is no `xaf` alternative. Case 5.6 180 TOPS.
+// Verified at 1024x1024x2048 / 2048x2048x4096 (tile XOR) and 512x512x4096 (digest). 2D block A needs
+// 16-byte alignment on Xe2.
+// Default: 32x64 with 2D transposed A, block B copied to SLM, `af` chains. With the walk-order reciprocal
+// fixed (case5_gemm_launch.cpp, 2026-11-01) it measures 197 TOPS pure and 187 with the tile XOR (2x4 grid of
+// 16x16 sub-tiles, interleaved fold, tile-major line stores), Case 5.6 183, at 16384^2 x 4096, 100+100.
+// The 48x32 direct-2D kernel below (no SLM, XeHPC pattern, `sb128` split barrier; 3x2 grid of 16x16
+// sub-tiles, 6 line stores, SIMD-8 hash of 6 tiles) is supported too but slower in the same batch: 193
+// pure, 181 Case 5, 177 Case 5.6; its 228 TOPS "peak" before the reciprocal fix came from a scrambled tile
+// walk (duplicated tiles) and was not real. CASE5_STRATEGY=... CASE5_UNROLL=48x32 selects it.
+constexpr char kXe2Int8Af[] =
+        "at32x2+m64@96 aB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys l4";
+// Packed A and B on Xe2 (the default for K <= 4096, like the XeHPG entry): both operands staged through
+// SLM as on XeHPG (`sB32x2 sB32 ... pab`). 16384^2 x 4096, 150+150, 3 rounds: pure 199.8 vs 196.6 plain,
+// Case 5 190.5 vs 187.6, Case 5.6 187.9 vs 184.5 (2026-11-01). The block-load forms of packed A
+// (`aB32 aB32`, 181 TOPS) and the single-buffered SLM form (`sB32 sB32`, 181) lose to the plain kernel;
+// double-buffered block loads of packed A do not fit the registers; packed B alone is neutral (196.9).
+// The first-day "packing does not help on Xe2" came from the 16x64 tile with block-load packed A.
+constexpr char kXe2Int8AfPackedA[] =
+    "sB32x2 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys pab";
+[[maybe_unused]] constexpr char kXe2Int8Direct2D48x32Xaf[] =
+        "at32x2+m64@96 am32x2+m64@96 aB wg 8x4 xaf vav hi pt sr br sb128 bk0 sm sn grf256 sys k128";
+
 const FamilyKernel kFamilyKernels[] = {
+    {HW::Xe2, "xe2-family", "Arc B580", true, 32, 64,
+     kXe2Int8Af, nullptr, kXe2Int8AfPackedA, nullptr, 4, 4096, 32, 16, 4},
     {HW::XeHPG, "xehpg-family", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
      kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
      kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4},
@@ -124,7 +158,8 @@ const FamilyKernel kFamilyKernels[] = {
 };
 
 // Keyed by gemmstone's HW family and XMX: Xe-HPG (Arc) and Xe-LPG (Meteor Lake) are both HW::XeHPG,
-// and only the dpas capability tells their int8 paths apart.
+// and only the dpas capability tells their int8 paths apart. Xe2 without XMX does not exist, so the
+// Xe2 entry covers Arc B and Lunar Lake alike (measured on the B580 only).
 const FamilyKernel *family_kernel(HW hw, bool systolic) {
     for (const auto &f : kFamilyKernels)
         if (f.hw == hw && f.systolic == systolic) return &f;
@@ -334,7 +369,7 @@ OnednnSelectInput onednn_select_input_from_dims(const BuildParams &dims) {
 
 std::vector<CatalogCandidate> fallback_candidates(HW hw) {
     std::vector<CatalogCandidate> out;
-    if (hw == HW::XeHPG) {
+    if (hw >= HW::XeHPG) {   // XeHPG and Xe2: dp4a with 256 GRFs (dp4a exists on both)
         out.push_back(CatalogCandidate{nullptr, "fallback-grf256", kFallbackXeHPG, true, false});
     } else {
         out.push_back(CatalogCandidate{nullptr, "fallback-Gen12LP", kFallbackGen12LP, true, false});
@@ -490,15 +525,19 @@ bool prepare_case5_strategy(HW hw, const Product &product, GEMMProblem &problem,
     try {
         if (candidate.from_catalog) {
             const Entry &entry = *candidate.entry;
+            // The entry's alignment is the minimum it was written for; keep the buffers' real alignment
+            // (from the leading dimensions, set before selection) when it is larger. The XeHPC int8
+            // entries declare 8 bytes for their 2D block B loads, which Xe2's 2D block messages reject
+            // (they need 16); with the real 64 they build and run there.
             if (!isPacked(problem.A.layout)
                     && problem.Ta_ext.paddedSize() >= problem.Ta.paddedSize()) {
-                problem.A.setAlignment(
-                        std::max(problem.Ta_ext.paddedSize(), entry.driverInfo.alignment[0]));
+                problem.A.setAlignment(std::max({problem.Ta_ext.paddedSize(),
+                        int(entry.driverInfo.alignment[0]), int(problem.A.alignment)}));
             }
             if (!isPacked(problem.B.layout)
                     && problem.Tb_ext.paddedSize() >= problem.Tb.paddedSize()) {
-                problem.B.setAlignment(
-                        std::max(problem.Tb_ext.paddedSize(), entry.driverInfo.alignment[1]));
+                problem.B.setAlignment(std::max({problem.Tb_ext.paddedSize(),
+                        int(entry.driverInfo.alignment[1]), int(problem.B.alignment)}));
             }
             if (!isPacked(problem.C.layout)) {
                 problem.C.setAlignment(std::max(problem.Tc_ext.paddedSize(),

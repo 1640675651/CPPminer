@@ -488,7 +488,7 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
             onednn_intel::enumerate_intel_gpus(platform_filter);
     if (intel_gpus.empty()) {
         std::fprintf(stderr,
-                     "[onednn] no Intel GPU found (Case 5 needs XeLP/Gen12LP or XeHPG)\n");
+                     "[onednn] no Intel GPU found (Case 5 needs XeLP/Gen12LP, XeHPG or Xe2)\n");
         std::snprintf(backend_, sizeof(backend_), "no Intel GPU");
         return false;
     }
@@ -529,6 +529,13 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     build_dims.ldb = b_row_major_ ? case5_ngen::pad_ld_int8(build_dims.n)
                                   : case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldc = case5_ngen::pad_ld_int8(build_dims.m);
+
+    // Xe2 runs the separate jackpot (interleaved fold to the 16-word message, jackpot kernel): the fused
+    // judge's in-kernel BLAKE3 still assumes 32-byte GRFs.
+    if (fused_jackpot_ && case5_ngen::is_xe2_device(ocl_.context, ocl_.device)) {
+        std::fprintf(stderr, "[gemmstone] fused jackpot is not ported to Xe2 yet: using the separate jackpot\n");
+        fused_jackpot_ = false;
+    }
 
     std::string ngen_err;
     kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,

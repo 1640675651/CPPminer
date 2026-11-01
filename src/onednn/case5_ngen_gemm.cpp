@@ -1,4 +1,4 @@
-// Case 5: gemmstone int8 GEMM -> OpenCL binary "case5_igemm" (Gen12LP or XeHPG).
+// Case 5: gemmstone int8 GEMM -> OpenCL binary "case5_igemm" (Gen12LP, XeHPG or Xe2).
 
 #include "case5_ngen_gemm.hpp"
 #include "case5_gemm_launch.hpp"
@@ -91,9 +91,11 @@ const char *product_family_name(ProductFamily family) {
     }
 }
 
+// Xe2 (Battlemage B-series, Lunar Lake) is a third Generator instantiation: 64-byte GRFs, 16-channel
+// dpas (osys 16, no dpasw) and LSC only. gemmstone's selector gives it the XeHPC catalog entries.
 bool is_supported_product(const Product &product) {
     const Core core = getCore(product.family);
-    return core == Core::XeLP || core == Core::XeHPG;
+    return core == Core::XeLP || core == Core::XeHPG || core == Core::Xe2;
 }
 
 HW select_hw(const Product &product) {
@@ -102,6 +104,8 @@ HW select_hw(const Product &product) {
         return HW::Gen12LP;
     case Core::XeHPG:
         return HW::XeHPG;
+    case Core::Xe2:
+        return HW::Xe2;
     default:
         return HW::Unknown;
     }
@@ -113,6 +117,8 @@ const char *hw_name(HW hw) {
         return "Gen12LP";
     case HW::XeHPG:
         return "XeHPG";
+    case HW::Xe2:
+        return "Xe2";
     default:
         return "unknown";
     }
@@ -400,11 +406,19 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 problem.B.panelLength = 0;
                 problem.B.setAlignment(problem.B.defaultAlignment(problem.Tb_ext));
             }
-            // XMX: split the milestone fold across dpas chain boundaries. Needs one milestone per
-            // k-unroll (period 1, no in-panel milestones) and a 1x4 / 1x8 sub-tile grid for the
-            // single-message store; other strategies keep the generic fold.
-            const bool fast_store_grid = xsd.split && xsd.subGridM == 1
-                    && (xsd.subGridN == 4 || xsd.subGridN == 8);
+            // XMX: split the milestone fold across dpas chain boundaries. Needs a dpas strategy (the hooks
+            // live in outerProductSystolic; a dp4a kernel on that path would store nothing), one milestone
+            // per k-unroll (period 1, no in-panel milestones) and the fast store, which takes any split
+            // sub-tile grid on the tile-major layout the miner always uses (1x4 for the A770's 16x64,
+            // 2x4 for the B580's 32x64). Other strategies keep the generic fold.
+            const bool fast_store_grid = xsd.split;
+            // The cooperative fused jackpot was written for one row of 4 or 8 sub-tiles (XeHPG 16x64).
+            const bool row_grid = xsd.split && xsd.subGridM == 1 && (xsd.subGridN == 4 || xsd.subGridN == 8);
+            // Xe2: only the separate jackpot is ported (interleaved fold + folded 16-word message); the
+            // fused judge's BLAKE3 code still assumes 32-byte GRFs. The worker resolves --fused-jackpot
+            // off on Xe2; refuse here rather than build a kernel with a wrong hash.
+            if (hw == HW::Xe2 && problem.case5FuseJackpot)
+                throw std::runtime_error("the fused jackpot is not ported to Xe2 yet (use the separate jackpot)");
             // Cooperative fused jackpot (CASE5_JACKPOT_COOP=0 disables): on the XMX fast-store path
             // the fold16 message stays in registers and, after one barrier, a quarter of the threads
             // hash 16 tiles per SIMD16 instruction and judge them in the kernel. It replaces the
@@ -413,7 +427,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 const char *coopEnv = std::getenv("CASE5_JACKPOT_COOP");
                 const char *f16 = std::getenv("CASE5_XOR_FOLD16");
                 const bool coop_ok = problem.case5FuseJackpot && !(coopEnv && coopEnv[0] == '0')
-                        && hw == HW::XeHPG && case5_tile_xor_interleave_enabled() && fast_store_grid
+                        && hw == HW::XeHPG && case5_tile_xor_interleave_enabled() && row_grid
                         && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0 && !xor_nop
                         && problem.case5XorMaxMilestones % 16 == 0 && !(f16 && f16[0] == '0')
                         && strategy.wg[LoopM] > 0 && strategy.wg[LoopN] > 0 && !problem.case5TileXorSlm;
@@ -433,8 +447,9 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                     problem.case5TileXorWrap = false;
                 }
             }
-            problem.case5TileXorInterleaved = case5_tile_xor_interleave_enabled() && hw == HW::XeHPG
-                    && fast_store_grid && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0
+            problem.case5TileXorInterleaved = case5_tile_xor_interleave_enabled()
+                    && (hw == HW::XeHPG || hw == HW::Xe2) && strategy.systolic && fast_store_grid
+                    && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0
                     && !xor_nop && !problem.case5TileXorWrap && !problem.case5TileXorWrapGrf
                     && (!problem.case5TileXorBlake3 || problem.case5JackpotCoop) && !problem.case5TileXorSlm;
             // tile_xor is tile-major ([tile][ms], index sid * num_ms + ms) on every path; the
@@ -551,19 +566,31 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 }
             }
             auto &gen = *genPtr;
-            // CASE5_DUMP_BINARY=<file>: save the device binary (for `ocloc disasm`).
-            if (const char *dump = std::getenv("CASE5_DUMP_BINARY")) {
-                if (dump[0]) {
-                    auto bin = gen.getBinary(ctx, device);
-                    if (FILE *f = std::fopen(dump, "wb")) {
-                        std::fwrite(bin.data(), 1, bin.size(), f);
-                        std::fclose(f);
-                    }
-                }
-            }
             cl_kernel k = gen.getKernel(ctx, device);
             if (!k) {
                 throw std::runtime_error("getKernel returned null");
+            }
+            // CASE5_DUMP_BINARY=<file>: save the device binary of the kernel actually returned (for
+            // tools/igadis.py). Taken from the kernel's program: a separate gen.getBinary() before
+            // getKernel() ran the generator twice and produced a kernel with wrong tile_xor words.
+            if (const char *dump = std::getenv("CASE5_DUMP_BINARY")) {
+                if (dump[0]) {
+                    cl_program prog = nullptr;
+                    size_t binSize = 0;
+                    if (clGetKernelInfo(k, CL_KERNEL_PROGRAM, sizeof(prog), &prog, nullptr) == CL_SUCCESS
+                            && clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof(binSize), &binSize, nullptr)
+                                    == CL_SUCCESS
+                            && binSize > 0) {
+                        std::vector<unsigned char> bin(binSize);
+                        unsigned char *ptr = bin.data();
+                        if (clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof(ptr), &ptr, nullptr) == CL_SUCCESS) {
+                            if (FILE *f = std::fopen(dump, "wb")) {
+                                std::fwrite(bin.data(), 1, bin.size(), f);
+                                std::fclose(f);
+                            }
+                        }
+                    }
+                }
             }
             return k;
         } catch (const std::exception &e) {
@@ -591,11 +618,16 @@ bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err) 
         return true;
     }
     if (err) {
-        *err = std::string("Case 5 requires XeLP/Gen12LP or XeHPG (Core Ultra MTL/ARL). Detected ")
+        *err = std::string("Case 5 requires XeLP/Gen12LP, XeHPG (Arc A, Core Ultra MTL/ARL) or Xe2 "
+                           "(Arc B, Lunar Lake). Detected ")
                + product_family_name(product.family)
                + " - unsupported ISA for Case 5.";
     }
     return false;
+}
+
+bool is_xe2_device(cl_context ctx, cl_device_id device) {
+    return select_hw(detect_product(ctx, device)) == HW::Xe2;
 }
 
 cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildParams *dims,
@@ -617,7 +649,7 @@ cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildPar
         if (!is_supported_product(product)) {
             throw std::runtime_error(
                 std::string("unsupported GPU: ") + product_family_name(product.family)
-                + " (Case 5 supports Gen12LP/XeLP and XeHPG only)");
+                + " (Case 5 supports Gen12LP/XeLP, XeHPG and Xe2 only)");
         }
 
         const HW hw = select_hw(product);
@@ -627,6 +659,9 @@ cl_kernel build_igemm_kernel(cl_context ctx, cl_device_id device, const BuildPar
                     err, xor_nop, fused_jackpot);
         case HW::XeHPG:
             return build_igemm_kernel_impl<HW::XeHPG>(ctx, device, product, build_dims, info, err,
+                    xor_nop, fused_jackpot);
+        case HW::Xe2:
+            return build_igemm_kernel_impl<HW::Xe2>(ctx, device, product, build_dims, info, err,
                     xor_nop, fused_jackpot);
         default:
             throw std::runtime_error("internal error: unsupported HW selection");
