@@ -85,7 +85,7 @@ inline int pad_ld_int8(int inner) {
 // Gen12LP/XeLP, XeHPG (Arc A, Core Ultra MTL/ARL) and Xe2 (Arc B, Lunar Lake).
 bool is_supported_device(cl_context ctx, cl_device_id device, std::string *err = nullptr);
 
-// True on Xe2 (Arc B, Lunar Lake): the separate jackpot only, the fused judge is not ported there.
+// True on Xe2 (Arc B, Lunar Lake): the fused jackpot exists there only with the own-tile judge.
 bool is_xe2_device(cl_context ctx, cl_device_id device);
 
 // Optional filter on a candidate's logical hash tile (sub_m x sub_n): a candidate it rejects is skipped

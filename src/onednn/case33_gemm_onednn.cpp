@@ -530,17 +530,21 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
                                   : case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldc = case5_ngen::pad_ld_int8(build_dims.m);
 
-    // Xe2 runs the separate jackpot (interleaved fold to the 16-word message, jackpot kernel): the fused
-    // judge's in-kernel BLAKE3 still assumes 32-byte GRFs.
-    if (fused_jackpot_ && case5_ngen::is_xe2_device(ocl_.context, ocl_.device)) {
-        std::fprintf(stderr, "[gemmstone] fused jackpot is not ported to Xe2 yet: using the separate jackpot\n");
-        fused_jackpot_ = false;
-    }
-
     std::string ngen_err;
     kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,
                                              &ngen_err, false, fused_jackpot_, a_row_major_,
                                              b_row_major_);
+    // Xe2 has the fused jackpot only on kernels with the own-tile judge (the family kernel); when none
+    // of the candidates qualifies, mine with the separate jackpot instead of not at all.
+    if (!kernel_ && fused_jackpot_ && case5_ngen::is_xe2_device(ocl_.context, ocl_.device)) {
+        std::fprintf(stderr, "[gemmstone] fused jackpot build failed on Xe2 (%s): using the separate jackpot\n",
+                     ngen_err.c_str());
+        fused_jackpot_ = false;
+        ngen_err.clear();
+        kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,
+                                                 &ngen_err, false, fused_jackpot_, a_row_major_,
+                                                 b_row_major_);
+    }
     if (!kernel_) {
         std::fprintf(stderr, "[onednn] gemmstone kernel build failed: %s\n", ngen_err.c_str());
         std::snprintf(backend_, sizeof(backend_), "gemmstone build failed: %s", ngen_err.c_str());

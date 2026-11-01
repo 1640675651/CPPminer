@@ -414,11 +414,12 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             const bool fast_store_grid = xsd.split;
             // The cooperative fused jackpot was written for one row of 4 or 8 sub-tiles (XeHPG 16x64).
             const bool row_grid = xsd.split && xsd.subGridM == 1 && (xsd.subGridN == 4 || xsd.subGridN == 8);
-            // Xe2: only the separate jackpot is ported (interleaved fold + folded 16-word message); the
-            // fused judge's BLAKE3 code still assumes 32-byte GRFs. The worker resolves --fused-jackpot
-            // off on Xe2; refuse here rather than build a kernel with a wrong hash.
-            if (hw == HW::Xe2 && problem.case5FuseJackpot)
-                throw std::runtime_error("the fused jackpot is not ported to Xe2 yet (use the separate jackpot)");
+            // Xe2: the own-tile judge (every thread hashes its N = subGridM x subGridN sub-tiles as N SIMD
+            // lanes, N a power of two <= 8: 2x4 for the B580's 32x64) on any split grid. The SLM variant
+            // and the per-tile wrap-GRF fused path stay XeHPG / Gen12LP only.
+            const int coop_tiles = xsd.subGridM * xsd.subGridN;
+            const bool xe2_own_grid = hw == HW::Xe2 && xsd.split && coop_tiles >= 2 && coop_tiles <= 8
+                    && (coop_tiles & (coop_tiles - 1)) == 0;
             // Cooperative fused jackpot (CASE5_JACKPOT_COOP=0 disables): on the XMX fast-store path
             // the fold16 message stays in registers and, after one barrier, a quarter of the threads
             // hash 16 tiles per SIMD16 instruction and judge them in the kernel. It replaces the
@@ -427,7 +428,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 const char *coopEnv = std::getenv("CASE5_JACKPOT_COOP");
                 const char *f16 = std::getenv("CASE5_XOR_FOLD16");
                 const bool coop_ok = problem.case5FuseJackpot && !(coopEnv && coopEnv[0] == '0')
-                        && hw == HW::XeHPG && case5_tile_xor_interleave_enabled() && row_grid
+                        && ((hw == HW::XeHPG && row_grid) || xe2_own_grid) && case5_tile_xor_interleave_enabled()
                         && problem.case5XorPeriod == 1 && problem.case5XorEveryK == 0 && !xor_nop
                         && problem.case5XorMaxMilestones % 16 == 0 && !(f16 && f16[0] == '0')
                         && strategy.wg[LoopM] > 0 && strategy.wg[LoopN] > 0 && !problem.case5TileXorSlm;
@@ -436,7 +437,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                     // Default: every thread hashes its own tiles (SIMD-N, no SLM). CASE5_COOP_OWN=0:
                     // SLM transpose, 8 tiles per hashing thread.
                     const char *ownEnv = std::getenv("CASE5_COOP_OWN");
-                    problem.case5JackpotCoopSlm = coop_ok && ownEnv && ownEnv[0] == '0';
+                    problem.case5JackpotCoopSlm = coop_ok && hw == HW::XeHPG && ownEnv && ownEnv[0] == '0';
                 }
                 {
                     const char *auditEnv = std::getenv("CASE5_COOP_AUDIT");
@@ -446,6 +447,11 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                     problem.case5TileXorWrapGrf = false;
                     problem.case5TileXorWrap = false;
                 }
+                // The wrap-GRF fused path (legacy messages, 32-byte GRF BLAKE3 state) does not exist on
+                // Xe2: a candidate without the own-tile judge cannot run the fused jackpot there.
+                if (hw == HW::Xe2 && problem.case5FuseJackpot && !coop_ok)
+                    throw std::runtime_error("fused jackpot on Xe2 needs the own-tile judge (interleaved fold, "
+                                             "2/4/8 sub-tiles per thread)");
             }
             problem.case5TileXorInterleaved = case5_tile_xor_interleave_enabled()
                     && (hw == HW::XeHPG || hw == HW::Xe2) && strategy.systolic && fast_store_grid

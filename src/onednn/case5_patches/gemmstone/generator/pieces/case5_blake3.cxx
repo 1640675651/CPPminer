@@ -999,7 +999,9 @@ void Generator<hw>::gemmCase5TileXorCoopStageArgs(const GEMMProblem &problem, co
                      size_t(strategy.slmABufSize(problem)), size_t(strategy.slmBBufSize(problem)),
                      strategy.slmBuffers, strategy.unrollKSLM);
     if (!in.tileXor.isValid()) stub("cooperative jackpot needs the tile_xor argument (found buffer)");
-    state.tileXorCoopJudge = in.foundFlag.isValid() && in.trBase.isValid() && in.tcBase.isValid();
+    // (Xe2 released the judge's arguments before the Case 5 allocations and set the flag there.)
+    state.tileXorCoopJudge = state.tileXorCoopJudge
+            || (in.foundFlag.isValid() && in.trBase.isValid() && in.tcBase.isValid());
     state.tileXorCoopDigestOut = in.blake3Out.isValid();      // harness digest-out mode keeps its pointer
     for (int i = 0; i < kBlake3DigestWords; i++) {
         state.ra.safeRelease(in.blake3KeyWords[i]);
@@ -1033,8 +1035,25 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
     const int hashNr = (problem.case5XorSubN > 0) ? problem.case5XorSubN : strategy.unroll[LoopN];
     const int dpg = grfDwords(hw);
     const uint32_t blake3BlockLen = 64, blake3Flags = 0x1Bu;   // CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
-    if (subGridM != 1 || tilesPerThread > dpg || (nTiles % 2) != 0 || nTiles <= 0)
+    if ((subGridM != 1 && problem.case5JackpotCoopSlm) || tilesPerThread > dpg || (nTiles % 2) != 0 || nTiles <= 0)
         stub("cooperative jackpot: unsupported sub-tile grid");
+    // Fold accumulator of one sub-tile: 16 dwords, 2 GRFs on 32-byte GRFs, 1 on Xe2.
+    const int accGrfs = std::max(1, 64 / GRF::bytes(hw));
+    // Scattered (one address per lane) stores of the judge / audit / digest-out: SIMD8 legacy messages
+    // on XeHPG, SIMD16 LSC messages on Xe2 (no legacy data port there); lanes >= N are masked off.
+    const int SE = (hw >= HW::Xe2) ? 16 : 8;
+    auto storeD32 = [&](const FlagRegister &f, const GRF &addr, const GRF &data) {
+        if (hw >= HW::Xe2)
+            store(SE | f, D32, A64, addr, data);
+        else
+            store(SE | f, scattered_dword(), A64, addr, data);
+    };
+    auto storeD64 = [&](const FlagRegister &f, const GRF &addr, const GRF &data) {
+        if (hw >= HW::Xe2)
+            store(SE | f, D64, A64, addr, data);
+        else
+            store(SE | f, scattered_qword(), A64, addr, data);
+    };
     const uint32_t slmBase = 0;                   // the k loop's SLM buffers are dead after the barrier below
     const uint32_t msgBase = slmBase;
     const uint32_t sidBase = msgBase + uint32_t(nTiles) * 64;
@@ -1059,14 +1078,14 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
     // (problem.case5JackpotCoopSlm, CASE5_COOP_OWN=0), which measured the same speed at N = 4.
     if (!problem.case5JackpotCoopSlm) {
         const int N = tilesPerThread;
-        if (subGridM != 1 || N < 1 || N > 8 || (N & (N - 1)) || dpg != 8)
-            stub("own-tile jackpot: needs a 1 x N sub-tile grid, N a power of two <= 8, and 32-byte GRFs");
+        if (N < 1 || N > 8 || (N & (N - 1)) || N > dpg)
+            stub("own-tile jackpot: needs N = subGridM x subGridN sub-tiles, a power of two <= 8");
         // With the hash skipped this kernel never completed on the A770 (cause not found); refuse
         // to build it rather than hang the GPU. Timing knob only.
         if (coopSkip & 2) stub("own-tile jackpot: CASE5_COOP_SKIP=2 hangs, not supported");
-        const int wpg = 8 / N;                                  // message words per GRF in the packed transpose
+        const int wpg = dpg / N;                                // message words per GRF in the packed transpose
         GRF hdr = state.ra.alloc(), sidG = state.ra.alloc();
-        GRFRange coordG = state.ra.alloc_range(2);              // SIMD8 qword payload (lanes 0..N-1 used)
+        GRFRange coordG = state.ra.alloc_range(2);              // SIMD8 (XeHPG) / SIMD16 (Xe2) qword payload
         GRFRange args = state.ra.alloc_range(int(kCoopBufLoadBytes) / GRF::bytes(hw));
         GRFRange hdrQ = state.ra.alloc_range(1);
         auto ARG = [&](int i) { return args[i / dpg].ud(i % dpg); };
@@ -1077,9 +1096,11 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
         {
             GRF lr = state.ra.alloc(), lc = state.ra.alloc();
             for (int fi = 0; fi < N; fi++) {
+                const int sr = fi / subGridN, sc = fi % subGridN;
                 mulConstant(1, lr.ud(0), state.tileXorRow, subGridM);
+                if (sr) add(1, lr.ud(0), lr.ud(0), uint16_t(sr));
                 mulConstant(1, lc.ud(0), state.tileXorCol, subGridN);
-                add(1, lc.ud(0), lc.ud(0), uint16_t(fi));
+                if (sc) add(1, lc.ud(0), lc.ud(0), uint16_t(sc));
                 emad(1, sidG.ud(fi), lc.ud(0), lr.ud(0), tileCols, strategy, state);  // spatial id
                 if (judge) {
                     add(1, lr.ud(0), lr.ud(0), trBase);
@@ -1101,7 +1122,7 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
                 shl(1, aoff.ud(1), sidG.ud(fi), uint16_t(6));
                 add(1, aoff.ud(1), aoff.ud(1), aoff.ud(0));
                 eadd(1, ahdr[0].uq(0), state.inputs.tileXor, aoff.ud(1), strategy, state);
-                store(1, block(D32, 16), A64, ahdr, GRFRange(state.tileXorFoldAcc.getBase() + fi * 2, 2));
+                store(1, block(D32, 16), A64, ahdr, GRFRange(state.tileXorFoldAcc.getBase() + fi * accGrfs, accGrfs));
             }
             state.ra.safeRelease(aoff);
             state.ra.safeRelease(ahdr);
@@ -1117,14 +1138,39 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
             // GRF (P); words not at a GRF start are copied to A[w], because add3 with an operand that
             // starts mid-register computed wrong sums (two-source ops on it were fine).
             auto Mw = [&](int w) { return (w % wpg) ? A[w].ud(0)(1) : P[w / wpg].ud(0)(1); };
+            auto MwLane = [&](int w, int fi) { return (w % wpg) ? A[w].ud(fi) : P[w / wpg].ud(fi); };
+            // Xe2: per-tile SIMD1 block stores (the SIMD16 scattered A64 stores lost lanes there).
+            const bool xe2Stores = hw >= HW::Xe2;
+            // Store 'words' dwords of 'data' (one GRF) at base + off + sid(fi) * pitch, for each tile fi.
+            auto storePerTile = [&](const Subregister &base, uint32_t off, int pitchShift, int words,
+                                    auto gather) {
+                GRFRange h1 = state.ra.alloc_range(1);
+                GRF o1 = state.ra.alloc();
+                for (int fi = 0; fi < N; fi++) {
+                    gather(fi);
+                    shl(1, o1.ud(0), sidG.ud(fi), uint16_t(pitchShift));
+                    if (off) add(1, o1.ud(0), o1.ud(0), off);
+                    eadd(1, h1[0].uq(0), base, o1.ud(0), strategy, state);
+                    store(1, block(D32, words), A64, h1, GRFRange(dtmp.getBase(), 1));
+                }
+                state.ra.safeRelease(o1);
+                state.ra.safeRelease(h1);
+            };
             auto T = [&](int k) { return tmp[k].ud(); };
             // transpose: tile fi's word w (fold GRF 2 fi + w/8, dword w%8) -> P[w/wpg] dword (w%wpg)*N + fi;
             // one mov per (tile, wpg consecutive words): 2 N^2 movs
             const int dstStride = (wpg > 1) ? N : 1;
+            // A destination stride above 4 is not encodable (8 lanes on 64-byte GRFs: stride 8), so that
+            // case writes the wpg words one dword at a time.
             for (int fi = 0; fi < N; fi++)
-                for (int w = 0; w < kBlake3MsgWords; w += wpg)
-                    mov(wpg, P[w / wpg].ud(fi)(dstStride),
-                        GRF(state.tileXorFoldAcc.getBase() + 2 * fi + w / 8).ud(w % 8)(1));
+                for (int w = 0; w < kBlake3MsgWords; w += wpg) {
+                    const GRF src(state.tileXorFoldAcc.getBase() + accGrfs * fi + w / dpg);
+                    if (dstStride > 4) {
+                        for (int j = 0; j < wpg; j++)
+                            mov(1, P[w / wpg].ud(j * N + fi), src.ud((w + j) % dpg));
+                    } else
+                        mov(wpg, P[w / wpg].ud(fi)(dstStride), src.ud(w % dpg)(1));
+                }
             for (int w = 0; w < kBlake3MsgWords; w++)
                 if (w % wpg) mov(N, A[w].ud(), P[w / wpg].ud((w % wpg) * N)(1));
             mov(1, scal.uw(0), uint16_t((1u << N) - 1));                      // valid lanes
@@ -1132,14 +1178,30 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
                 // hasher copy: tile_xor + 4096 + tile_count*96 + sid*64 + 4w (stores stay SIMD8, masked)
                 mulConstant(1, hdr.ud(1), ARG(kCoopBufTileCountDw), 96);
                 add(1, hdr.ud(1), hdr.ud(1), uint32_t(kCoopAuditOff));
-                shl(8, hdrS.ud(), sidG.ud(), uint16_t(6));
-                add(8, hdrS.ud(), hdrS.ud(), hdr.ud(1));
-                eadd(8, hdr64[0].uq(), state.inputs.tileXor, hdrS.ud(), strategy, state);
+                if (xe2Stores) {
+                    // offset tile_count*96 + 4096 is in hdr.ud(1); add it per tile
+                    GRFRange h1 = state.ra.alloc_range(1);
+                    GRF o1 = state.ra.alloc();
+                    for (int fi = 0; fi < N; fi++) {
+                        for (int w = 0; w < kBlake3MsgWords; w++)
+                            mov(1, dtmp.ud(w), MwLane(w, fi));
+                        shl(1, o1.ud(0), sidG.ud(fi), uint16_t(6));
+                        add(1, o1.ud(0), o1.ud(0), hdr.ud(1));
+                        eadd(1, h1[0].uq(0), state.inputs.tileXor, o1.ud(0), strategy, state);
+                        store(1, block(D32, kBlake3MsgWords), A64, h1, GRFRange(dtmp.getBase(), 1));
+                    }
+                    state.ra.safeRelease(o1);
+                    state.ra.safeRelease(h1);
+                } else {
+                shl(SE, hdrS.ud(), sidG.ud(), uint16_t(6));
+                add(SE, hdrS.ud(), hdrS.ud(), hdr.ud(1));
+                eadd(SE, hdr64[0].uq(), state.inputs.tileXor, hdrS.ud(), strategy, state);
                 mov(1, f1[0], scal.uw(0));
                 for (int w = 0; w < kBlake3MsgWords; w++) {
-                    if (w) eadd(8, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
+                    if (w) eadd(SE, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
                     mov(N, dtmp.ud(), Mw(w));
-                    store(8 | f1[0], scattered_dword(), A64, hdr64[0], dtmp);
+                    storeD32(f1[0], hdr64[0], dtmp);
+                }
                 }
             }
             for (int i = 0; i < kBlake3DigestWords; i++) mov(N, V(i), ARG(kCoopBufKeyDw + i));
@@ -1156,13 +1218,19 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
             for (int i = 0; i < kBlake3DigestWords; i++) xor_(N, V(i), V(i), V(8 + i));   // digest in V(0..7)
             if (digestOut) {
                 const auto outBase = audit ? state.inputs.tileXor : blake3Out;
-                shl(8, hdrS.ud(), sidG.ud(), uint16_t(5));
-                if (audit) add(8, hdrS.ud(), hdrS.ud(), uint32_t(kCoopAuditOff));
-                eadd(8, hdr64[0].uq(), outBase, hdrS.ud(), strategy, state);
+                if (xe2Stores) {
+                    storePerTile(outBase, audit ? uint32_t(kCoopAuditOff) : 0u, 5, kBlake3DigestWords, [&](int fi) {
+                        for (int w = 0; w < kBlake3DigestWords; w++) mov(1, dtmp.ud(w), v[w].ud(fi));
+                    });
+                } else {
+                shl(SE, hdrS.ud(), sidG.ud(), uint16_t(5));
+                if (audit) add(SE, hdrS.ud(), hdrS.ud(), uint32_t(kCoopAuditOff));
+                eadd(SE, hdr64[0].uq(), outBase, hdrS.ud(), strategy, state);
                 mov(1, f1[0], scal.uw(0));
                 for (int w = 0; w < kBlake3DigestWords; w++) {
-                    if (w) eadd(8, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
-                    store(8 | f1[0], scattered_dword(), A64, hdr64[0], v[w]);
+                    if (w) eadd(SE, hdr64[0].uq(), hdr64[0].uq(), uint32_t(4), strategy, state);
+                    storeD32(f1[0], hdr64[0], v[w]);
+                }
                 }
             }
             if (judge) {
@@ -1178,11 +1246,27 @@ void Generator<hw>::gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, cons
                 }
                 and_(1, scal.uw(1), scal.uw(1), scal.uw(0));
                 mov(1, f0[1], scal.uw(1));
-                mov(8, ones[0].ud(), uint32_t(1));
-                eadd(8, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundFlagOff), strategy, state);
-                store(8 | f0[1], scattered_dword(), A64, hdr64[0], ones[0]);      // found = 1 (any winner)
-                eadd(8, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundCoordsOff), strategy, state);
-                store(8 | f0[1], scattered_qword(), A64, hdr64[0], coordG[0]);    // one winner's (t_rows, t_cols)
+                if (xe2Stores) {
+                    // dtmp.ud(0..1) = coordinates of the highest winning lane, dtmp.ud(2) = 1; then, if any
+                    // lane won, found = 1 and the coordinates, each with one SIMD1 block store.
+                    for (int fi = 0; fi < N; fi++) {
+                        and_(1 | nz | f1[0], null.uw(), scal.uw(1), uint16_t(1u << fi));
+                        mov(1 | f1[0], dtmp.ud(0), coordG[(2 * fi) / dpg].ud((2 * fi) % dpg));
+                        mov(1 | f1[0], dtmp.ud(1), coordG[(2 * fi + 1) / dpg].ud((2 * fi + 1) % dpg));
+                    }
+                    mov(1, ones[0].ud(0), uint32_t(1));
+                    cmp(1 | ne | f0[1], null.uw(), scal.uw(1), uint16_t(0));
+                    eadd(1, hdr64[0].uq(0), foundFlag, uint32_t(kJackpotFoundFlagOff), strategy, state);
+                    store(1 | f0[1], block(D32, 1), A64, GRFRange(hdr64.getBase(), 1), GRFRange(ones.getBase(), 1));
+                    eadd(1, hdr64[0].uq(0), foundFlag, uint32_t(kJackpotFoundCoordsOff), strategy, state);
+                    store(1 | f0[1], block(D32, 2), A64, GRFRange(hdr64.getBase(), 1), GRFRange(dtmp.getBase(), 1));
+                } else {
+                mov(SE, ones[0].ud(), uint32_t(1));
+                eadd(SE, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundFlagOff), strategy, state);
+                storeD32(f0[1], hdr64[0], ones[0]);      // found = 1 (any winner)
+                eadd(SE, hdr64[0].uq(), foundFlag, uint32_t(kJackpotFoundCoordsOff), strategy, state);
+                storeD64(f0[1], hdr64[0], coordG[0]);    // one winner's (t_rows, t_cols)
+                }
             }
             state.ra.safeRelease(hdrS);
             state.ra.safeRelease(dtmp);

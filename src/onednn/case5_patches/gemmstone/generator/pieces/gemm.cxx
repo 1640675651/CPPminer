@@ -433,6 +433,22 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
             state.ra.safeRelease(in.trBase);
             state.ra.safeRelease(in.tcBase);
         }
+        if (problem.case5JackpotCoop && hw >= HW::Xe2) {
+            // Same for the cooperative (own-tile) judge on Xe2: released after gemmCase5TileXorAlloc they
+            // left holes below the Case 5 registers, and the 32x64 kernel's k loop then found no room for
+            // a register bundle ("Insufficient registers in requested bundle"). The judge flag is taken
+            // first; gemmCase5TileXorCoopStageArgs releases the rest after the spatial ids. XeHPG keeps
+            // the original order (its 16x64 kernel is tuned to the resulting register placement).
+            auto &in = state.inputs;
+            state.tileXorCoopJudge = in.foundFlag.isValid() && in.trBase.isValid() && in.tcBase.isValid();
+            for (int i = 0; i < 8; i++) {
+                state.ra.safeRelease(in.blake3KeyWords[i]);
+                state.ra.safeRelease(in.blake3BoundWords[i]);
+            }
+            state.ra.safeRelease(in.foundFlag);
+            state.ra.safeRelease(in.trBase);
+            state.ra.safeRelease(in.tcBase);
+        }
         gemmCase5TileXorAlloc(problem, strategy, state);
         case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
         if (problem.case5JackpotCoop)
