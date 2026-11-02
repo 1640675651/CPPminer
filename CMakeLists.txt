@@ -60,6 +60,10 @@ endif()
 
 set(CP_COMMON_SOURCES
     src/common/main.cpp
+    src/common/cp_options.cpp
+    src/common/cp_diagnostics.cpp
+    src/common/cp_backend_setup.cpp
+    src/common/cp_pool_session.cpp
     src/common/cp_util.cpp
     src/common/cp_json_frame.cpp
     src/common/cp_pool.cpp

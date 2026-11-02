@@ -22,6 +22,10 @@ int cp_mine_job(const uint8_t* header, int hlen,
                 uint32_t cert_version,
                 int sock, int* msg_id);
 
+/* Offline --mock: fixed job, mine until the first share, verify it, free the host buffers
+ * and shut the worker down. Returns 0 on PASS, 1 on FAIL. */
+int cp_mine_mock(void);
+
 #ifdef __cplusplus
 }
 #endif

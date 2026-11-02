@@ -423,3 +423,58 @@ job_done:
     }
     return rc;
 }
+
+int cp_mine_mock(void)
+{
+    /* Fixed legal stratum-style job id + deterministic 76-byte incomplete header. */
+    static const char k_mock_job_id[] = "00000000-0000-4000-8000-000000000001";
+    uint8_t header[INCOMPLETE_HEADER_BYTES];
+    memset(header, 0, sizeof(header));
+    /* Minimal non-zero fields so the blob is not all-zero (version + tag). */
+    header[0] = 0x01;
+    header[1] = 0x00;
+    header[2] = 0x00;
+    header[3] = 0x00;
+    memcpy(header + 4, "CPMOCK", 6);
+    header[10] = 0x01; /* mock revision */
+
+    /* Mock difficulty → pool target (same path as mining.set_difficulty). */
+    const double mock_diff = cp_resolve_mock_diff(0);
+    uint32_t tgt[8];
+    cp_mock_target_from_difficulty(mock_diff, tgt);
+    char target_hex[65];
+    cp_le_words_to_be_target_hex(tgt, target_hex);
+
+    printf("[mock] job_id=%s (offline, no pool)\n", k_mock_job_id);
+    printf("[mock] difficulty=%.1f target=%.16s... cert_version=%u%s\n",
+           mock_diff, target_hex, (unsigned)g_cert_version,
+           g_cert_version_forced ? " (forced)" : "");
+    printf("[mock] mining until first share + zk-pow verify...\n");
+    fflush(stdout);
+
+    const int rc = cp_mine_job(header, INCOMPLETE_HEADER_BYTES, k_mock_job_id, target_hex, tgt,
+                               g_cert_version, -1, NULL);
+    const int outcome = cp_mine_last_share_outcome();
+    cp_mine_free_host_buffers();
+    cp_worker_shutdown();
+
+    if(rc == CP_JOB_CANCELLED){
+        fprintf(stderr, "[mock] cancelled before share\n");
+        return 1;
+    }
+    if(outcome == CP_SHARE_OUTCOME_OK){
+        printf("[mock] PASS: first share built and verified\n");
+        fflush(stdout);
+        return 0;
+    }
+    if(outcome == CP_SHARE_OUTCOME_NONE){
+        fprintf(stderr, "[mock] FAIL: no share produced\n");
+    } else if(outcome == CP_SHARE_OUTCOME_VERIFY_FAIL){
+        fprintf(stderr, "[mock] FAIL: share verify failed\n");
+    } else if(outcome == CP_SHARE_OUTCOME_PROOF_FAIL){
+        fprintf(stderr, "[mock] FAIL: proof build failed\n");
+    } else {
+        fprintf(stderr, "[mock] FAIL: share outcome=%d\n", outcome);
+    }
+    return 1;
+}
