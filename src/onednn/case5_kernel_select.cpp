@@ -134,14 +134,19 @@ constexpr char kXeLPGInt8Packed[] = "aB16 aB16 aB wg 4x4 cab4 ks16 nse bo sr bk0
 // walk (duplicated tiles) and was not real. CASE5_STRATEGY=... CASE5_UNROLL=48x32 selects it.
 constexpr char kXe2Int8Af[] =
         "at32x2+m64@96 aB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys l4";
-// Packed A and B on Xe2 (the default for K <= 4096, like the XeHPG entry): both operands staged through
-// SLM as on XeHPG (`sB32x2 sB32 ... pab`). 16384^2 x 4096, 150+150, 3 rounds: pure 199.8 vs 196.6 plain,
-// Case 5 190.5 vs 187.6, Case 5.6 187.9 vs 184.5 (2026-11-01). The block-load forms of packed A
-// (`aB32 aB32`, 181 TOPS) and the single-buffered SLM form (`sB32 sB32`, 181) lose to the plain kernel;
-// double-buffered block loads of packed A do not fit the registers; packed B alone is neutral (196.9).
-// The first-day "packing does not help on Xe2" came from the 16x64 tile with block-load packed A.
+// Packed A and B on Xe2 (the default for K <= 4096, like the XeHPG entry): A by BTS block loads with two
+// register copies (`sB32x2`), B copied to SLM (`cb4x2`), both padded (`pab`). 16384^2 x 4096, 150+150,
+// 3 rounds: pure 199.8 vs 196.6 plain, Case 5 190.5 vs 187.6, Case 5.6 187.9 vs 184.5 (2026-11-01). The
+// block-load forms of packed A (`aB32 aB32`, 181 TOPS) and the single-buffered SLM form (`sB32 sB32`,
+// 181) lose to the plain kernel; double-buffered block loads of packed A do not fit the registers;
+// packed B alone is neutral (196.9). The first-day "packing does not help on Xe2" came from the 16x64
+// tile with block-load packed A. `+B64@96` prefetches A 96 k ahead in 64-k blocks: the only strategy
+// knob of a 31-variant screen that paid (pure 202-204 vs 199, Case 5 193.9 vs 190.5, Case 5.6 188.9 vs
+// 188.0; other distances 200-203, B prefetch 187). Removing the k loop's 64 A-deinterleave movs with a
+// tiled packed layout (CASE5_A_TILE=16,32) changed nothing; tiles wider than ka_load are mis-addressed
+// by gemmstone and refused (gemm_xor note.md, *B580 kernel-side levers, second pass*).
 constexpr char kXe2Int8AfPackedA[] =
-    "sB32x2 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys pab";
+    "sB32x2+B64@96 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys pab";
 [[maybe_unused]] constexpr char kXe2Int8Direct2D48x32Xaf[] =
         "at32x2+m64@96 am32x2+m64@96 aB wg 8x4 xaf vav hi pt sr br sb128 bk0 sm sn grf256 sys k128";
 
