@@ -1,5 +1,5 @@
 /*
- * Cross-platform shims for CPminer (Windows MSVC + POSIX).
+ * Cross-platform shims for CPPminer (Windows MSVC + POSIX).
  */
 #ifndef CP_PLATFORM_H
 #define CP_PLATFORM_H

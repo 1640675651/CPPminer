@@ -281,6 +281,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 |--------|-----|----------|-----------|
 | UHD 770 | DP4A | 1.4 TH/s | 13 |
 | Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | 3.5 TH/s | 14 |
+| ARC B580 | DPAS | 95 TH/s | 200 |
+| ARC A770 | DPAS | 115 TH/s | 210 |
 
 ### Other GPU (OpenCL)
 | Device | ISA | Tile size | Hashrate |

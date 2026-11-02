@@ -309,7 +309,7 @@ fn dispatch_2d(num_wg: u32) -> (u32, u32, i32) {
     (wg_x, wg_y, wg_x as i32)
 }
 
-/// Max workgroups per submit 鈥?Windows TDR is ~2s; iGPU prepack must stay under that.
+/// Max workgroups per submit. Windows TDR is ~2s; iGPU prepack must stay under that.
 fn max_wg_per_submit(device_type: wgpu::DeviceType) -> u32 {
     match device_type {
         wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu => 2048,

@@ -1,7 +1,4 @@
-﻿/*
- * CPminer 鈥?cross-platform LuckyPool plain_proof miner (CPU / CUDA / 鈥?.
- */
-#include "cp_config.h"
+﻿#include "cp_config.h"
 #include "cp_algo.h"
 #include "cp_fee.h"
 #include "cp_mine.h"
@@ -46,7 +43,7 @@
 
 static void print_usage(void)
 {
-    printf("CPminer - multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("CPPminer - multi-algo LuckyPool miner (pearl / quantus)\n");
     printf("  --algo NAME        pearl (default) or quantus\n");
     {
         char pb[64], qb[64];
@@ -58,7 +55,7 @@ static void print_usage(void)
     printf("  --pool URI         stratum+tcp://host:port (required for quantus unless --mock)\n");
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
-    printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
+    printf("  --agent NAME       agent string (default: cppminer/0.5)\n");
     printf("  --pool-pass STR    mining.authorize password (default: x); Kryptex custom\n");
     printf("                     share difficulty: d=N (default d=2097152)\n");
     printf("  --backend NAME     cpu");

@@ -1,6 +1,6 @@
 # Plain proof: noise and proof dependency chains
 
-This document describes how CPminer derives **pearl noise** for mining scans and what data is required to build a **plain_proof** share. It mirrors the reference logic in `src/common/cp_noise.c` and `rust/cp-proof-ffi` (zk-pow–compatible).
+This document describes how CPPminer derives **pearl noise** for mining scans and what data is required to build a **plain_proof** share. It mirrors the reference logic in `src/common/cp_noise.c` and `rust/cp-proof-ffi` (zk-pow–compatible).
 
 Production dimensions (unless `--m`/`--n`): `m = n = 131072`, `k = 4096`, `rank r = 256`.
 
@@ -29,7 +29,7 @@ Signal matrices are the **unnoised** A and B^T the miner used for the attempt (n
 
 Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix generation). Zero is valid.
 
-**How CPminer fills them:**
+**How CPPminer fills them:**
 
 | Backend | Signal A / B^T source | Proof on share |
 |---------|------------------------|----------------|
@@ -37,7 +37,7 @@ Each entry must be in `[-64, 63]` (same range zk-pow uses for random matrix gene
 | **CPU** (default) | Zero signal `B^T`; A zeroed at launch, one random row written per attempt (`pearl_fill_random_a_row`, seeded from **CSPRNG**, not header/nonce) | No host B^T (`cp_proof_build(bt = NULL)`, zero-B sub-roots cached per job), sparse `h_Ap_global` |
 | **OpenCL** (default) | Same zero-B strategy; A seed from **CSPRNG** (`cp_random_bytes`) into GPU `ocl_gen_random_matrix` | `cp_proof_build_witness`: D2H A sub-roots + tile blocks of `d_A_sig_`; B^T from zero sub-roots cached per job; no host A/B matrices |
 
-The zk-pow reference miner (`third_party/zk-pow/src/ffi/mine.rs`) also uses independent random A/B per attempt. `pearl_generate_ab()` is a **CPminer CPU convenience**, not a protocol rule.
+The zk-pow reference miner (`third_party/zk-pow/src/ffi/mine.rs`) also uses independent random A/B per attempt. `pearl_generate_ab()` is a **CPPminer CPU convenience**, not a protocol rule.
 
 ### Signal matrix hashes
 
@@ -55,7 +55,7 @@ b_noise_seed = BLAKE3(job_key || hash_b)
 a_noise_seed = BLAKE3(b_noise_seed || hash_a)
 ```
 
-In zk-pow notation: `(b_noise_seed, a_noise_seed)` is the **commitment hash** pair. MoE jobs replace `hash_a` with `hash_activations` (routing-dependent); CPminer’s plain path uses the standard chain above.
+In zk-pow notation: `(b_noise_seed, a_noise_seed)` is the **commitment hash** pair. MoE jobs replace `hash_a` with `hash_activations` (routing-dependent); CPPminer’s plain path uses the standard chain above.
 
 **Implication:** `E_AL`, `E_AR`, `E_BL`, and `E_BR` are **not** functions of `job_key` alone. They depend on `job_key` **and** the committed signal matrices (via `hash_a` / `hash_b`). A new random A (CUDA) or a new `ab_seed` (CPU) → new hashes → new noise.
 
@@ -79,7 +79,7 @@ Jackpot verification recomputes the same noise from **proof strips + job_key** (
 
 ### Fixed labels and constants
 
-| Constant | CPminer (`cp_noise.c`) | Role |
+| Constant | CPPminer (`cp_noise.c`) | Role |
 |----------|--------------------------|------|
 | `PEARL_SEED_LABEL_A` | `"A_tensor"` (32-byte padded) | Domain separator for A-side noise PRF |
 | `PEARL_SEED_LABEL_B` | `"B_tensor"` | Domain separator for B-side noise PRF |
@@ -88,7 +88,7 @@ Jackpot verification recomputes the same noise from **proof strips + job_key** (
 | `k` | `4096` | Dot-product length |
 | `rank` | `256` | Width of uniform blocks; inner-hash period |
 
-Vendored `third_party/zk-pow` uses `ZERO_POINT_TRANSLATION = 32` (`[-32, 31]` uniform range). CPminer and CUDA use `ZERO_PT = 16`. Pool verify must use the same convention as the miner.
+Vendored `third_party/zk-pow` uses `ZERO_POINT_TRANSLATION = 32` (`[-32, 31]` uniform range). CPPminer and CUDA use `ZERO_PT = 16`. Pool verify must use the same convention as the miner.
 
 `ZERO_PT` is **not** in `MiningConfiguration`; it is a hardcoded implementation constant.
 
@@ -165,7 +165,7 @@ noisy[l] = (int8_t)((int32_t)signal[l] + (int32_t)noise[l]);
 
 (`pearl_fuse_noise_row_a` / `_b`.)
 
-### Value ranges (CPminer `ZERO_PT = 16`)
+### Value ranges (CPPminer `ZERO_PT = 16`)
 
 | Quantity | Range |
 |----------|--------|
@@ -181,7 +181,7 @@ Protocol MMA type is `Int7xInt7ToInt32` (7-bit signed operands in the proof); sc
 
 Noise sampling is fixed by the protocol (`ZERO_PT`, `RANGE_MASK`, permutation structure) — miners cannot widen or narrow it via `MiningConfiguration`.
 
-**Noisy operand magnitudes** (CPminer `ZERO_PT = 16`):
+**Noisy operand magnitudes** (CPPminer `ZERO_PT = 16`):
 
 | Matrix | Signal | Noise (typical) | Noisy (signal + noise) |
 |--------|--------|-----------------|-------------------------|

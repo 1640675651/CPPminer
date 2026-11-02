@@ -242,7 +242,7 @@ public:
 
     /* Case 9 only: reuse Mma + inline XOR. kInlineXor and kReuseMma must be true. */
     static_assert(kInlineXor && kReuseMmaAcrossMilestones,
-                  "CPminer fused path requires Case 9 (inline XOR + reuse Mma)");
+                  "CPPminer fused path requires Case 9 (inline XOR + reuse Mma)");
 
     Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
 

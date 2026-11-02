@@ -1,6 +1,6 @@
 // Case 10: ONE continuous main loop with XOR at milestone boundaries.
 // Uses MmaMilestone::inline_operator() (skip residue-first, in-order K).
-// CPminer: jackpot fold in the XOR callback; optional tile-xor store.
+// CPPminer: jackpot fold in the XOR callback; optional tile-xor store.
 #pragma once
 
 #include "cp_cutlass_jackpot.cuh"

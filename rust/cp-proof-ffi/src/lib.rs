@@ -1,4 +1,4 @@
-//! Build plain_proof base64 for CPminer (stock pearl-blake3 + zk-pow-compatible bincode).
+//! Build plain_proof base64 for CPPminer (stock pearl-blake3 + zk-pow-compatible bincode).
 
 mod mining_config;
 mod verify;
