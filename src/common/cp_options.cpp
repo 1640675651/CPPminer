@@ -1,13 +1,21 @@
 #include "cp_options.h"
 #include "cp_algo.h"
+#include "cp_cli.h"
 #include "cp_config.h"
 #include "cp_diagnostics.h"
 #include "cp_state.h"
 #include "cp_worker.h"
 
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+#include "cp_onednn_worker.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <stdexcept>
+#include <string>
 
 static void print_usage(void)
 {
@@ -182,64 +190,66 @@ static void print_usage(void)
     printf("                       overrides it. Threads fill physical cores first\n");
 }
 
-int cp_options_parse(int argc, char** argv, CpOptions* o)
+/* --ocl-tile / --wgpu-tile: MxN register tile, optionally followed by a /MxN macro block. */
+[[maybe_unused]] static void parse_tile(const char* v, int* tile_mr, int* tile_nr,
+                                        int* macro_m, int* macro_n)
 {
-    int simd_env_invalid = 0;
-    {
-        const char* env = getenv("CP_SIMD");
-        if(!env) env = getenv("CASE33_ISA");
-        if(env){
-            if(!strcmp(env, "avx512vnni") || !strcmp(env, "avx512-vnni"))
-                o->simd_isa = CP_SIMD_AVX512VNNI;
-            else if(!strcmp(env, "avx512") || !strcmp(env, "avx512bw") ||
-                    !strcmp(env, "avx512-bw"))
-                o->simd_isa = CP_SIMD_AVX512BW;
-            else if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
-                o->simd_isa = CP_SIMD_AVXVNNI;
-            else if(!strcmp(env, "avx2")) o->simd_isa = CP_SIMD_AVX2;
-            else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
-                o->simd_isa = CP_SIMD_SSE;
-            else if(!strcmp(env, "i8mm")) o->simd_isa = CP_SIMD_I8MM;
-            else if(!strcmp(env, "dotprod")) o->simd_isa = CP_SIMD_DOTPROD;
-            else if(!strcmp(env, "neon")) o->simd_isa = CP_SIMD_NEON;
-            else if(!strcmp(env, "scalar")) o->simd_isa = CP_SIMD_SCALAR;
-            else if(!strcmp(env, "hybrid")) o->simd_isa = CP_SIMD_HYBRID;
-            else if(!strcmp(env, "auto")) o->simd_isa = CP_SIMD_AUTO;
-            else {
-                fprintf(stderr, "unknown CP_SIMD/CASE33_ISA value %s\n", env);
-                simd_env_invalid = 1;
-            }
-        }
+    int mr = 0, nr = 0, mm = 0, mn = 0;
+    int nfields;
+    try {
+        nfields = cp_cli_dimensions(v, &mr, &nr, &mm, &mn);
+    } catch(const std::invalid_argument&) {
+        throw std::invalid_argument(std::string("expected 4x4, 4x8, 8x8, 8x16, or MxN/64x64|128x128, got \"") +
+                                    v + "\"");
     }
+    if(!((mr == 4 && (nr == 4 || nr == 8)) || (mr == 8 && (nr == 8 || nr == 16))))
+        throw std::invalid_argument(std::string("expected a 4x4, 4x8, 8x8, or 8x16 tile, got \"") + v + "\"");
+    if(nfields == 4 && !((mm == 64 && mn == 64) || (mm == 128 && mn == 128)))
+        throw std::invalid_argument(std::string("expected a 64x64 or 128x128 macro, got \"") + v + "\"");
+    *tile_mr = mr;
+    *tile_nr = nr;
+    if(nfields == 4){
+        *macro_m = mm;
+        *macro_n = mn;
+    }
+}
 
-    if(simd_env_invalid)
-        return 1;
+/* --ocl-macro / --wgpu-macro: 64x64 or 128x128. */
+[[maybe_unused]] static void parse_macro(const char* v, int* macro_m, int* macro_n)
+{
+    int mm = 0, mn = 0;
+    try {
+        cp_cli_dimensions(v, &mm, &mn);
+    } catch(const std::invalid_argument&) {
+        mm = mn = 0;
+    }
+    if(!((mm == 64 && mn == 64) || (mm == 128 && mn == 128)))
+        throw std::invalid_argument(std::string("expected 64x64 or 128x128, got \"") + v + "\"");
+    *macro_m = mm;
+    *macro_n = mn;
+}
 
+/* The argv loop of cp_options_parse; option is the option being parsed, for error messages.
+ * Returns -1 to continue, else the exit status. */
+static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
+{
     for(int i = 1; i < argc; i++){
-        if(!strcmp(argv[i], "--pool") && i + 1 < argc){
-            const char* u = argv[++i];
-            const char* h = strstr(u, "://");
-            if(h){
-                h += 3;
-                const char* colon = strchr(h, ':');
-                if(colon){
-                    int hlen = (int)(colon - h);
-                    static char hbuf[256];
-                    strncpy(hbuf, h, hlen); hbuf[hlen] = 0;
-                    o->pool_host = hbuf;
-                    o->pool_port = atoi(colon + 1);
-                    o->pool_specified = 1;
-                }
-            }
-        } else if(!strcmp(argv[i], "--algo") && i + 1 < argc){
-            if(cp_algo_parse(argv[++i], &o->algo_sel) != 0){
-                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", argv[i]);
+        option = cp_cli_option_name(argv[i]);
+        if(cp_cli_option(argv[i], "--pool")){
+            static char hbuf[256];
+            o->pool_port = cp_cli_pool_uri(cp_cli_value(argc, argv, i), hbuf, sizeof(hbuf));
+            o->pool_host = hbuf;
+            o->pool_specified = 1;
+        } else if(cp_cli_option(argv[i], "--algo")){
+            const char* algo = cp_cli_value(argc, argv, i);
+            if(cp_algo_parse(algo, &o->algo_sel) != 0){
+                fprintf(stderr, "unknown --algo %s (want pearl|quantus)\n", algo);
                 return 1;
             }
-        } else if(!strcmp(argv[i], "--wallet") && i + 1 < argc){
-            o->wallet = argv[++i];
-        } else if(!strcmp(argv[i], "--backend") && i + 1 < argc){
-            const char* b = argv[++i];
+        } else if(cp_cli_option(argv[i], "--wallet")){
+            o->wallet = cp_cli_value(argc, argv, i, sizeof(wallet_global));
+        } else if(cp_cli_option(argv[i], "--backend")){
+            const char* b = cp_cli_value(argc, argv, i);
             if(!strcmp(b, "cpu")) o->backend_sel = CP_BACKEND_CPU;
             else if(!strcmp(b, "cuda")) o->backend_sel = CP_BACKEND_CUDA;
             else if(!strcmp(b, "opencl")) o->backend_sel = CP_BACKEND_OPENCL;
@@ -251,79 +261,37 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                 fprintf(stderr, "unknown --backend %s\n", b);
                 return 1;
             }
-        } else if((!strcmp(argv[i], "--device") || !strcmp(argv[i], "--devices")) && i + 1 < argc){
-            const char* s = argv[++i];
-            char tmp[256];
-            strncpy(tmp, s, 255); tmp[255] = 0;
-            char* tok = strtok(tmp, ",");
-            while(tok && o->ndev < MAX_GPUS){ o->devs[o->ndev++] = atoi(tok); tok = strtok(NULL, ","); }
+        } else if(cp_cli_option(argv[i], "--device") || cp_cli_option(argv[i], "--devices")){
+            cp_cli_devices(cp_cli_value(argc, argv, i), o->devs, o->ndev, MAX_GPUS);
             o->devices_specified = 1;
         } else if(!strcmp(argv[i], "--list-devices")){
             o->list_devices = 1;
-#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-        } else if(!strcmp(argv[i], "--ocl-platform") && i + 1 < argc){
-            o->ocl_platform = atoi(argv[++i]);
-        } else if(!strncmp(argv[i], "--ocl-tile", 10)){
-            const char* v = argv[i] + 10;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-tile requires MxN or MxN/MACROMxMACRON "
-                                "(e.g. 4x8, 4x8/64x64)\n");
-                return 1;
-            }
-            int tile_macro_m = 0, tile_macro_n = 0;
-            const int nfields = sscanf(v, "%dx%d/%dx%d", &o->ocl_tile_mr, &o->ocl_tile_nr,
-                                       &tile_macro_m, &tile_macro_n);
-            if(nfields == 2){
-                /* tile only */
-            } else if(nfields == 4){
-                o->ocl_macro_m = tile_macro_m;
-                o->ocl_macro_n = tile_macro_n;
+#if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
+        } else if(cp_cli_option(argv[i], "--ocl-platform")){
+            o->ocl_platform = cp_cli_int(cp_cli_value(argc, argv, i));
+        } else if(cp_cli_option(argv[i], "--ocl-throttle")){
+            const char* v = cp_cli_value(argc, argv, i);
+            if(!strcmp(v, "low")){
+                o->ocl_throttle = 3;
+            } else if(!strcmp(v, "med") || !strcmp(v, "medium")){
+                o->ocl_throttle = 2;
+            } else if(!strcmp(v, "high")){
+                o->ocl_throttle = 1;
+            } else if(!strcmp(v, "off") || !strcmp(v, "none")){
+                o->ocl_throttle = 0;
             } else {
-                fprintf(stderr,
-                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
-                        "or MxN/64x64|128x128)\n",
-                        v);
+                fprintf(stderr, "invalid --ocl-throttle %s (expected low, med, high, or off)\n", v);
                 return 1;
             }
-            if(!((o->ocl_tile_mr == 4 && (o->ocl_tile_nr == 4 || o->ocl_tile_nr == 8)) ||
-                 (o->ocl_tile_mr == 8 && (o->ocl_tile_nr == 8 || o->ocl_tile_nr == 16)))){
-                fprintf(stderr,
-                        "invalid --ocl-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
-                return 1;
-            }
-            if(nfields == 4 &&
-               !((o->ocl_macro_m == 64 && o->ocl_macro_n == 64) ||
-                 (o->ocl_macro_m == 128 && o->ocl_macro_n == 128))){
-                fprintf(stderr,
-                        "invalid --ocl-tile macro in %s (expected 64x64 or 128x128)\n",
-                        v);
-                return 1;
-            }
-        } else if(!strncmp(argv[i], "--ocl-macro", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-macro requires MxN (64x64 or 128x128)\n");
-                return 1;
-            }
-            if(sscanf(v, "%dx%d", &o->ocl_macro_m, &o->ocl_macro_n) != 2 ||
-               !((o->ocl_macro_m == 64 && o->ocl_macro_n == 64) ||
-                 (o->ocl_macro_m == 128 && o->ocl_macro_n == 128))){
-                fprintf(stderr,
-                        "invalid --ocl-macro %s (expected 64x64 or 128x128)\n", v);
-                return 1;
-            }
-        } else if(!strncmp(argv[i], "--ocl-issue", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-issue requires auto, broadcast, or packed\n");
-                return 1;
-            }
+#endif
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+        } else if(cp_cli_option(argv[i], "--ocl-tile")){
+            parse_tile(cp_cli_value(argc, argv, i), &o->ocl_tile_mr, &o->ocl_tile_nr,
+                       &o->ocl_macro_m, &o->ocl_macro_n);
+        } else if(cp_cli_option(argv[i], "--ocl-macro")){
+            parse_macro(cp_cli_value(argc, argv, i), &o->ocl_macro_m, &o->ocl_macro_n);
+        } else if(cp_cli_option(argv[i], "--ocl-issue")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "auto")){
                 o->ocl_issue_mode = 0;
             } else if(!strcmp(v, "broadcast")){
@@ -334,14 +302,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                 fprintf(stderr, "invalid --ocl-issue %s (expected auto, broadcast, or packed)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-dot", 9)){
-            const char* v = argv[i] + 9;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-dot requires auto, sudot, sdot4, khr, force-khr, asm, or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-dot")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "auto")){
                 o->ocl_dot_policy = 0;
             } else if(!strcmp(v, "force-khr") || !strcmp(v, "force")){
@@ -362,14 +324,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                         v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-cpm-type", 14)){
-            const char* v = argv[i] + 14;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-cpm-type requires auto, float, int, or mad24\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-cpm-type")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "auto")){
                 o->ocl_cpm_type = 0;
             } else if(!strcmp(v, "float") || !strcmp(v, "fp32")){
@@ -383,34 +339,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                         "invalid --ocl-cpm-type %s (expected auto, float, int, or mad24)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-throttle", 14)){
-            const char* v = argv[i] + 14;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-throttle requires low, med, high, or off\n");
-                return 1;
-            }
-            if(!strcmp(v, "low")){
-                o->ocl_throttle = 3;
-            } else if(!strcmp(v, "med") || !strcmp(v, "medium")){
-                o->ocl_throttle = 2;
-            } else if(!strcmp(v, "high")){
-                o->ocl_throttle = 1;
-            } else if(!strcmp(v, "off") || !strcmp(v, "none")){
-                o->ocl_throttle = 0;
-            } else {
-                fprintf(stderr, "invalid --ocl-throttle %s (expected low, med, high, or off)\n", v);
-                return 1;
-            }
-        } else if(!strncmp(argv[i], "--ocl-lds", 9)){
-            const char* v = argv[i] + 9;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-lds requires on or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-lds")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
                 o->ocl_lds = 1;
             } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
@@ -419,14 +349,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                 fprintf(stderr, "invalid --ocl-lds %s (expected on or off)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--ocl-double-buff", 17)){
-            const char* v = argv[i] + 17;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--ocl-double-buff requires on or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--ocl-double-buff")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
                 o->ocl_double_buff = 1;
             } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
@@ -437,14 +361,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
             }
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
-        } else if(!strncmp(argv[i], "--wgpu-lds", 10)){
-            const char* v = argv[i] + 10;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-lds requires on or off\n");
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--wgpu-lds")){
+            const char* v = cp_cli_value(argc, argv, i);
             if(!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true")){
                 o->wgpu_lds = 1;
             } else if(!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false")){
@@ -453,92 +371,24 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                 fprintf(stderr, "invalid --wgpu-lds %s (expected on or off)\n", v);
                 return 1;
             }
-        } else if(!strncmp(argv[i], "--wgpu-tile", 11)){
-            const char* v = argv[i] + 11;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-tile requires MxN or MxN/MACROMxMACRON "
-                                "(e.g. 4x8, 4x8/64x64)\n");
-                return 1;
-            }
-            int tile_macro_m = 0, tile_macro_n = 0;
-            const int nfields = sscanf(v, "%dx%d/%dx%d", &o->wgpu_tile_mr, &o->wgpu_tile_nr,
-                                       &tile_macro_m, &tile_macro_n);
-            if(nfields != 2 && nfields != 4){
-                fprintf(stderr,
-                        "invalid --wgpu-tile %s (expected 4x4, 4x8, 8x8, 8x16, "
-                        "or MxN/64x64|128x128)\n",
-                        v);
-                return 1;
-            }
-            if(!((o->wgpu_tile_mr == 4 && (o->wgpu_tile_nr == 4 || o->wgpu_tile_nr == 8)) ||
-                 (o->wgpu_tile_mr == 8 && (o->wgpu_tile_nr == 8 || o->wgpu_tile_nr == 16)))){
-                fprintf(stderr,
-                        "invalid --wgpu-tile %s (expected 4x4, 4x8, 8x8, or 8x16)\n", v);
-                return 1;
-            }
-            if(nfields == 4){
-                if(!((tile_macro_m == 64 && tile_macro_n == 64) ||
-                     (tile_macro_m == 128 && tile_macro_n == 128))){
-                    fprintf(stderr,
-                            "invalid --wgpu-tile macro in %s (expected 64x64 or 128x128)\n",
-                            v);
-                    return 1;
-                }
-                o->wgpu_macro_m = tile_macro_m;
-                o->wgpu_macro_n = tile_macro_n;
-            }
-        } else if(!strncmp(argv[i], "--wgpu-macro", 12)){
-            const char* v = argv[i] + 12;
-            if(*v == '=') v++;
-            else if(*v == '\0' && i + 1 < argc) v = argv[++i];
-            else {
-                fprintf(stderr, "--wgpu-macro requires MxN (64x64 or 128x128)\n");
-                return 1;
-            }
-            if(sscanf(v, "%dx%d", &o->wgpu_macro_m, &o->wgpu_macro_n) != 2 ||
-               !((o->wgpu_macro_m == 64 && o->wgpu_macro_n == 64) ||
-                 (o->wgpu_macro_m == 128 && o->wgpu_macro_n == 128))){
-                fprintf(stderr,
-                        "invalid --wgpu-macro %s (expected 64x64 or 128x128)\n", v);
-                return 1;
-            }
+        } else if(cp_cli_option(argv[i], "--wgpu-tile")){
+            parse_tile(cp_cli_value(argc, argv, i), &o->wgpu_tile_mr, &o->wgpu_tile_nr,
+                       &o->wgpu_macro_m, &o->wgpu_macro_n);
+        } else if(cp_cli_option(argv[i], "--wgpu-macro")){
+            parse_macro(cp_cli_value(argc, argv, i), &o->wgpu_macro_m, &o->wgpu_macro_n);
 #endif
-        } else if(!strcmp(argv[i], "--m") || !strncmp(argv[i], "--m=", 4) ||
-                  !strcmp(argv[i], "--n") || !strncmp(argv[i], "--n=", 4)){
-            const int is_m = argv[i][2] == 'm';
-            const char* v = argv[i][3] == '=' ? argv[i] + 4 : (i + 1 < argc ? argv[++i] : NULL);
-            char* end = NULL;
-            const long units = v ? strtol(v, &end, 10) : 0;
-            if(!v || end == v || *end || units < 1 || units > CP_MATRIX_UNITS_MAX){
-                fprintf(stderr, "%s requires 1..%d (units of %d)\n", is_m ? "--m" : "--n",
-                        CP_MATRIX_UNITS_MAX, CP_MATRIX_UNIT);
-                return 1;
-            }
-            if(is_m) o->m_units = (int)units;
-            else o->n_units = (int)units;
+        } else if(cp_cli_option(argv[i], "--m") || cp_cli_option(argv[i], "--n")){
+            const int units = cp_cli_int(cp_cli_value(argc, argv, i), 1, CP_MATRIX_UNITS_MAX);
+            if(option == "--m") o->m_units = units;
+            else o->n_units = units;
         } else if(!strcmp(argv[i], "--no-period-gemm")){
             o->no_period_gemm = 1;
-        } else if(!strncmp(argv[i], "--batch-size", 12)){
-            const char* v = argv[i] + 12;
-            if(*v == '=') o->batch_size = atoi(v + 1);
-            else if(i + 1 < argc) o->batch_size = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--batch-size") || cp_cli_option(argv[i], "--period-batch") ||
+                  cp_cli_option(argv[i], "--col-period-batch")){
+            o->batch_size = cp_cli_int(cp_cli_value(argc, argv, i), 1);
             o->batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--period-batch", 14)){
-            const char* v = argv[i] + 14;
-            if(*v == '=') o->batch_size = atoi(v + 1);
-            else if(i + 1 < argc) o->batch_size = atoi(argv[++i]);
-            o->batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--col-period-batch", 18)){
-            const char* v = argv[i] + 18;
-            if(*v == '=') o->batch_size = atoi(v + 1);
-            else if(i + 1 < argc) o->batch_size = atoi(argv[++i]);
-            o->batch_size_set = 1;
-        } else if(!strncmp(argv[i], "--row-period-batch", 18)){
-            const char* v = argv[i] + 18;
-            if(*v == '=') o->row_period_batch = atoi(v + 1);
-            else if(i + 1 < argc) o->row_period_batch = atoi(argv[++i]);
+        } else if(cp_cli_option(argv[i], "--row-period-batch")){
+            o->row_period_batch = cp_cli_int(cp_cli_value(argc, argv, i), 1);
             o->row_period_batch_set = 1;
         } else if(!strcmp(argv[i], "--row-major-ap")){
             o->step_major_ap = 0;
@@ -561,18 +411,19 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
             o->fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
             o->fused_jackpot = 0;
-        } else if(!strcmp(argv[i], "--onednn-layout")){
-            if(i + 1 >= argc){
-                fprintf(stderr, "--onednn-layout requires TN, TT, NT, or NN\n");
-                return 1;
-            }
-            o->onednn_layout = argv[++i];
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+        } else if(cp_cli_option(argv[i], "--onednn-layout")){
+            o->onednn_layout = cp_cli_value(argc, argv, i);
+            if(!cp_onednn_worker_gemm_layout_valid(o->onednn_layout))
+                throw std::invalid_argument(std::string("expected TN, TT, NT, or NN, got \"") +
+                                            o->onednn_layout + "\"");
+#endif
         } else if(!strcmp(argv[i], "--cpu-gen")){
             g_cpu_matrix_gen = 1;
         } else if(!strcmp(argv[i], "--inplace-prepack")){
             o->prepack_mode = CP_PREPACK_REUSE;
-        } else if(!strcmp(argv[i], "--prepack") && i + 1 < argc){
-            const char* mode = argv[++i];
+        } else if(cp_cli_option(argv[i], "--prepack")){
+            const char* mode = cp_cli_value(argc, argv, i);
             if(!strcmp(mode, "separate"))
                 o->prepack_mode = CP_PREPACK_SEPARATE;
             else if(!strcmp(mode, "reuse") || !strcmp(mode, "inplace"))
@@ -583,8 +434,8 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
                 fprintf(stderr, "unknown --prepack mode %s (separate|reuse|fused)\n", mode);
                 return 1;
             }
-        } else if(!strcmp(argv[i], "--simd") && i + 1 < argc){
-            const char* isa = argv[++i];
+        } else if(cp_cli_option(argv[i], "--simd")){
+            const char* isa = cp_cli_value(argc, argv, i);
             if(!strcmp(isa, "auto"))
                 o->simd_isa = CP_SIMD_AUTO;
             else if(!strcmp(isa, "avx512vnni") || !strcmp(isa, "avx512-vnni"))
@@ -619,67 +470,97 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
             o->simd_test = 1;
         } else if(!strcmp(argv[i], "--prepack-test")){
             o->prepack_test = 1;
-        } else if(!strcmp(argv[i], "--max-nonce") && i + 1 < argc){
-            g_max_nonce = atoi(argv[++i]);
-        } else if(!strcmp(argv[i], "--worker") && i + 1 < argc){
-            strncpy(worker_global, argv[++i], sizeof(worker_global) - 1);
-            worker_global[sizeof(worker_global) - 1] = 0;
-        } else if(!strcmp(argv[i], "--agent") && i + 1 < argc){
-            strncpy(agent_global, argv[++i], sizeof(agent_global) - 1);
-            agent_global[sizeof(agent_global) - 1] = 0;
-        } else if(!strcmp(argv[i], "--pool-pass") && i + 1 < argc){
-            strncpy(pool_pass_global, argv[++i], sizeof(pool_pass_global) - 1);
-            pool_pass_global[sizeof(pool_pass_global) - 1] = 0;
+        } else if(cp_cli_option(argv[i], "--max-nonce")){
+            g_max_nonce = cp_cli_int(cp_cli_value(argc, argv, i));
+        } else if(cp_cli_option(argv[i], "--worker")){
+            cp_cli_string(argc, argv, i, worker_global, sizeof(worker_global));
+        } else if(cp_cli_option(argv[i], "--agent")){
+            cp_cli_string(argc, argv, i, agent_global, sizeof(agent_global));
+        } else if(cp_cli_option(argv[i], "--pool-pass")){
+            cp_cli_string(argc, argv, i, pool_pass_global, sizeof(pool_pass_global));
         } else if(!strcmp(argv[i], "--dry-run")){
             g_dry_run = 1;
         } else if(!strcmp(argv[i], "--verify")){
             g_plain_verify = 1;
-        } else if(!strcmp(argv[i], "--cert-version") && i + 1 < argc){
-            int v = atoi(argv[++i]);
-            if(v < 1 || v > 3){
-                fprintf(stderr, "--cert-version must be 1, 2, or 3 (got %d)\n", v);
-                return 1;
-            }
-            g_cert_version = (uint32_t)v;
+        } else if(cp_cli_option(argv[i], "--cert-version")){
+            g_cert_version = (uint32_t)cp_cli_int(cp_cli_value(argc, argv, i), 1, 3);
             g_cert_version_forced = 1;
         } else if(!strcmp(argv[i], "--mock") || !strcmp(argv[i], "-mock")){
             g_mock = 1;
-        } else if(!strcmp(argv[i], "--mock-diff") && i + 1 < argc){
-            g_mock_diff = atof(argv[++i]);
-            if(g_mock_diff < 1.0) g_mock_diff = 1.0;
+        } else if(cp_cli_option(argv[i], "--mock-diff")){
+            g_mock_diff = cp_cli_real(cp_cli_value(argc, argv, i), 1.0);
             g_mock_diff_forced = 1;
         } else if(!strcmp(argv[i], "--align-test")){
             o->align_test = 1;
         } else if(!strcmp(argv[i], "--align-test-prod")){
             o->align_test = 1;
             o->align_test_prod = 1;
-        } else if(!strncmp(argv[i], "--profile-scan", 14)){
+        } else if(cp_cli_option(argv[i], "--profile-scan")){
+            /* Optional count: --profile-scan=N, or a next argument that is not an option. */
             o->profile_scan = 1;
-            const char* v = argv[i] + 14;
-            if(*v == '=') o->profile_runs = atoi(v + 1);
-            else if(i + 1 < argc && argv[i + 1][0] != '-')
-                o->profile_runs = atoi(argv[++i]);
-            if(o->profile_runs < 1) o->profile_runs = 1;
-#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
-        } else if(!strncmp(argv[i], "--profile-prep", 14)){
+            if(strchr(argv[i], '=') || (i + 1 < argc && argv[i + 1][0] != '-'))
+                o->profile_runs = cp_cli_int(cp_cli_value(argc, argv, i), 1);
+        } else if(cp_cli_option(argv[i], "--profile-prep")){
             o->profile_prep = 1;
-            const char* v = argv[i] + 14;
-            if(*v == '=') o->profile_prep_runs = atoi(v + 1);
-            else if(i + 1 < argc && argv[i + 1][0] != '-')
-                o->profile_prep_runs = atoi(argv[++i]);
-            if(o->profile_prep_runs < 1) o->profile_prep_runs = 1;
-#endif
+            if(strchr(argv[i], '=') || (i + 1 < argc && argv[i + 1][0] != '-'))
+                o->profile_prep_runs = cp_cli_int(cp_cli_value(argc, argv, i), 1);
         } else if(!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")){
             print_usage();
             return 0;
-        } else if(!strcmp(argv[i], "--threads") && i + 1 < argc){
-            int n = atoi(argv[++i]);
-            if(n < 0) n = 0;
+        } else if(cp_cli_option(argv[i], "--threads")){
+            const int n = cp_cli_int(cp_cli_value(argc, argv, i));
             g_qpow_threads = n;
             g_cpu_threads = n;
         } else if(!strcmp(argv[i], "--qpow-selftest")){
             return cp_qpow_selftest();
+        } else {
+            fprintf(stderr, "unknown option: %s\n", option.c_str());
+            return 1;
         }
+    }
+    return -1;
+}
+
+int cp_options_parse(int argc, char** argv, CpOptions* o)
+{
+    int simd_env_invalid = 0;
+    {
+        const char* env = getenv("CP_SIMD");
+        if(!env) env = getenv("CASE33_ISA");
+        if(env){
+            if(!strcmp(env, "avx512vnni") || !strcmp(env, "avx512-vnni"))
+                o->simd_isa = CP_SIMD_AVX512VNNI;
+            else if(!strcmp(env, "avx512") || !strcmp(env, "avx512bw") ||
+                    !strcmp(env, "avx512-bw"))
+                o->simd_isa = CP_SIMD_AVX512BW;
+            else if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
+                o->simd_isa = CP_SIMD_AVXVNNI;
+            else if(!strcmp(env, "avx2")) o->simd_isa = CP_SIMD_AVX2;
+            else if(!strcmp(env, "sse") || !strcmp(env, "ssse3"))
+                o->simd_isa = CP_SIMD_SSE;
+            else if(!strcmp(env, "i8mm")) o->simd_isa = CP_SIMD_I8MM;
+            else if(!strcmp(env, "dotprod")) o->simd_isa = CP_SIMD_DOTPROD;
+            else if(!strcmp(env, "neon")) o->simd_isa = CP_SIMD_NEON;
+            else if(!strcmp(env, "scalar")) o->simd_isa = CP_SIMD_SCALAR;
+            else if(!strcmp(env, "hybrid")) o->simd_isa = CP_SIMD_HYBRID;
+            else if(!strcmp(env, "auto")) o->simd_isa = CP_SIMD_AUTO;
+            else {
+                fprintf(stderr, "unknown CP_SIMD/CASE33_ISA value %s\n", env);
+                simd_env_invalid = 1;
+            }
+        }
+    }
+
+    if(simd_env_invalid)
+        return 1;
+
+    std::string option;
+    try {
+        const int rc = parse_argv(argc, argv, o, option);
+        if(rc >= 0) return rc;
+    } catch(const std::invalid_argument& error){
+        fprintf(stderr, "invalid command line %s: %s\n", option.c_str(), error.what());
+        return 1;
     }
 
     {

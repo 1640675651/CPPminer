@@ -22,6 +22,8 @@ void cp_onednn_worker_set_fused_jackpot(int on);
 /* Jackpot mode actually in use after init (1 fused, 0 separate; Xe2 is always separate). */
 int cp_onednn_worker_fused_jackpot(void);
 void cp_onednn_worker_set_gemm_layout(const char *name);
+/* 1 when set_gemm_layout accepts name (TN, TT, NT, NN in either case, or the legacy TNN forms). */
+int cp_onednn_worker_gemm_layout_valid(const char *name);
 void cp_onednn_worker_set_platform(int platform_index);
 int cp_onednn_worker_list_devices(void);
 int cp_onednn_worker_handles_matrix_prep(void);

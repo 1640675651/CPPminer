@@ -256,6 +256,12 @@ extern "C" void cp_onednn_worker_set_gemm_layout(const char *name) {
     g_gemm_layout_cli = 1;
 }
 
+extern "C" int cp_onednn_worker_gemm_layout_valid(const char *name) {
+    bool a_row = false;
+    bool b_row = false;
+    return case5_ngen::case5_parse_gemm_layout_name(name, a_row, b_row) ? 1 : 0;
+}
+
 static void resolve_gemm_layout(void) {
     if (!g_gemm_layout_cli) {
         bool a_row = g_a_row_major;
