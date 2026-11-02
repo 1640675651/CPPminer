@@ -355,6 +355,7 @@ struct GEMMState : public CommonState {
     bool tileXorLineHdrPacked = false;                      // tile-major store: the line addresses are qwords of tileXorLineHdr[0], sent via tileXorStoreHdr
     int tileXorLineBlock = 0;                               // tile-major store: milestones per flushed line (8 or 16)
     ngen::GRFRange tileXorFoldAcc;                          // fold16: 16-word folded message per sub-tile (2 GRFs each)
+    ngen::Subregister tileXorAccSlmOff;                     // Case5.7: this thread's SLM byte base for its message line blocks
     ngen::Subregister tileXorLidFlat;                       // ud flat local thread id (cooperative jackpot)
     bool tileXorCoopJudge = false;                          // cooperative jackpot: found/tr/tc arguments bound
     bool tileXorCoopDigestOut = false;                      // cooperative jackpot: blake3_out argument bound

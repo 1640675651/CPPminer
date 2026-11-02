@@ -64,6 +64,11 @@ constexpr char kPreferredXeHPGInt8XafPackedA[] =
         "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr char kPreferredXeHPGInt8AfPackedA[] =
         "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
+// Case 5.7 on XeHPG: with the fold16 / wrap accumulators in SLM the 16x64 kernel has room for a second
+// register copy of the packed A (`sB32x2`) once the SLM copy of B is single (`cb4`); gemm_xor note.md,
+// *Case 5.7*.
+constexpr char kPreferredXeHPGInt8XafPackedAccSlm[] =
+        "sB32x2 sB32 aB wg 16x2 cb4 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr int kPreferredXeHPGUnrollM = 16;
 constexpr int kPreferredXeHPGUnrollN = 64;
 
@@ -95,6 +100,7 @@ struct FamilyKernel {
     int pack_a_max_k;            // pack A only while K <= this (0 = any K)
     int pack_b_cp;               // 0 = never pack B
     int min_align_a, min_align_b;
+    const char *packed_accslm;          // packed A, Case 5.7 (message blocks in SLM, accumulator GRFs free); nullptr = packed
 };
 
 // UHD 770 (Gen12LP, 32 EUs): kernel.db entry 24, gemmstone's catalog kernel for packed int8 (A and B
@@ -155,7 +161,7 @@ const FamilyKernel kFamilyKernels[] = {
      kXe2Int8Af, nullptr, kXe2Int8AfPackedA, nullptr, 4, 4096, 32, 16, 4},
     {HW::XeHPG, "xehpg-family", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
      kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
-     kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4},
+     kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4, kPreferredXeHPGInt8XafPackedAccSlm},
     {HW::Gen12LP, "gen12lp-family", "UHD 770", false, 16, 32,
      nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1},
     {HW::XeHPG, "xelpg-family", "Xe-LPG 64 EU", false, 32, 32,
@@ -484,7 +490,8 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
                 && problem.B.layout == gemmstone::MatrixLayout::N;
         c.pack_a_cp = fk->pack_a_cp;
         c.pack_b_cp = fk->pack_b_cp;
-        const char *s = c.pack_a ? (useAlt && fk->packed_alt ? fk->packed_alt : fk->packed)
+        const char *s = c.pack_a ? (problem.case5TileXorAccSlm && fk->packed_accslm ? fk->packed_accslm
+                                    : useAlt && fk->packed_alt ? fk->packed_alt : fk->packed)
                                  : (useAlt && fk->plain_alt ? fk->plain_alt : fk->plain);
         // Kernels without a plain-A strategy (the dp4a ones) were measured with both operands packed;
         // anything else falls through to the catalog.

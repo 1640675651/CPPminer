@@ -239,6 +239,7 @@ struct GEMMProblem : public CommonProblem {
     int case5XorSubGridN = 1;                       // Sub-tiles per thread along N
     bool case5TileXorInterleaved = false;           // XMX: fold split across dpas chain boundaries (period 1)
     bool case5TileXorFold16 = false;                // interleaved: write the 16-word folded jackpot message per tile
+    bool case5TileXorAccSlm = false;                // Case5.7: the 16-milestone line blocks go to SLM as they complete and are folded into the message after the k loop (frees the accumulator GRFs)
     int case5XorLayout = 0;                        // tile_xor index: 0 [ms][tile], 1 [thread][ms][sub] (diag), 2 [tile][ms]
 
     // The following data is derived from the postOps and does not need

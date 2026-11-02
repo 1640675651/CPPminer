@@ -580,9 +580,9 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     char layout_name[8] = {};
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
-                  "oneDNN gemmstone %s/%s %s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
+                  "oneDNN gemmstone %s/%s %s%s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
                   "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d apack=%d bpack=%dx%d",
-                  info_.hwName, info_.strategyName, scan_mode, layout_name, info_.unrollM,
+                  info_.hwName, info_.strategyName, scan_mode, info_.xorAccSlm ? "+slmAcc" : "", layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, tile_xor_folded_() ? folded_msg_words_ : 0,
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, info_.slm, info_.aPackRows,

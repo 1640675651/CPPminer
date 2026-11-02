@@ -334,7 +334,7 @@ void Generator<hw>::case5UpdateTileXorSpatialIdFromIds(const GEMMProblem &proble
     if (problem.case5TileXorInterleaved)
         case5InitTileXorPhase(problem, strategy, state, idM, idN);
 
-    if (problem.case5TileXorSlm && state.tileXorLocalId.isValid()) {
+    if ((problem.case5TileXorSlm || problem.case5TileXorAccSlm) && state.tileXorLocalId.isValid()) {
         const int wgM = strategy.wg[LoopM];
         const int wgN = strategy.wg[LoopN];
         auto localM = state.ra.alloc_sub<uint32_t>();
@@ -344,6 +344,17 @@ void Generator<hw>::case5UpdateTileXorSpatialIdFromIds(const GEMMProblem &proble
         emad(1, state.tileXorLocalId, localM, localN, wgM, strategy, state);
         state.ra.safeRelease(localM);
         state.ra.safeRelease(localN);
+        if (problem.case5TileXorAccSlm && state.tileXorAccSlmOff.isValid()) {
+            // Case 5.7: this thread's line blocks start at base + lid * (blocks * sub-tiles * 64 bytes).
+            const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
+            const int nBlocks = std::max(1, problem.case5XorMaxMilestones / 16);
+            mulConstant(1, state.tileXorAccSlmOff, state.tileXorLocalId, nBlocks * nFolds * 64);
+            const uint32_t base = static_cast<uint32_t>(case5TileXorAccSlmByteOffset(hw, problem, strategy));
+            if (base)
+                add(1, state.tileXorAccSlmOff, state.tileXorAccSlmOff, base);
+            if (state.inputs.slmBase.isValid())
+                add(1, state.tileXorAccSlmOff, state.tileXorAccSlmOff, state.inputs.slmBase);
+        }
     }
 }
 
@@ -362,7 +373,7 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
     state.tileXorPanel = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
     // Full GRFs: alloc_sub parents get reused by later ra.alloc() and clobber spat/row/col.
     state.spatialId = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
-    if (problem.case5TileXorSlm)
+    if (problem.case5TileXorSlm || problem.case5TileXorAccSlm)
         state.tileXorLocalId = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
     state.tileXorRow = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
     state.tileXorCol = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
@@ -506,9 +517,16 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         if (ok && (problem.case5TileXorFold16 || wrapAcc)) {
             if (B != 16)
                 throw std::runtime_error("Case5 wrap/fold16 accumulators need 16-milestone line blocks (K/128 % 16 == 0)");
-            state.tileXorFoldAcc = state.ra.try_alloc_range(grfPerLine * nFolds, getHint(HintType::LongTerm, strategy));
-            if (!state.tileXorFoldAcc.isValid())
-                throw std::runtime_error("Case5 wrap/fold16: insufficient registers for the fold accumulators");
+            if (problem.case5TileXorAccSlm) {
+                // Case 5.7: each completed line block goes to SLM (case5TileXorSend) and the message is
+                // folded after the k loop (case5TileXorLoadAccFromSlm), in registers the finished C tile
+                // no longer needs: the accumulators cost nothing during the loop.
+                state.tileXorAccSlmOff = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
+            } else {
+                state.tileXorFoldAcc = state.ra.try_alloc_range(grfPerLine * nFolds, getHint(HintType::LongTerm, strategy));
+                if (!state.tileXorFoldAcc.isValid())
+                    throw std::runtime_error("Case5 wrap/fold16: insufficient registers for the fold accumulators");
+            }
         }
         if (!ok) {
             state.ra.safeRelease(state.tileXorLineBuf);
@@ -1867,6 +1885,31 @@ void Generator<hw>::case5TileXorSend(const GEMMProblem &problem, const GEMMStrat
         cmp(1 | ne | state.flagCase5Xor, t, uint16_t(msIncremented ? 0 : (B - 1)));
         state.ra.safeRelease(t);
         jmpi(1 | state.flagCase5Xor, lSkip);
+        if (problem.case5TileXorAccSlm && state.tileXorAccSlmOff.isValid()) {
+            // Case 5.7: the completed block (milestones 16b..16b+15 of every sub-tile) goes to SLM as it
+            // is; the fold into the message happens after the k loop. The fast-store header carries the
+            // SLM offset: nothing else uses it inside the loop on the fold16 / wrap paths.
+            auto blk = state.ra.alloc_sub<uint32_t>();
+            if (msIncremented)
+                add(1, blk, state.tileXorMs, -int32_t(1));
+            else
+                mov(1, blk, state.tileXorMs);
+            shr(1, blk, blk, uint16_t(4));                      // block index (B == 16)
+            mulConstant(1, blk, blk, nFolds * 64);
+            add(1, blk, blk, state.tileXorAccSlmOff);
+            GRFRange hdr(state.tileXorStoreHdr.getBase(), 1);
+            for (int fi = 0; fi < nFolds; fi++) {
+                if (fi == 0)
+                    mov(1, hdr[0].ud(0), blk);
+                else
+                    add(1, hdr[0].ud(0), blk, uint32_t(fi * 64));
+                store(1, block(D32, 16), SLM, hdr,
+                      GRFRange(state.tileXorLineBuf.getBase() + fi * grfPerLine, grfPerLine));
+            }
+            state.ra.safeRelease(blk);
+            mark(lSkip);
+            return;
+        }
         if (state.tileXorFoldAcc.isValid()) {
             // The line holds milestones 16b..16b+15 in slot order. Case 5.5a: the protocol fold
             // msg[w] = rotl(msg[w], 13) ^ x[16b + w], one rotate and one xor per 16 lanes. Wrap cases:
@@ -2240,6 +2283,40 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
     }
 }
 
+// Case 5.7: after the k loop, fold the SLM-staged line blocks of each sub-tile into its 16-word message
+// (fold16: msg = rotl(msg, 13) ^ block, wrap cases: xor), in registers the finished C tile no longer
+// needs. The stores, the judges and the hash then read tileXorFoldAcc as they always did.
+template <HW hw>
+void Generator<hw>::case5TileXorLoadAccFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                               GEMMState &state)
+{
+    if (!problem.case5TileXorAccSlm || state.tileXorFoldAcc.isValid() || !state.tileXorAccSlmOff.isValid())
+        return;
+    const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
+    const int nBlocks = std::max(1, problem.case5XorMaxMilestones / 16);
+    const int grfPerLine = std::max(1, 16 * 4 / GRF::bytes(hw));
+    gemmCase5ReleaseAccForBlake3(strategy, state);
+    state.tileXorFoldAcc = state.ra.alloc_range(grfPerLine * nFolds, getHint(HintType::LongTerm, strategy));
+    auto tmp = state.ra.alloc_range(grfPerLine);
+    auto hdr = state.ra.alloc_range(1);
+    for (int fi = 0; fi < nFolds; fi++) {
+        GRFRange acc(state.tileXorFoldAcc.getBase() + fi * grfPerLine, grfPerLine);
+        for (int b = 0; b < nBlocks; b++) {
+            add(1, hdr[0].ud(0), state.tileXorAccSlmOff, uint32_t((b * nFolds + fi) * 64));
+            if (b == 0) {
+                load(1, acc, block(D32, 16), SLM, hdr);
+            } else {
+                load(1, tmp, block(D32, 16), SLM, hdr);
+                if (problem.case5TileXorFold16)
+                    rol(16, acc[0].ud(), acc[0].ud(), uint16_t(13));
+                xor_(16, acc[0].ud(), acc[0].ud(), tmp[0].ud());
+            }
+        }
+    }
+    state.ra.safeRelease(hdr);
+    state.ra.safeRelease(tmp);
+}
+
 template <HW hw>
 void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const GEMMStrategy &strategy,
                                                GEMMState &state)
@@ -2280,6 +2357,9 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
     }
     // Folded message / interleaved 5.4 and 5.5: every block has been folded; write each sub-tile's
     // 16-word message (or wrapped slots) as one line, or hand the messages to the cooperative jackpot.
+    // Case 5.7: fold the SLM-staged blocks into the message now (C is finished, its registers are free).
+    if (problem.case5TileXorAccSlm && (problem.case5JackpotCoop || !problem.case5TileXorBlake3))
+        case5TileXorLoadAccFromSlm(problem, strategy, state);
     if (state.tileXorFoldAcc.isValid() && problem.case5JackpotCoop) {
         gemmCase5TileXorJackpotCoop(problem, strategy, state);
     } else if (state.tileXorFoldAcc.isValid() && !problem.case5TileXorBlake3) {

@@ -64,6 +64,22 @@ static size_t case5TileXorSlmBytesPerWG(const GEMMProblem &problem, const GEMMSt
     return static_cast<size_t>(wgThreads) * static_cast<size_t>(slotsPerThread) * sizeof(uint32_t);
 }
 
+size_t case5TileXorAccSlmBytesPerWG(const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    if (!problem.case5TileXorAccSlm) return 0;
+    const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
+    const int nBlocks = std::max(1, problem.case5XorMaxMilestones / 16);
+    const int wgThreads = strategy.wg[LoopM] * strategy.wg[LoopN] * std::max(1, strategy.wg[LoopK]);
+    return static_cast<size_t>(wgThreads) * static_cast<size_t>(nBlocks) * static_cast<size_t>(nFolds) * 64;
+}
+
+size_t case5TileXorAccSlmByteOffset(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    GEMMProblem base = problem;
+    base.case5TileXorAccSlm = false;
+    return gemmSLMSize(hw, base, strategy, false);
+}
+
 size_t case5TileXorSlmByteOffset(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
                                 bool computeMax)
 {
@@ -92,6 +108,7 @@ size_t gemmSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strate
         slmSize = std::max<size_t>(slmSize, 8);
 
     slmSize += case5TileXorSlmBytesPerWG(problem, strategy);
+    slmSize += case5TileXorAccSlmBytesPerWG(problem, strategy);
     // Cooperative jackpot tables live in the k loop's (then dead) SLM buffers: above 16 KB the
     // A770 loses a quarter of its throughput, so they only ever grow the allocation when needed.
     if (problem.case5JackpotCoop && problem.case5JackpotCoopSlm)

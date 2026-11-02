@@ -29,6 +29,11 @@ GEMMSTONE_NAMESPACE_START
 // Return amount of SLM needed by a GEMM kernel.
 size_t gemmSLMSize(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy, bool computeMax = false);
 
+// Case5.7: SLM bytes per work-group for the message line blocks (wg threads x blocks x sub-tiles x 64), and
+// their byte offset (after everything else the kernel puts in SLM).
+size_t case5TileXorAccSlmBytesPerWG(const GEMMProblem &problem, const GEMMStrategy &strategy);
+size_t case5TileXorAccSlmByteOffset(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy);
+
 // Byte offset in SLM where Case5 tile_xor staging begins (after A/B SLM).
 size_t case5TileXorSlmByteOffset(ngen::HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
                                  bool computeMax = false);

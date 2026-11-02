@@ -334,7 +334,9 @@ void Generator<hw>::gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem,
 
     }
 
-
+    // Case 5.7: the message blocks were staged in SLM; fold them into tileXorFoldAcc first.
+    if (problem.case5TileXorAccSlm)
+        case5TileXorLoadAccFromSlm(problem, strategy, state);
 
     for (auto &g : state.tileXorWrapGrf) {
         if (g.isValid()) {
