@@ -77,8 +77,12 @@ int main(int argc, char** argv)
         if(rc >= 0) return rc;
     }
 
+    /* Runs that never reach a pool: --mock, and Pearl's --simd-test / --prepack-test, which
+     * exit after backend setup (Quantus --simd-test already exited above). */
+    const int offline = g_mock ||
+        (opt.algo_sel == CP_ALGO_PEARL && (opt.simd_test || opt.prepack_test));
     if(!opt.wallet){
-        if(g_mock){
+        if(offline){
             opt.wallet = "mock-wallet";
         } else {
             fprintf(stderr, "--wallet required\n");
@@ -96,8 +100,8 @@ int main(int argc, char** argv)
     strncpy(wallet_global, opt.wallet, sizeof(wallet_global) - 1);
     wallet_global[sizeof(wallet_global) - 1] = 0;
 
-    /* Offline mock skips the pool; no fee reconnects. */
-    cp_fee_init(wallet_global, g_mock ? 0 : 1, opt.algo_sel);
+    /* Offline runs skip the pool; no fee reconnects. */
+    cp_fee_init(wallet_global, offline ? 0 : 1, opt.algo_sel);
 
     if(opt.algo_sel == CP_ALGO_QUANTUS){
         if(cp_quantus_backend_init(&opt) != 0)
