@@ -54,8 +54,8 @@ inline int list_intel_gpus(int platform_filter = -1) {
     std::printf("[onednn] Intel GPU devices (use --devices N; default is first Intel GPU):\n");
     for (const OclDeviceInfo &d : devices) {
         std::printf("  [%d] %s\n", d.flat_index, d.device_name.c_str());
-        std::printf("      platform[%d]=%s  integrated GPU%s\n", d.platform_index,
-                    d.platform_name.c_str(), d.integer_dot_product ? "  int-dot" : "");
+        std::printf("      platform[%d]=%s  %s%s\n", d.platform_index, d.platform_name.c_str(),
+                    d.discrete ? "discrete GPU" : "integrated GPU", d.integer_dot_product ? "  int-dot" : "");
     }
     return static_cast<int>(devices.size());
 }
