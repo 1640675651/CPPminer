@@ -57,6 +57,8 @@ struct CpOptions {
     int wgpu_macro_m = 0;
     int wgpu_macro_n = 0;
     CpBackendId backend_sel = CP_BACKEND_NONE;
+    int api_port = 0;              /* --api-port, 0 = no stats API */
+    const char* api_bind = NULL;   /* --api-bind, NULL = 127.0.0.1 */
 };
 
 /* CP_SIMD / CASE33_ISA, then argv; sets g_m_active / g_n_active from --m / --n.

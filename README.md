@@ -141,6 +141,8 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 | `--list-devices` | List devices for the selected backend and exit |
 | `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |
+| `--api-port N` | Serve a read-only HTTP stats API on `127.0.0.1:N`: `/summary` (JSON: hashrate over 10 s / 60 s / 15 min, shares, devices with PCI addresses) and `/hiveos`. See [docs/api.md](docs/api.md) |
+| `--api-bind ADDR` | API listen address (default `127.0.0.1`; `0.0.0.0` for all interfaces) |
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |

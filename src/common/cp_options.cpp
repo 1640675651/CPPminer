@@ -34,6 +34,8 @@ static void print_usage(void)
     printf("  --agent NAME       agent string (default: cppminer/0.5)\n");
     printf("  --pool-pass STR    mining.authorize password (default: x); Kryptex custom\n");
     printf("                     share difficulty: d=N (default d=2097152)\n");
+    printf("  --api-port N       HTTP stats API on this port: /summary (JSON) and /hiveos\n");
+    printf("  --api-bind ADDR    API listen address (default: 127.0.0.1; 0.0.0.0 for all)\n");
     printf("  --backend NAME     cpu");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("|cuda");
@@ -476,6 +478,10 @@ static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
             cp_cli_string(argc, argv, i, worker_global, sizeof(worker_global));
         } else if(cp_cli_option(argv[i], "--agent")){
             cp_cli_string(argc, argv, i, agent_global, sizeof(agent_global));
+        } else if(cp_cli_option(argv[i], "--api-port")){
+            o->api_port = cp_cli_int(cp_cli_value(argc, argv, i), 1, 65535);
+        } else if(cp_cli_option(argv[i], "--api-bind")){
+            o->api_bind = cp_cli_value(argc, argv, i, 64);
         } else if(cp_cli_option(argv[i], "--pool-pass")){
             cp_cli_string(argc, argv, i, pool_pass_global, sizeof(pool_pass_global));
         } else if(!strcmp(argv[i], "--dry-run")){
