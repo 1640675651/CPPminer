@@ -27,6 +27,9 @@ double cp_json_num(const char* json, const char* key);
 /* Value of a member of the outermost object only (nested members are skipped), with
  * leading whitespace skipped; NULL if absent. */
 const char* cp_json_member(const char* json, const char* key);
+/* cp_json_str for a member of the outermost object only; 0 if absent, not a string, or
+ * too long for out. */
+int cp_json_member_str(const char* json, const char* key, char* out, int outlen);
 /* A JSON-RPC response: the outermost object has an integer "id" (or a string holding one)
  * and no "method". */
 int cp_json_rpc_response_id(const char* json, int* id);

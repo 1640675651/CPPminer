@@ -4,11 +4,70 @@
 #endif
 #include "cp_json_frame.h"
 #include "cp_json_text.hpp"
+#include "cp_pool.h"
+#include "cp_state.h"
 #include "cp_submit_table.hpp"
 #include "cp_util.h"
 
 #include <cassert>
 #include <cstring>
+#include <string>
+
+struct Notify {
+    char job_id[16], header[320], target[80];
+    uint32_t cert_version;
+    int ok;
+};
+
+static Notify parse_notify(const std::string& json)
+{
+    Notify n;
+    n.ok = cp_pool_parse_notify(json.c_str(), n.job_id, sizeof(n.job_id), n.header,
+                                sizeof(n.header), n.target, sizeof(n.target), &n.cert_version);
+    return n;
+}
+
+static void test_parse_notify()
+{
+    const std::string h = std::string(HEADER_HEX_LEN, 'a'), t = std::string(TARGET_HEX_LEN, 'f');
+    const std::string obj = "{\"id\":null,\"method\":\"mining.notify\",\"params\":{";
+    Notify n = parse_notify(obj + "\"job_id\":\"j1\",\"header\":\"" + h + "\",\"target\":\"" + t +
+                            "\",\"cert_version\":2}}");
+    assert(n.ok && !strcmp(n.job_id, "j1") && n.header == h && n.target == t && n.cert_version == 2);
+    /* cert_version beside params; no target. */
+    n = parse_notify("{\"cert_version\":3,\"params\": {\"job_id\":\"j1\",\"header\":\"" + h + "\"}}");
+    assert(n.ok && n.cert_version == 3 && !n.target[0]);
+    /* Fields only from params itself, not from nested objects. */
+    n = parse_notify(obj + "\"extra\":{\"job_id\":\"decoy\",\"target\":\"" + t + "\"},\"header\":\"" +
+                     h + "\",\"job_id\":\"real\"}}");
+    assert(n.ok && !strcmp(n.job_id, "real") && !n.target[0]);
+    /* No params: members of the message itself. */
+    n = parse_notify("{\"method\":\"mining.notify\",\"job_id\":\"j1\",\"header\":\"" + h + "\"}");
+    assert(n.ok && !strcmp(n.job_id, "j1"));
+    /* The target is copied as sent; callers check it. */
+    n = parse_notify(obj + "\"job_id\":\"j1\",\"header\":\"" + h + "\",\"target\":\"" +
+                     std::string(TARGET_HEX_LEN, 'z') + "\"}}");
+    assert(n.ok && n.target[0] == 'z');
+    /* Rejected: no header, no / empty / over-long job id, unknown cert_version. */
+    assert(!parse_notify(obj + "\"job_id\":\"j1\"}}").ok);
+    assert(!parse_notify(obj + "\"header\":\"" + h + "\"}}").ok);
+    assert(!parse_notify(obj + "\"job_id\":\"\",\"header\":\"" + h + "\"}}").ok);
+    assert(!parse_notify(obj + "\"job_id\":\"0123456789abcdef\",\"header\":\"" + h + "\"}}").ok);
+    const std::string cv4 = obj + "\"job_id\":\"j1\",\"header\":\"" + h + "\",\"cert_version\":4}}";
+    assert(!parse_notify(cv4).ok);
+    assert(!parse_notify(obj + "\"job_id\":\"j1\",\"header\":\"" + h + "\",\"cert_version\":2.5}}").ok);
+    g_cert_version_forced = 1; /* --cert-version overrides whatever the pool sends */
+    n = parse_notify(cv4);
+    assert(n.ok && n.cert_version == 0);
+    g_cert_version_forced = 0;
+
+    /* Positional params: id first, then target and header by length; a trailing object. */
+    n = parse_notify("{\"method\":\"mining.notify\",\"params\":[\"j2\", \"" + h + "\", \"" + t +
+                     "\", {\"cert_version\":1}]}");
+    assert(n.ok && !strcmp(n.job_id, "j2") && n.header == h && n.target == t && n.cert_version == 1);
+    assert(!parse_notify("{\"params\":[\"0123456789abcdef\",\"" + h + "\"]}").ok);
+    assert(!parse_notify("{\"params\":[\"" + h + "\"]}").ok); /* the only string is the id */
+}
 
 int main()
 {
@@ -68,6 +127,8 @@ int main()
 
     const double t0 = cp_now_sec(), t1 = cp_now_sec();
     assert(t1 >= t0);
+
+    test_parse_notify();
 
     uint8_t bytes[2] = {};
     assert(cp_hex_to_bytes("0aFf", bytes, 2) == 2 && bytes[0] == 10 && bytes[1] == 255);

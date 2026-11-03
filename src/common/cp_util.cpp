@@ -202,11 +202,11 @@ static const char* cp_json_value(const char* json, const char* key)
     return NULL;
 }
 
-int cp_json_str(const char* json, const char* key, char* out, int outlen)
+/* Decode the JSON string value at p (its opening quote) into out. */
+static int json_decode_str(const char* p, char* out, int outlen)
 {
     if(!out || outlen <= 0) return 0;
     out[0] = 0;
-    const char* p = cp_json_value(json, key);
     if(!p || *p++ != '"') return 0;
     int i = 0;
     while(*p && *p != '"'){
@@ -229,6 +229,11 @@ int cp_json_str(const char* json, const char* key, char* out, int outlen)
     if(*p != '"'){ out[0] = 0; return 0; }
     out[i] = 0;
     return 1;
+}
+
+int cp_json_str(const char* json, const char* key, char* out, int outlen)
+{
+    return json_decode_str(cp_json_value(json, key), out, outlen);
 }
 
 double cp_json_num(const char* json, const char* key)
@@ -270,6 +275,11 @@ const char* cp_json_member(const char* json, const char* key)
         }
     }
     return NULL;
+}
+
+int cp_json_member_str(const char* json, const char* key, char* out, int outlen)
+{
+    return json_decode_str(cp_json_member(json, key), out, outlen);
 }
 
 int cp_json_rpc_response_id(const char* json, int* id)

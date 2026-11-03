@@ -46,6 +46,7 @@ if(BUILD_TESTING)
     add_executable(cp_pool_protocol_test
         tests/cp_pool_protocol_test.cpp
         src/common/cp_json_frame.cpp
+        src/common/cp_pool_notify.cpp
         src/common/cp_util.cpp
         src/common/cp_state.cpp)
     target_include_directories(cp_pool_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -77,6 +78,7 @@ set(CP_COMMON_SOURCES
     src/common/cp_util.cpp
     src/common/cp_json_frame.cpp
     src/common/cp_pool.cpp
+    src/common/cp_pool_notify.cpp
     src/common/cp_job_ctrl.cpp
     src/common/cp_mine.cpp
     src/common/cp_fee.cpp

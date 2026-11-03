@@ -54,6 +54,9 @@ void cp_pool_track_submit(int msg_id);
 void cp_pool_untrack_submit(int msg_id);
 void cp_pool_log_share_submit_outcome(int msg_id);
 
+/* Job fields of a mining.notify (cp_pool_notify.cpp). 0 without a header string, and with a
+ * logged reason without a job id that fits job_id, or with a cert_version other than 1..3
+ * (unless --cert-version is forced). The target is copied as sent; callers check it. */
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,
                          char* header_hex, int header_len,

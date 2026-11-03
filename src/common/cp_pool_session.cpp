@@ -59,9 +59,15 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
         printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
+        /* An unusable target is mined like a missing one; kept, it would fail proof
+         * verification and drop every share. */
+        const int bad_target = target_hex[0] != 0;
+        target_hex[0] = 0;
         cp_pool_target_from_difficulty(cp_pool_difficulty(), tgt);
-        printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
-               job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
+        printf("[job] notify id=%s header=%.16s... diff=%.1f (%s) cert_version=%u\n",
+               job_id, header_hex, cp_pool_difficulty(),
+               bad_target ? "notify target unusable" : "no target in notify",
+               (unsigned)cert_version);
     }
     fflush(stdout);
 

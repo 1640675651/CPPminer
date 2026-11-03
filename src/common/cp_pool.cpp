@@ -289,15 +289,21 @@ static void pool_dispatch_line(const char* line)
 
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
-        if(!target_hex[0] || !cp_be_target_hex_to_le_words(target_hex, tgt))
+        const int bad_target = target_hex[0] && !cp_be_target_hex_to_le_words(target_hex, tgt);
+        if(!target_hex[0] || bad_target){
+            /* Mine an unusable target like a missing one; kept, it would fail proof
+             * verification and drop every share. */
+            target_hex[0] = 0;
             cp_pool_target_from_difficulty(g_diff.load(), tgt);
+        }
 
         if(cp_job_mining_active()){
             if(cp_job_key_matches(job_key)) return;
             cp_job_request_cancel();
             queue_pending_job(job_id, job_key, header, target_hex, tgt, cert_version);
-            printf("[net] new job %s while mining %s - cancelling stale work\n",
-                   job_id, cp_job_mining_key());
+            printf("[net] new job %s while mining %s - cancelling stale work%s\n",
+                   job_id, cp_job_mining_key(),
+                   bad_target ? " (notify target unusable, using difficulty)" : "");
             fflush(stdout);
             return;
         }
@@ -591,61 +597,6 @@ void cp_pool_log_share_submit_outcome(int msg_id)
     else
         printf("[plain] share submitted; pool response already received\n");
     fflush(stdout);
-}
-
-int cp_pool_parse_notify(const char* json,
-                         char* job_id, int job_len,
-                         char* header_hex, int header_len,
-                         char* target_hex, int target_len,
-                         uint32_t* cert_version_out)
-{
-    job_id[0] = header_hex[0] = target_hex[0] = 0;
-    uint32_t cert_version = 0;
-    double cv = cp_json_num(json, "cert_version");
-    if(cv >= 1.0 && cv <= 3.0)
-        cert_version = (uint32_t)cv;
-    if(cert_version_out)
-        *cert_version_out = cert_version;
-
-    if(strstr(json, "\"header\"")){
-        cp_json_str(json, "job_id", job_id, job_len);
-        cp_json_str(json, "header", header_hex, header_len);
-        cp_json_str(json, "target", target_hex, target_len);
-        return header_hex[0] != 0;
-    }
-
-    const char* p = strstr(json, "\"params\":[");
-    if(!p) return 0;
-    p = strchr(p, '[');
-    if(!p) return 0;
-    p++;
-    while(*p && *p != ']'){
-        while(*p==' ' || *p=='\t' || *p==',') p++;
-        if(*p == '"'){
-            p++;
-            char tmp[320];
-            int i = 0;
-            while(*p && *p != '"' && i < (int)sizeof(tmp) - 1) tmp[i++] = *p++;
-            tmp[i] = 0;
-            if(i == 0){ if(*p=='"') p++; continue; }
-            if(!job_id[0]){
-                strncpy(job_id, tmp, job_len - 1);
-                job_id[job_len - 1] = 0;
-            } else if((int)strlen(tmp) == TARGET_HEX_LEN && !target_hex[0]){
-                strncpy(target_hex, tmp, target_len - 1);
-                target_hex[target_len - 1] = 0;
-            } else if((int)strlen(tmp) == HEADER_HEX_LEN && !header_hex[0]){
-                strncpy(header_hex, tmp, header_len - 1);
-                header_hex[header_len - 1] = 0;
-            }
-            if(*p=='"') p++;
-        } else if(*p=='{' ){
-            break;
-        } else {
-            while(*p && *p != ',' && *p != ']') p++;
-        }
-    }
-    return header_hex[0] != 0;
 }
 
 int cp_pool_take_pending_job(CpPendingJob* out)
