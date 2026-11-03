@@ -6,6 +6,8 @@
 #include "cp_platform.h"
 #include "cp_qpow_pool.h"
 #include "cp_state.h"
+#include "cp_submit_table.hpp"
+#include "cp_tcp.h"
 #include "cp_util.h"
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
@@ -29,11 +31,21 @@
 
 static int tcp_sock = -1;
 static std::atomic<double> g_diff{32.0};
-static std::atomic<int> g_submit_inflight{0};
-/* cp_now_sec() when the in-flight submit was sent; the reader gives up on the
- * connection when no reply arrives within CP_SUBMIT_ACK_TIMEOUT_SEC. */
-static std::atomic<double> g_submit_sent_at{0.0};
+/* Every submit waits here until the pool replies to its id; the reader gives up on the
+ * connection when the oldest one has no reply within CP_SUBMIT_ACK_TIMEOUT_SEC. */
+static CpSubmitTable g_submits;
 #define CP_SUBMIT_ACK_TIMEOUT_SEC 60.0
+
+/* Session deadlines. A pool that keeps the connection open but never answers the
+ * authorize, or never sends a job, would otherwise leave the miner idle for good
+ * (keepalive only notices a dead peer). The reader drops the connection when the
+ * authorize reply is missing for CP_AUTHORIZE_TIMEOUT_SEC, or no job follows the
+ * login for CP_FIRST_JOB_TIMEOUT_SEC. */
+#define CP_AUTHORIZE_TIMEOUT_SEC 30.0
+#define CP_FIRST_JOB_TIMEOUT_SEC 30.0
+enum { CP_SESSION_IDLE, CP_SESSION_AUTHORIZE, CP_SESSION_FIRST_JOB, CP_SESSION_READY };
+static std::atomic<int> g_session_stage{CP_SESSION_IDLE};
+static std::atomic<double> g_session_deadline{0.0};
 
 /* Pools and middleboxes drop idle stratum connections without a RST. Without
  * probes the miner keeps scanning a stale job and queues every submit into a
@@ -90,28 +102,73 @@ static std::atomic<int> g_auth_msg_id{-1};
 static std::atomic<int> g_pool_proof_gzip{0};
 static char g_pool_host[256] = {0};
 
+/* Budget for resolving and connecting to every address of the pool host. */
+#define CP_CONNECT_TIMEOUT_MS 10000
+
 static int tcp_connect(const char* host, int port)
 {
-    if(cp_net_init() != 0){
-        fprintf(stderr, "WSAStartup failed\n");
-        return (int)CP_INVALID_SOCK;
-    }
-    struct hostent* he = gethostbyname(host);
-    if(!he){ perror("gethostbyname"); return (int)CP_INVALID_SOCK; }
-    cp_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
-    if(s == CP_INVALID_SOCK){ perror("socket"); return (int)CP_INVALID_SOCK; }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((u_short)port);
-    memcpy(&sa.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-    if(connect(s, (struct sockaddr*)&sa, sizeof(sa)) < 0){
-        perror("connect");
-        CP_SOCK_CLOSE(s);
-        return (int)CP_INVALID_SOCK;
-    }
+    cp_sock_t s = cp_tcp_connect(host, port, CP_CONNECT_TIMEOUT_MS);
+    if(s == CP_INVALID_SOCK) return (int)CP_INVALID_SOCK;
     tcp_tune(s);
     return (int)s;
+}
+
+static void session_set(int stage, double timeout_sec)
+{
+    g_session_deadline.store(cp_now_sec() + timeout_sec);
+    g_session_stage.store(stage);
+}
+
+/* Reason the session is over, or NULL. */
+static const char* session_expired(void)
+{
+    const double now = cp_now_sec();
+    const int stage = g_session_stage.load();
+    if(stage == CP_SESSION_AUTHORIZE && now > g_session_deadline.load())
+        return "no authorize response for 30 s";
+    if(stage == CP_SESSION_FIRST_JOB && now > g_session_deadline.load())
+        return "no job from the pool for 30 s after login";
+    /* A submit that gets no reply is the first visible symptom of a dead connection
+     * (keepalive catches the rest); reconnect rather than mine on. Timed from the oldest
+     * unanswered submit, so newer submits cannot push the deadline back. */
+    double sent_at = 0.0;
+    if(g_submits.oldest(&sent_at) && now - sent_at > CP_SUBMIT_ACK_TIMEOUT_SEC)
+        return "no pool reply to a submit for 60 s";
+    return NULL;
+}
+
+static void pool_connection_lost(const char* reason)
+{
+    g_submits.clear();
+    g_net_conn_lost.store(1);
+    g_inbox_cv.notify_all();
+    printf("[net] %s; treating the connection as lost\n", reason);
+    fflush(stdout);
+}
+
+void cp_pool_note_job(void)
+{
+    g_session_stage.store(CP_SESSION_READY);
+}
+
+void cp_pool_expect_job(void)
+{
+    if(g_session_stage.load() != CP_SESSION_READY)
+        session_set(CP_SESSION_FIRST_JOB, CP_FIRST_JOB_TIMEOUT_SEC);
+}
+
+double cp_pool_parse_difficulty(const char* line)
+{
+    /* "params":[D] (stratum) or "params":D, with any whitespace around the number. */
+    const char* p = cp_json_member(line, "params");
+    if(!p) return 0.0;
+    if(*p == '['){
+        ++p;
+        while(*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    }
+    char* end = NULL;
+    const double d = strtod(p, &end);
+    return end != p && d > 0.0 && d < 1e300 ? d : 0.0;
 }
 
 static void queue_pending_job(
@@ -185,14 +242,7 @@ static void pool_dispatch_line(const char* line)
         return;
 
     if(strstr(line, "mining.set_difficulty")){
-        double d = cp_json_num(line, "params");
-        if(!d){
-            const char* p = strstr(line, "\"params\":[");
-            if(p){
-                p = strchr(p, '[');
-                if(p) d = atof(p + 1);
-            }
-        }
+        const double d = cp_pool_parse_difficulty(line);
         if(d > 0.0){
             g_diff.store(d);
             printf("[pool] mining.set_difficulty %.0f%s\n", d,
@@ -206,12 +256,13 @@ static void pool_dispatch_line(const char* line)
         return;
 
     if(strstr(line, "result") || strstr(line, "error")){
-        if(g_submit_inflight.load())
+        /* Only the reply carrying a submit's own id answers that submit. */
+        int response_id = 0;
+        if(cp_json_rpc_response_id(line, &response_id) && g_submits.finish(response_id))
             printf("[pool] submit response: %s\n", line);
         else
             printf("[pool] jsonrpc: %s\n", line);
         fflush(stdout);
-        g_submit_inflight.store(0);
         return;
     }
 
@@ -234,6 +285,7 @@ static void pool_dispatch_line(const char* line)
         uint8_t header[INCOMPLETE_HEADER_BYTES];
         int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
         if(hlen != INCOMPLETE_HEADER_BYTES) return;
+        cp_pool_note_job();
 
         uint32_t tgt[8];
         memset(tgt, 0, sizeof(tgt));
@@ -267,6 +319,11 @@ static void pool_net_reader_thread(void)
     cp_cpu_affinity_release_thread();
 #endif
     while(g_net_reader_run.load()){
+        /* Checked on every pass, so steady pool traffic cannot postpone a deadline. */
+        if(const char* reason = session_expired()){
+            pool_connection_lost(reason);
+            return;
+        }
         /* Drain buffered messages before waiting — pool often sends authorize
          * ack + mining.notify back-to-back in one TCP segment. */
         int state;
@@ -286,22 +343,8 @@ static void pool_net_reader_thread(void)
             printf("[net] invalid or oversized pool message\n"); fflush(stdout);
             return;
         }
-        if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load()){
-            /* A submit that gets no reply is the first visible symptom of a
-             * dead connection (keepalive catches the rest); reconnect rather
-             * than mine on. */
-            if(g_submit_inflight.load() &&
-               cp_now_sec() - g_submit_sent_at.load() > CP_SUBMIT_ACK_TIMEOUT_SEC){
-                g_submit_inflight.store(0);
-                g_net_conn_lost.store(1);
-                g_inbox_cv.notify_all();
-                printf("[net] no pool reply to submit for %.0f s; treating the connection as lost\n",
-                       CP_SUBMIT_ACK_TIMEOUT_SEC);
-                fflush(stdout);
-                return;
-            }
+        if(!net_wait_readable(tcp_sock, 100) || !g_net_reader_run.load())
             continue;
-        }
         std::lock_guard<std::mutex> lk(g_net_mx);
         int n = recv(tcp_sock, net_buf + net_pos,
                      (int)sizeof(net_buf) - net_pos - 1, 0);
@@ -319,6 +362,8 @@ int cp_pool_connect(const char* host, int port)
 {
     strncpy(g_pool_host, host ? host : "", sizeof(g_pool_host) - 1);
     g_pool_host[sizeof(g_pool_host) - 1] = 0;
+    g_session_stage.store(CP_SESSION_IDLE);
+    g_submits.clear();
     tcp_sock = tcp_connect(host, port);
     return tcp_sock >= 0;
 }
@@ -367,6 +412,7 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
      * the dev-fee wallet switch). */
     g_pool_proof_gzip.store(0);
     g_auth_msg_id.store(msg_id);
+    session_set(CP_SESSION_AUTHORIZE, CP_AUTHORIZE_TIMEOUT_SEC);
     const std::string msg =
         "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(msg_id) +
         ",\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
@@ -385,12 +431,16 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
 int cp_pool_on_authorize_response(const char* line)
 {
     const int want = g_auth_msg_id.load();
-    if(want < 0 || !line) return 0;
-    if(!strstr(line, "\"result\"") && !strstr(line, "\"error\"")) return 0;
-    if(strstr(line, "\"method\"")) return 0;
-    const double id = cp_json_num(line, "id");
-    if(id != (double)want) return 0;
+    int id = 0;
+    if(want < 0 || !line || !cp_json_rpc_response_id(line, &id) || id != want) return 0;
     g_auth_msg_id.store(-1);
+    if(cp_json_rpc_rejected(line)){
+        printf("[pool] authorize response: %s\n", line);
+        pool_connection_lost("pool rejected the authorize");
+        return 1;
+    }
+    if(g_session_stage.load() == CP_SESSION_AUTHORIZE)
+        session_set(CP_SESSION_FIRST_JOB, CP_FIRST_JOB_TIMEOUT_SEC);
 
     char type[16];
     const int v2 = cp_json_str(line, "type", type, (int)sizeof(type)) &&
@@ -524,15 +574,19 @@ int cp_pool_conn_lost(void)
     return g_net_conn_lost.load();
 }
 
-void cp_pool_set_submit_inflight(int on)
+void cp_pool_track_submit(int msg_id)
 {
-    if(on) g_submit_sent_at.store(cp_now_sec());
-    g_submit_inflight.store(on);
+    g_submits.track(msg_id, cp_now_sec());
 }
 
-void cp_pool_log_share_submit_outcome(void)
+void cp_pool_untrack_submit(int msg_id)
 {
-    if(g_submit_inflight.load())
+    g_submits.finish(msg_id);
+}
+
+void cp_pool_log_share_submit_outcome(int msg_id)
+{
+    if(g_submits.pending(msg_id))
         printf("[plain] share submitted; pool ack pending (reader will log [pool] submit response)\n");
     else
         printf("[plain] share submitted; pool response already received\n");

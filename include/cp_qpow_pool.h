@@ -44,6 +44,13 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
 int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int session_len,
                                     CpQpowJob* job_out);
 int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out);
+/* 1 when the message's method is "job". */
+int cp_qpow_pool_is_job(const char* line);
+
+/* After sending login (reader stopped): read lines for up to 30 s until the response
+ * with id login_id. Jobs announced before it are kept; the reply's own job wins.
+ * job_out->job_id is empty when neither carried a job. Returns 1 when logged in. */
+int cp_qpow_pool_wait_login(int login_id, char* session_out, int session_len, CpQpowJob* job_out);
 
 /* Called from Pearl pool reader when Quantus mode is active. Returns 1 if handled. */
 int cp_qpow_pool_on_line(const char* line);

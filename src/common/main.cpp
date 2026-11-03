@@ -151,9 +151,9 @@ int main(int argc, char** argv)
     if(g_mock)
         return cp_mine_mock();
 
-    cp_run_pearl_pool(opt.pool_host, opt.pool_port);
+    const int rc = cp_run_pearl_pool(opt.pool_host, opt.pool_port);
 
     cp_mine_free_host_buffers();
     cp_worker_shutdown();
-    return 0;
+    return rc;
 }

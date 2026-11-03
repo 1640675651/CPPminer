@@ -53,6 +53,12 @@ if(BUILD_TESTING)
         target_link_libraries(cp_pool_protocol_test PRIVATE bcrypt ws2_32)
     endif()
     add_test(NAME cp_pool_protocol COMMAND cp_pool_protocol_test)
+    add_executable(cp_tcp_test tests/cp_tcp_test.cpp src/common/cp_tcp.cpp)
+    target_include_directories(cp_tcp_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(WIN32)
+        target_link_libraries(cp_tcp_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME cp_tcp COMMAND cp_tcp_test)
     add_executable(cp_cli_test tests/cp_cli_test.cpp)
     target_include_directories(cp_cli_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME cp_cli COMMAND cp_cli_test)
@@ -67,6 +73,7 @@ set(CP_COMMON_SOURCES
     src/common/cp_diagnostics.cpp
     src/common/cp_backend_setup.cpp
     src/common/cp_pool_session.cpp
+    src/common/cp_tcp.cpp
     src/common/cp_util.cpp
     src/common/cp_json_frame.cpp
     src/common/cp_pool.cpp

@@ -3,13 +3,15 @@
 #include "cp_state.h"
 #include "cp_platform.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
-#include <sys/time.h>
+#include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #else
 #include <bcrypt.h>
@@ -25,9 +27,10 @@ double cp_now_sec(void)
     QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)freq.QuadPart;
 #else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+    /* Monotonic: deadlines and hash rates must not jump with NTP or manual clock changes. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 #endif
 }
 
@@ -237,6 +240,63 @@ double cp_json_num(const char* json, const char* key)
     return end != p && isfinite(value) ? value : 0;
 }
 
+const char* cp_json_member(const char* json, const char* key)
+{
+    if(!json || !key || !*key) return NULL;
+    const size_t key_len = strlen(key);
+    const char* p = strchr(json, '{');
+    if(!p) return NULL;
+    int depth = 0;
+    for(; *p; ++p){
+        if(*p == '"'){
+            const char* begin = ++p;
+            while(*p && *p != '"'){
+                if(*p == '\\' && p[1]) ++p;
+                ++p;
+            }
+            if(!*p) return NULL;
+            if(depth != 1) continue;
+            const char* after = p + 1;
+            while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+            if(*after == ':' && (size_t)(p - begin) == key_len && !memcmp(begin, key, key_len)){
+                ++after;
+                while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+                return after;
+            }
+        } else if(*p == '{' || *p == '['){
+            ++depth;
+        } else if(*p == '}' || *p == ']'){
+            if(--depth <= 0) return NULL;
+        }
+    }
+    return NULL;
+}
+
+int cp_json_rpc_response_id(const char* json, int* id)
+{
+    if(cp_json_member(json, "method")) return 0;
+    const char* p = cp_json_member(json, "id");
+    if(!p) return 0;
+    /* Some pools echo the request id back as a string. */
+    const int quoted = *p == '"';
+    if(quoted) ++p;
+    if(!(*p == '-' || (*p >= '0' && *p <= '9'))) return 0;
+    char* end = NULL;
+    const long value = strtol(p, &end, 10);
+    if(end == p || value < INT_MIN || value > INT_MAX) return 0;
+    if(quoted ? *end != '"' : (*end == '.' || *end == 'e' || *end == 'E')) return 0;
+    if(id) *id = (int)value;
+    return 1;
+}
+
+int cp_json_rpc_rejected(const char* json)
+{
+    const char* error = cp_json_member(json, "error");
+    if(error && strncmp(error, "null", 4) != 0) return 1;
+    const char* result = cp_json_member(json, "result");
+    return result && (strncmp(result, "false", 5) == 0 || strncmp(result, "null", 4) == 0);
+}
+
 static int g_pp_hash_h_override = 0;
 static int g_pp_hash_w_override = 0;
 
@@ -403,7 +463,14 @@ int cp_send_all(int sock, const void* data, size_t len)
         int chunk = (len > 65536) ? 65536 : (int)len;
         int n = send(sock, p, chunk, 0);
 #else
+        /* MSG_NOSIGNAL: a peer reset returns EPIPE instead of killing the process with
+         * SIGPIPE (macOS has no MSG_NOSIGNAL; cp_tcp_connect sets SO_NOSIGPIPE there). */
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(sock, p, len, MSG_NOSIGNAL);
+#else
         ssize_t n = send(sock, p, len, 0);
+#endif
+        if(n < 0 && errno == EINTR) continue;
 #endif
         if(n <= 0){
             perror("send");

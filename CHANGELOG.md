@@ -1,9 +1,10 @@
 # Changelog
 
-## v0.6 (tentative)
+## v1.0 (tentative)
 ### New features
-- Experimental hexagon backend for qualcomm devices
-- OneDNN backend now supports Xe-HPG GPU with XMX cores with tuned performance
+- OneDNN backend now supports Xe-HPG and Xe2 GPU with XMX cores with optimized performance
+- Experimental Hexagon backend
+- Experimental Intel NPU backend
 (3 features below thanks to @danifest751)
 - AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
 - ARM i8mm kernel
@@ -13,26 +14,33 @@
 - Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
 - OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
 - Fix Pearl wgpu hang on AMD Metal
-(5 improvements below thanks to @danifest751)
-- NEON DotProd and basic NEON kernel rewrite, reduce instruction count
+- Refactored lengthy main.cpp
+(6 improvements below thanks to @danifest751)
+- NEON DotProd and basic NEON kernel rewrite, reducing instruction count
 - OpenCL: mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8)
 - OpenCL: 2 launches in flight, reducing GPU idle time
 - OpenCL: Faster noisy matrix preparation
 - Improve pool connection robustness
+- Reject illegal CLI options
 
 ### Pearl Hexagon
 - DSP self-guided loop, negligible kernel launch overhead
 - Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
 
+### Pearl Intel NPU
+- Patched NPU compiler to expose int32 accumulator
+- Custom XOR kernel on the SHAVE vector cores, thanks to the npunlock project
+- Almost fully overlapped DPU (matrix engine) and SHAVE work
+
 ### Pearl OneDNN
-- Rewrite gemmstone strategy selection logic to pick better kernels
-- Reduce xor overhead by overlapping xor with dpas
-- Reduce xor overhead with bfn 3-way xor instruction on Xe-HPG and Xe-LPG
-- In-register 16 XOR slot folding, reducing global memory writeout
+- Rewrite gemmstone strategy selection logic to pick the best kernel
+- Reduce XOR overhead by overlapping XOR with dpas
+- Reduce XOR overhead with bfn 3-way XOR instruction on Xe-HPG, Xe-LPG, and Xe2
+- In-register/SLM 16 XOR slot folding, reducing global memory writeout
 - SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
 - Prepack A and B to reduce data reordering in GEMM
 - Layout parameter is deprecated, packed layout is optimal
-- --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (cause GPU stall sometimes due to buggy intel driver, off by default)
+- --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (may cause intel GPU stall sometimes due to buggy intel driver, off by default)
 
 ## v0.5
 ### New features

@@ -124,25 +124,36 @@ inline int cp_cli_dimensions(const char* value, int* m, int* n, int* macro_m = n
     return 4;
 }
 
-/* "scheme://host:port", optionally followed by "/..." (ignored). Copies the host into
- * host (shorter than capacity) and returns the port, 1..65535. */
+/* "scheme://host:port" or "scheme://[IPv6]:port", optionally followed by "/..." (ignored).
+ * Copies the host (without brackets) into host (shorter than capacity) and returns the
+ * port, 1..65535. */
 inline int cp_cli_pool_uri(const char* value, char* host, size_t capacity)
 {
+    const std::string expected = "expected scheme://host:port, got \"" + std::string(value) + "\"";
     const char* h = strstr(value, "://");
-    if(!h) throw std::invalid_argument("expected scheme://host:port, got \"" + std::string(value) + "\"");
+    if(!h) throw std::invalid_argument(expected);
     h += 3;
     const char* end = h + strcspn(h, "/");
-    const char* colon = nullptr;
-    for(const char* p = h; p < end; ++p)
-        if(*p == ':') colon = p;
-    if(!colon || colon == h)
-        throw std::invalid_argument("expected scheme://host:port, got \"" + std::string(value) + "\"");
-    const size_t length = (size_t)(colon - h);
+    const char* host_begin = h;
+    const char* host_end = nullptr;
+    if(*h == '['){
+        const char* close = (const char*)memchr(h, ']', (size_t)(end - h));
+        if(!close || close[1] != ':') throw std::invalid_argument(expected);
+        host_begin = h + 1;
+        host_end = close;
+    } else {
+        for(const char* p = h; p < end; ++p)
+            if(*p == ':') host_end = p;
+        if(!host_end) throw std::invalid_argument(expected);
+    }
+    if(host_end == host_begin) throw std::invalid_argument(expected);
+    const char* port_begin = host_end + (*host_end == ']' ? 2 : 1);
+    const size_t length = (size_t)(host_end - host_begin);
     if(length >= capacity)
         throw std::invalid_argument("host name is longer than " + std::to_string(capacity - 1) +
                                     " characters");
-    const int port = cp_cli_int(std::string(colon + 1, end).c_str(), 1, 65535);
-    memcpy(host, h, length);
+    const int port = cp_cli_int(std::string(port_begin, end).c_str(), 1, 65535);
+    memcpy(host, host_begin, length);
     host[length] = 0;
     return port;
 }

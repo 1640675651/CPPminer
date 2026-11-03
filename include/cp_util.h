@@ -24,6 +24,14 @@ int cp_hex_to_bytes(const char* hex, uint8_t* out, int out_cap);
 
 int cp_json_str(const char* json, const char* key, char* out, int outlen);
 double cp_json_num(const char* json, const char* key);
+/* Value of a member of the outermost object only (nested members are skipped), with
+ * leading whitespace skipped; NULL if absent. */
+const char* cp_json_member(const char* json, const char* key);
+/* A JSON-RPC response: the outermost object has an integer "id" (or a string holding one)
+ * and no "method". */
+int cp_json_rpc_response_id(const char* json, int* id);
+/* 1 when a response carries a non-null "error", or "result" is false or null. */
+int cp_json_rpc_rejected(const char* json);
 
 /* Offline mock: unscaled target 2^(256 - D); the tile is applied once by cp_scale_jackpot_target. */
 void cp_mock_target_from_difficulty(double difficulty, uint32_t tgt[8]);

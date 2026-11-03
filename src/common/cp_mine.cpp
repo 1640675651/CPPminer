@@ -129,7 +129,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             h_B_scan = (int8_t *)malloc(szBpT);
             if (!h_A_scan || !h_B_scan) {
                 fprintf(stderr, "OOM scan buffers\n");
-                rc = CP_JOB_CANCELLED;
+                rc = CP_JOB_ERROR;
                 goto job_done;
             }
         }
@@ -200,7 +200,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                            handoff_bt ? &h_BpT_global : NULL);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
                 fprintf(stderr, "[plain] host matrix buffers missing after reclaim\n");
-                rc = CP_JOB_NONE;
+                rc = CP_JOB_ERROR;
                 goto job_done;
             }
         }
@@ -209,7 +209,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         if (ab_len < 0) {
             fprintf(stderr, "[plain] effective_seed failed nonce=%llu\n",
                     (unsigned long long)nonce);
-            rc = CP_JOB_NONE;
+            rc = CP_JOB_ERROR;
             goto job_done;
         }
 
@@ -240,6 +240,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 } else {
                     printf("[gen] noisy matrix build failed\n");
                     fflush(stdout);
+                    rc = CP_JOB_ERROR;
                 }
                 goto job_done;
             }
@@ -272,7 +273,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             } else {
                 fprintf(stderr, "[plain] %s mine_attempt failed (rc=%d)\n",
                         cp_worker_backend_name(), found);
-                rc = CP_JOB_NONE;
+                rc = CP_JOB_ERROR;
             }
             fflush(stdout);
             cp_fee_note_tiles(scan_tiles);
@@ -317,8 +318,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         if (!g_share_queue) {
             fprintf(stderr, "[plain] share queue unavailable\n");
             cp_fee_note_tiles(scan_tiles);
-            nonce++;
-            continue;
+            rc = CP_JOB_ERROR;
+            goto job_done;
         }
 
         {
@@ -336,8 +337,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                     fprintf(stderr, "[plain] failed to fetch share witness nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
-                    nonce++;
-                    continue;
+                    rc = CP_JOB_ERROR;
+                    goto job_done;
                 }
                 const CpShareHit hit = {nonce, t_rows, t_cols, tiles_since_prev, interval_sec, 0};
                 if (cp_share_queue_enqueue_witness(g_share_queue, &hit, header, hlen, job_id,
@@ -345,6 +346,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                     cp_share_witness_free(witness);
                     fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
                             (unsigned long long)nonce);
+                    cp_fee_note_tiles(scan_tiles);
+                    rc = CP_JOB_ERROR;
+                    goto job_done;
                 } else {
                     tiles_at_prev_share = tiles_scanned_total;
                     t_prev_share = now_hit;
@@ -369,8 +373,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
                 fprintf(stderr, "[plain] host matrix buffers missing before proof handoff\n");
                 cp_fee_note_tiles(scan_tiles);
-                nonce++;
-                continue;
+                rc = CP_JOB_ERROR;
+                goto job_done;
             }
             if (defer_host_reclaim) {
                 if (cp_worker_fetch_share_signals(
@@ -378,8 +382,8 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                     fprintf(stderr, "[plain] failed to fetch signal matrices nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
-                    nonce++;
-                    continue;
+                    rc = CP_JOB_ERROR;
+                    goto job_done;
                 }
             }
             const CpShareHit hit = {nonce,
@@ -392,6 +396,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                            &h_Ap_global, szAp, &h_BpT_global, szBpT) != 0) {
                 fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
                         (unsigned long long)nonce);
+                cp_fee_note_tiles(scan_tiles);
+                rc = CP_JOB_ERROR;
+                goto job_done;
             } else {
                 tiles_at_prev_share = tiles_scanned_total;
                 t_prev_share = now_hit;
@@ -417,6 +424,8 @@ job_done:
     }
     free(h_A_scan);
     free(h_B_scan);
+    /* A failure caused by the cancellation itself is not a backend error. */
+    if (cp_job_should_cancel() && rc != CP_JOB_FEE_SWITCH) rc = CP_JOB_CANCELLED;
     cp_job_mine_end();
     if (cp_pool_conn_lost()) {
         return CP_JOB_CANCELLED;
@@ -460,6 +469,10 @@ int cp_mine_mock(void)
 
     if(rc == CP_JOB_CANCELLED){
         fprintf(stderr, "[mock] cancelled before share\n");
+        return 1;
+    }
+    if(rc == CP_JOB_ERROR){
+        fprintf(stderr, "[mock] FAIL: backend or resource failure\n");
         return 1;
     }
     if(outcome == CP_SHARE_OUTCOME_OK){

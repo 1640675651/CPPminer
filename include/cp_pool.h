@@ -40,8 +40,19 @@ int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms);
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms);
 int cp_pool_conn_lost(void);
 
-void cp_pool_set_submit_inflight(int on);
-void cp_pool_log_share_submit_outcome(void);
+/* A job arrived on this connection: ends the first-job deadline. Reader thread. */
+void cp_pool_note_job(void);
+/* Start the first-job deadline (Quantus: login reply without an embedded job). */
+void cp_pool_expect_job(void);
+/* Difficulty of a mining.set_difficulty line ("params":[D] or "params":D, any
+ * whitespace); 0 if absent or not a positive number. */
+double cp_pool_parse_difficulty(const char* line);
+
+/* Wait for the pool's reply to submit msg_id (call before sending); the connection is
+ * treated as lost when a tracked submit has no reply for 60 s. Untrack after a failed send. */
+void cp_pool_track_submit(int msg_id);
+void cp_pool_untrack_submit(int msg_id);
+void cp_pool_log_share_submit_outcome(int msg_id);
 
 int cp_pool_parse_notify(const char* json,
                          char* job_id, int job_len,

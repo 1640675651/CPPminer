@@ -74,6 +74,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
         printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
         return rc;
     }
+    if(rc == CP_JOB_ERROR) return rc;
     if(rc == CP_JOB_CANCELLED){
         printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
     } else if(rc == CP_JOB_NONE){
@@ -92,6 +93,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
             printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
             return rc;
         }
+        if(rc == CP_JOB_ERROR) return rc;
         if(rc == CP_JOB_CANCELLED){
             printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
         } else if(rc == CP_JOB_NONE){
@@ -121,6 +123,7 @@ static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char* cur_job_key,
         fflush(stdout);
         return rc;
     }
+    if(rc == CP_JOB_ERROR) return rc;
     if(rc == CP_JOB_CANCELLED){
         printf("[qpow] job ended (new job or disconnect)\n");
         fflush(stdout);
@@ -138,6 +141,7 @@ static int handle_qpow_job(const CpQpowJob* job, int* msg_id, char* cur_job_key,
             fflush(stdout);
             return rc;
         }
+        if(rc == CP_JOB_ERROR) return rc;
         if(rc == CP_JOB_CANCELLED){
             printf("[qpow] job ended (new job or disconnect)\n");
             fflush(stdout);
@@ -170,6 +174,16 @@ static void pool_session_ok(void)
     g_reconnect_delay_sec = 0;
 }
 
+/* CP_JOB_ERROR: mining cannot continue on this backend; stop instead of reconnecting. */
+static int pool_session_fatal(void)
+{
+    printf("[main] stopping: backend or resource failure (see the error above)\n");
+    fflush(stdout);
+    cp_pool_reader_stop();
+    cp_pool_disconnect();
+    return 1;
+}
+
 int cp_run_quantus_pool(const char* pool_host, int pool_port)
 {
     char cur_job_key[160] = {0};
@@ -195,29 +209,21 @@ reconnect:
         if(cp_pool_connect(pool_host, pool_port)) break;
     }
 
-    if(!cp_qpow_pool_send_login(msg_id++, cp_fee_wallet(), worker_global, agent_global))
+    const int login_id = msg_id++;
+    if(!cp_qpow_pool_send_login(login_id, cp_fee_wallet(), worker_global, agent_global))
         goto reconnect;
-
-    char login_line[65536];
-    int got = cp_pool_recv_one(login_line, sizeof(login_line), 30000);
-    if(got <= 0){
-        printf("[net] login response missing, reconnecting...\n");
-        fflush(stdout);
-        goto reconnect;
-    }
-    printf("[pool-raw] %s\n", login_line);
-    fflush(stdout);
 
     char session[80] = {0};
     CpQpowJob first_job;
-    memset(&first_job, 0, sizeof(first_job));
-    if(!cp_qpow_pool_parse_login_result(login_line, session, (int)sizeof(session),
-                                        &first_job)){
-        printf("[net] login parse failed: %s\n", login_line);
-        fflush(stdout);
+    if(!cp_qpow_pool_wait_login(login_id, session, (int)sizeof(session), &first_job))
         goto reconnect;
+    /* Reset the reconnect backoff only once a job arrives (as for Pearl). */
+    if(first_job.job_id[0]){
+        pool_session_ok();
+        cp_pool_note_job();
+    } else {
+        cp_pool_expect_job();
     }
-    pool_session_ok();
     cp_qpow_pool_set_session_id(session);
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
@@ -235,6 +241,7 @@ reconnect:
 
     {
         int rc = handle_qpow_job(&first_job, &msg_id, cur_job_key, sizeof(cur_job_key));
+        if(rc == CP_JOB_ERROR) return pool_session_fatal();
         if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
     }
 
@@ -248,15 +255,16 @@ reconnect:
         }
         if(wr == 0) continue;
 
-        if(strstr(line_buf, "\"method\":\"job\"") ||
-           strstr(line_buf, "\"method\": \"job\"")){
+        if(cp_qpow_pool_is_job(line_buf)){
             CpQpowJob job;
             if(!cp_qpow_pool_parse_job(line_buf, &job)){
                 printf("[pool] quantus job parse failed\n");
                 fflush(stdout);
                 continue;
             }
+            pool_session_ok();
             int rc = handle_qpow_job(&job, &msg_id, cur_job_key, sizeof(cur_job_key));
+            if(rc == CP_JOB_ERROR) return pool_session_fatal();
             if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
         }
@@ -315,19 +323,13 @@ reconnect:
         if(strstr(line_buf, "mining.notify")){
             pool_session_ok();
             int rc = handle_notify_line(line_buf, &msg_id, cur_job_key, sizeof(cur_job_key));
+            if(rc == CP_JOB_ERROR) return pool_session_fatal();
             if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
         }
 
         if(strstr(line_buf, "mining.set_difficulty")){
-            double d = cp_json_num(line_buf, "params");
-            if(!d){
-                const char* p = strstr(line_buf, "\"params\":[");
-                if(p){
-                    p = strchr(p, '[');
-                    if(p) d = atof(p + 1);
-                }
-            }
+            const double d = cp_pool_parse_difficulty(line_buf);
             if(d > 0.0){
                 cp_pool_set_difficulty(d);
                 printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);

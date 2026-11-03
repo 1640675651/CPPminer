@@ -1,10 +1,12 @@
-#include "cp_json_frame.h"
-#include "cp_json_text.hpp"
-#include "cp_util.h"
-
+/* Before any include: a header that pulls in <cassert> first would keep assert off in Release. */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+#include "cp_json_frame.h"
+#include "cp_json_text.hpp"
+#include "cp_submit_table.hpp"
+#include "cp_util.h"
+
 #include <cassert>
 #include <cstring>
 
@@ -26,6 +28,46 @@ int main()
     assert(value[0] == 0);
     assert(cp_json_str("{\"id\":\"unterminated}", "id", value, sizeof(value)) == 0);
     assert(cp_json_num("{\"note\":\"fake \\\"seq\\\":99\",\"seq\":7}", "seq") == 7);
+
+    /* Outermost members only: the Quantus login nests its session "id" in result. */
+    const char* login = "{\"result\":{\"id\":\"sess\",\"status\":\"OK\"},\"jsonrpc\":\"2.0\",\"id\":5,\"error\":null}";
+    int id = 0;
+    assert(cp_json_rpc_response_id(login, &id) == 1 && id == 5);
+    assert(!cp_json_rpc_rejected(login));
+    assert(cp_json_member(login, "status") == NULL);
+    assert(cp_json_member("{\"a\":{\"b\":1}}", "b") == NULL);
+    assert(cp_json_member("{\"note\":\"\\\"id\\\":7\",\"x\":1}", "id") == NULL);
+    const char* params = cp_json_member("{ \"params\" : [ 512 ] }", "params");
+    assert(params && params[0] == '[');
+    assert(!cp_json_rpc_response_id("{\"id\":3,\"method\":\"job\",\"params\":{}}", &id));
+    assert(cp_json_rpc_response_id("{\"id\":\"3\",\"result\":true}", &id) && id == 3);
+    assert(!cp_json_rpc_response_id("{\"id\":\"3x\",\"result\":true}", &id));
+    assert(!cp_json_rpc_response_id("{\"id\":\"\",\"result\":true}", &id));
+    assert(!cp_json_rpc_response_id("{\"id\":null,\"result\":true}", &id));
+    assert(!cp_json_rpc_response_id("{\"id\":3.5,\"result\":true}", &id));
+
+    /* Each submit waits for its own reply; the oldest one sets the deadline. */
+    CpSubmitTable submits;
+    double sent_at = 0.0;
+    assert(!submits.oldest(&sent_at));
+    submits.track(7, 100.0);
+    submits.track(8, 130.0);
+    assert(submits.oldest(&sent_at) && sent_at == 100.0);
+    assert(!submits.finish(9) && submits.pending(7));
+    assert(submits.finish(8) && !submits.pending(8));
+    assert(submits.oldest(&sent_at) && sent_at == 100.0); /* a newer reply leaves 7 waiting */
+    submits.track(9, 150.0);
+    assert(submits.finish(7) && submits.oldest(&sent_at) && sent_at == 150.0);
+    submits.clear();
+    assert(!submits.pending(9) && !submits.oldest(&sent_at));
+    assert(cp_json_rpc_rejected(
+        "{\"error\":{\"code\":24,\"msg\":\"login is missing PRL wallet\"},\"id\":1,\"result\":null}"));
+    assert(cp_json_rpc_rejected("{\"id\":1,\"result\":false}"));
+    assert(!cp_json_rpc_rejected("{\"id\":1,\"result\":true,\"error\":null}"));
+    assert(!cp_json_rpc_rejected("{\"id\":1,\"result\":{\"type\":\"v2\"}}"));
+
+    const double t0 = cp_now_sec(), t1 = cp_now_sec();
+    assert(t1 >= t0);
 
     uint8_t bytes[2] = {};
     assert(cp_hex_to_bytes("0aFf", bytes, 2) == 2 && bytes[0] == 10 && bytes[1] == 255);

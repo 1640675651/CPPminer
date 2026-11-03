@@ -90,9 +90,9 @@ int cp_qpow_pool_send_submit(int sock, int msg_id, const char* job_id,
     printf("[net] quantus submit job=%s nonce=%.16s...\n", job_id ? job_id : "", nonce_hex);
     fflush(stdout);
     /* In flight before sending, see cp_share_queue.cpp. */
-    cp_pool_set_submit_inflight(1);
+    cp_pool_track_submit(msg_id);
     int ok = cp_send_json(sock, msg.c_str());
-    if(!ok) cp_pool_set_submit_inflight(0);
+    if(!ok) cp_pool_untrack_submit(msg_id);
     return ok;
 }
 
@@ -134,10 +134,16 @@ int cp_qpow_pool_parse_job(const char* json, CpQpowJob* out)
     return 1;
 }
 
+int cp_qpow_pool_is_job(const char* line)
+{
+    const char* method = cp_json_member(line, "method");
+    return method && !strncmp(method, "\"job\"", 5);
+}
+
 int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int session_len,
                                     CpQpowJob* job_out)
 {
-    if(!json) return 0;
+    if(!json || cp_json_rpc_rejected(json)) return 0;
     const char* result = strstr(json, "\"result\"");
     if(!result) return 0;
     if(strstr(result, "\"status\":\"OK\"") == NULL &&
@@ -150,9 +156,50 @@ int cp_qpow_pool_parse_login_result(const char* json, char* session_out, int ses
             return 0;
     }
     if(job_out){
-        if(!cp_qpow_pool_parse_job(result, job_out)) return 0;
+        /* The job is optional; a login without one waits for the first notification. */
+        memset(job_out, 0, sizeof(*job_out));
+        if(strstr(result, "\"job_id\"") && !cp_qpow_pool_parse_job(result, job_out)) return 0;
     }
     return 1;
+}
+
+int cp_qpow_pool_wait_login(int login_id, char* session_out, int session_len, CpQpowJob* job_out)
+{
+    memset(job_out, 0, sizeof(*job_out));
+    CpQpowJob early;
+    int have_early = 0;
+    const double deadline = cp_now_sec() + 30.0;
+    for(;;){
+        const int remaining_ms = (int)((deadline - cp_now_sec()) * 1000.0);
+        if(remaining_ms <= 0) break;
+        static char line[65536];
+        const int got = cp_pool_recv_one(line, sizeof(line), remaining_ms);
+        if(got < 0){
+            printf("[net] connection lost during login\n");
+            fflush(stdout);
+            return 0;
+        }
+        if(got == 0) break;
+        printf("[pool-raw] %s\n", line);
+        fflush(stdout);
+        int id = 0;
+        if(cp_json_rpc_response_id(line, &id) && id == login_id){
+            if(!cp_qpow_pool_parse_login_result(line, session_out, session_len, job_out)){
+                printf("[net] login rejected or malformed\n");
+                fflush(stdout);
+                return 0;
+            }
+            /* The reply's own job is current and carries this session's extranonce; a job
+             * broadcast before it is only a fallback. */
+            if(!job_out->job_id[0] && have_early) *job_out = early;
+            return 1;
+        }
+        if(cp_qpow_pool_is_job(line) && cp_qpow_pool_parse_job(line, &early))
+            have_early = 1;
+    }
+    printf("[net] login response missing for 30 s\n");
+    fflush(stdout);
+    return 0;
 }
 
 int cp_qpow_pool_on_line(const char* line)
@@ -160,10 +207,7 @@ int cp_qpow_pool_on_line(const char* line)
     if(!g_qpow_active.load() || !line) return 0;
 
     /* Job notification (and login-embedded jobs are handled by main). */
-    const int is_job_method =
-        (strstr(line, "\"method\":\"job\"") != NULL) ||
-        (strstr(line, "\"method\": \"job\"") != NULL);
-    if(!is_job_method) return 0;
+    if(!cp_qpow_pool_is_job(line)) return 0;
 
     CpQpowJob job;
     if(!cp_qpow_pool_parse_job(line, &job)){
@@ -171,6 +215,7 @@ int cp_qpow_pool_on_line(const char* line)
         fflush(stdout);
         return 1;
     }
+    cp_pool_note_job();
 
     if(cp_job_mining_active()){
         if(cp_job_key_matches(job.job_key)) return 1;

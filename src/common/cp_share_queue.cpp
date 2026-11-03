@@ -353,11 +353,11 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     const int submit_id = (*job_ctx.msg_id)++;
-    /* Mark in flight before sending: a reply processed before a late set(1) would leave the
-     * flag stuck and trip the reader's submit-reply watchdog on a healthy connection. */
-    cp_pool_set_submit_inflight(1);
+    /* Track before sending: a reply processed before a late track() would leave the id
+     * waiting and trip the reader's submit-reply watchdog on a healthy connection. */
+    cp_pool_track_submit(submit_id);
     if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, submit_b64, hs)) {
-        cp_pool_set_submit_inflight(0);
+        cp_pool_untrack_submit(submit_id);
         printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
@@ -370,7 +370,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     printf("[net] plain_proof submit sent (nonce=%llu%s)\n", (unsigned long long)snap->nonce,
            submit_b64 == gz_b64 ? ", gzip" : "");
-    cp_pool_log_share_submit_outcome();
+    cp_pool_log_share_submit_outcome(submit_id);
     fflush(stdout);
 
     set_outcome(CP_SHARE_OUTCOME_OK);

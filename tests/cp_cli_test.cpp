@@ -113,6 +113,13 @@ int main()
                            "tcp://h:3333x", "tcp://h/x:3333", "tcp://1234567890123456:1"})
         assert(rejects([bad, &host] { cp_cli_pool_uri(bad, host, sizeof(host)); }));
     assert(cp_cli_pool_uri("tcp://123456789012345:1", host, sizeof(host)) == 1);
+    assert(cp_cli_pool_uri("stratum+tcp://[::1]:3333", host, sizeof(host)) == 3333 &&
+           std::string(host) == "::1");
+    assert(cp_cli_pool_uri("tcp://[2001:db8::7]:1/", host, sizeof(host)) == 1 &&
+           std::string(host) == "2001:db8::7");
+    for(const char* bad : {"tcp://[::1]", "tcp://[::1]3333", "tcp://[]:1", "tcp://[::1:1",
+                           "tcp://[::1]:", "tcp://[::1]:0"})
+        assert(rejects([bad, &host] { cp_cli_pool_uri(bad, host, sizeof(host)); }));
 
     int devices[3], count = 0;
     cp_cli_devices("0,2", devices, count, 3);
