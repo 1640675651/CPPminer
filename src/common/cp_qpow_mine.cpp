@@ -244,6 +244,16 @@ static int build_start_nonce(const CpQpowJob* job, const char* worker_name,
 static int submit_qpow_share(const CpQpowJob* job, int sock, int* msg_id,
                              const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid);
 
+/* The CPU search finds shares through the nonce line's fast path; confirm the nonce that will
+ * be submitted with the reference hash, as the OpenCL worker does for its candidates. */
+static bool qpow_reference_hash_ok(const CpQpowJob* job, const uint8_t nonce[CP_QPOW_NONCE_BYTES])
+{
+    uint64_t mid[qpow::WIDTH];
+    uint8_t hash[64];
+    qpow::mining_midstate(job->mining_hash, nonce, mid);
+    return qpow::hash_if_valid(mid, nonce + 32, job->target, hash);
+}
+
 /* Handle a found nonce. Returns 1 if mining should stop (mock done). */
 static int on_qpow_share_found(const CpQpowJob* job, int sock, int* msg_id,
                                const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid)
@@ -587,7 +597,11 @@ static int mine_job_cpu(const CpQpowJob* job, int sock, int* msg_id,
             }
             /* A share in this chunk is still submitted (current wallet) even if a switch was
              * just requested; the thread exits at the running check below. */
-            if(r.found){
+            if(r.found && !qpow_reference_hash_ok(job, r.nonce)){
+                fprintf(stderr, "[qpow] cpu share failed the reference hash, dropped (tid=%d)\n", tid);
+                memcpy(cur, r.counter, CP_QPOW_NONCE_BYTES);
+                qpow::inc_be(cur);
+            } else if(r.found){
                 std::lock_guard<std::mutex> lk(submit_mx);
                 if(on_qpow_share_found(job, sock, msg_id, r.nonce, tid)){
                     stop_rc.store(CP_JOB_NONE, std::memory_order_relaxed);

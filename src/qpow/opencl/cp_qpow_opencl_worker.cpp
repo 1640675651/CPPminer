@@ -126,6 +126,11 @@ void release_buffers()
     release_kernel();
 }
 
+/* Set once the device compiler rejected the default add-with-overflow carry: Intel UHD 770
+ * lowers __builtin_add_overflow on ulong to __spirv_IAddCarry, which its backend cannot build.
+ * Every later build then uses the compare form (-DQV_OVF=0). */
+bool g_ovf_compare = false;
+
 bool build_variant(int mul, int red)
 {
     release_kernel();
@@ -144,7 +149,14 @@ bool build_variant(int mul, int red)
         const int v = atoi(p + 7);
         if(v >= 1 && v <= 4) g_npw = v;
     }
-    if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts.c_str())) return false;
+    if(g_ovf_compare) opts += " -DQV_OVF=0";
+    if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts.c_str())){
+        if(g_ovf_compare || opts.find("QV_OVF=") != std::string::npos) return false;
+        fprintf(stderr, "[qpow-ocl] retrying the build with the compare-based carry (-DQV_OVF=0)\n");
+        opts += " -DQV_OVF=0";
+        if(!g_ctx.safe_build_program_from_file(g_kernel_path.c_str(), opts.c_str())) return false;
+        g_ovf_compare = true;
+    }
     g_kernel = g_ctx.create_kernel("qpow_scan");
     return g_kernel != nullptr;
 }
@@ -200,9 +212,10 @@ bool self_test(size_t local)
     clReleaseMemObject(dump);
     if(!ok) return false;
     /* 128 samples: an unstable clock that corrupts a few hashes in a thousand still shows up.
-     * The kernel's fast reduction (QV_WRED_FAST) misses about 2 hashes in a million, so one
-     * mismatch is reported but tolerated; a broken variant or clock produces many. */
-    int bad = 0;
+     * The inputs are fixed, so the fast reduction's rare misses (QV_WRED_FAST, about 2 hashes
+     * in a million) either hit these samples on every run or never; they hit none. Any
+     * mismatch therefore rejects the variant: tolerating one would only let a slightly
+     * broken variant or clock through, and its wrong hashes would silently lose shares. */
     for(u32 i = 0; i < n; i += 32){
         uint8_t c[64], nn[64];
         memcpy(c, ctr, 64);
@@ -212,7 +225,7 @@ bool self_test(size_t local)
         if(got[i] != ref){
             fprintf(stderr, "[qpow-ocl] self-test mismatch (mul=%d red=%d) at nonce +%u: got %016llx, want %016llx\n",
                     g_mul, g_red, i, (unsigned long long)got[i], (unsigned long long)ref);
-            if(++bad > 1) return false;
+            return false;
         }
     }
     return true;
