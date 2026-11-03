@@ -621,13 +621,17 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     Hit hit;
     int rc = 0;
 
-    printf("[hexagon] plain_proof scan %d launches of %dx%d (%d panels), %llu hash tiles, "
-           "difficulty scaled by %llu; hash_a %.3fs (%zu of %zu chunks)\n",
-           S, g_buf.rows, g_buf.cols, panels,
-           (unsigned long long)((uint64_t)(m / kTileRows) * (uint64_t)(n / kTileCols)),
-           (unsigned long long)cp_jackpot_scale_factor(), hash_sec, rehashed,
-           (size_t)m * K_DIM / 1024);
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if(!scan_logged){
+        scan_logged = true;
+        printf("[hexagon] plain_proof scan %d launches of %dx%d (%d panels), %llu hash tiles, "
+               "difficulty scaled by %llu\n",
+               S, g_buf.rows, g_buf.cols, panels,
+               (unsigned long long)((uint64_t)(m / kTileRows) * (uint64_t)(n / kTileCols)),
+               (unsigned long long)cp_jackpot_scale_factor());
+        fflush(stdout);
+    }
 
     auto launch_tiles = [](const Launch& l) {
         return (uint64_t)(l.rows / kTileRows) * (uint64_t)(l.cols / kTileCols);
@@ -786,8 +790,9 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
     if(out_tiles_scanned) *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("hexagon", prep_sec, scan_sec, tiles_done, 0.0);
     printf("[hexagon] scan %.3fs: DSP busy %.3fs, waited for the host %.3fs; host %s "
-           "%.3fs, waiting for the DSP %.3fs\n", scan_sec, run.dsp_us / 1e6, run.wait_us / 1e6,
-           g_fused_jackpot ? "hit check" : "jackpot", check_sec, wait_sec);
+           "%.3fs, waiting for the DSP %.3fs; hash_a %.3fs (%zu of %zu chunks)\n", scan_sec,
+           run.dsp_us / 1e6, run.wait_us / 1e6, g_fused_jackpot ? "hit check" : "jackpot",
+           check_sec, wait_sec, hash_sec, rehashed, (size_t)m * K_DIM / 1024);
     fflush(stdout);
     if(rc != 0)
         return rc;

@@ -27,8 +27,8 @@ Rates are printed as TMAC/s when ≥ 10¹² MAC/s (`cp_pp_fmt_mac_rate`).
 |----------|---------|-----------|----------|
 | `[ocl]` / `[cpu]` / `[gpu] plain_proof progress` | tiles_so_far / scan_elapsed | From scan start of **this** matrix attempt | Scan only |
 | `[…] attempt timing: … X TMAC/s` | tiles_this_attempt / **scan_sec** | Scan start → scan end | Scan only (`prep=` is printed separately and **not** in the rate) |
-| `[plain] … no share yet` | `tiles_scanned_total` / `(now − job_t0)` | Job start → now | Prep, scans, gaps, hit handling since job start |
-| `[plain] proof ready … X TMAC/s (hs=…)` | `tiles_since_prev` / `interval_sec` | Previous share → this share (or **job start** → first share) | Prep, misses, scans, and gaps in that interval — **not** proof build |
+| `[pearl] … no share yet` | `tiles_scanned_total` / `(now − first attempt start)` | First attempt of the job → now | Prep, scans, gaps, hit handling since the first attempt — **not** job setup |
+| `[pearl] proof ready … X TMAC/s (hs=…)` | `tiles_since_prev` / `interval_sec` | Previous share → this share (or **job start** → first share) | Prep, misses, scans, and gaps in that interval — **not** proof build |
 | Pool submit `hs` | Same as proof-ready | Same interval | Same as proof-ready |
 
 ### Progress (in-scan)
@@ -51,14 +51,16 @@ Logged once per matrix attempt when the scan returns:
 - Early exit shortens both tiles and `scan_sec` together → rate stays close to progress  
 - Prep (~0.3s GPU matrix prep) does **not** dilute this number  
 
-### Job-level `[plain] … no share yet`
+### Job-level `[pearl] … no share yet`
 
 ```text
-[plain] nonce=… attempts=… (…/s) 4.16 TMAC/s no share yet
+[pearl] attempts=… (…/s) 4.16 TMAC/s no share yet
 ```
 
+- Printed after every 5th attempt of a job (unless that attempt found a share)  
 - **Numerator:** cumulative tiles for the whole job  
-- **Denominator:** wall time since `job_t0`  
+- **Denominator:** wall time since the job's first attempt started; the per-job setup before it
+  (`cp_worker_begin_job`: B digest and prep) is left out  
 - Diluted by every prep, early-exit overhead fraction, and gaps  
 
 Used for operator visibility only; **not** sent to the pool.
@@ -76,7 +78,7 @@ Then:
 hs = cp_pp_mac_rate_from_tiles(tiles_since_prev, interval_sec)
 ```
 
-Submitted as JSON field `hs` in `mining.submit` (`cp_pool_send_plain_proof_submit`). The same value is printed on `[plain] proof ready`.
+Submitted as JSON field `hs` in `mining.submit` (`cp_pool_send_plain_proof_submit`). The same value is printed on `[pearl] proof ready`.
 
 **Proof construction is async and is not included in `hs`.** The interval is snapped when the hit is enqueued, before proof build.
 

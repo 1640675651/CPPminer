@@ -229,10 +229,15 @@ extern "C" int cp_pearl_wgpu_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
-    printf("[pearl-wgpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu (tile %dx%d)\n",
-           row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor(),
-           cp_pp_hash_tile_h(), cp_pp_hash_tile_w());
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if (!scan_logged) {
+        scan_logged = true;
+        printf("[pearl-wgpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu (tile %dx%d)\n",
+               row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor(),
+               cp_pp_hash_tile_h(), cp_pp_hash_tile_w());
+        fflush(stdout);
+    }
 
     std::atomic<uint64_t> tiles{0};
     std::atomic<bool> scan_done{false};

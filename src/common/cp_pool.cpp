@@ -605,9 +605,9 @@ void cp_pool_untrack_submit(int msg_id)
 void cp_pool_log_share_submit_outcome(int msg_id)
 {
     if(g_submits.pending(msg_id))
-        printf("[plain] share submitted; pool ack pending (reader will log [pool] submit response)\n");
+        printf("[pool] share submitted; pool ack pending (reader will log [pool] submit response)\n");
     else
-        printf("[plain] share submitted; pool response already received\n");
+        printf("[pool] share submitted; pool response already received\n");
     fflush(stdout);
 }
 

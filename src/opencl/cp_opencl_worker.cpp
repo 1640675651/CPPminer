@@ -588,10 +588,15 @@ extern "C" int cp_opencl_worker_mine_attempt(
     const double prep_sec = cp_now_sec() - attempt_t0;
     const double scan_t0 = cp_now_sec();
 
-    printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n", row_parts,
-           col_parts, (unsigned long long)cp_jackpot_scale_factor());
-    printf("[ocl] GEMM %s\n", g_gemm.backend());
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if (!scan_logged) {
+        scan_logged = true;
+        printf("[ocl] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n", row_parts,
+               col_parts, (unsigned long long)cp_jackpot_scale_factor());
+        printf("[ocl] GEMM %s\n", g_gemm.backend());
+        fflush(stdout);
+    }
 
     std::atomic<uint64_t> tiles{0};
     std::atomic<bool> scan_done{false};

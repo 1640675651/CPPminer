@@ -1933,12 +1933,17 @@ static int gpu_scan_device_period(
 
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
-    printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
-           "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %llu\n",
-           row_periods, col_periods, g_row_period_batch, g_col_period_batch,
-           total_tiles,
-           (unsigned long long)cp_jackpot_scale_factor());
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if(!scan_logged){
+        scan_logged = true;
+        printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
+               "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %llu\n",
+               row_periods, col_periods, g_row_period_batch, g_col_period_batch,
+               total_tiles,
+               (unsigned long long)cp_jackpot_scale_factor());
+        fflush(stdout);
+    }
 
     for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch){
         if(cp_job_should_cancel()){
@@ -2024,10 +2029,15 @@ static int gpu_scan_device(
 
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
-    printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
-           row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
-    //printf("[gpu] jackpot target LE: %08X %08X ...\n", bound[0], bound[1]);
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if(!scan_logged){
+        scan_logged = true;
+        printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
+               row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
+        //printf("[gpu] jackpot target LE: %08X %08X ...\n", bound[0], bound[1]);
+        fflush(stdout);
+    }
 
     for(int rp0 = 0; rp0 < row_parts && !found; rp0 += batch){
         if(cp_job_should_cancel()){

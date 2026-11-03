@@ -72,7 +72,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
     }
     fflush(stdout);
 
-    printf("[plain] mining job=%s%s...\n", job_id,
+    printf("[pearl] mining job=%s%s...\n", job_id,
            cp_fee_next_is_dev() ? " [DEV FEE]" : "");
     fflush(stdout);
     int rc = cp_mine_job(header, hlen, job_id, target_hex, tgt, cert_version,
@@ -83,15 +83,15 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
     }
     if(rc == CP_JOB_ERROR) return rc;
     if(rc == CP_JOB_CANCELLED){
-        printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
+        printf("[pearl] job ended (new notify or disconnect)\n"); fflush(stdout);
     } else if(rc == CP_JOB_NONE){
-        printf("[plain] job stopped (max_nonce or error)\n"); fflush(stdout);
+        printf("[pearl] job stopped (max_nonce or error)\n"); fflush(stdout);
     }
 
     CpPendingJob pj;
     while(rc == CP_JOB_CANCELLED && cp_pool_take_pending_job(&pj)){
         set_cur_job_key(cur_job_key, key_size, pj.job_key);
-        printf("[plain] mining queued job=%s%s...\n", pj.job_id,
+        printf("[pearl] mining queued job=%s%s...\n", pj.job_id,
                cp_fee_next_is_dev() ? " [DEV FEE]" : "");
         fflush(stdout);
         rc = cp_mine_job(pj.header, INCOMPLETE_HEADER_BYTES, pj.job_id,
@@ -102,9 +102,9 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
         }
         if(rc == CP_JOB_ERROR) return rc;
         if(rc == CP_JOB_CANCELLED){
-            printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
+            printf("[pearl] job ended (new notify or disconnect)\n"); fflush(stdout);
         } else if(rc == CP_JOB_NONE){
-            printf("[plain] job stopped (max_nonce or error)\n"); fflush(stdout);
+            printf("[pearl] job stopped (max_nonce or error)\n"); fflush(stdout);
         }
     }
     return rc;

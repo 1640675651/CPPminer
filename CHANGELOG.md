@@ -5,15 +5,17 @@
 - OneDNN backend now supports Xe-HPG and Xe2 GPU with XMX cores with optimized performance
 - Experimental Hexagon backend
 - Experimental Intel NPU backend
-(3 features below thanks to @danifest751)
+(4 features below thanks to @danifest751)
 - AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
 - ARM i8mm kernel
 - Kryptex Pearl stratum gzip protocol v2
+- HTTP API for HiveOS
 
 ### Fix & Enhancements
 - Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
 - OpenCL: `int` accumulates straight into the int32 tile instead of a separate panel, lower register pressure and overhead
 - Fix Pearl wgpu hang on AMD Metal
+- Reduce repetitive log output
 - Refactored lengthy main.cpp
 (6 improvements below thanks to @danifest751)
 - NEON DotProd and basic NEON kernel rewrite, reducing instruction count

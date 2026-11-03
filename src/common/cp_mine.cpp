@@ -111,8 +111,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
     uint64_t attempts = 0;
     uint64_t tiles_scanned_total = 0;
     uint64_t tiles_at_prev_share = 0;
-    double last_report = 0.0;
     double t_prev_share = 0.0;
+    /* Start of the first attempt: the progress line's rate leaves out the job setup. */
+    double t_attempts0 = 0.0;
 
     /* These are assigned inside the scope below so that early goto job_done
      * does not cross initializations (GCC 15 C++17 strictness). */
@@ -140,7 +141,6 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         tiles_per_attempt = cp_pp_num_row_parts(g_m_active, cp_worker_uses_contiguous_tiles()) *
                             cp_pp_num_col_parts(g_n_active, cp_worker_uses_contiguous_tiles());
         cp_fee_set_tiles_per_matrix((uint64_t)tiles_per_attempt);
-        last_report = cp_now_sec();
         t_prev_share = t0;
         tiles_at_prev_share = 0;
 
@@ -164,9 +164,10 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         share_witness = cp_worker_supports_share_witness() && !host_matrices;
     }
 
+    t_attempts0 = cp_now_sec();
     for (;;) {
         if (cp_job_should_cancel()) {
-            printf("[plain] job cancelled\n");
+            printf("[pearl] job cancelled\n");
             fflush(stdout);
             rc = CP_JOB_CANCELLED;
             goto job_done;
@@ -187,7 +188,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             fflush(stdout);
         }
         if (g_max_nonce > 0 && nonce >= (uint64_t)g_max_nonce) {
-            printf("[plain] stopped after max_nonce=%d\n", g_max_nonce);
+            printf("[pearl] stopped after max_nonce=%d\n", g_max_nonce);
             fflush(stdout);
             rc = CP_JOB_NONE;
             goto job_done;
@@ -200,7 +201,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
                                            handoff_bt ? &h_BpT_global : NULL);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
-                fprintf(stderr, "[plain] host matrix buffers missing after reclaim\n");
+                fprintf(stderr, "[pearl] host matrix buffers missing after reclaim\n");
                 rc = CP_JOB_ERROR;
                 goto job_done;
             }
@@ -208,14 +209,18 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         ab_len = pearl_effective_seed(header, hlen, nonce, ab_seed, (int)sizeof(ab_seed));
         if (ab_len < 0) {
-            fprintf(stderr, "[plain] effective_seed failed nonce=%llu\n",
+            fprintf(stderr, "[pearl] effective_seed failed nonce=%llu\n",
                     (unsigned long long)nonce);
             rc = CP_JOB_ERROR;
             goto job_done;
         }
 
+        /* The matrix generation mode is the same for every attempt: log it once. */
+        static bool gen_logged = false;
+        const bool log_gen = !gen_logged;
+        gen_logged = true;
         if (host_matrices) {
-            if (nonce < 3 || nonce % 16 == 0) {
+            if (log_gen) {
                 printf("[gen] nonce=%llu: host A/B + noise (%s)...\n",
                        (unsigned long long)nonce, cp_worker_backend_name());
                 fflush(stdout);
@@ -223,7 +228,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
             if (pearl_generate_ab(ab_seed, ab_len, g_m_active, g_n_active, K_DIM, h_Ap_global,
                                   h_BpT_global) != 0) {
-                printf("[plain] job cancelled during A,B generation\n");
+                printf("[pearl] job cancelled during A,B generation\n");
                 fflush(stdout);
                 rc = CP_JOB_CANCELLED;
                 goto job_done;
@@ -235,7 +240,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             if (pearl_build_noisy_matrices(g_m_active, g_n_active, K_DIM, R_RANK, b_seed, a_key,
                                            h_Ap_global, h_BpT_global, h_A_scan, h_B_scan) != 0) {
                 if (cp_job_should_cancel()) {
-                    printf("[plain] job cancelled during noise fusion\n");
+                    printf("[pearl] job cancelled during noise fusion\n");
                     fflush(stdout);
                     rc = CP_JOB_CANCELLED;
                 } else {
@@ -245,7 +250,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 }
                 goto job_done;
             }
-        } else if (nonce < 3 || nonce % 16 == 0) {
+        } else if (log_gen) {
             if (cp_worker_worker_handles_matrix_prep()) {
                 printf("[gen] nonce=%llu: zero-B random A + A-noise (%s)...\n",
                        (unsigned long long)nonce, cp_worker_backend_name());
@@ -270,10 +275,10 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         if (found < 0) {
             if (cp_job_should_cancel()) {
-                printf("[plain] job cancelled during %s scan\n", cp_worker_backend_name());
+                printf("[pearl] job cancelled during %s scan\n", cp_worker_backend_name());
                 rc = CP_JOB_CANCELLED;
             } else {
-                fprintf(stderr, "[plain] %s mine_attempt failed (rc=%d)\n",
+                fprintf(stderr, "[pearl] %s mine_attempt failed (rc=%d)\n",
                         cp_worker_backend_name(), found);
                 rc = CP_JOB_ERROR;
             }
@@ -283,20 +288,17 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         if (found == 0) {
-            double now = cp_now_sec();
-            if (now - last_report >= (g_mock ? 2.0 : 10.0)) {
-                double sec = now - t0;
+            if (attempts % 5 == 0) {
+                double sec = cp_now_sec() - t_attempts0;
                 if (sec < 1e-3) {
                     sec = 1e-3;
                 }
                 char mac_buf[32];
                 cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_scanned_total, sec), mac_buf,
                                    sizeof(mac_buf));
-                printf("[plain] nonce=%llu attempts=%llu (%.2f/s) %s no share yet\n",
-                       (unsigned long long)nonce, (unsigned long long)attempts,
-                       (double)attempts / sec, mac_buf);
+                printf("[pearl] attempts=%llu (%.2f/s) %s no share yet\n",
+                       (unsigned long long)attempts, (double)attempts / sec, mac_buf);
                 fflush(stdout);
-                last_report = now;
             }
             /* Matrix finished with no hit — update fee debt after completion logs. */
             cp_fee_note_tiles(scan_tiles);
@@ -305,12 +307,12 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         /* Hit: log on the mining thread before fee accounting / proof enqueue. */
-        printf("[plain] %s hit nonce=%llu t_rows=%d t_cols=%d - building proof (async)...\n",
+        printf("[pearl] %s hit nonce=%llu t_rows=%d t_cols=%d - building proof (async)...\n",
                cp_worker_backend_name(), (unsigned long long)nonce, t_rows, t_cols);
         fflush(stdout);
 
         if (cp_job_should_cancel()) {
-            printf("[plain] job cancelled after %s hit (stale)\n", cp_worker_backend_name());
+            printf("[pearl] job cancelled after %s hit (stale)\n", cp_worker_backend_name());
             fflush(stdout);
             cp_fee_note_tiles(scan_tiles);
             rc = CP_JOB_CANCELLED;
@@ -318,7 +320,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         if (!g_share_queue) {
-            fprintf(stderr, "[plain] share queue unavailable\n");
+            fprintf(stderr, "[pearl] share queue unavailable\n");
             cp_fee_note_tiles(scan_tiles);
             rc = CP_JOB_ERROR;
             goto job_done;
@@ -336,7 +338,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 CpShareWitness *witness = NULL;
                 if (cp_worker_fetch_share_witness(t_rows, t_cols, cp_worker_proof_tile_layout(),
                                                   &witness) != 0) {
-                    fprintf(stderr, "[plain] failed to fetch share witness nonce=%llu\n",
+                    fprintf(stderr, "[pearl] failed to fetch share witness nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
                     rc = CP_JOB_ERROR;
@@ -346,7 +348,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 if (cp_share_queue_enqueue_witness(g_share_queue, &hit, header, hlen, job_id,
                                                    target_hex, &witness) != 0) {
                     cp_share_witness_free(witness);
-                    fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
+                    fprintf(stderr, "[pearl] failed to enqueue share nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
                     rc = CP_JOB_ERROR;
@@ -373,7 +375,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                                handoff_bt ? &h_BpT_global : NULL);
             }
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
-                fprintf(stderr, "[plain] host matrix buffers missing before proof handoff\n");
+                fprintf(stderr, "[pearl] host matrix buffers missing before proof handoff\n");
                 cp_fee_note_tiles(scan_tiles);
                 rc = CP_JOB_ERROR;
                 goto job_done;
@@ -381,7 +383,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             if (defer_host_reclaim) {
                 if (cp_worker_fetch_share_signals(
                             h_Ap_global, handoff_bt ? h_BpT_global : NULL) != 0) {
-                    fprintf(stderr, "[plain] failed to fetch signal matrices nonce=%llu\n",
+                    fprintf(stderr, "[pearl] failed to fetch signal matrices nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
                     rc = CP_JOB_ERROR;
@@ -396,7 +398,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                     handoff_bt};
             if (cp_share_queue_enqueue_hit(g_share_queue, &hit, header, hlen, job_id, target_hex,
                                            &h_Ap_global, szAp, &h_BpT_global, szBpT) != 0) {
-                fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
+                fprintf(stderr, "[pearl] failed to enqueue share nonce=%llu\n",
                         (unsigned long long)nonce);
                 cp_fee_note_tiles(scan_tiles);
                 rc = CP_JOB_ERROR;

@@ -617,11 +617,16 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     }
     const uint64_t total_tiles = uint64_t(m / kTileRows) * uint64_t(n / kTileCols);
     const double prep_sec = cp_now_sec() - attempt_t0;
-    printf("[intel-npu] plain_proof scan %d launches of %dx%d (%d row panels), %llu hash tiles, difficulty "
-           "scaled by %llu; hash_a %.3fs (%zu of %zu chunks)\n",
-           s.launches, rows, cols, s.panels, (unsigned long long)total_tiles,
-           (unsigned long long)cp_jackpot_scale_factor(), hash_sec, rehashed, size_t(m) * K_DIM / 1024);
-    fflush(stdout);
+    /* The scan setup is the same for every attempt: log it once. */
+    static bool scan_logged = false;
+    if (!scan_logged) {
+        scan_logged = true;
+        printf("[intel-npu] plain_proof scan %d launches of %dx%d (%d row panels), %llu hash tiles, "
+               "difficulty scaled by %llu\n",
+               s.launches, rows, cols, s.panels, (unsigned long long)total_tiles,
+               (unsigned long long)cp_jackpot_scale_factor());
+        fflush(stdout);
+    }
 
     const double scan_t0 = cp_now_sec();
     const int gen_threads = std::max(1, std::min(8, hw_threads() - 1));
@@ -635,8 +640,9 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
     if (out_tiles_scanned)
         *out_tiles_scanned = tiles_done;
     cp_log_attempt_timing("intel-npu", prep_sec, scan_sec, tiles_done, 0.0);
-    printf("[intel-npu] scan %.3fs: host A prep %.3fs, %s %.3fs\n", scan_sec, s.prep_busy,
-           g_eng->shape().fused_jackpot ? "hit check" : "jackpot", s.check_busy);
+    printf("[intel-npu] scan %.3fs: host A prep %.3fs, %s %.3fs; hash_a %.3fs (%zu of %zu chunks)\n",
+           scan_sec, s.prep_busy, g_eng->shape().fused_jackpot ? "hit check" : "jackpot",
+           s.check_busy, hash_sec, rehashed, size_t(m) * K_DIM / 1024);
     fflush(stdout);
     if (!s.error.empty()) {
         fprintf(stderr, "[intel-npu] %s\n", s.error.c_str());

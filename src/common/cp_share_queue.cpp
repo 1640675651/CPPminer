@@ -203,7 +203,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     if (!cp_job_key_matches(snap->job_key)) {
-        printf("[plain] stale share nonce=%llu dropped (job changed)\n",
+        printf("[pearl] stale share nonce=%llu dropped (job changed)\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_DROPPED);
@@ -214,7 +214,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     char *b64 = (char *)malloc(PLAIN_PROOF_B64_MAX);
     if (!b64) {
-        fprintf(stderr, "[plain] OOM proof b64 buffer (nonce=%llu)\n",
+        fprintf(stderr, "[pearl] OOM proof b64 buffer (nonce=%llu)\n",
                 (unsigned long long)snap->nonce);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         return_snapshot_matrices(snap);
@@ -228,7 +228,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     const int prc = build_snapshot_proof(snap, job_ctx, b64, errbuf, sizeof(errbuf));
     const double proof_build_sec = cp_now_sec() - proof_started;
     if (prc != 0) {
-        printf("[plain] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
+        printf("[pearl] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
                errbuf[0] ? errbuf : "unknown");
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
@@ -240,7 +240,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     const int bn = (int)strlen(b64);
     if (bn < 32) {
-        printf("[plain] proof too short (%d) nonce=%llu\n", bn, (unsigned long long)snap->nonce);
+        printf("[pearl] proof too short (%d) nonce=%llu\n", bn, (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
@@ -253,13 +253,13 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (g_dry_run) {
         if (!cp_write_file_bin(job_ctx.hdr_path, snap->header, (size_t)snap->header_len) ||
             !cp_write_file_bin(job_ctx.proof_path, b64, (size_t)bn)) {
-            fprintf(stderr, "[plain] dry-run: could not save %s / %s\n", job_ctx.hdr_path,
+            fprintf(stderr, "[pearl] dry-run: could not save %s / %s\n", job_ctx.hdr_path,
                     job_ctx.proof_path);
         }
     }
 
     if (!cp_job_key_matches(snap->job_key)) {
-        printf("[plain] stale share nonce=%llu dropped before verify/submit\n",
+        printf("[pearl] stale share nonce=%llu dropped before verify/submit\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_DROPPED);
@@ -274,7 +274,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
         const double verify_started = cp_now_sec();
         if (verify_proof(snap->header, snap->header_len, snap->target_hex, b64, (size_t)bn,
                          job_ctx.cert_version) != 0) {
-            printf("[plain] verify failed (nonce=%llu cert_version=%u)\n",
+            printf("[pearl] verify failed (nonce=%llu cert_version=%u)\n",
                    (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
             fflush(stdout);
             set_outcome(CP_SHARE_OUTCOME_VERIFY_FAIL);
@@ -284,12 +284,12 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
             return;
         }
         proof_verify_sec = cp_now_sec() - verify_started;
-        printf("[plain] verify OK (nonce=%llu cert_version=%u)\n",
+        printf("[pearl] verify OK (nonce=%llu cert_version=%u)\n",
                (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
         fflush(stdout);
     }
 
-    printf("[plain] proof timing: build=%.3fs verify=%.3fs\n",
+    printf("[pearl] proof timing: build=%.3fs verify=%.3fs\n",
            proof_build_sec, proof_verify_sec);
 
     double hs = cp_pp_mac_rate_from_tiles(snap->tiles_since_prev, snap->interval_sec);
@@ -299,7 +299,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     {
         char mac_buf[32];
         cp_pp_fmt_mac_rate(hs, mac_buf, sizeof(mac_buf));
-        printf("[plain] proof ready (%d chars) nonce=%llu %s (hs=%.0f)\n", bn,
+        printf("[pearl] proof ready (%d chars) nonce=%llu %s (hs=%.0f)\n", bn,
                (unsigned long long)snap->nonce, mac_buf, hs);
     }
     fflush(stdout);
@@ -315,13 +315,13 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
             errbuf[0] = 0;
             const double gz_started = cp_now_sec();
             if (cp_proof_gzip_b64(b64, gz_b64, PLAIN_PROOF_B64_MAX, errbuf, sizeof(errbuf)) != 0) {
-                printf("[plain] proof gzip failed (nonce=%llu): %s%s\n",
+                printf("[pearl] proof gzip failed (nonce=%llu): %s%s\n",
                        (unsigned long long)snap->nonce, errbuf[0] ? errbuf : "unknown",
                        pool_gzip ? " - submitting plain base64" : "");
                 free(gz_b64);
                 gz_b64 = nullptr;
             } else {
-                printf("[plain] proof gzip: %d -> %zu chars (%.1fx, %.3fs)%s\n", bn,
+                printf("[pearl] proof gzip: %d -> %zu chars (%.1fx, %.3fs)%s\n", bn,
                        strlen(gz_b64), (double)bn / (double)(strlen(gz_b64) ? strlen(gz_b64) : 1),
                        cp_now_sec() - gz_started,
                        pool_gzip ? "" : " (not submitted compressed: pool is not v2)");
@@ -332,7 +332,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     const char *submit_b64 = (pool_gzip && gz_b64) ? gz_b64 : b64;
 
     if (g_dry_run) {
-        printf("[plain] dry-run: proof saved to %s (nonce=%llu)\n", job_ctx.proof_path,
+        printf("[pearl] dry-run: proof saved to %s (nonce=%llu)\n", job_ctx.proof_path,
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_OK);
@@ -358,7 +358,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     cp_pool_track_submit(submit_id);
     if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, submit_b64, hs)) {
         cp_pool_untrack_submit(submit_id);
-        printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
+        printf("[pearl] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(gz_b64);
