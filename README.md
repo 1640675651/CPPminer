@@ -21,7 +21,7 @@ Select the algorithm and backend at runtime with `--algo` (default `pearl`) and 
 | Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + tile XOR on the SHAVE cores ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
-| Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device |
+| Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device ([docs](docs/quantus_opencl.md)) |
 
 ## Requirements
 
@@ -174,6 +174,8 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 | `--ocl-throttle L` | OpenCL and oneDNN backends: `cl_khr_throttle_hints` queue hint, `low`, `med`, `high`, or `off`. With `low`, Intel's driver sleeps while waiting for the GPU instead of spinning a CPU core; `med`, `high` and `off` spin. Default `off`: `low` cuts oneDNN's CPU use from 0.5-1 core to about 0 (A770 and UHD 770, hashrate within 0.6%), but on the A770 the driver's sleeping wait occasionally misses its wake-up and a scan stalls for ~70 s, and `--backend opencl` loses 3.6% with it. Ignored by devices without the extension (NVIDIA) |
 
 `--ocl-tile` sets the GEMM register tile. Jackpot XOR, hashrate counting, and proof layout use the corresponding semantic hash tile. `--ocl-macro` sets the WG macro block (work-group covers one macro); it is independent of the register tile. Examples: `--ocl-tile 4x8 --ocl-macro 64x64` or `--ocl-tile 4x8/64x64`. `--ocl-issue` / `--ocl-dot` / `--ocl-cpm-type` select the nest ([`docs/opencl_issue_shape.md`](docs/opencl_issue_shape.md)). Default **auto** picks the best available accelerated dot, then float **B-scalar broadcast** fallback.
+
+The GEMM flags above are for Pearl. Quantus on OpenCL picks its kernel variant per device at start-up, and environment variables override the choice ([`docs/quantus_opencl.md`](docs/quantus_opencl.md)).
 
 ### wgpu options (Pearl)
 
