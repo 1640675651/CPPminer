@@ -285,7 +285,9 @@ extern "C" void cp_ocl_set_queue_throttle(int level) {
     g_queue_throttle = level;
 }
 
-#ifndef CL_VERSION_2_0
+/* Apple's OpenCL.framework is 1.2 only: it neither exports clCreateCommandQueueWithProperties
+   nor offers cl_khr_throttle_hints, so the hint path is compiled out there. */
+#if !defined(CL_VERSION_2_0) && !defined(__APPLE__)
 /* OpenCL 2.0 entry point (exported by the ICD loader); the 1.2 headers do not declare it. */
 extern "C" CL_API_ENTRY cl_command_queue CL_API_CALL clCreateCommandQueueWithProperties(
         cl_context, cl_device_id, const cl_ulong *, cl_int *);
@@ -293,6 +295,7 @@ extern "C" CL_API_ENTRY cl_command_queue CL_API_CALL clCreateCommandQueueWithPro
 
 cl_command_queue OpenClContext::create_queue(cl_context context, cl_device_id device,
                                              cl_command_queue_properties props, cl_int *err) {
+#ifndef __APPLE__
     if (g_queue_throttle >= 1 && g_queue_throttle <= 3) {
         size_t len = 0;
         std::string ext;
@@ -315,6 +318,7 @@ cl_command_queue OpenClContext::create_queue(cl_context context, cl_device_id de
             std::fprintf(stderr, "[ocl] queue throttle hint rejected (%d); using a plain queue\n", e);
         }
     }
+#endif
 #ifdef CL_VERSION_2_0
     const cl_queue_properties plain[] = {CL_QUEUE_PROPERTIES, props, 0};
     return clCreateCommandQueueWithProperties(context, device, plain, err);
