@@ -21,7 +21,7 @@ Select the algorithm and backend at runtime with `--algo` (default `pearl`) and 
 | Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + tile XOR on the SHAVE cores ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
-| Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 ulong kernel (port of mining_u64.wgsl) |
+| Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device |
 
 ## Requirements
 
@@ -144,7 +144,7 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
-| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus wgpu/OpenCL: **nonces per launch** (default 1000000). Aliases: `--period-batch`, `--col-period-batch` |
+| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus: **nonces per launch** (wgpu default 1000000; OpenCL default automatic, about 100 ms per launch). Aliases: `--period-batch`, `--col-period-batch` |
 | `--period-batch N` | Alias for `--batch-size` |
 | `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA: row-period batch (default 32, max 1024); oneDNN, Hexagon, Intel NPU: see below |

@@ -133,14 +133,14 @@ AVX2_INL void avx_int(__m256i s[WIDTH]) {
         s[i] = avx_add(avx_mul(s[i], _mm256_set1_epi64x((long long)MDS_DIAG[i])), sum);
 }
 
-AVX2_ATTR void avx_permute(__m256i s[WIDTH]) {
+AVX2_INL void avx_initial_round(__m256i s[WIDTH], int r) {
+    for (int i = 0; i < WIDTH; i++)
+        s[i] = avx_add(s[i], _mm256_set1_epi64x((long long)RC_INITIAL[r][i]));
+    for (int i = 0; i < WIDTH; i++) s[i] = avx_sbox(s[i]);
     avx_ext(s);
-    for (int r = 0; r < 4; r++) {
-        for (int i = 0; i < WIDTH; i++)
-            s[i] = avx_add(s[i], _mm256_set1_epi64x((long long)RC_INITIAL[r][i]));
-        for (int i = 0; i < WIDTH; i++) s[i] = avx_sbox(s[i]);
-        avx_ext(s);
-    }
+}
+
+AVX2_INL void avx_internal_terminal(__m256i s[WIDTH]) {
     for (int r = 0; r < 22; r++) {
         s[0] = avx_sbox(avx_add(s[0], _mm256_set1_epi64x((long long)RC_INTERNAL[r])));
         avx_int(s);
@@ -151,6 +151,20 @@ AVX2_ATTR void avx_permute(__m256i s[WIDTH]) {
         for (int i = 0; i < WIDTH; i++) s[i] = avx_sbox(s[i]);
         avx_ext(s);
     }
+}
+
+AVX2_ATTR void avx_permute(__m256i s[WIDTH]) {
+    avx_ext(s);
+    for (int r = 0; r < 4; r++) avx_initial_round(s, r);
+    avx_internal_terminal(s);
+}
+
+/* First permutation from the nonce line's round-1 state (round constants already added). */
+AVX2_ATTR void avx_permute_from_round1(__m256i s[WIDTH]) {
+    for (int i = 0; i < WIDTH; i++) s[i] = avx_sbox(s[i]);
+    avx_ext(s);
+    for (int r = 2; r < 4; r++) avx_initial_round(s, r);
+    avx_internal_terminal(s);
 }
 
 AVX2_ATTR void avx_absorb32(__m256i s[WIDTH], const uint8_t lows[4][32]) {
@@ -168,12 +182,7 @@ AVX2_ATTR void avx_absorb32(__m256i s[WIDTH], const uint8_t lows[4][32]) {
 // Returns a bitmask of lanes that still need the second squeeze
 // (high 32 bytes of hash are <= target high 32). Full hashes are only
 // valid for those lanes after the optional third permute.
-AVX2_ATTR int avx_hash4_impl(const uint64_t mid[WIDTH], const uint8_t lows[4][32],
-                             const uint8_t target[64], uint8_t hashes[4][64]) {
-    __m256i s[WIDTH];
-    for (int i = 0; i < WIDTH; i++) s[i] = _mm256_set1_epi64x((long long)mid[i]);
-    avx_absorb32(s, lows);
-    avx_permute(s);
+AVX2_ATTR int avx_finish(__m256i s[WIDTH], const uint8_t target[64], uint8_t hashes[4][64]) {
     s[0] = avx_add(s[0], _mm256_set1_epi64x(1));
     s[1] = avx_add(s[1], _mm256_set1_epi64x(1));
     avx_permute(s);
@@ -208,6 +217,37 @@ AVX2_ATTR int avx_hash4_impl(const uint64_t mid[WIDTH], const uint8_t lows[4][32
     return need;
 }
 
+AVX2_ATTR int avx_hash4_impl(const uint64_t mid[WIDTH], const uint8_t lows[4][32],
+                             const uint8_t target[64], uint8_t hashes[4][64]) {
+    __m256i s[WIDTH];
+    for (int i = 0; i < WIDTH; i++) s[i] = _mm256_set1_epi64x((long long)mid[i]);
+    avx_absorb32(s, lows);
+    avx_permute(s);
+    return avx_finish(s, target, hashes);
+}
+
+/* Line positions t .. t + 3 (nonce_line.hpp): only lanes 0 and 4 depend on t after the first
+ * linear layer, so the first round runs two S-boxes and folds in the precomputed rest. */
+AVX2_ATTR int avx_hash4_line(const uint64_t pk[nonce_line::kParams], uint32_t t,
+                             const uint8_t target[64], uint8_t hashes[4][64]) {
+    const __m256i d = _mm256_set_epi64x(35ll * (t + 3), 35ll * (t + 2), 35ll * (t + 1), 35ll * t);
+    const __m256i f = avx_sbox(avx_add(_mm256_set1_epi64x((long long)pk[0]),
+                                       _mm256_sub_epi64(_mm256_set1_epi64x((long long)P64), d)));
+    const __m256i g = avx_sbox(avx_add(_mm256_set1_epi64x((long long)pk[1]), d));
+    const __m256i c2 = avx_add(f, g);
+    const __m256i c[3] = {avx_add(c2, f), avx_add(c2, g), c2};
+    const int m0[4] = {2, 1, 1, 3};
+    __m256i s[WIDTH];
+    for (int blk = 0; blk < 3; blk++)
+        for (int j = 0; j < 4; j++) {
+            __m256i v = c[blk];
+            for (int r = 1; r < m0[j]; r++) v = avx_add(v, c[blk]);
+            s[4 * blk + j] = avx_add(_mm256_set1_epi64x((long long)pk[2 + 4 * blk + j]), v);
+        }
+    avx_permute_from_round1(s);
+    return avx_finish(s, target, hashes);
+}
+
 }  // namespace
 
 bool cpu_has_avx2() {
@@ -230,72 +270,45 @@ SearchResult search_range_avx2(const uint8_t header[32], const uint8_t start[64]
     if (!cpu_has_avx2()) return search_range_scalar(header, start, count, target);
 
     SearchResult r{};
-    uint8_t nonce[64];
-    std::memcpy(nonce, start, 64);
-    uint64_t mid[WIDTH];
-    mining_midstate(header, nonce, mid);
-    uint8_t high[32];
-    std::memcpy(high, nonce, 32);
-
+    uint8_t ctr[64];
+    std::memcpy(ctr, start, 64);
+    LineCache line;
     uint64_t i = 0;
-    while (i + 4 <= count) {
-        uint8_t batch[4][64];
-        uint8_t lows[4][32];
-        bool split = false;
-        for (int k = 0; k < 4; k++) {
-            std::memcpy(batch[k], nonce, 64);
-            if (std::memcmp(nonce, high, 32) != 0) {
-                split = true;
-                break;
-            }
-            std::memcpy(lows[k], nonce + 32, 32);
-            inc_be(nonce);
-        }
-        if (split) {
-            std::memcpy(nonce, batch[0], 64);
-            std::memcpy(high, nonce, 32);
-            mining_midstate(header, high, mid);
-            uint8_t hash[64];
-            r.hashes++;
-            i++;
-            if (hash_if_valid(mid, nonce + 32, target, hash)) {
-                r.found = true;
-                std::memcpy(r.nonce, nonce, 64);
-                std::memcpy(r.hash, hash, 64);
-                return r;
-            }
-            inc_be(nonce);
-            continue;
-        }
-
-        uint8_t hashes[4][64];
-        avx_hash4_impl(mid, lows, target, hashes);
-        r.hashes += 4;
-        i += 4;
-        for (int k = 0; k < 4; k++) {
-            if (std::memcmp(hashes[k], target, 64) < 0) {
-                r.found = true;
-                std::memcpy(r.nonce, batch[k], 64);
-                std::memcpy(r.hash, hashes[k], 64);
-                return r;
-            }
-        }
-    }
     while (i < count) {
-        if (std::memcmp(nonce, high, 32) != 0) {
-            std::memcpy(high, nonce, 32);
-            mining_midstate(header, high, mid);
-        }
+        /* one stretch of a single line: t .. t + n - 1 without a wrap of t */
+        line.update(header, ctr);
+        const uint32_t t = nonce_line::t_of(ctr);
+        uint64_t n = nonce_line::kTSpan - t;
+        if (n > count - i) n = count - i;
+        uint64_t j = 0;
+        int hit = -1;
         uint8_t hash[64];
-        r.hashes++;
-        i++;
-        if (hash_if_valid(mid, nonce + 32, target, hash)) {
+        for (; j + 4 <= n && hit < 0; j += 4) {
+            uint8_t hashes[4][64];
+            avx_hash4_line(line.pk, t + (uint32_t)j, target, hashes);
+            r.hashes += 4;
+            for (int k = 0; k < 4; k++)
+                if (std::memcmp(hashes[k], target, 64) < 0) {
+                    hit = (int)k;
+                    std::memcpy(hash, hashes[k], 64);
+                    break;
+                }
+            if (hit >= 0) { j += (uint64_t)hit; break; }
+        }
+        for (; hit < 0 && j < n; j++) {
+            r.hashes++;
+            if (nonce_line::hash_if_valid(line.pk, t + (uint32_t)j, target, hash)) { hit = 0; break; }
+        }
+        if (hit >= 0) {
+            nonce_line::add_be(ctr, j);
             r.found = true;
-            std::memcpy(r.nonce, nonce, 64);
+            nonce_line::map(ctr, r.nonce);
+            std::memcpy(r.counter, ctr, 64);
             std::memcpy(r.hash, hash, 64);
             return r;
         }
-        inc_be(nonce);
+        nonce_line::add_be(ctr, n);
+        i += n;
     }
     return r;
 }
@@ -359,6 +372,20 @@ int test_avx2_hash_parity() {
         get_nonce_hash(header, nonce, sc);
         if (std::memcmp(avx_h[k], sc, 64) != 0) fail++;
         inc_be(nonce);
+    }
+    /* nonce line: four positions, the last group crossing byte boundaries of t */
+    uint8_t ctr[64];
+    std::memcpy(ctr, start, 64);
+    ctr[61] = 0x12; ctr[62] = 0xFF; ctr[63] = 0xFE;
+    uint64_t pk[nonce_line::kParams];
+    nonce_line::launch_params(mid, ctr, pk);
+    avx_hash4_line(pk, nonce_line::t_of(ctr), all_ff, avx_h);
+    for (int k = 0; k < 4; k++) {
+        uint8_t mapped[64], sc[64];
+        nonce_line::map(ctr, mapped);
+        get_nonce_hash(header, mapped, sc);
+        if (std::memcmp(avx_h[k], sc, 64) != 0) fail++;
+        inc_be(ctr);
     }
     return fail;
 }
