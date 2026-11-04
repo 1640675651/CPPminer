@@ -12,6 +12,7 @@
  */
 #include "cp_qpow_cuda_worker.h"
 
+#include "cp_api.h"
 #include "cp_job_ctrl.h"
 #include "cp_pool.h"
 #include "qpow/nonce_line.hpp"
@@ -626,6 +627,9 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         d.blocks = d.sms * (per_sm > 0 ? per_sm : 1);
         /* Start at ~2^22 nonces and let search() settle near 100 ms per launch. */
         d.launch = g_batch_req ? g_batch_req : (uint32_t)d.blocks * k_tpb * 16;
+        char pci[32];
+        snprintf(pci, sizeof(pci), "%04x:%02x:%02x.0", prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+        cp_api_add_device(prop.name, pci);
         printf("[qpow-cuda] device[%d]: %s sm_%d%d SMs=%d blocks=%d batch=%s self-test ok\n",
                ordinal, prop.name, prop.major, prop.minor, d.sms, d.blocks,
                g_batch_req ? "fixed" : "auto");
