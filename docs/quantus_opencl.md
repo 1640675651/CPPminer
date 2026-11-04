@@ -102,9 +102,10 @@ fixes the size at N nonces. Before automatic sizing, the default was 10^6 nonces
 far too few for a large GPU: the A770 mined at 10.7 MH/s with it and at 105.9 MH/s
 with automatic sizing and the current kernel.
 
-After a share, the search resumes right after the lowest share of the launch, so the
-rest of that launch and the other launch in flight are hashed again (up to about
-200 ms of work per share).
+The two launches stay queued between search calls: each call collects the older one,
+queues the next and returns, and a new job drops whatever is still queued. Every share
+of a finished launch is submitted and the search continues after it, so no nonce is
+hashed twice.
 
 ## Environment variables
 

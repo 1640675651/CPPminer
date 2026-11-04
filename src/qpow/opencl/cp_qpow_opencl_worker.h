@@ -22,19 +22,19 @@ int cp_qpow_opencl_worker_list_devices(void);
 void cp_qpow_opencl_worker_set_batch_size(uint32_t batch);
 uint32_t cp_qpow_opencl_worker_batch_size(void);
 
-/* Search [start_be, start_be+count). Writes BE nonce/hash on found. */
+/* Search counters from start_be: 64-byte values that stand for nonces of qpow/nonce_line.hpp, so
+ * out_nonces_be holds the nonces to submit. Each call hands back one launch: *out_hashes counters
+ * from start_be, with every share among them (up to max_shares) in out_nonces_be[0 .. *out_nshares).
+ * The next launch is already queued: a call for the same header and target at
+ * start_be + *out_hashes picks it up, any other call drops it and starts over. */
 int cp_qpow_opencl_worker_search(
     const uint8_t header[32],
     const uint8_t target_be[64],
     const uint8_t start_be[64],
-    uint64_t count,
-    uint8_t out_nonce_be[64],
-    uint8_t out_hash_be[64],
+    uint8_t out_nonces_be[][64],
+    int max_shares,
+    int* out_nshares,
     uint64_t* out_hashes);
-
-/* search() counts 64-byte values that stand for nonces of qpow/nonce_line.hpp, so out_nonce_be is
- * the nonce to submit; this gives the counter to continue from after it. */
-void cp_qpow_opencl_worker_resume(const uint8_t found_be[64], uint8_t next_be[64]);
 
 #ifdef __cplusplus
 }

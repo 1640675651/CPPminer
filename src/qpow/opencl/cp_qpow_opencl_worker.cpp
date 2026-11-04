@@ -93,9 +93,6 @@ void be_add(uint8_t n[64], u64 v)
 
 constexpr int k_params = qpow::nonce_line::kParams;
 
-uint8_t g_found_nonce[64]; /* last reported nonce and the search counter it came from */
-uint8_t g_found_ctr[64];
-
 /* What the kernel computes for one nonce: canonical s[0] after the second permutation. */
 u64 cpu_out0(const uint8_t header[32], const uint8_t nonce[64])
 {
@@ -268,13 +265,10 @@ extern "C" void cp_qpow_opencl_worker_set_batch_size(uint32_t batch)
     g_batch_req = batch;
 }
 
-/* Nonces per search() call: several launches, so the two-slot pipeline stays full. */
-constexpr u32 k_launches_per_search = 8;
-
+/* Nonces per search() call: one launch. */
 extern "C" uint32_t cp_qpow_opencl_worker_batch_size(void)
 {
-    const uint64_t n = (uint64_t)g_launch * k_launches_per_search;
-    return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)n;
+    return g_launch;
 }
 
 extern "C" int cp_qpow_opencl_worker_list_devices(void)
@@ -391,8 +385,14 @@ extern "C" int cp_qpow_opencl_worker_init(int* devices, int ndev)
     return 0;
 }
 
+namespace {
+void discard();
+} // namespace
+
 extern "C" void cp_qpow_opencl_worker_shutdown(void)
 {
+    discard();
+    if(g_ctx.queue) clFinish(g_ctx.queue); /* launches still queued use the buffers */
     release_buffers();
     if(g_ctx.queue){
         clReleaseCommandQueue(g_ctx.queue);
@@ -453,127 +453,143 @@ bool enqueue_slot(Slot& sl, u64 t0, size_t local)
     return true;
 }
 
+/* The search pipeline outlives search(): two launches stay queued between calls, and the next
+ * call collects the older one if it continues the same search. */
+struct Pipe {
+    bool active = false;
+    int head = 0;            /* slot of the older launch */
+    Slot slot[2];
+    uint8_t header[32];
+    uint8_t target[64];
+    u64 t0 = 0;
+    uint8_t expect[64];      /* start_be that continues the search: base of the older launch */
+    uint8_t next[64];        /* counter the next queued launch starts at */
+    uint8_t mid_high[32];    /* midstate cache for the launch parameters */
+    u64 mid[12];
+    bool have_mid = false;
+    std::chrono::steady_clock::time_point t_win; /* rate window of the automatic launch size */
+    uint64_t measured = 0;
+};
+Pipe g_pipe;
+
+/* Plan the next launch at g_pipe.next into slot si and queue it. A launch must not cross a wrap
+ * of the line position t (k stays fixed). Returns false on an enqueue error. */
+bool enqueue_launch(int si)
+{
+    Pipe& q = g_pipe;
+    Slot& sl = q.slot[si];
+    sl.out = si ? g_buf_out2 : g_buf_out;
+    sl.pre_buf = si ? g_buf_pre2 : g_buf_pre;
+    const uint64_t room = qpow::nonce_line::kTSpan - qpow::nonce_line::t_of(q.next);
+    const uint64_t n = g_launch < room ? g_launch : room;
+    memcpy(sl.base, q.next, 64);
+    if(!q.have_mid || memcmp(q.mid_high, q.next, 32) != 0){
+        memcpy(q.mid_high, q.next, 32);
+        qpow::mining_midstate(q.header, q.next, q.mid);
+        q.have_mid = true;
+    }
+    qpow::nonce_line::launch_params(q.mid, q.next, sl.pk);
+    sl.n = (u32)n;
+    be_add(q.next, n);
+    return enqueue_slot(sl, q.t0, g_local);
+}
+
+/* Forget the queued launches. No wait: the in-order queue runs the next launches after them. */
+void discard()
+{
+    for(Slot& sl : g_pipe.slot){
+        if(sl.done_ev){ clReleaseEvent(sl.done_ev); sl.done_ev = nullptr; }
+        sl.n = 0;
+    }
+    g_pipe.active = false;
+}
+
 } // namespace
 
 extern "C" int cp_qpow_opencl_worker_search(
     const uint8_t header[32],
     const uint8_t target_be[64],
     const uint8_t start_be[64],
-    uint64_t count,
-    uint8_t out_nonce_be[64],
-    uint8_t out_hash_be[64],
+    uint8_t out_nonces_be[][64],
+    int max_shares,
+    int* out_nshares,
     uint64_t* out_hashes)
 {
-    if(!g_ready || !out_hashes || count == 0) return CP_QPOW_OCL_ERROR;
+    if(!g_ready || !out_nshares || !out_hashes) return CP_QPOW_OCL_ERROR;
+    *out_nshares = 0;
     *out_hashes = 0;
-
-    u64 t0 = 0;
-    for(int i = 0; i < 8; i++) t0 = (t0 << 8) | target_be[i];
-
-    uint8_t cur[64];
-    memcpy(cur, start_be, 64);
-    uint8_t mid_high[32];
-    u64 mid[12];
-    bool have_mid = false;
-    uint64_t planned = 0, done = 0;
-
-    /* Two launches in flight: the next one is queued before the current one's candidates
-     * are checked on the host, so the device does not idle between launches. */
-    Slot slots[2];
-    slots[0].out = g_buf_out; slots[0].pre_buf = g_buf_pre;
-    slots[1].out = g_buf_out2; slots[1].pre_buf = g_buf_pre2;
-    auto plan = [&](Slot& sl) -> bool {
-        sl.n = 0;
-        if(planned >= count) return false;
-        /* A launch must not cross a wrap of the line position t (k stays fixed). */
-        const uint64_t room = qpow::nonce_line::kTSpan - qpow::nonce_line::t_of(cur);
-        uint64_t n = g_launch;
-        if(n > count - planned) n = count - planned;
-        if(n > room) n = room;
-        memcpy(sl.base, cur, 64);
-        if(!have_mid || memcmp(mid_high, cur, 32) != 0){
-            memcpy(mid_high, cur, 32);
-            qpow::mining_midstate(header, cur, mid);
-            have_mid = true;
-        }
-        qpow::nonce_line::launch_params(mid, cur, sl.pk);
-        sl.n = (u32)n;
-        be_add(cur, n);
-        planned += n;
-        return true;
-    };
-    auto drain = [&](){
-        clFinish(g_ctx.queue);
-        for(Slot& sl : slots)
-            if(sl.done_ev){ clReleaseEvent(sl.done_ev); sl.done_ev = nullptr; }
-    };
-
-    for(Slot& sl : slots)
-        if(plan(sl) && !enqueue_slot(sl, t0, g_local)){ drain(); return CP_QPOW_OCL_ERROR; }
-    const auto t_start = std::chrono::steady_clock::now();
-    uint64_t measured = 0;
-    for(int si = 0; slots[si].n; si ^= 1){
-        Slot& sl = slots[si];
-        if(clWaitForEvents(1, &sl.done_ev) != CL_SUCCESS){
-            drain();
-            *out_hashes = done;
-            return CP_QPOW_OCL_ERROR;
-        }
-        clReleaseEvent(sl.done_ev);
-        sl.done_ev = nullptr;
-        /* Automatic launch size: ~100 ms of work, from the rate over the whole call. The time
-         * between two completions is no measure: some drivers (Intel) report both slots of the
-         * pipeline done within a millisecond, which made the size jump a hundredfold. */
-        measured += sl.n;
-        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-        if(!g_batch_req && s > 0.05){
-            double next = (double)measured / s * 0.1;
-            next = next < 65536.0 ? 65536.0 : (next > 1073741824.0 ? 1073741824.0 : next);
-            g_launch = (u32)(0.5 * g_launch + 0.5 * next);
-        }
-
-        /* Lowest valid nonce of the launch: the caller resumes right after it, so later
-         * shares (including the other slot's range) are found again on the next call. */
-        const u32 nc = sl.out_host[0] < k_max_candidates ? sl.out_host[0] : k_max_candidates;
-        u32 best = 0xFFFFFFFFu;
-        for(u32 k = 0; k < nc; k++){
-            const u32 idx = sl.out_host[1 + k];
-            if(idx >= best) continue;
-            uint8_t c[64], nonce[64], hash[64];
-            memcpy(c, sl.base, 64);
-            be_add(c, idx);
-            qpow::nonce_line::map(c, nonce);
-            u64 m[12];
-            qpow::mining_midstate(header, nonce, m);
-            if(qpow::hash_if_valid(m, nonce + 32, target_be, hash)){
-                best = idx;
-                memcpy(out_nonce_be, nonce, 64);
-                memcpy(out_hash_be, hash, 64);
-                memcpy(g_found_nonce, nonce, 64);
-                memcpy(g_found_ctr, c, 64);
-            }
-        }
-        done += sl.n;
-        *out_hashes = done;
-        if(best != 0xFFFFFFFFu){
-            drain();
-            return CP_QPOW_OCL_OK_FOUND;
-        }
-        if(cancelled()){
-            drain();
-            return CP_QPOW_OCL_CANCELLED;
-        }
-        if(plan(sl) && !enqueue_slot(sl, t0, g_local)){
-            drain();
+    Pipe& q = g_pipe;
+    if(cancelled()){
+        discard();
+        return CP_QPOW_OCL_CANCELLED;
+    }
+    /* The queued launches belong to the call that continues them: same job and target, starting
+     * where the last call stopped. Anything else (a new job, a fee switch) starts over. */
+    if(q.active && (memcmp(q.header, header, 32) != 0 || memcmp(q.target, target_be, 64) != 0 ||
+                    memcmp(q.expect, start_be, 64) != 0))
+        discard();
+    if(!q.active){
+        memcpy(q.header, header, 32);
+        memcpy(q.target, target_be, 64);
+        q.t0 = 0;
+        for(int i = 0; i < 8; i++) q.t0 = (q.t0 << 8) | target_be[i];
+        memcpy(q.expect, start_be, 64);
+        memcpy(q.next, start_be, 64);
+        q.have_mid = false;
+        q.head = 0;
+        q.active = true;
+        q.t_win = std::chrono::steady_clock::now();
+        q.measured = 0;
+        /* Two launches in flight: the next one is queued before the current one's candidates
+         * are checked on the host, so the device does not idle between launches. */
+        if(!enqueue_launch(0) || !enqueue_launch(1)){
+            discard();
             return CP_QPOW_OCL_ERROR;
         }
     }
 
-    return CP_QPOW_OCL_OK_EXHAUSTED;
-}
+    /* Collect the older launch. */
+    const int si = q.head;
+    Slot& sl = q.slot[si];
+    if(clWaitForEvents(1, &sl.done_ev) != CL_SUCCESS){
+        discard();
+        return CP_QPOW_OCL_ERROR;
+    }
+    clReleaseEvent(sl.done_ev);
+    sl.done_ev = nullptr;
+    /* Automatic launch size: ~100 ms of work, from the rate over a window of about a second.
+     * The time between two completions is no measure: some drivers (Intel) report both slots of
+     * the pipeline done within a millisecond, which made the size jump a hundredfold. */
+    q.measured += sl.n;
+    const auto now = std::chrono::steady_clock::now();
+    const double s = std::chrono::duration<double>(now - q.t_win).count();
+    if(!g_batch_req && s > 0.05){
+        double next = (double)q.measured / s * 0.1;
+        next = next < 65536.0 ? 65536.0 : (next > 1073741824.0 ? 1073741824.0 : next);
+        g_launch = (u32)(0.5 * g_launch + 0.5 * next);
+    }
+    if(s > 1.0){
+        q.t_win = now;
+        q.measured = 0;
+    }
 
-extern "C" void cp_qpow_opencl_worker_resume(const uint8_t found_be[64], uint8_t next_be[64])
-{
-    memcpy(next_be, memcmp(found_be, g_found_nonce, 64) == 0 ? g_found_ctr : found_be, 64);
-    be_add(next_be, 1);
+    /* Every valid candidate of the launch is a share to report. */
+    const u32 nc = sl.out_host[0] < k_max_candidates ? sl.out_host[0] : k_max_candidates;
+    for(u32 k = 0; k < nc && *out_nshares < max_shares; k++){
+        uint8_t c[64], nonce[64], hash[64];
+        memcpy(c, sl.base, 64);
+        be_add(c, sl.out_host[1 + k]);
+        qpow::nonce_line::map(c, nonce);
+        u64 m[12];
+        qpow::mining_midstate(header, nonce, m);
+        if(qpow::hash_if_valid(m, nonce + 32, target_be, hash))
+            memcpy(out_nonces_be[(*out_nshares)++], nonce, 64);
+    }
+    *out_hashes = sl.n;
+    be_add(q.expect, sl.n);
+    q.head ^= 1;
+    /* Refill the slot, so two launches stay queued until the next call. If that fails, this
+     * launch still counts; the next call starts over and reports the error. */
+    if(!enqueue_launch(si)) discard();
+    return *out_nshares ? CP_QPOW_OCL_OK_FOUND : CP_QPOW_OCL_OK_EXHAUSTED;
 }

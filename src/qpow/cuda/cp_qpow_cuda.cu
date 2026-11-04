@@ -12,6 +12,7 @@
  */
 #include "cp_qpow_cuda_worker.h"
 
+#include "cp_api.h"
 #include "cp_job_ctrl.h"
 #include "cp_pool.h"
 #include "qpow/nonce_line.hpp"
@@ -400,40 +401,51 @@ __global__ void __launch_bounds__(k_tpb, CP_QPOW_MIN_BLOCKS) qpow_cuda_scan(cons
 
 /* ------------------------------------------------------------------ host side */
 
+/* One launch in flight on a device. */
+struct Slot {
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    cudaEvent_t done = nullptr; /* blocking sync: the host sleeps on it instead of spinning */
+    u32* d_out = nullptr;
+    u32* h_out = nullptr;    /* pinned */
+    uint8_t base[64];
+    uint32_t n = 0;
+    bool full = false;       /* n was the device's whole launch size: timed for the automatic batch */
+};
+
 struct Dev {
     int ordinal = -1;
     int sms = 0;
     int blocks = 0;          /* resident blocks for the whole grid */
     uint32_t launch = 0;     /* nonces per launch */
     cudaStream_t stream = nullptr;
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-    u32* d_out = nullptr;
-    u32* h_out = nullptr;    /* pinned */
-    /* per-step state */
-    uint8_t base[64];
-    uint32_t n = 0;
+    Slot slot[2];
 };
 
 std::vector<Dev> g_devs;
 uint32_t g_batch_req = 0;
 int g_ready = 0;
-uint8_t g_found_nonce[64]; /* last reported nonce and the search counter it came from */
-uint8_t g_found_ctr[64];
+
+/* The search pipeline outlives search(): two rounds (one launch per device each) stay queued
+ * between calls, and the next call collects the older one if it continues the same search. */
+struct Pipe {
+    bool active = false;
+    int head = 0;            /* slot of the older round */
+    uint8_t header[32];
+    uint8_t target[64];
+    u64 t0 = 0;
+    uint8_t expect[64];      /* start_be that continues the search: base of the older round */
+    uint8_t next[64];        /* counter the next queued round starts at */
+    uint8_t mid_high[32];    /* midstate cache for the launch parameters */
+    u64 mid[12];
+    bool have_mid = false;
+};
+Pipe g_pipe;
 
 bool ck(cudaError_t e, const char* what, int ordinal)
 {
     if (e == cudaSuccess) return true;
     fprintf(stderr, "[qpow-cuda] device %d: %s: %s\n", ordinal, what, cudaGetErrorString(e));
     return false;
-}
-
-void be_add(uint8_t n[64], u64 add)
-{
-    for (int i = 63; i >= 0 && add; i--) {
-        add += n[i];
-        n[i] = (uint8_t)add;
-        add >>= 8;
-    }
 }
 
 bool upload_constants()
@@ -459,8 +471,6 @@ bool upload_constants()
 
 using qpow::nonce_line::kTSpan;
 
-void map_nonce(const uint8_t ctr[64], uint8_t out[64]) { qpow::nonce_line::map(ctr, out); }
-
 /* Kernel parameters for counters ctr .. ctr + count - 1 (count <= kTSpan - t: k stays fixed). */
 void make_params(const u64 mid[12], const uint8_t ctr[64], Params& p)
 {
@@ -485,7 +495,7 @@ u64 cpu_out0(const uint8_t header[32], const uint8_t nonce[64])
     return qpow::gf_canon(s[0]);
 }
 
-/* Hash 4096 nonces on the device and compare a spread of them with the reference code. */
+/* Hash 4096 nonces on the device and compare every one with the reference code. */
 bool self_test(Dev& d)
 {
     uint8_t header[32], ctr[64];
@@ -505,8 +515,8 @@ bool self_test(Dev& d)
     u64* dump = nullptr;
     if (!ck(cudaMalloc(&dump, n * sizeof(u64)), "self-test alloc", d.ordinal)) return false;
     p.dump = dump;
-    p.out = d.d_out;
-    bool ok = ck(cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream), "self-test memset", d.ordinal);
+    p.out = d.slot[0].d_out;
+    bool ok = ck(cudaMemsetAsync(p.out, 0, 16 * sizeof(u32), d.stream), "self-test memset", d.ordinal);
     if (ok) {
         qpow_cuda_scan<<<(n + k_tpb - 1) / k_tpb, k_tpb, 0, d.stream>>>(p);
         ok = ck(cudaGetLastError(), "self-test launch", d.ordinal) &&
@@ -516,15 +526,15 @@ bool self_test(Dev& d)
     if (ok) ok = ck(cudaMemcpy(got.data(), dump, n * sizeof(u64), cudaMemcpyDeviceToHost), "self-test copy", d.ordinal);
     cudaFree(dump);
     if (!ok) return false;
-    /* 128 samples: an unstable overclock that corrupts a few hashes in a thousand still shows up.
-     * The fast reduction (CP_QPOW_WRED_FAST) itself misses about 2 hashes in a million, so one
-     * mismatch is reported but tolerated; a bad overclock produces many. */
+    /* All 4096: an unstable overclock that corrupts a few hashes in a thousand shows up as
+     * several mismatches. The fast reduction (CP_QPOW_WRED_FAST) itself misses about 2 hashes in
+     * a million, so one mismatch is reported but tolerated. */
     int bad = 0;
-    for (u32 i = 0; i < n; i += 32) {
+    for (u32 i = 0; i < n; i++) {
         uint8_t c[64], nn[64];
         memcpy(c, ctr, 64);
-        be_add(c, i);
-        map_nonce(c, nn);
+        qpow::nonce_line::add_be(c, i);
+        qpow::nonce_line::map(c, nn);
         const u64 ref = cpu_out0(header, nn);
         if (got[i] != ref) {
             fprintf(stderr, "[qpow-cuda] device %d: self-test mismatch at nonce +%u (got %016llx, want %016llx)\n",
@@ -539,17 +549,81 @@ void release(Dev& d)
 {
     if (d.ordinal < 0) return;
     cudaSetDevice(d.ordinal);
-    if (d.d_out) cudaFree(d.d_out);
-    if (d.h_out) cudaFreeHost(d.h_out);
-    if (d.ev0) cudaEventDestroy(d.ev0);
-    if (d.ev1) cudaEventDestroy(d.ev1);
+    if (d.stream) cudaStreamSynchronize(d.stream); /* launches still queued use the buffers */
+    for (Slot& sl : d.slot) {
+        if (sl.d_out) cudaFree(sl.d_out);
+        if (sl.h_out) cudaFreeHost(sl.h_out);
+        if (sl.ev0) cudaEventDestroy(sl.ev0);
+        if (sl.ev1) cudaEventDestroy(sl.ev1);
+        if (sl.done) cudaEventDestroy(sl.done);
+    }
     if (d.stream) cudaStreamDestroy(d.stream);
     d = Dev{};
+}
+
+/* The kernel's compile-time tuning for an arch (75, 120, ...): CP_QPOW_ADD64 and
+ * CP_QPOW_MIN_BLOCKS, as their #if blocks above choose them. */
+int tuning_of(int arch)
+{
+    return (arch < 100 ? 1 : 0) | (arch == 75 ? 2 : 0);
 }
 
 int cancelled()
 {
     return cp_job_should_cancel() || cp_pool_conn_lost();
+}
+
+/* Plan the next round at g_pipe.next into slot si and queue it: one range per device in device
+ * order, so ranges ascend by device within a round and by round. No launch crosses a wrap of t
+ * (k stays fixed). Returns false on a launch error. */
+bool enqueue_round(int si)
+{
+    Pipe& q = g_pipe;
+    for (Dev& d : g_devs) {
+        Slot& sl = d.slot[si];
+        const uint64_t room = kTSpan - qpow::nonce_line::t_of(q.next);
+        const uint64_t n = d.launch < room ? d.launch : room;
+        memcpy(sl.base, q.next, 64);
+        sl.n = (uint32_t)n;
+        sl.full = n == d.launch;
+        qpow::nonce_line::add_be(q.next, n);
+        if (!q.have_mid || memcmp(q.mid_high, sl.base, 32) != 0) {
+            memcpy(q.mid_high, sl.base, 32);
+            qpow::mining_midstate(q.header, sl.base, q.mid);
+            q.have_mid = true;
+        }
+        Params p{};
+        make_params(q.mid, sl.base, p);
+        p.t0 = q.t0;
+        p.count = sl.n;
+        p.out = sl.d_out;
+        bool ok = ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) &&
+                  ck(cudaMemsetAsync(sl.d_out, 0, 16 * sizeof(u32), d.stream), "scan memset", d.ordinal);
+        if (ok) {
+            const uint64_t want_blocks = ((uint64_t)sl.n + k_tpb - 1) / k_tpb;
+            const int grid = (int)(want_blocks < (uint64_t)d.blocks ? want_blocks : (uint64_t)d.blocks);
+            cudaGetLastError(); /* clear a stale error so the check below is this launch's */
+            cudaEventRecord(sl.ev0, d.stream);
+            qpow_cuda_scan<<<grid, k_tpb, 0, d.stream>>>(p);
+            ok = ck(cudaGetLastError(), "scan launch", d.ordinal);
+        }
+        if (ok) {
+            cudaEventRecord(sl.ev1, d.stream);
+            ok = ck(cudaMemcpyAsync(sl.h_out, sl.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream),
+                    "scan copy", d.ordinal) &&
+                 ck(cudaEventRecord(sl.done, d.stream), "scan event", d.ordinal);
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* Forget the queued rounds. No wait: each device's stream runs the next launches after them. */
+void discard()
+{
+    for (Dev& d : g_devs)
+        for (Slot& sl : d.slot) sl.n = 0;
+    g_pipe.active = false;
 }
 
 }  // namespace
@@ -573,6 +647,7 @@ extern "C" int cp_qpow_cuda_worker_is_ready(void)
 
 extern "C" void cp_qpow_cuda_worker_shutdown(void)
 {
+    discard();
     for (Dev& d : g_devs) release(d);
     g_devs.clear();
     g_ready = 0;
@@ -601,11 +676,15 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         cudaDeviceProp prop;
         bool ok = ck(cudaSetDevice(ordinal), "set device", ordinal) &&
                   ck(cudaGetDeviceProperties(&prop, ordinal), "properties", ordinal) &&
-                  ck(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking), "stream", ordinal) &&
-                  ck(cudaEventCreate(&d.ev0), "event", ordinal) &&
-                  ck(cudaEventCreate(&d.ev1), "event", ordinal) &&
-                  ck(cudaMalloc(&d.d_out, 16 * sizeof(u32)), "alloc", ordinal) &&
-                  ck(cudaMallocHost(&d.h_out, 16 * sizeof(u32)), "pinned alloc", ordinal);
+                  ck(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking), "stream", ordinal);
+        for (Slot& sl : d.slot)
+            ok = ok &&
+                 ck(cudaEventCreate(&sl.ev0), "event", ordinal) &&
+                 ck(cudaEventCreate(&sl.ev1), "event", ordinal) &&
+                 ck(cudaEventCreateWithFlags(&sl.done, cudaEventBlockingSync | cudaEventDisableTiming),
+                    "event", ordinal) &&
+                 ck(cudaMalloc(&sl.d_out, 16 * sizeof(u32)), "alloc", ordinal) &&
+                 ck(cudaMallocHost(&sl.h_out, 16 * sizeof(u32)), "pinned alloc", ordinal);
         if (ok && !upload_constants()) {
             fprintf(stderr, "[qpow-cuda] device %d: constant upload failed\n", ordinal);
             ok = false;
@@ -613,6 +692,15 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         int per_sm = 0;
         if (ok) ok = ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, qpow_cuda_scan, k_tpb, 0),
                         "occupancy", ordinal);
+        /* Without its own arch in the build the device JIT-compiles another arch's PTX, and
+         * __CUDA_ARCH__ picks that arch's tuning. */
+        cudaFuncAttributes fa;
+        if (ok && cudaFuncGetAttributes(&fa, qpow_cuda_scan) == cudaSuccess &&
+            tuning_of(fa.ptxVersion) != tuning_of(prop.major * 10 + prop.minor)) {
+            fprintf(stderr, "[qpow-cuda] device %d: sm_%d%d runs code built for compute_%d, tuned for that "
+                            "arch; build with CP_CUDA_ARCH including %d%d\n",
+                    ordinal, prop.major, prop.minor, fa.ptxVersion, prop.major, prop.minor);
+        }
         if (ok && !self_test(d)) {
             fprintf(stderr, "[qpow-cuda] device %d: hash self-test failed, not mining on it\n", ordinal);
             ok = false;
@@ -626,6 +714,9 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         d.blocks = d.sms * (per_sm > 0 ? per_sm : 1);
         /* Start at ~2^22 nonces and let search() settle near 100 ms per launch. */
         d.launch = g_batch_req ? g_batch_req : (uint32_t)d.blocks * k_tpb * 16;
+        char pci[32];
+        snprintf(pci, sizeof(pci), "%04x:%02x:%02x.0", prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+        cp_api_add_device(prop.name, pci);
         printf("[qpow-cuda] device[%d]: %s sm_%d%d SMs=%d blocks=%d batch=%s self-test ok\n",
                ordinal, prop.name, prop.major, prop.minor, d.sms, d.blocks,
                g_batch_req ? "fixed" : "auto");
@@ -640,113 +731,79 @@ extern "C" int cp_qpow_cuda_worker_search(
     const uint8_t header[32],
     const uint8_t target_be[64],
     const uint8_t start_be[64],
-    uint64_t count,
-    uint8_t out_nonce_be[64],
-    uint8_t out_hash_be[64],
+    uint8_t out_nonces_be[][64],
+    int max_shares,
+    int* out_nshares,
     uint64_t* out_hashes)
 {
-    if (!g_ready || !out_hashes || count == 0) return CP_QPOW_CUDA_ERROR;
+    if (!g_ready || !out_nshares || !out_hashes) return CP_QPOW_CUDA_ERROR;
+    *out_nshares = 0;
     *out_hashes = 0;
-
-    u64 t0 = 0;
-    for (int i = 0; i < 8; i++) t0 = (t0 << 8) | target_be[i];
-
-    uint8_t cur[64];
-    memcpy(cur, start_be, 64);
-    uint8_t mid_high[32];
-    u64 mid[12];
-    bool have_mid = false;
-    uint64_t done = 0;
-
-    while (done < count) {
-        if (cancelled()) {
-            *out_hashes = done;
-            return CP_QPOW_CUDA_CANCELLED;
-        }
-        /* Split the next step across the devices; no launch crosses a wrap of t (k stays fixed). */
-        uint64_t planned = 0;
-        for (Dev& d : g_devs) {
-            d.n = 0;
-            if (done + planned >= count) continue;
-            memcpy(d.base, cur, 64);
-            uint64_t n = d.launch;
-            n = n < count - done - planned ? n : count - done - planned;
-            const uint64_t room = kTSpan - qpow::nonce_line::t_of(cur);
-            n = n < room ? n : room;
-            d.n = (uint32_t)n;
-            be_add(cur, n);
-            planned += n;
-        }
-        for (Dev& d : g_devs) {
-            if (!d.n) continue;
-            if (!have_mid || memcmp(mid_high, d.base, 32) != 0) {
-                memcpy(mid_high, d.base, 32);
-                qpow::mining_midstate(header, d.base, mid);
-                have_mid = true;
-            }
-            Params p{};
-            make_params(mid, d.base, p);
-            p.t0 = t0;
-            p.count = d.n;
-            p.out = d.d_out;
-            cudaSetDevice(d.ordinal);
-            cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream);
-            cudaEventRecord(d.ev0, d.stream);
-            const uint64_t want_blocks = ((uint64_t)d.n + k_tpb - 1) / k_tpb;
-            const int grid = (int)(want_blocks < (uint64_t)d.blocks ? want_blocks : (uint64_t)d.blocks);
-            qpow_cuda_scan<<<grid, k_tpb, 0, d.stream>>>(p);
-            cudaEventRecord(d.ev1, d.stream);
-            cudaMemcpyAsync(d.h_out, d.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream);
-        }
-        int found = 0;
-        for (Dev& d : g_devs) {
-            if (!d.n) continue;
-            cudaSetDevice(d.ordinal);
-            if (!ck(cudaStreamSynchronize(d.stream), "scan", d.ordinal)) {
-                *out_hashes = done;
-                return CP_QPOW_CUDA_ERROR;
-            }
-            /* Automatic batch: aim at ~100 ms per launch. */
-            float ms = 0;
-            if (!g_batch_req && d.n == d.launch && cudaEventElapsedTime(&ms, d.ev0, d.ev1) == cudaSuccess && ms > 0) {
-                double next = (double)d.launch * 100.0 / ms;
-                const double lo = (double)d.blocks * k_tpb, hi = 1u << 30;
-                next = next < lo ? lo : (next > hi ? hi : next);
-                d.launch = (uint32_t)(0.5 * d.launch + 0.5 * next);
-            }
-            /* Report the lowest valid nonce of the step: the caller resumes right after it,
-             * so later shares of the same step are found again on the next call. Devices
-             * hold ascending ranges, so the first device with a share wins. */
-            const u32 nc = d.h_out[0] < (u32)k_max_candidates ? d.h_out[0] : (u32)k_max_candidates;
-            u32 best = 0xFFFFFFFFu;
-            for (u32 k = 0; k < nc && !found; k++) {
-                const u32 idx = d.h_out[1 + k];
-                if (idx >= best) continue;
-                uint8_t c[64], nonce[64], hash[64];
-                memcpy(c, d.base, 64);
-                be_add(c, idx);
-                map_nonce(c, nonce);
-                u64 m[12];
-                qpow::mining_midstate(header, nonce, m);
-                if (qpow::hash_if_valid(m, nonce + 32, target_be, hash)) {
-                    best = idx;
-                    memcpy(out_nonce_be, nonce, 64);
-                    memcpy(out_hash_be, hash, 64);
-                    memcpy(g_found_nonce, nonce, 64);
-                    memcpy(g_found_ctr, c, 64);
-                }
-            }
-            if (best != 0xFFFFFFFFu) found = 1;
-        }
-        done += planned;
-        *out_hashes = done;
-        if (found) return CP_QPOW_CUDA_OK_FOUND;
+    Pipe& q = g_pipe;
+    if (cancelled()) {
+        discard();
+        return CP_QPOW_CUDA_CANCELLED;
     }
-    return CP_QPOW_CUDA_OK_EXHAUSTED;
-}
+    /* The queued rounds belong to the call that continues them: same job and target, starting
+     * where the last call stopped. Anything else (a new job, a fee switch) starts over. */
+    if (q.active && (memcmp(q.header, header, 32) != 0 || memcmp(q.target, target_be, 64) != 0 ||
+                     memcmp(q.expect, start_be, 64) != 0))
+        discard();
+    if (!q.active) {
+        memcpy(q.header, header, 32);
+        memcpy(q.target, target_be, 64);
+        q.t0 = 0;
+        for (int i = 0; i < 8; i++) q.t0 = (q.t0 << 8) | target_be[i];
+        memcpy(q.expect, start_be, 64);
+        memcpy(q.next, start_be, 64);
+        q.have_mid = false;
+        q.head = 0;
+        q.active = true;
+        /* Two rounds in flight: one runs while the host checks the other's candidates. */
+        if (!enqueue_round(0) || !enqueue_round(1)) {
+            discard();
+            return CP_QPOW_CUDA_ERROR;
+        }
+    }
 
-extern "C" void cp_qpow_cuda_worker_resume(const uint8_t found_be[64], uint8_t next_be[64])
-{
-    memcpy(next_be, memcmp(found_be, g_found_nonce, 64) == 0 ? g_found_ctr : found_be, 64);
-    be_add(next_be, 1);
+    /* Collect the older round. */
+    const int si = q.head;
+    uint64_t round = 0;
+    for (Dev& d : g_devs) {
+        Slot& sl = d.slot[si];
+        if (!ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) ||
+            !ck(cudaEventSynchronize(sl.done), "scan", d.ordinal)) {
+            discard();
+            return CP_QPOW_CUDA_ERROR;
+        }
+        round += sl.n;
+        /* Automatic batch: aim at ~100 ms per launch. Only full launches are timed, and no
+         * launch spans more than one line of kTSpan counters, so that is the upper bound. */
+        float ms = 0;
+        if (!g_batch_req && sl.full && cudaEventElapsedTime(&ms, sl.ev0, sl.ev1) == cudaSuccess && ms > 0) {
+            double next = (double)sl.n * 100.0 / ms;
+            const double lo = (double)d.blocks * k_tpb, hi = (double)kTSpan;
+            next = next < lo ? lo : (next > hi ? hi : next);
+            d.launch = (uint32_t)(0.5 * d.launch + 0.5 * next);
+        }
+        /* Every valid candidate of the launch is a share to report. */
+        const u32 nc = sl.h_out[0] < (u32)k_max_candidates ? sl.h_out[0] : (u32)k_max_candidates;
+        for (u32 k = 0; k < nc && *out_nshares < max_shares; k++) {
+            uint8_t c[64], nonce[64], hash[64];
+            memcpy(c, sl.base, 64);
+            qpow::nonce_line::add_be(c, sl.h_out[1 + k]);
+            qpow::nonce_line::map(c, nonce);
+            u64 m[12];
+            qpow::mining_midstate(header, nonce, m);
+            if (qpow::hash_if_valid(m, nonce + 32, target_be, hash))
+                memcpy(out_nonces_be[(*out_nshares)++], nonce, 64);
+        }
+    }
+    *out_hashes = round;
+    qpow::nonce_line::add_be(q.expect, round);
+    q.head ^= 1;
+    /* Refill the slot, so two rounds stay queued until the next call. If that fails, this
+     * round still counts; the next call starts over and reports the error. */
+    if (!enqueue_round(si)) discard();
+    return *out_nshares ? CP_QPOW_CUDA_OK_FOUND : CP_QPOW_CUDA_OK_EXHAUSTED;
 }

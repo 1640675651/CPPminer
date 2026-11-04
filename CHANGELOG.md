@@ -5,11 +5,13 @@
 - OneDNN backend now supports Xe-HPG and Xe2 GPU with XMX cores with optimized performance
 - Experimental Hexagon backend
 - Experimental Intel NPU backend
-(4 features below thanks to @danifest751)
+- (5 features below thanks to @danifest751)
 - AVX512-VNNI and AVX512 CPU kernel (`--simd avx512vnni`, `--simd avx512` auto-selected)
 - ARM i8mm kernel
+- Quantus CUDA backend
 - Kryptex Pearl stratum gzip protocol v2
 - HTTP API for HiveOS
+
 
 ### Fix & Enhancements
 - Light random A matrix generation on GPU and CPU, only fill one random row and hash incrementally
@@ -17,22 +19,15 @@
 - Fix Pearl wgpu hang on AMD Metal
 - Reduce repetitive log output
 - Refactored lengthy main.cpp
-(6 improvements below thanks to @danifest751)
+- (7 improvements below thanks to @danifest751)
 - NEON DotProd and basic NEON kernel rewrite, reducing instruction count
 - OpenCL: mad24 mode for AMD GCN GPU: `--ocl-cpm-type auto|float|int|mad24` (auto keeps it on AMD GCN gfx6-8)
 - OpenCL: 2 launches in flight, reducing GPU idle time
 - OpenCL: Faster noisy matrix preparation
 - Improve pool connection robustness
+- Quantus OpenCL kernel rewrite, improved performance
 - Reject illegal CLI options
 
-### Pearl Hexagon
-- DSP self-guided loop, negligible kernel launch overhead
-- Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
-
-### Pearl Intel NPU
-- Patched NPU compiler to expose int32 accumulator
-- Custom XOR kernel on the SHAVE vector cores, thanks to the npunlock project
-- Almost fully overlapped DPU (matrix engine) and SHAVE work
 
 ### Pearl OneDNN
 - Rewrite gemmstone strategy selection logic to pick the best kernel
@@ -41,8 +36,18 @@
 - In-register/SLM 16 XOR slot folding, reducing global memory writeout
 - SIMD fused jackpot kernel on ARC GPU, beating a separate jackpot kernel, which is memory bound
 - Prepack A and B to reduce data reordering in GEMM
-- Layout parameter is deprecated, packed layout is optimal
+- Layout parameter is deprecated, use optimal packed layout
 - --ocl-throttle low to reduce CPU busy wait with cl_khr_throttle_hints (may cause intel GPU stall sometimes due to buggy intel driver, off by default)
+
+### Pearl Hexagon
+- Int8 acceleration with HVX instructions
+- DSP self-guided loop, negligible kernel launch overhead
+- Ahead of time B noise+prepack, per row-batch A noise+prepack, all on DSP
+
+### Pearl Intel NPU
+- Patched NPU compiler to expose int32 accumulator
+- Custom XOR kernel on the SHAVE vector cores, thanks to the npunlock project
+- Almost fully overlapped DPU (matrix engine) and SHAVE work
 
 ## v0.5
 ### New features
@@ -83,6 +88,7 @@
 - Quantus wgpu backend via quantus-miner GpuEngine FFI
 - Quantus OpenCL Poseidon2 worker under src/qpow/opencl
 - Optimized CPU backend with scalar + AVX2 hybrid ISA
+
 ## v0.4
 - ARM CPU + NEON support.
 - AVX-VNNI support.
@@ -90,7 +96,6 @@
 - Dynamic openmp schedule for CPUs with big and small cores.
 - Lightweight random matrix generation on CPU, only sparsely fill matrix elements (one random write per column).
 - Zero-B on cuda worker (reduce VRAM usage, 2GiB -> 1.5 GiB).
-
 
 ## v0.3
 - Switch to cert V3 to align with the salted seed hardfork. Old cert V2 shares are no longer accepted by the network.
