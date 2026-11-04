@@ -20,7 +20,7 @@ int cp_qpow_cuda_worker_is_ready(void);
 
 /* Nonces per launch per device; 0 -> automatic (about 100 ms per launch). Call before init. */
 void cp_qpow_cuda_worker_set_batch_size(uint32_t batch);
-/* Nonces one search step covers on all devices (for the mine loop's chunking). */
+/* Nonces one search() call covers: several launches on every device (for the mine loop's chunking). */
 uint64_t cp_qpow_cuda_worker_batch_size(void);
 
 /* Search the counters [start_be, start_be + count). Each counter stands for one nonce (bytes

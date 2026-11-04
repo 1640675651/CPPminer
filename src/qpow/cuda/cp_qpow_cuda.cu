@@ -401,19 +401,27 @@ __global__ void __launch_bounds__(k_tpb, CP_QPOW_MIN_BLOCKS) qpow_cuda_scan(cons
 
 /* ------------------------------------------------------------------ host side */
 
+/* Rounds (one launch per device) per search() call; two rounds are in flight at a time. */
+constexpr int k_rounds_per_search = 8;
+
+/* One launch in flight on a device. */
+struct Slot {
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    cudaEvent_t done = nullptr; /* blocking sync: the host sleeps on it instead of spinning */
+    u32* d_out = nullptr;
+    u32* h_out = nullptr;    /* pinned */
+    uint8_t base[64];
+    uint32_t n = 0;
+    bool full = false;       /* n was the device's whole launch size: timed for the automatic batch */
+};
+
 struct Dev {
     int ordinal = -1;
     int sms = 0;
     int blocks = 0;          /* resident blocks for the whole grid */
     uint32_t launch = 0;     /* nonces per launch */
     cudaStream_t stream = nullptr;
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-    cudaEvent_t done = nullptr; /* blocking sync: the host sleeps on it instead of spinning */
-    u32* d_out = nullptr;
-    u32* h_out = nullptr;    /* pinned */
-    /* per-step state */
-    uint8_t base[64];
-    uint32_t n = 0;
+    Slot slot[2];
 };
 
 std::vector<Dev> g_devs;
@@ -507,8 +515,8 @@ bool self_test(Dev& d)
     u64* dump = nullptr;
     if (!ck(cudaMalloc(&dump, n * sizeof(u64)), "self-test alloc", d.ordinal)) return false;
     p.dump = dump;
-    p.out = d.d_out;
-    bool ok = ck(cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream), "self-test memset", d.ordinal);
+    p.out = d.slot[0].d_out;
+    bool ok = ck(cudaMemsetAsync(p.out, 0, 16 * sizeof(u32), d.stream), "self-test memset", d.ordinal);
     if (ok) {
         qpow_cuda_scan<<<(n + k_tpb - 1) / k_tpb, k_tpb, 0, d.stream>>>(p);
         ok = ck(cudaGetLastError(), "self-test launch", d.ordinal) &&
@@ -541,11 +549,13 @@ void release(Dev& d)
 {
     if (d.ordinal < 0) return;
     cudaSetDevice(d.ordinal);
-    if (d.d_out) cudaFree(d.d_out);
-    if (d.h_out) cudaFreeHost(d.h_out);
-    if (d.ev0) cudaEventDestroy(d.ev0);
-    if (d.ev1) cudaEventDestroy(d.ev1);
-    if (d.done) cudaEventDestroy(d.done);
+    for (Slot& sl : d.slot) {
+        if (sl.d_out) cudaFree(sl.d_out);
+        if (sl.h_out) cudaFreeHost(sl.h_out);
+        if (sl.ev0) cudaEventDestroy(sl.ev0);
+        if (sl.ev1) cudaEventDestroy(sl.ev1);
+        if (sl.done) cudaEventDestroy(sl.done);
+    }
     if (d.stream) cudaStreamDestroy(d.stream);
     d = Dev{};
 }
@@ -573,7 +583,7 @@ extern "C" uint64_t cp_qpow_cuda_worker_batch_size(void)
 {
     uint64_t total = 0;
     for (const Dev& d : g_devs) total += d.launch;
-    return total ? total : 1000000u;
+    return total ? total * k_rounds_per_search : 1000000u;
 }
 
 extern "C" int cp_qpow_cuda_worker_is_ready(void)
@@ -611,13 +621,15 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         cudaDeviceProp prop;
         bool ok = ck(cudaSetDevice(ordinal), "set device", ordinal) &&
                   ck(cudaGetDeviceProperties(&prop, ordinal), "properties", ordinal) &&
-                  ck(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking), "stream", ordinal) &&
-                  ck(cudaEventCreate(&d.ev0), "event", ordinal) &&
-                  ck(cudaEventCreate(&d.ev1), "event", ordinal) &&
-                  ck(cudaEventCreateWithFlags(&d.done, cudaEventBlockingSync | cudaEventDisableTiming),
-                     "event", ordinal) &&
-                  ck(cudaMalloc(&d.d_out, 16 * sizeof(u32)), "alloc", ordinal) &&
-                  ck(cudaMallocHost(&d.h_out, 16 * sizeof(u32)), "pinned alloc", ordinal);
+                  ck(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking), "stream", ordinal);
+        for (Slot& sl : d.slot)
+            ok = ok &&
+                 ck(cudaEventCreate(&sl.ev0), "event", ordinal) &&
+                 ck(cudaEventCreate(&sl.ev1), "event", ordinal) &&
+                 ck(cudaEventCreateWithFlags(&sl.done, cudaEventBlockingSync | cudaEventDisableTiming),
+                    "event", ordinal) &&
+                 ck(cudaMalloc(&sl.d_out, 16 * sizeof(u32)), "alloc", ordinal) &&
+                 ck(cudaMallocHost(&sl.h_out, 16 * sizeof(u32)), "pinned alloc", ordinal);
         if (ok && !upload_constants()) {
             fprintf(stderr, "[qpow-cuda] device %d: constant upload failed\n", ordinal);
             ok = false;
@@ -680,88 +692,112 @@ extern "C" int cp_qpow_cuda_worker_search(
     uint8_t mid_high[32];
     u64 mid[12];
     bool have_mid = false;
-    uint64_t done = 0;
+    uint64_t planned = 0, done = 0;
 
-    while (done < count) {
-        if (cancelled()) {
-            *out_hashes = done;
-            return CP_QPOW_CUDA_CANCELLED;
-        }
-        /* Split the next step across the devices; no launch crosses a wrap of t (k stays fixed). */
-        uint64_t planned = 0;
+    /* Plan the next round into slot si and queue it: one range per device in device order, so
+     * ranges ascend by device within a round and by round. No launch crosses a wrap of t (k
+     * stays fixed). Returns false on a launch error. */
+    auto enqueue = [&](int si) -> bool {
         for (Dev& d : g_devs) {
-            d.n = 0;
-            if (done + planned >= count) continue;
-            memcpy(d.base, cur, 64);
+            Slot& sl = d.slot[si];
+            sl.n = 0;
+            if (planned >= count) continue;
             uint64_t n = d.launch;
-            n = n < count - done - planned ? n : count - done - planned;
+            n = n < count - planned ? n : count - planned;
             const uint64_t room = kTSpan - qpow::nonce_line::t_of(cur);
             n = n < room ? n : room;
-            d.n = (uint32_t)n;
+            memcpy(sl.base, cur, 64);
+            sl.n = (uint32_t)n;
+            sl.full = n == d.launch;
             be_add(cur, n);
             planned += n;
-        }
-        for (Dev& d : g_devs) {
-            if (!d.n) continue;
-            if (!have_mid || memcmp(mid_high, d.base, 32) != 0) {
-                memcpy(mid_high, d.base, 32);
-                qpow::mining_midstate(header, d.base, mid);
+            if (!have_mid || memcmp(mid_high, sl.base, 32) != 0) {
+                memcpy(mid_high, sl.base, 32);
+                qpow::mining_midstate(header, sl.base, mid);
                 have_mid = true;
             }
             Params p{};
-            make_params(mid, d.base, p);
+            make_params(mid, sl.base, p);
             p.t0 = t0;
-            p.count = d.n;
-            p.out = d.d_out;
+            p.count = sl.n;
+            p.out = sl.d_out;
             bool ok = ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) &&
-                      ck(cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream), "scan memset", d.ordinal);
+                      ck(cudaMemsetAsync(sl.d_out, 0, 16 * sizeof(u32), d.stream), "scan memset", d.ordinal);
             if (ok) {
-                const uint64_t want_blocks = ((uint64_t)d.n + k_tpb - 1) / k_tpb;
+                const uint64_t want_blocks = ((uint64_t)sl.n + k_tpb - 1) / k_tpb;
                 const int grid = (int)(want_blocks < (uint64_t)d.blocks ? want_blocks : (uint64_t)d.blocks);
                 cudaGetLastError(); /* clear a stale error so the check below is this launch's */
-                cudaEventRecord(d.ev0, d.stream);
+                cudaEventRecord(sl.ev0, d.stream);
                 qpow_cuda_scan<<<grid, k_tpb, 0, d.stream>>>(p);
                 ok = ck(cudaGetLastError(), "scan launch", d.ordinal);
             }
             if (ok) {
-                cudaEventRecord(d.ev1, d.stream);
-                ok = ck(cudaMemcpyAsync(d.h_out, d.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream),
+                cudaEventRecord(sl.ev1, d.stream);
+                ok = ck(cudaMemcpyAsync(sl.h_out, sl.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream),
                         "scan copy", d.ordinal) &&
-                     ck(cudaEventRecord(d.done, d.stream), "scan event", d.ordinal);
+                     ck(cudaEventRecord(sl.done, d.stream), "scan event", d.ordinal);
             }
-            /* A launch that never ran must not count as hashed. */
             if (!ok) {
-                *out_hashes = done;
-                return CP_QPOW_CUDA_ERROR;
+                sl.n = 0;
+                return false;
             }
         }
+        return true;
+    };
+    /* Wait for whatever is still queued before returning. */
+    auto drain = [&]() {
+        for (Dev& d : g_devs)
+            for (Slot& sl : d.slot)
+                if (sl.n) {
+                    cudaSetDevice(d.ordinal);
+                    cudaEventSynchronize(sl.done);
+                    sl.n = 0;
+                }
+    };
+
+    if (cancelled()) return CP_QPOW_CUDA_CANCELLED;
+    /* Two rounds in flight: the next one runs while the host checks the current one's
+     * candidates, so the devices do not idle between launches. */
+    for (int si = 0; si < 2; si++)
+        if (!enqueue(si)) {
+            drain();
+            return CP_QPOW_CUDA_ERROR;
+        }
+    for (int si = 0;; si ^= 1) {
+        bool any = false;
+        for (const Dev& d : g_devs) any = any || d.slot[si].n;
+        if (!any) break;
         int found = 0;
+        uint64_t round = 0;
         for (Dev& d : g_devs) {
-            if (!d.n) continue;
+            Slot& sl = d.slot[si];
+            if (!sl.n) continue;
             if (!ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) ||
-                !ck(cudaEventSynchronize(d.done), "scan", d.ordinal)) {
+                !ck(cudaEventSynchronize(sl.done), "scan", d.ordinal)) {
+                drain();
                 *out_hashes = done;
                 return CP_QPOW_CUDA_ERROR;
             }
+            round += sl.n;
             /* Automatic batch: aim at ~100 ms per launch. Only full launches are timed, and no
              * launch spans more than one line of kTSpan counters, so that is the upper bound. */
             float ms = 0;
-            if (!g_batch_req && d.n == d.launch && cudaEventElapsedTime(&ms, d.ev0, d.ev1) == cudaSuccess && ms > 0) {
-                double next = (double)d.launch * 100.0 / ms;
+            if (!g_batch_req && sl.full && cudaEventElapsedTime(&ms, sl.ev0, sl.ev1) == cudaSuccess && ms > 0) {
+                double next = (double)sl.n * 100.0 / ms;
                 const double lo = (double)d.blocks * k_tpb, hi = (double)kTSpan;
                 next = next < lo ? lo : (next > hi ? hi : next);
                 d.launch = (uint32_t)(0.5 * d.launch + 0.5 * next);
             }
-            /* Report the lowest valid nonce of the step: the caller resumes right after it,
-             * so later shares of the same step are found again on the next call. Devices
-             * hold ascending ranges, so the first device with a share wins. */
-            const u32 nc = d.h_out[0] < (u32)k_max_candidates ? d.h_out[0] : (u32)k_max_candidates;
+            /* Report the lowest valid nonce: the caller resumes right after it, so later shares
+             * (including the round still queued) are found again on the next call. Ranges ascend
+             * by device within a round, so the first device with a share wins. */
+            const u32 nc = sl.h_out[0] < (u32)k_max_candidates ? sl.h_out[0] : (u32)k_max_candidates;
             u32 best = 0xFFFFFFFFu;
             for (u32 k = 0; k < nc && !found; k++) {
-                const u32 idx = d.h_out[1 + k];
+                const u32 idx = sl.h_out[1 + k];
                 if (idx >= best) continue;
                 uint8_t c[64], nonce[64], hash[64];
-                memcpy(c, d.base, 64);
+                memcpy(c, sl.base, 64);
                 be_add(c, idx);
                 map_nonce(c, nonce);
                 u64 m[12];
@@ -776,9 +812,20 @@ extern "C" int cp_qpow_cuda_worker_search(
             }
             if (best != 0xFFFFFFFFu) found = 1;
         }
-        done += planned;
+        done += round;
         *out_hashes = done;
-        if (found) return CP_QPOW_CUDA_OK_FOUND;
+        if (found) {
+            drain();
+            return CP_QPOW_CUDA_OK_FOUND;
+        }
+        if (cancelled()) {
+            drain();
+            return CP_QPOW_CUDA_CANCELLED;
+        }
+        if (!enqueue(si)) {
+            drain();
+            return CP_QPOW_CUDA_ERROR;
+        }
     }
     return CP_QPOW_CUDA_OK_EXHAUSTED;
 }
