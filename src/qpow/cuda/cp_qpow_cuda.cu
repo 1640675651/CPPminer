@@ -550,6 +550,13 @@ void release(Dev& d)
     d = Dev{};
 }
 
+/* The kernel's compile-time tuning for an arch (75, 120, ...): CP_QPOW_ADD64 and
+ * CP_QPOW_MIN_BLOCKS, as their #if blocks above choose them. */
+int tuning_of(int arch)
+{
+    return (arch < 100 ? 1 : 0) | (arch == 75 ? 2 : 0);
+}
+
 int cancelled()
 {
     return cp_job_should_cancel() || cp_pool_conn_lost();
@@ -618,6 +625,15 @@ extern "C" int cp_qpow_cuda_worker_init(const int* devices, int ndev)
         int per_sm = 0;
         if (ok) ok = ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, qpow_cuda_scan, k_tpb, 0),
                         "occupancy", ordinal);
+        /* Without its own arch in the build the device JIT-compiles another arch's PTX, and
+         * __CUDA_ARCH__ picks that arch's tuning. */
+        cudaFuncAttributes fa;
+        if (ok && cudaFuncGetAttributes(&fa, qpow_cuda_scan) == cudaSuccess &&
+            tuning_of(fa.ptxVersion) != tuning_of(prop.major * 10 + prop.minor)) {
+            fprintf(stderr, "[qpow-cuda] device %d: sm_%d%d runs code built for compute_%d, tuned for that "
+                            "arch; build with CP_CUDA_ARCH including %d%d\n",
+                    ordinal, prop.major, prop.minor, fa.ptxVersion, prop.major, prop.minor);
+        }
         if (ok && !self_test(d)) {
             fprintf(stderr, "[qpow-cuda] device %d: hash self-test failed, not mining on it\n", ordinal);
             ok = false;

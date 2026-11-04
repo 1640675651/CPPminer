@@ -256,11 +256,14 @@ detect_cuda_arch() {
     if [[ -n "$CUDA_ARCH" ]]; then
         echo "$CUDA_ARCH"; return
     fi
+    # Every installed GPU's arch ("75;120" on a mixed rig): a GPU without its own arch in the
+    # build runs JIT-compiled PTX of another arch, with that arch's kernel tuning.
     if command -v nvidia-smi &>/dev/null; then
-        local cap
-        cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1)
-        if [[ "$cap" =~ ([0-9]+)\.([0-9]+) ]]; then
-            echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; return
+        local archs
+        archs=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null |
+                sed -n 's/^ *\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1\2/p' | sort -n -u | paste -sd';' -)
+        if [[ -n "$archs" ]]; then
+            echo "$archs"; return
         fi
     fi
     echo "75"  # conservative default

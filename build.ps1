@@ -167,13 +167,17 @@ function Find-CudaRoot {
     throw "CUDA Toolkit not found (needed when -Backend includes Cuda)."
 }
 
+# Every installed GPU's arch ("75;120" on a mixed rig): a GPU without its own arch in the build
+# runs JIT-compiled PTX of another arch, with that arch's kernel tuning.
 function Get-GpuArch {
     if ($CudaArch) { return $CudaArch.Trim() }
     try {
-        $cap = & nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>$null | Select-Object -First 1
-        if ($cap -match '(\d+)\.(\d+)') {
-            return "$($Matches[1])$($Matches[2])"
-        }
+        $archs = @(
+            & nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>$null |
+                ForEach-Object { if ("$_" -match '(\d+)\.(\d+)') { "$($Matches[1])$($Matches[2])" } } |
+                Sort-Object { [int]$_ } -Unique
+        )
+        if ($archs.Count -gt 0) { return ($archs -join ';') }
     } catch {}
     return "75"
 }
