@@ -689,20 +689,32 @@ extern "C" int cp_qpow_cuda_worker_search(
             p.t0 = t0;
             p.count = d.n;
             p.out = d.d_out;
-            cudaSetDevice(d.ordinal);
-            cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream);
-            cudaEventRecord(d.ev0, d.stream);
-            const uint64_t want_blocks = ((uint64_t)d.n + k_tpb - 1) / k_tpb;
-            const int grid = (int)(want_blocks < (uint64_t)d.blocks ? want_blocks : (uint64_t)d.blocks);
-            qpow_cuda_scan<<<grid, k_tpb, 0, d.stream>>>(p);
-            cudaEventRecord(d.ev1, d.stream);
-            cudaMemcpyAsync(d.h_out, d.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream);
+            bool ok = ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) &&
+                      ck(cudaMemsetAsync(d.d_out, 0, 16 * sizeof(u32), d.stream), "scan memset", d.ordinal);
+            if (ok) {
+                const uint64_t want_blocks = ((uint64_t)d.n + k_tpb - 1) / k_tpb;
+                const int grid = (int)(want_blocks < (uint64_t)d.blocks ? want_blocks : (uint64_t)d.blocks);
+                cudaGetLastError(); /* clear a stale error so the check below is this launch's */
+                cudaEventRecord(d.ev0, d.stream);
+                qpow_cuda_scan<<<grid, k_tpb, 0, d.stream>>>(p);
+                ok = ck(cudaGetLastError(), "scan launch", d.ordinal);
+            }
+            if (ok) {
+                cudaEventRecord(d.ev1, d.stream);
+                ok = ck(cudaMemcpyAsync(d.h_out, d.d_out, 16 * sizeof(u32), cudaMemcpyDeviceToHost, d.stream),
+                        "scan copy", d.ordinal);
+            }
+            /* A launch that never ran must not count as hashed. */
+            if (!ok) {
+                *out_hashes = done;
+                return CP_QPOW_CUDA_ERROR;
+            }
         }
         int found = 0;
         for (Dev& d : g_devs) {
             if (!d.n) continue;
-            cudaSetDevice(d.ordinal);
-            if (!ck(cudaStreamSynchronize(d.stream), "scan", d.ordinal)) {
+            if (!ck(cudaSetDevice(d.ordinal), "set device", d.ordinal) ||
+                !ck(cudaStreamSynchronize(d.stream), "scan", d.ordinal)) {
                 *out_hashes = done;
                 return CP_QPOW_CUDA_ERROR;
             }
