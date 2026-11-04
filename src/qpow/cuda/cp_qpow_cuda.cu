@@ -727,11 +727,12 @@ extern "C" int cp_qpow_cuda_worker_search(
                 *out_hashes = done;
                 return CP_QPOW_CUDA_ERROR;
             }
-            /* Automatic batch: aim at ~100 ms per launch. */
+            /* Automatic batch: aim at ~100 ms per launch. Only full launches are timed, and no
+             * launch spans more than one line of kTSpan counters, so that is the upper bound. */
             float ms = 0;
             if (!g_batch_req && d.n == d.launch && cudaEventElapsedTime(&ms, d.ev0, d.ev1) == cudaSuccess && ms > 0) {
                 double next = (double)d.launch * 100.0 / ms;
-                const double lo = (double)d.blocks * k_tpb, hi = 1u << 30;
+                const double lo = (double)d.blocks * k_tpb, hi = (double)kTSpan;
                 next = next < lo ? lo : (next > hi ? hi : next);
                 d.launch = (uint32_t)(0.5 * d.launch + 0.5 * next);
             }
