@@ -485,7 +485,7 @@ u64 cpu_out0(const uint8_t header[32], const uint8_t nonce[64])
     return qpow::gf_canon(s[0]);
 }
 
-/* Hash 4096 nonces on the device and compare a spread of them with the reference code. */
+/* Hash 4096 nonces on the device and compare every one with the reference code. */
 bool self_test(Dev& d)
 {
     uint8_t header[32], ctr[64];
@@ -516,11 +516,11 @@ bool self_test(Dev& d)
     if (ok) ok = ck(cudaMemcpy(got.data(), dump, n * sizeof(u64), cudaMemcpyDeviceToHost), "self-test copy", d.ordinal);
     cudaFree(dump);
     if (!ok) return false;
-    /* 128 samples: an unstable overclock that corrupts a few hashes in a thousand still shows up.
-     * The fast reduction (CP_QPOW_WRED_FAST) itself misses about 2 hashes in a million, so one
-     * mismatch is reported but tolerated; a bad overclock produces many. */
+    /* All 4096: an unstable overclock that corrupts a few hashes in a thousand shows up as
+     * several mismatches. The fast reduction (CP_QPOW_WRED_FAST) itself misses about 2 hashes in
+     * a million, so one mismatch is reported but tolerated. */
     int bad = 0;
-    for (u32 i = 0; i < n; i += 32) {
+    for (u32 i = 0; i < n; i++) {
         uint8_t c[64], nn[64];
         memcpy(c, ctr, 64);
         be_add(c, i);
