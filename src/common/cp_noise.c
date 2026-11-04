@@ -1205,6 +1205,63 @@ int pearl_matrix_hash_from_cvs(PearlMatrixHash* h, const int8_t* mat, size_t raw
     return 0;
 }
 
+/* Levels of a tree over n chunks: 0 .. top, top the highest with n >> top >= 2 (as
+ * pearl_mh_alloc_levels). */
+static int pearl_mh_top_level(size_t n)
+{
+    int top = 0;
+    while(((size_t)2 << top) <= n) top++;
+    return top;
+}
+
+size_t pearl_matrix_tree_level_offset(size_t num_chunks, int level)
+{
+    size_t off = 0;
+    for(int j = 0; j < level; j++)
+        off += ((num_chunks >> j) + 3) / 4 * 4;
+    return off;
+}
+
+size_t pearl_matrix_tree_nodes(size_t num_chunks)
+{
+    return pearl_matrix_tree_level_offset(num_chunks, pearl_mh_top_level(num_chunks) + 1);
+}
+
+int pearl_matrix_hash_from_tree(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                                const uint8_t key[32], const uint8_t* tree, uint8_t out[32])
+{
+    const size_t n = padded_chunk_len(raw_len) / B3_CHUNK;
+    if(n <= 1 || !tree) return -1;
+    if(!h){
+        /* A view of the tree for the root only: pearl_mh_root reads the levels. */
+        PearlMatrixHash v;
+        memset(&v, 0, sizeof(v));
+        load_key_words(key, v.key_words);
+        v.num_chunks = n;
+        v.num_levels = pearl_mh_top_level(n) + 1;
+        for(int j = 0; j < v.num_levels; j++)
+            v.level[j] = (uint8_t*)tree + pearl_matrix_tree_level_offset(n, j) * BLAKE3_OUT_LEN;
+        pearl_mh_root(&v, out);
+        return 0;
+    }
+    pearl_mh_release(h);
+    memcpy(h->key, key, 32);
+    load_key_words(key, h->key_words);
+    h->data = mat;
+    h->raw_len = raw_len;
+    h->num_chunks = n;
+    if(pearl_mh_alloc_levels(h) != 0){
+        pearl_mh_release(h);
+        return -1;
+    }
+    for(int j = 0; j < h->num_levels; j++)
+        memcpy(h->level[j], tree + pearl_matrix_tree_level_offset(n, j) * BLAKE3_OUT_LEN,
+               (n >> j) * BLAKE3_OUT_LEN);
+    h->valid = 1;
+    pearl_mh_root(h, out);
+    return 0;
+}
+
 void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
                                 const int8_t* Bt, int n, int k, int salted,
                                 uint8_t b_noise_seed[32])

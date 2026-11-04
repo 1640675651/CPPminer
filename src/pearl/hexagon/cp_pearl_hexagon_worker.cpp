@@ -33,7 +33,7 @@
  * Hexagon cDSP worker (zero-B, like the CPU worker). The DSP generates and packs all the
  * noise; the host keeps signal A (shared with the DSP), its hash, the seeds and the jackpot.
  *   job:     noisy B (signal B = 0) generated packed in DSP memory (pearlx set_b_gen).
- *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs;
+ *   attempt: one random row of signal A on the host -> a_noise_seed and permutation pairs;
  *            then the matrix is scanned in launches of row_macros x col_macros 128x128
  *            macro blocks. The DSP runs the launches itself (scan_run): it generates and
  *            packs each row panel of noisy A from the panel's signal rows, then runs it
@@ -134,6 +134,12 @@ const bool g_hash_check = [] {
     const char* v = getenv("CP_HEXAGON_HASH_CHECK");
     return v && *v && strcmp(v, "0") != 0;
 }();
+/* One random row of signal A per attempt (default); CP_HEXAGON_PREP_ROWPOKE=0 restores one
+ * random value per column. */
+const bool g_rowpoke = [] {
+    const char* v = getenv("CP_HEXAGON_PREP_ROWPOKE");
+    return !(v && v[0] == '0');
+}();
 
 struct JobCache {
     uint8_t job_key[32]{};
@@ -227,26 +233,53 @@ void seed_label_words(const uint8_t seed[32], const uint8_t label[32], uint32_t 
     memcpy(out + 8, label, 32);
 }
 
-/* Keyed matrix hash with the chunk hashes on the DSP and the tree above them on the host:
- * the root of data (NULL: all zeros) into root, and the tree into cache when given. */
-int dsp_matrix_hash(const int8_t* data, size_t bytes, const uint8_t key[32], uint8_t* cvs,
-                    PearlMatrixHash* cache, uint8_t root[32])
+/* Bytes of the DSP's tree of a bytes-long matrix (pearlx tree_cvs). */
+size_t tree_bytes(size_t bytes)
+{
+    return pearl_matrix_tree_nodes(bytes / 1024) * 32;
+}
+
+/* CP_HEXAGON_HOST_TREE=1: the tree above the chunk hashes on the host (the old split). */
+const bool g_host_tree = [] {
+    const char* v = getenv("CP_HEXAGON_HOST_TREE");
+    return v && *v && strcmp(v, "0") != 0;
+}();
+
+/* Keyed matrix hash on the DSP: the chunk hashes and every level of the tree above them;
+ * the host merges the subtree tops into the root of data (NULL: all zeros), and copies the
+ * tree into cache when given (for incremental updates). tree: tree_bytes(bytes) of rpcmem.
+ * If the DSP library has no tree_cvs (an older skel), the host builds the tree from the
+ * chunk hashes. */
+int dsp_matrix_hash(const int8_t* data, size_t bytes, const uint8_t key[32], uint8_t* tree,
+                    PearlMatrixHash* cache, uint8_t root[32], double* dsp_sec)
 {
     uint32_t key8[8];
     memcpy(key8, key, 32);
     uint64_t us = 0;
-    if(cp_pearlx_chunk_cvs(g_px, data, bytes, key8, (uint32_t*)cvs, &us) != 0)
+    static bool tree_ok = true;
+    if(tree_ok && !g_host_tree){
+        if(cp_pearlx_tree_cvs(g_px, data, bytes, key8, (uint32_t*)tree, tree_bytes(bytes) / 4,
+                              &us) == 0){
+            *dsp_sec += us / 1e6;
+            return pearl_matrix_hash_from_tree(cache, data, bytes, key, tree, root);
+        }
+        fprintf(stderr, "[hexagon] pearlx tree_cvs failed (older libpearlx_skel.so?); "
+                        "building the hash trees on the host\n");
+        tree_ok = false;
+    }
+    if(cp_pearlx_chunk_cvs(g_px, data, bytes, key8, (uint32_t*)tree, &us) != 0)
         return -1;
+    *dsp_sec += us / 1e6;
     PearlMatrixHash* h = cache ? cache : pearl_matrix_hash_create();
-    const int rc = h ? pearl_matrix_hash_from_cvs(h, data, bytes, key, cvs, root) : -1;
+    const int rc = h ? pearl_matrix_hash_from_cvs(h, data, bytes, key, tree, root) : -1;
     if(!cache) pearl_matrix_hash_free(h);
     return rc;
 }
 
 /* The job's B (signal B = 0): its noise seed from the hash of the zero B^T, then noisy B
  * generated and packed in DSP memory. Then signal A's hash tree under the new job key, so
- * that the job's first attempt rehashes only what it changes. The chunk hashes of both
- * matrices run on the DSP. */
+ * that the job's first attempt rehashes only what it changes. Both hashes run on the DSP,
+ * chunks and tree; the host only finishes each root and keeps a copy of A's tree. */
 int prepare_job(const uint8_t job_key[32], int m, int n)
 {
     if(!g_px) return -2;
@@ -260,10 +293,11 @@ int prepare_job(const uint8_t job_key[32], int m, int n)
     g_job.m = m;
     g_job.n = n;
     const size_t b_bytes = (size_t)n * K_DIM, a_bytes = (size_t)m * K_DIM;
-    uint8_t* cvs = (uint8_t*)cp_pearlx_alloc(g_px, (b_bytes > a_bytes ? b_bytes : a_bytes) / 1024 * 32);
+    uint8_t* cvs = (uint8_t*)cp_pearlx_alloc(g_px, tree_bytes(b_bytes > a_bytes ? b_bytes : a_bytes));
+    double hash_dsp_sec = 0.0;
 
     uint8_t root_b[32];
-    if(cvs && dsp_matrix_hash(NULL, b_bytes, job_key, cvs, nullptr, root_b) == 0){
+    if(cvs && dsp_matrix_hash(NULL, b_bytes, job_key, cvs, nullptr, root_b, &hash_dsp_sec) == 0){
         pearl_b_noise_seed_from_root(job_key, root_b, n, g_job.salted, g_job.b_noise_seed);
     } else {
         fprintf(stderr, "[hexagon] DSP hash of the zero B failed; hashing it on the host\n");
@@ -300,7 +334,8 @@ int prepare_job(const uint8_t job_key[32], int m, int n)
         if(!g_ahash) g_ahash = pearl_matrix_hash_create();
         uint8_t root_a[32];
         if(g_ahash &&
-           dsp_matrix_hash(h_Ap_global, a_bytes, job_key, cvs, g_ahash, root_a) == 0){
+           dsp_matrix_hash(h_Ap_global, a_bytes, job_key, cvs, g_ahash, root_a,
+                           &hash_dsp_sec) == 0){
             if(g_hash_check){
                 uint8_t ref[32];
                 pearl_keyed_digest_int8(h_Ap_global, a_bytes, job_key, ref);
@@ -320,8 +355,9 @@ int prepare_job(const uint8_t job_key[32], int m, int n)
     if(ensure_buffers(rows, cols) != 0)
         return -2;
     printf("[hexagon] job setup %.3fs: B seed %.3fs, noisy B generated on the DSP %.3fs, "
-           "signal A hash tree %.3fs (salted=%d)\n", cp_now_sec() - t0, t_seed, dsp_us / 1e6,
-           t_a, g_job.salted);
+           "signal A hash tree %.3fs; hashes: DSP %.3fs, host and calls %.3fs (salted=%d)\n",
+           cp_now_sec() - t0, t_seed, dsp_us / 1e6, t_a, hash_dsp_sec,
+           t_seed + t_a - hash_dsp_sec, g_job.salted);
     fflush(stdout);
     g_job.ready = 1;
     return 0;
@@ -550,16 +586,29 @@ extern "C" int cp_pearl_hexagon_worker_mine_attempt(
         if(rc != 0) return rc;
     }
 
-    /* Signal A: ~K_DIM random writes per attempt (CSPRNG), then the attempt's noise seed. */
+    /* Signal A: one random row per attempt (CSPRNG seed), as the CPU and GPU backends do,
+     * then the attempt's noise seed. CP_HEXAGON_PREP_ROWPOKE=0: one random value per
+     * column instead (~K_DIM chunks to rehash instead of K_DIM / 1024). */
     uint8_t a_rng[32];
     if(cp_random_bytes(a_rng, sizeof(a_rng)) != 0){
         fprintf(stderr, "[hexagon] CSPRNG failed for random A\n");
         return -2;
     }
-    std::vector<uint64_t> changed((size_t)K_DIM);
-    if(pearl_perturb_random_a_one_per_col_ex(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig,
-                                             changed.data()) != 0)
-        return -1;
+    std::vector<uint64_t> changed;
+    if(g_rowpoke){
+        int row = -1;
+        if(pearl_fill_random_a_row(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig, &row) != 0)
+            return -1;
+        const uint64_t base = (uint64_t)row * K_DIM;
+        for(uint64_t off = 0; off < (uint64_t)K_DIM; off += 1024)
+            changed.push_back(base + off);
+        changed.push_back(base + K_DIM - 1);
+    } else {
+        changed.resize((size_t)K_DIM);
+        if(pearl_perturb_random_a_one_per_col_ex(a_rng, (int)sizeof(a_rng), m, K_DIM, h_A_sig,
+                                                 changed.data()) != 0)
+            return -1;
+    }
     /* hash_a over all of signal A, but only the chunks this attempt wrote (and their tree
      * ancestors) are hashed again; the first attempt of a job hashes everything. */
     const double t_hash = cp_now_sec();

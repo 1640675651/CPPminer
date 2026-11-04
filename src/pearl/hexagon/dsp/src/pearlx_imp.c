@@ -1348,6 +1348,18 @@ static void cv_run(void *arg) {
     }
 }
 
+// The chunk chaining values of raw_len bytes (a multiple of CV_GROUP KB) into cvs.
+static int cv_level(pearlx_ctx *ctx, const uint8 *data, int raw_len, const uint32 *key,
+                    uint32 *cvs) {
+    const int groups = raw_len / 1024 / CV_GROUP;
+    const int nthreads = hvx_threads(0);
+    const int nc = nthreads < groups ? nthreads : groups;
+    cv_job jc[MAX_NUM_WORKERS];
+    for (int t = 0; t < nc; t++)
+        jc[t] = (cv_job){ data, key, cvs, groups * t / nc, groups * (t + 1) / nc };
+    return run_hvx_jobs(ctx, nc, cv_run, jc, sizeof(jc[0]));
+}
+
 int pearlx_chunk_cvs(remote_handle64 h, const int8 *data, int dataLen, int raw_len,
                      const uint32 *key, int keyLen, uint32 *cvs, int cvsLen, uint64 *dsp_us) {
     pearlx_ctx *ctx = (pearlx_ctx *)h;
@@ -1357,14 +1369,133 @@ int pearlx_chunk_cvs(remote_handle64 h, const int8 *data, int dataLen, int raw_l
         ((uintptr_t)cvs & (VBYTES - 1)))
         return AEE_EBADPARM;
     uint64 t0 = HAP_perf_get_time_us();
-    const int groups = chunks / CV_GROUP;
+    int err = cv_level(ctx, dataLen ? (const uint8 *)data : NULL, raw_len, key, cvs);
+    *dsp_us = HAP_perf_get_time_us() - t0;
+    return err;
+}
+
+// ---- The tree above the chunks (cp_noise.c's PearlMatrixHash levels) ----
+// Parent i of level j is the keyed compression of nodes 2i and 2i + 1 of level j - 1 (64
+// bytes, counter 0, flags PARENT | KEYED_HASH). PT_GROUP parents per step: their 64
+// children are 32 vectors of two parents' messages each, transposed as in cv_run, then
+// compressed as two 32-lane halves (even and odd parents).
+
+#define B3_PARENT 4
+#define PT_GROUP 64                 // parents per step: 4 KB in, 2 KB out
+
+static void pt_group(const HVX_Vector *in, HVX_Vector *out, const uint32 *key) {
+    HVX_Vector r[32];
+    for (int c = 0; c < 32; c++)
+        r[c] = in[c];
+    // r[w] lane c = word w of vector c: words 0..15 parent 2c's message, 16..31 parent 2c + 1's.
+    for (int d = 16; d >= 1; d /= 2)
+        for (int i = 0; i < 32; i++)
+            if (!(i & d)) {
+                HVX_VectorPair w = Q6_W_vshuff_VVR(r[i + d], r[i], -4);
+                r[i] = Q6_V_lo_W(w);
+                r[i + d] = Q6_V_hi_W(w);
+            }
+    HVX_Vector ev[8], od[8];
+#pragma clang loop unroll(full)
+    for (int w = 0; w < 8; w++)
+        ev[w] = od[w] = Q6_V_vsplat_R(key[w]);
+    b3_compress(r, ev, Q6_V_vzero(), B3_PARENT | B3_KEYED_HASH);
+    b3_compress(r + 16, od, Q6_V_vzero(), B3_PARENT | B3_KEYED_HASH);
+    // Interleave even and odd parents: lo lane p = parent p (0..31), hi = parents 32..63.
+    HVX_Vector lo[8], hi[8];
+#pragma clang loop unroll(full)
+    for (int w = 0; w < 8; w++) {
+        HVX_VectorPair x = Q6_W_vshuff_VVR(od[w], ev[w], -4);
+        lo[w] = Q6_V_lo_W(x);
+        hi[w] = Q6_V_hi_W(x);
+    }
+    // 8 x 32 word transposes (as in cv_run): vector v = parents 4v .. 4v + 3, 8 words each.
+#pragma clang loop unroll(full)
+    for (int d = 4; d >= 1; d /= 2)
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; i++)
+            if (!(i & d)) {
+                HVX_VectorPair a = Q6_W_vshuff_VVR(lo[i + d], lo[i], -4);
+                lo[i] = Q6_V_lo_W(a);
+                lo[i + d] = Q6_V_hi_W(a);
+                HVX_VectorPair b = Q6_W_vshuff_VVR(hi[i + d], hi[i], -4);
+                hi[i] = Q6_V_lo_W(b);
+                hi[i + d] = Q6_V_hi_W(b);
+            }
+    for (int v = 0; v < 8; v++) {
+        out[v] = lo[v];
+        out[8 + v] = hi[v];
+    }
+}
+
+typedef struct {
+    const uint8 *prev;              // level j - 1
+    uint8 *cur;                     // level j
+    const uint32 *key;
+    int g0, g1;                     // full groups of PT_GROUP parents
+    int tail;                       // parents after the full groups (last job only)
+} pt_job;
+
+// The tail's staging (a level's last, partial group): only the last job of a level uses it,
+// and calls into pearlx are not concurrent.
+static HVX_Vector pt_tail_in[32], pt_tail_out[16];
+
+static void pt_run(void *arg) {
+    const pt_job *j = arg;
+    for (int g = j->g0; g < j->g1; g++)
+        pt_group((const HVX_Vector *)(j->prev + (size_t)g * PT_GROUP * 64),
+                 (HVX_Vector *)(j->cur + (size_t)g * PT_GROUP * 32), j->key);
+    if (j->tail) {
+        memset(pt_tail_in, 0, sizeof(pt_tail_in));
+        memcpy(pt_tail_in, j->prev + (size_t)j->g1 * PT_GROUP * 64, (size_t)j->tail * 64);
+        pt_group(pt_tail_in, pt_tail_out, j->key);
+        memcpy(j->cur + (size_t)j->g1 * PT_GROUP * 32, pt_tail_out, (size_t)j->tail * 32);
+    }
+}
+
+// Node offset of level j in tree_cvs's layout: each level padded to 4 nodes (128 bytes).
+static size_t tree_level_offset(int n, int level) {
+    size_t off = 0;
+    for (int j = 0; j < level; j++)
+        off += (size_t)(((n >> j) + 3) / 4 * 4);
+    return off;
+}
+
+static int tree_top_level(int n) {
+    int top = 0;
+    while ((2 << top) <= n)
+        top++;
+    return top;
+}
+
+int pearlx_tree_cvs(remote_handle64 h, const int8 *data, int dataLen, int raw_len,
+                    const uint32 *key, int keyLen, uint32 *nodes, int nodesLen, uint64 *dsp_us) {
+    pearlx_ctx *ctx = (pearlx_ctx *)h;
+    const int n = raw_len / 1024;
+    if (raw_len <= 0 || raw_len % (1024 * CV_GROUP) || keyLen < 8 ||
+        (dataLen != 0 && dataLen < raw_len) || ((uintptr_t)data & (VBYTES - 1)) ||
+        ((uintptr_t)nodes & (VBYTES - 1)))
+        return AEE_EBADPARM;
+    const int top = tree_top_level(n);
+    if ((size_t)nodesLen < tree_level_offset(n, top + 1) * 8)
+        return AEE_EBADPARM;
+    uint64 t0 = HAP_perf_get_time_us();
+    int err = cv_level(ctx, dataLen ? (const uint8 *)data : NULL, raw_len, key, nodes);
     const int nthreads = hvx_threads(0);
-    const int nc = nthreads < groups ? nthreads : groups;
-    cv_job jc[MAX_NUM_WORKERS];
-    for (int t = 0; t < nc; t++)
-        jc[t] = (cv_job){ dataLen ? (const uint8 *)data : NULL, key, cvs, groups * t / nc,
-                          groups * (t + 1) / nc };
-    int err = run_hvx_jobs(ctx, nc, cv_run, jc, sizeof(jc[0]));
+    for (int j = 1; j <= top && !err; j++) {
+        const int len = n >> j;
+        const int groups = len / PT_GROUP;
+        int nc = nthreads < groups ? nthreads : groups;
+        if (nc < 1)
+            nc = 1;
+        const uint8 *prev = (const uint8 *)(nodes + tree_level_offset(n, j - 1) * 8);
+        uint8 *cur = (uint8 *)(nodes + tree_level_offset(n, j) * 8);
+        pt_job jp[MAX_NUM_WORKERS];
+        for (int t = 0; t < nc; t++)
+            jp[t] = (pt_job){ prev, cur, key, groups * t / nc, groups * (t + 1) / nc,
+                              t == nc - 1 ? len % PT_GROUP : 0 };
+        err = run_hvx_jobs(ctx, nc, pt_run, jp, sizeof(jp[0]));
+    }
     *dsp_us = HAP_perf_get_time_us() - t0;
     return err;
 }

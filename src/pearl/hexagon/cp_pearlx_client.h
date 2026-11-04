@@ -44,6 +44,11 @@ int cp_pearlx_set_a_gen(CpPearlx* px, const int8_t* a_sig, int row0, int rows, i
  * data NULL: all zeros) into cvs (8 words per chunk). data and cvs 128-byte aligned. */
 int cp_pearlx_chunk_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const uint32_t key[8],
                         uint32_t* cvs, uint64_t* dsp_us);
+/* Like chunk_cvs, plus every complete parent level of the tree above the chunks, in the
+ * layout of pearl_matrix_tree_level_offset (cp_noise.h); nodes_words = 8 *
+ * pearl_matrix_tree_nodes(raw_len / 1024). */
+int cp_pearlx_tree_cvs(CpPearlx* px, const int8_t* data, size_t raw_len, const uint32_t key[8],
+                       uint32_t* nodes, size_t nodes_words, uint64_t* dsp_us);
 int cp_pearlx_info(CpPearlx* px, int* hvx_contexts, int* clock_vote_err, int* clock_mhz,
                    int* vtcm_kb);
 

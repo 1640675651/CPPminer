@@ -229,6 +229,65 @@ static int hash_test(remote_handle64 h, size_t bytes) {
     return bad ? 1 : 0;
 }
 
+/* -H 2: tree_cvs, the whole tree on the DSP. Its root must equal pearl_keyed_digest_int8,
+ * and the host's copy of it must stay right under incremental updates: random one-byte
+ * changes, each rehashed through the copied levels and compared with a full hash. */
+static int tree_test(remote_handle64 h, size_t bytes) {
+    const size_t chunks = bytes / 1024, nodes_words = pearl_matrix_tree_nodes(chunks) * 8;
+    int8_t *data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes);
+    uint32_t *nodes = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, nodes_words * 4);
+    PearlMatrixHash *tree = pearl_matrix_hash_create();
+    if (!data || !nodes || !tree) {
+        printf("ERROR: allocation failed\n");
+        return 1;
+    }
+    uint8_t key[32];
+    uint32_t sd = 778, key8[8];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(lcg(&sd) >> 24);
+    memcpy(key8, key, 32);
+    int bad = 0;
+    for (int zero = 0; zero < 2; zero++) {
+        if (zero) memset(data, 0, bytes);
+        else fill(data, bytes, 32);
+        uint64 dsp_us = 0;
+        int err = pearlx_tree_cvs(h, zero ? NULL : data, zero ? 0 : (int)bytes, (int)bytes, key8, 8,
+                                  nodes, (int)nodes_words, &dsp_us);
+        if (err) {
+            printf("ERROR 0x%x: tree_cvs\n", err);
+            return 1;
+        }
+        uint8_t root[32], kept[32], ref[32];
+        const uint64_t t0 = now_us();
+        pearl_matrix_hash_from_tree(NULL, data, bytes, key, (const uint8_t *)nodes, root);
+        const uint64_t root_us = now_us() - t0;
+        const uint64_t t1 = now_us();
+        pearl_matrix_hash_from_tree(tree, data, bytes, key, (const uint8_t *)nodes, kept);
+        const uint64_t copy_us = now_us() - t1;
+        pearl_keyed_digest_int8(data, bytes, key, ref);
+        int ok = memcmp(root, ref, 32) == 0 && memcmp(kept, ref, 32) == 0;
+        int upd_bad = 0;
+        for (int u = 0; u < 4; u++) {
+            const uint64_t off = ((uint64_t)lcg(&sd) << 16 ^ lcg(&sd)) % bytes;
+            data[off] ^= 0x5A;
+            uint8_t inc[32];
+            size_t rehashed = 0;
+            pearl_matrix_hash_digest(tree, data, bytes, key, &off, 1, inc, &rehashed);
+            pearl_keyed_digest_int8(data, bytes, key, ref);
+            upd_bad += memcmp(inc, ref, 32) != 0 || rehashed != 1;
+        }
+        ok = ok && !upd_bad;
+        printf("tree check (%s, %zu MiB): %s; DSP chunks + tree %.1f ms, host root %.2f ms, "
+               "host copy of the tree %.1f ms, 4 incremental updates %s\n",
+               zero ? "zeros" : "random", bytes >> 20, ok ? "PASS" : "FAIL", dsp_us / 1e3,
+               root_us / 1e3, copy_us / 1e3, upd_bad ? "WRONG" : "right");
+        bad += !ok;
+    }
+    pearl_matrix_hash_free(tree);
+    rpcmem_free(nodes);
+    rpcmem_free(data);
+    return bad ? 1 : 0;
+}
+
 /* scan_run's control block words (pearlx.idl). */
 enum { CTL_LAUNCHED = 0, CTL_EPOCH_ACK = 1, CTL_STATE = 2, CTL_HITS = 3, CTL_HIT_ROW = 4,
        CTL_HIT_COL = 5, CTL_HIT_XOR = 8, CTL_CHECKED = 64, CTL_STOP = 65, CTL_EPOCH = 66,
@@ -513,7 +572,7 @@ int main(int argc, char *argv[]) {
     }
     printf("Usage: pearlx_test [-n N] [-k K] [-r rows/panel] [-w cols/call] [-g panels]"
            " [-t threads] [-c 0|1] [-s samples/call] [-j 0|1] [-b hit_bits] [-u 0|1]"
-           " [-G 0|1] [-H 0|1] [-L 0|1|2|3|4]\n");
+           " [-G 0|1] [-H 0|1|2] [-L 0|1|2|3|4]\n");
     /* scan cross-check: a fixed key and a bound hitting 1 in 2^hit_bits hash tiles. */
     uint32_t key_bound[16];
     for (int i = 0; i < 8; i++) key_bound[i] = 0x9E3779B9u * (uint32_t)(i + 1);
@@ -566,7 +625,7 @@ int main(int argc, char *argv[]) {
         return err ? 1 : 0;
     }
     if (hash) {
-        err = hash_test(h, (size_t)n * k);
+        err = hash == 2 ? tree_test(h, (size_t)n * k) : hash_test(h, (size_t)n * k);
         pearlx_close(h);
         printf("%s\n", err ? "FAILED" : "Success");
         return err ? 1 : 0;

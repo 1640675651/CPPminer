@@ -85,4 +85,12 @@ interface pearlx : remote_handle64 {
                  in sequence<uint32> key_bound, rout sequence<uint32> ctl,
                  rout sequence<uint32> xr, rout uint64 dsp_us, rout uint64 wait_us,
                  rout long launched);
+
+   // Like chunk_cvs, plus every complete parent of the BLAKE3 tree above the chunks (the
+   // levels of cp_noise.c's PearlMatrixHash), so the host only merges the subtree tops into
+   // the root. n = raw_len / 1024 chunks; level j (0 = the chunk values) has n >> j nodes of
+   // 8 words starting at node sum over i < j of roundup(n >> i, 4); every level with at
+   // least 2 nodes is written. nodes 128-byte aligned.
+   long tree_cvs(in sequence<int8> data, in long raw_len, in sequence<uint32> key,
+                 rout sequence<uint32> nodes, rout uint64 dsp_us);
 };

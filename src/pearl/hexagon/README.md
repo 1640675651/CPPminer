@@ -11,27 +11,34 @@ contexts).
 | Snapdragon 480 cDSP | hexagon | ~403 GMAC/s while scanning, ~402 GMAC/s overall |
 | Snapdragon 480 CPU (2x A76 + 6x A55) | cpu (NEON DotProd) | ~130 GMAC/s |
 
-The overall rate includes about 0.03 s of host work per 10.96 s attempt, while
-the DSP is idle: the random signal A, its hash for the noise seed, and the
-permutation pairs. Each new job also idles the DSP for ~0.38 s:
-- ~0.07 s for the zero B's hash, which gives the B noise seed;
-- ~0.10 s for the DSP to generate B;
-- ~0.19 s to rebuild signal A's hash tree under the new job key, so the job's
+The overall rate includes about 2 ms of host work per 10.95 s attempt, while
+the DSP is idle: the random row of signal A, its hash for the noise seed, and
+the permutation pairs. Each new job also idles the DSP for ~0.30 s:
+- ~0.03 s for the zero B's hash, which gives the B noise seed;
+- ~0.11 s for the DSP to generate B;
+- ~0.14 s to rebuild signal A's hash tree under the new job key, so the job's
   first attempt is incremental too.
 
-Both hashes compute their 1 KB chunk hashes on the DSP (`pearlx chunk_cvs`, HVX
-BLAKE3, 32 chunks per vector) and build the tree above them on the host
-(`pearl_matrix_hash_from_cvs`). The host alone takes ~0.36 s per 128 MiB.
+Both hashes run on the DSP (`pearlx tree_cvs`, HVX BLAKE3): the 1 KB chunk
+hashes, 32 chunks per vector, and every level of the tree above them, 64
+parents per step. The host only merges the subtree tops into the root and keeps
+a copy of signal A's tree for the incremental hash (~10 ms per 128 MiB). That
+leaves ~0.08 s of host time per job, the calls included, against ~0.20 s when
+the host built the trees on all six cores (`CP_HEXAGON_HOST_TREE=1`; ~45 ms per
+128 MiB tree). At the default size a job's setup takes ~0.80 s instead of
+~0.99 s. Hashing everything on the host takes ~0.36 s per 128 MiB.
 
 Measured from `adb shell`, which limits the process to the six A55 cores.
 
 The hash of signal A is incremental (`pearl_matrix_hash_digest` in
-`cp_noise.c`). An attempt changes one value per column, so only about 4,000 of
-signal A's 131,072 1 KB chunks change. The worker keeps every chunk's chaining
-value and every complete parent of the BLAKE3 tree, and hashes again only the
-changed chunks and their ancestors. That takes 0.03 s instead of 0.35 s; the
-first attempt of each job hashes everything. Set `CP_HEXAGON_HASH_CHECK=1` to
-compare it with a full hash on every attempt.
+`cp_noise.c`). An attempt fills one random row of signal A, as the CPU and GPU
+backends do (`pearl_fill_random_a_row`), so only 4 of signal A's 131,072 1 KB
+chunks change. The worker keeps every chunk's chaining value and every complete
+parent of the BLAKE3 tree, and hashes again only the changed chunks and their
+ancestors: under 1 ms, against 0.35 s for a full hash. The earlier fill, one
+random value per column (`CP_HEXAGON_PREP_ROWPOKE=0`), changes ~4,000 chunks
+and takes 0.02-0.035 s. Set `CP_HEXAGON_HASH_CHECK=1` to compare the hashes
+with full host hashes on every attempt and job.
 
 Where the scan rate goes, against the kernel's ~413 GMAC/s peak:
 
@@ -91,9 +98,10 @@ backends' macro panels: by default 32 x 32 macros, so 4096 rows x 4096 columns
 
 | Step | Where | When |
 |---|---|---|
-| B noise seed (hash of the zero B^T), B permutation pairs | host | once per job |
+| Hashes of the zero B^T and of signal A under the job key: chunks and tree (`pearlx tree_cvs`) | cDSP | once per job |
+| B noise seed from the zero B's root, B permutation pairs; the roots, and a copy of signal A's tree | host | once per job |
 | Noisy B (signal B = 0) generated in packed layout (`pearlx set_b_gen`) | cDSP | once per job |
-| Sparse random signal A, its incremental hash, `a_noise_seed`, A permutation pairs | host | every attempt |
+| One random row of signal A, its incremental hash, `a_noise_seed`, A permutation pairs | host | every attempt |
 | Noisy A of a row panel generated from its signal rows, in packed layout | cDSP | per panel, before its first launch |
 | GEMM + milestone XOR of the panel against one block of columns | cDSP | per launch |
 | BLAKE3 jackpot over the launch's tile XORs | host, OpenMP | per launch |
@@ -182,9 +190,9 @@ that fits in VTCM, so after each of the first 3 blocks a tile's int32
 accumulators (4 x 128, 2 KiB) are stored next to its A, one slot per DSP
 thread. Each record buffer has 256 bytes per 4 x 128 register tile.
 
-Job setup briefly needs another ~48 MiB at the default size, freed before the
-scan: the chunk hashes from the DSP (max(m, n)·k / 32, rpcmem) and the zero B's
-temporary hash tree (n·k / 16, host). VTCM (128 KB per thread) is on-chip and
+Job setup briefly needs another ~32 MiB at the default size, freed before the
+scan: the hash tree from the DSP (max(m, n)·k / 16, rpcmem), which holds the
+zero B's tree and then signal A's. VTCM (128 KB per thread) is on-chip and
 not counted.
 
 ## Files
@@ -193,10 +201,10 @@ not counted.
 |---|---|
 | `cp_pearl_hexagon_worker.cpp` | Worker: job and attempt prep (seeds, signal A, its incremental hash), the launch pipeline, jackpot, hit recompute |
 | `cp_pearlx_client.c` | FastRPC client: loads `libcdsprpc.so` at run time and marshals the `pearlx` calls by hand. No Hexagon SDK headers are needed |
-| `dsp/inc/pearlx.idl` | DSP interface: `scan_run` (an attempt's launches, run by the DSP, with the control block), `set_b_gen` (noisy B generated on the DSP), `chunk_cvs` (matrix hash leaves), `info`; `set_a_gen` and `gemm_xor` (one panel / one launch per call), `set_b`, `set_a` (pack host-built matrices) and `scan` (jackpot on the DSP) are used only by the self-test |
+| `dsp/inc/pearlx.idl` | DSP interface: `scan_run` (an attempt's launches, run by the DSP, with the control block), `set_b_gen` (noisy B generated on the DSP), `tree_cvs` (matrix hashes: the chunks and the tree above them; `chunk_cvs`, the chunks alone, is the fallback for an older library), `info`; `set_a_gen` and `gemm_xor` (one panel / one launch per call), `set_b`, `set_a` (pack host-built matrices) and `scan` (jackpot on the DSP) are used only by the self-test |
 | `dsp/src/pearlx_imp.c` | DSP side: noise generation, packing, VTCM, threads over both HVX contexts, the DSP jackpot |
 | `dsp/src/pearlx.S`, `dsp/src/pearlx_xor.inc` | HVX kernel (Case 1.1 fold and reduction) |
-| `dsp/src/pearlx_test.c` | Android self-test against CPU references, plus timing: GEMM + XOR, the DSP jackpot (`-b` hit rate), the noise generators (`-G 1`), the chunk hashes (`-H 1`), and `scan_run` against one call per launch with records read during the run and a mid-run stop (`-L 1`; `-L 2` with a host slower than the DSP; `-L 3` with the DSP idle after each launch, the case that catches missing cache cleaning), with the miner's `cp_noise.c` linked in as the reference |
+| `dsp/src/pearlx_test.c` | Android self-test against CPU references, plus timing: GEMM + XOR, the DSP jackpot (`-b` hit rate), the noise generators (`-G 1`), the chunk hashes (`-H 1`), the whole hash tree with incremental updates through the host's copy (`-H 2`), and `scan_run` against one call per launch with records read during the run and a mid-run stop (`-L 1`; `-L 2` with a host slower than the DSP; `-L 3` with the DSP idle after each launch, the case that catches missing cache cleaning), with the miner's `cp_noise.c` linked in as the reference |
 | `dsp/CMakeLists.txt`, `dsp/build.ps1` | Hexagon SDK build of the DSP library and the self-test |
 
 ## Build
@@ -211,6 +219,7 @@ There are two parts:
    .\build.ps1                                   # hexagon_Release_toolv87_v66\ship\libpearlx_skel.so
    .\build.ps1 -NoBuild -Test "-n 32768 -r 4096 -w 4096 -g 2"   # push + self-test on the phone
    .\build.ps1 -NoBuild -Test "-n 32768 -r 4096 -G 1"           # DSP noise vs cp_noise.c
+   .\build.ps1 -NoBuild -Test "-n 32768 -H 2"                    # DSP hash tree vs cp_noise.c
    ```
 
    Ship `libpearlx_skel.so` and the SDK's `libworker_pool.so` from

@@ -70,6 +70,17 @@ int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_l
  * updated, e.g. an all-zero one), and return the root, as pearl_keyed_digest_int8 would. */
 int pearl_matrix_hash_from_cvs(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
                                const uint8_t key[32], const uint8_t* chunk_cvs, uint8_t out[32]);
+/* A whole tree computed elsewhere (the Hexagon DSP's pearlx tree_cvs): level j (0 = the
+ * chunk chaining values) holds the num_chunks >> j complete nodes of 32 bytes, starting at
+ * node pearl_matrix_tree_level_offset(num_chunks, j) (each level padded to 4 nodes, 128
+ * bytes), for every level with at least 2 nodes. pearl_matrix_tree_nodes is the total. */
+size_t pearl_matrix_tree_level_offset(size_t num_chunks, int level);
+size_t pearl_matrix_tree_nodes(size_t num_chunks);
+/* The root from such a tree, as pearl_keyed_digest_int8 would give it. h NULL: read the
+ * tree in place (nothing kept). h given: h takes a copy of the tree, so later
+ * pearl_matrix_hash_digest calls on mat are incremental. */
+int pearl_matrix_hash_from_tree(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                                const uint8_t key[32], const uint8_t* tree, uint8_t out[32]);
 
 int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
                          uint8_t* out, int out_cap);
