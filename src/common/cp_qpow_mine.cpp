@@ -262,7 +262,7 @@ static bool qpow_reference_hash_ok(const CpQpowJob* job, const uint8_t nonce[CP_
     return qpow::hash_if_valid(mid, nonce + 32, job->target, hash);
 }
 
-/* Handle a found nonce. Returns 1 if mining should stop (mock done). */
+/* Handle a found nonce. Returns 1 if mining should stop (mock done, or the job was replaced). */
 static int on_qpow_share_found(const CpQpowJob* job, int sock, int* msg_id,
                                const uint8_t nonce[CP_QPOW_NONCE_BYTES], int tid)
 {
@@ -291,6 +291,14 @@ static int on_qpow_share_found(const CpQpowJob* job, int sock, int* msg_id,
                                       std::memory_order_relaxed);
             fprintf(stderr, "[mock] FAIL: hash does not meet target\n");
         }
+        return 1;
+    }
+    /* A new job (or a lost connection) arrived while this share was being mined: the pool has
+     * moved on, so the share would only come back stale. Drop it and stop mining the job. */
+    if(cp_job_should_cancel() || cp_pool_conn_lost()){
+        printf("[qpow] share for job %s dropped: %s\n", job->job_id,
+               cp_pool_conn_lost() ? "pool connection lost" : "job replaced");
+        fflush(stdout);
         return 1;
     }
     submit_qpow_share(job, sock, msg_id, nonce, tid);
