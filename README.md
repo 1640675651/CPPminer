@@ -8,7 +8,7 @@ Select the algorithm and backend at runtime with `--algo` (default `pearl`) and 
 | Algo | Backends | PoW |
 |------|----------|-----|
 | `pearl` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu` | GEMM+XOR jackpot + `plain_proof` |
-| `quantus` | `cpu` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
+| `quantus` | `cpu` / `cuda` / `wgpu` / `opencl` | Poseidon2 QPoW (`qpow-poseidon2`) |
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
@@ -20,6 +20,7 @@ Select the algorithm and backend at runtime with `--algo` (default `pearl`) and 
 | Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
 | Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + tile XOR on the SHAVE cores ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
+| Quantus CUDA | `src/qpow/cuda/` | Poseidon2 kernel on the nonce line, self-tested per device |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device ([docs](docs/quantus_opencl.md)) |
 
@@ -63,7 +64,7 @@ Enable multiple backends in one binary; select at runtime with `--backend`. Both
 | | cpu | cuda | opencl | onednn | wgpu | hexagon | intel_npu |
 |--|-----|------|--------|--------|------|---------|-----------|
 | pearl | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| quantus | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
+| quantus | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
 ## Build (Windows)
 
@@ -105,7 +106,7 @@ cppminer [--algo pearl|quantus] --backend BACKEND [--devices IDS]
          [--pool stratum+tcp://HOST:PORT] --wallet ADDRESS [--worker NAME] [backend options]
 ```
 
-- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu`, `hexagon` and `intel_npu`; Quantus on `cpu`, `opencl` and `wgpu`. The backend must be enabled in the build.
+- `--algo` defaults to `pearl`. Pearl runs on `cpu`, `cuda`, `opencl`, `onednn`, `wgpu`, `hexagon` and `intel_npu`; Quantus on `cpu`, `cuda`, `opencl` and `wgpu`. The backend must be enabled in the build.
 - Pearl defaults to the LuckyPool Pearl pool; Quantus needs `--pool`.
 - `--list-devices` prints the device indices that `--devices` takes.
 - `--mock` mines a fixed job offline until the first share, verifies it and exits; it needs no pool or wallet.
@@ -130,7 +131,7 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 
 | Flag | Description |
 |------|-------------|
-| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu`. `--pool` required for Quantus unless `--mock` |
+| `--algo` | `pearl` (default) or `quantus` (`qpow` / `qpow-poseidon2` aliases). Quantus: `cpu` / `cuda` / `wgpu` / `opencl`; Pearl: `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu`. `--pool` required for Quantus unless `--mock` |
 | `--backend` | `cpu` / `cuda` / `opencl` / `onednn` / `wgpu` / `hexagon` / `intel_npu` (alias `npu`) (must be compiled in; must be valid for `--algo`).
 | `--pool` | `stratum+tcp://host:port` (required for `--algo quantus` unless `--mock`) |
 | `--wallet` | Wallet address (required unless `--mock`) |
@@ -146,7 +147,7 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 | `--cutlass-fused` | CUDA: fused CUTLASS GEMM + jackpot (**default**) |
 | `--cublas-period` | CUDA debug: cuBLAS period GEMM (only if built with `CP_ENABLE_CUBLAS`) |
 | `--no-cutlass-fused` | CUDA debug: non-CUTLASS period path |
-| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus: **nonces per launch** (wgpu default 1000000; OpenCL default automatic, about 100 ms per launch). Aliases: `--period-batch`, `--col-period-batch` |
+| `--batch-size N` | Launch batch. Pearl: col/macro panel size (default 1024; backend may remap). Quantus: **nonces per launch** (wgpu default 1000000; CUDA/OpenCL default automatic, about 100 ms per launch). Aliases: `--period-batch`, `--col-period-batch` |
 | `--period-batch N` | Alias for `--batch-size` |
 | `--col-period-batch N` | Alias for `--batch-size` |
 | `--row-period-batch N` | CUDA: row-period batch (default 32, max 1024); oneDNN, Hexagon, Intel NPU: see below |
