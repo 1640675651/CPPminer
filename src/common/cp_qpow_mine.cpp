@@ -36,11 +36,6 @@
 #endif
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
 #include "cp_qpow_cuda_worker.h"
-#ifndef CP_QPOW_OCL_OK_FOUND
-#define CP_QPOW_OCL_OK_FOUND     CP_QPOW_CUDA_OK_FOUND
-#define CP_QPOW_OCL_OK_EXHAUSTED CP_QPOW_CUDA_OK_EXHAUSTED
-#define CP_QPOW_OCL_CANCELLED    CP_QPOW_CUDA_CANCELLED
-#endif
 #endif
 #if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
 #include "cp_cpu_affinity.h"
@@ -462,7 +457,15 @@ static int mine_job_wgpu(const CpQpowJob* job, int sock, int* msg_id,
 #endif
 
 #if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA)
-/* One GPU backend's search entry points. Return codes share the CP_QPOW_OCL_* values. */
+/* Return codes of QpowGpuOps::search; each backend's own codes are asserted equal below. */
+enum {
+    QPOW_GPU_OK_FOUND = 1,
+    QPOW_GPU_OK_EXHAUSTED = 0,
+    QPOW_GPU_CANCELLED = -1,
+    QPOW_GPU_ERROR = -2,
+};
+
+/* One GPU backend's search entry points. */
 struct QpowGpuOps {
     const char* name;
     int (*ready)(void);
@@ -513,16 +516,16 @@ static int mine_job_gpu(const QpowGpuOps& ops, const CpQpowJob* job, int sock, i
         cp_fee_prepare_matrix();
         /* Switch only after this batch's share (if any) is submitted under the current wallet. */
         const int fee_switch = cp_fee_needs_switch();
-        if(st == CP_QPOW_OCL_OK_FOUND){
+        if(st == QPOW_GPU_OK_FOUND){
             if(on_qpow_share_found(job, sock, msg_id, out_nonce, 0)){
                 stop_rc = CP_JOB_NONE;
                 break;
             }
             /* out_nonce is the mapped nonce; continue after its line counter */
             ops.resume(out_nonce, cur);
-        } else if(st == CP_QPOW_OCL_OK_EXHAUSTED){
+        } else if(st == QPOW_GPU_OK_EXHAUSTED){
             add_be_u64(cur, hashes > 0 ? hashes : search_chunk);
-        } else if(st == CP_QPOW_OCL_CANCELLED){
+        } else if(st == QPOW_GPU_CANCELLED){
             stop_rc = CP_JOB_CANCELLED;
             break;
         } else {
@@ -552,6 +555,9 @@ static int mine_job_gpu(const QpowGpuOps& ops, const CpQpowJob* job, int sock, i
 #endif
 
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+static_assert(CP_QPOW_OCL_OK_FOUND == QPOW_GPU_OK_FOUND && CP_QPOW_OCL_OK_EXHAUSTED == QPOW_GPU_OK_EXHAUSTED &&
+              CP_QPOW_OCL_CANCELLED == QPOW_GPU_CANCELLED && CP_QPOW_OCL_ERROR == QPOW_GPU_ERROR,
+              "OpenCL Quantus worker return codes must match QPOW_GPU_*");
 static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
                            const char* worker_name)
 {
@@ -563,9 +569,9 @@ static int mine_job_opencl(const CpQpowJob* job, int sock, int* msg_id,
 #endif
 
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
-static_assert(CP_QPOW_CUDA_OK_FOUND == 1 && CP_QPOW_CUDA_OK_EXHAUSTED == 0 &&
-              CP_QPOW_CUDA_CANCELLED == -1 && CP_QPOW_CUDA_ERROR == -2,
-              "CUDA and OpenCL Quantus workers share return codes");
+static_assert(CP_QPOW_CUDA_OK_FOUND == QPOW_GPU_OK_FOUND && CP_QPOW_CUDA_OK_EXHAUSTED == QPOW_GPU_OK_EXHAUSTED &&
+              CP_QPOW_CUDA_CANCELLED == QPOW_GPU_CANCELLED && CP_QPOW_CUDA_ERROR == QPOW_GPU_ERROR,
+              "CUDA Quantus worker return codes must match QPOW_GPU_*");
 static int mine_job_cuda(const CpQpowJob* job, int sock, int* msg_id,
                          const char* worker_name)
 {

@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-/* Return codes align with CP_QPOW_OCL_* / CP_WGPU_* for mine-loop sharing. */
+/* Return codes: the shared GPU mine loop asserts they equal its QPOW_GPU_* codes. */
 #define CP_QPOW_CUDA_OK_FOUND     1
 #define CP_QPOW_CUDA_OK_EXHAUSTED 0
 #define CP_QPOW_CUDA_CANCELLED   (-1)

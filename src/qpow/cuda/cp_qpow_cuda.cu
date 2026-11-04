@@ -437,15 +437,6 @@ bool ck(cudaError_t e, const char* what, int ordinal)
     return false;
 }
 
-void be_add(uint8_t n[64], u64 add)
-{
-    for (int i = 63; i >= 0 && add; i--) {
-        add += n[i];
-        n[i] = (uint8_t)add;
-        add >>= 8;
-    }
-}
-
 bool upload_constants()
 {
     u64 post[16][12] = {};
@@ -468,8 +459,6 @@ bool upload_constants()
 }
 
 using qpow::nonce_line::kTSpan;
-
-void map_nonce(const uint8_t ctr[64], uint8_t out[64]) { qpow::nonce_line::map(ctr, out); }
 
 /* Kernel parameters for counters ctr .. ctr + count - 1 (count <= kTSpan - t: k stays fixed). */
 void make_params(const u64 mid[12], const uint8_t ctr[64], Params& p)
@@ -533,8 +522,8 @@ bool self_test(Dev& d)
     for (u32 i = 0; i < n; i++) {
         uint8_t c[64], nn[64];
         memcpy(c, ctr, 64);
-        be_add(c, i);
-        map_nonce(c, nn);
+        qpow::nonce_line::add_be(c, i);
+        qpow::nonce_line::map(c, nn);
         const u64 ref = cpu_out0(header, nn);
         if (got[i] != ref) {
             fprintf(stderr, "[qpow-cuda] device %d: self-test mismatch at nonce +%u (got %016llx, want %016llx)\n",
@@ -709,7 +698,7 @@ extern "C" int cp_qpow_cuda_worker_search(
             memcpy(sl.base, cur, 64);
             sl.n = (uint32_t)n;
             sl.full = n == d.launch;
-            be_add(cur, n);
+            qpow::nonce_line::add_be(cur, n);
             planned += n;
             if (!have_mid || memcmp(mid_high, sl.base, 32) != 0) {
                 memcpy(mid_high, sl.base, 32);
@@ -798,8 +787,8 @@ extern "C" int cp_qpow_cuda_worker_search(
                 if (idx >= best) continue;
                 uint8_t c[64], nonce[64], hash[64];
                 memcpy(c, sl.base, 64);
-                be_add(c, idx);
-                map_nonce(c, nonce);
+                qpow::nonce_line::add_be(c, idx);
+                qpow::nonce_line::map(c, nonce);
                 u64 m[12];
                 qpow::mining_midstate(header, nonce, m);
                 if (qpow::hash_if_valid(m, nonce + 32, target_be, hash)) {
@@ -833,5 +822,5 @@ extern "C" int cp_qpow_cuda_worker_search(
 extern "C" void cp_qpow_cuda_worker_resume(const uint8_t found_be[64], uint8_t next_be[64])
 {
     memcpy(next_be, memcmp(found_be, g_found_nonce, 64) == 0 ? g_found_ctr : found_be, 64);
-    be_add(next_be, 1);
+    qpow::nonce_line::add_be(next_be, 1);
 }
