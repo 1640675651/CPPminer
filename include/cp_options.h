@@ -29,6 +29,9 @@ struct CpOptions {
     int step_major_ap = -1; /* -1 = unset; CUTLASS→row-major, cuBLAS period→step-major */
     /* -1 = unset; CUDA defaults to fused CUTLASS, other backends force off. */
     int cutlass_fused = -1;
+    /* --cuda-mma (CP_CUTLASS_MMA_*): 0 auto, 1 simt dp4a, 2 tensorop (Sm75),
+     * 3 tensorop80 (Sm80 m16n8k32 multistage), 4 tensoropms. */
+    int cuda_mma = 0;
     int fused_jackpot = -1;   /* unset: on for --backend onednn, off for hexagon and intel_npu */
     const char *onednn_layout = nullptr;
     CpPrepackMode prepack_mode = CP_PREPACK_FUSED;
