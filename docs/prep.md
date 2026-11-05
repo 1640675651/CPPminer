@@ -144,7 +144,7 @@ prep kernels for experiments: `NSG_KPL` (4 or 16 bytes per item), `NSG_UNROLL` (
 
 The signal does not have to be regenerated in full per nonce: the share commits to whatever A_sig was
 used, and the noise rebuilt from the new root changes every element of A anyway. The CPU worker used to
-write one random value per column into a zero matrix (the Hexagon worker still does; the CPU now writes
+write one random value per column into a zero matrix (the CPU, Hexagon and Intel NPU workers now write
 one row into it). For the GPU a full
 random row is the better unit:
 

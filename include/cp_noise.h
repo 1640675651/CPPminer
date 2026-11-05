@@ -37,7 +37,7 @@ int pearl_generate_ab(const uint8_t* seed, int seed_len, int m, int n, int k,
 int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
                             int8_t* A_out);
 
-/* Row A refresh (all backends but Hexagon): rewrite one random row with the values
+/* Row A refresh (every backend): rewrite one random row with the values
  * pearl_generate_random_a gives it for this seed; *row_out (may be NULL) gets the row.
  * The rest of A must already be in [-64, 63], e.g. zeroed or from pearl_generate_random_a. */
 int pearl_fill_random_a_row(const uint8_t* seed, int seed_len, int m, int k, int8_t* A_inout,

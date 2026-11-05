@@ -29,7 +29,7 @@
  * BLAKE3 jackpot.
  *   job:     noisy B (signal B = 0) built on the host and packed per launch column block into tensors
  *            the NPU reads in place.
- *   attempt: sparse random signal A on the host -> a_noise_seed and permutation pairs; then the matrix
+ *   attempt: one random row of signal A on the host -> a_noise_seed and permutation pairs; then the matrix
  *            is scanned in launches of rows x columns x K (one compiled graph, cp_npu_graph.cpp; the
  *            shape in 128x128 macros from --row-period-batch x --col-period-batch).
  *            A prep thread builds each row panel of noisy A ahead of its launches; the calling thread
@@ -553,15 +553,21 @@ extern "C" int cp_pearl_npu_worker_mine_attempt(
             return rc;
     }
 
-    /* Signal A: ~K_DIM random writes per attempt (CSPRNG), then the attempt's noise seed. */
+    /* Signal A: one random row per attempt (CSPRNG seed), as the other backends do, then the attempt's
+     * noise seed. Only the row's chunks are hashed again. */
     uint8_t a_rng[32];
     if (cp_random_bytes(a_rng, sizeof(a_rng)) != 0) {
         fprintf(stderr, "[intel-npu] CSPRNG failed for random A\n");
         return -2;
     }
-    std::vector<uint64_t> changed(size_t(K_DIM));
-    if (pearl_perturb_random_a_one_per_col_ex(a_rng, int(sizeof(a_rng)), m, K_DIM, h_A_sig, changed.data()) != 0)
+    int row = -1;
+    if (pearl_fill_random_a_row(a_rng, int(sizeof(a_rng)), m, K_DIM, h_A_sig, &row) != 0)
         return -1;
+    std::vector<uint64_t> changed;
+    const uint64_t base = uint64_t(row) * K_DIM;
+    for (uint64_t off = 0; off < uint64_t(K_DIM); off += 1024)
+        changed.push_back(base + off);
+    changed.push_back(base + K_DIM - 1);
     /* hash_a over all of signal A, rehashing only the chunks this attempt wrote (the first attempt of
      * a job hashes everything). */
     const double t_hash = cp_now_sec();
