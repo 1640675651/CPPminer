@@ -120,6 +120,7 @@ typedef enum {
     CP_SIMD_AVX512VNNI = 8, /* force AVX512-VNNI (EVEX vpdpbusd) path */
     CP_SIMD_AVX512BW   = 9, /* force base AVX-512 (F+BW, zmm vpmaddubsw) path */
     CP_SIMD_I8MM       = 10, /* force AArch64 I8MM (smmla) path */
+    CP_SIMD_AVXVNNIINT8 = 11, /* force AVX-VNNI-INT8 vpdpbssd path (signed A, no u8s8 offset) */
 } CpSimdIsa;
 
 /* Returns 0, or -1 when an explicit ISA is unavailable. */

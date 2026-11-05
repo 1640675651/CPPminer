@@ -5,6 +5,7 @@ struct Case33CpuFeatures {
     bool ssse3 = false;
     bool avx2 = false;
     bool avx_vnni = false;
+    bool avx_vnni_int8 = false; /* VEX vpdpbssd (signed x signed bytes) */
     bool avx512_bw = false;   /* AVX512F+BW+VL with OS ZMM/opmask state */
     bool avx512_vnni = false; /* AVX512F+BW+VL+VNNI with OS ZMM/opmask state */
     bool i8mm = false;    /* AArch64 FEAT_I8MM (smmla); implies DotProd in practice */
