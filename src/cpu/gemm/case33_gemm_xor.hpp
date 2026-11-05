@@ -70,6 +70,9 @@ struct Case33GemmXor {
     /* True when the resolved ISA runs the u8s8 fast path, i.e. A is packed with
      * the +128 offset and B carries compensation sums. ARM kernels are s8s8. */
     bool fast_u8s8_active() const { return use_fast_u8s8_(); }
+    /* True when AVX-VNNI u8s8 runs the 16x4 assembly kernel (Case 3.5 port); packed B is then
+     * quarter-major (each 4-column slice contiguous over K), and hash tiles are still 8x16. */
+    bool avxvnni_16x4_active() const;
     Case33SseTile sse_tile() const { return sse_tile_; }
     /* Resolve the requested ISA against compiled and runtime capabilities. */
     bool resolve_runtime_isa();
@@ -137,6 +140,8 @@ private:
     int8_t *b_scan_ = nullptr;
     std::vector<int8_t> a_pre_;
     std::vector<int8_t> b_pre_;
+    /* u8s8: -128 * sum(B) per [milestone][column]; with the 16x4 kernel instead its
+     * subtracted corrections, 128 * sum(B) per [16-col tile][4-col quarter][milestone][4]. */
     std::vector<int32_t> b_comp_ms_;
     std::vector<uint32_t> tile_xor_;
     char backend_buf_[192] = {};
