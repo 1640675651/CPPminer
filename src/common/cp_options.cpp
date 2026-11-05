@@ -141,9 +141,10 @@ static void print_usage(void)
     printf("                       (mma.m8n8k16, 2-stage), tensorop80 (mma.m16n8k32,\n");
     printf("                       multistage cp.async; sm_80+), tensoropms (multistage\n");
     printf("                       + m8n8k16; A/B and sm_75 validation)\n");
-    printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128 (default),\n");
-    printf("                       256x128 or 128x256 (= 2 virtual 128x128 CTAs, same\n");
-    printf("                       hash tiles); env CP_CUDA_TB sets the same\n");
+    printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128, 256x128 or\n");
+    printf("                       128x256 (= 2 virtual 128x128 CTAs, same hash tiles);\n");
+    printf("                       default 256x128 on sm_75, 128x128 on sm_80+;\n");
+    printf("                       env CP_CUDA_TB sets the same\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
