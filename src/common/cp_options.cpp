@@ -133,6 +133,11 @@ static void print_usage(void)
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+    printf("  --cuda-mma MODE      CUTLASS warp MMA: auto (default: tensorop80 on sm_80+,\n");
+    printf("                       tensorop on sm_75, dp4a SIMT below), simt, tensorop\n");
+    printf("                       (mma.m8n8k16, 2-stage), tensorop80 (mma.m16n8k32,\n");
+    printf("                       multistage cp.async; sm_80+), tensoropms (multistage\n");
+    printf("                       + m8n8k16; A/B and sm_75 validation)\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
@@ -409,6 +414,18 @@ static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
 #endif
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             o->cutlass_fused = 0;
+        } else if(!strcmp(argv[i], "--cuda-mma") && i + 1 < argc){
+            const char* v = argv[++i];
+            if(!strcmp(v, "auto")) o->cuda_mma = 0;
+            else if(!strcmp(v, "simt")) o->cuda_mma = 1;
+            else if(!strcmp(v, "tensorop")) o->cuda_mma = 2;
+            else if(!strcmp(v, "tensorop80")) o->cuda_mma = 3;
+            else if(!strcmp(v, "tensoropms")) o->cuda_mma = 4;
+            else {
+                fprintf(stderr, "--cuda-mma requires auto, simt, tensorop, tensorop80, "
+                                "or tensoropms\n");
+                return 1;
+            }
         } else if(!strcmp(argv[i], "--fused-jackpot")){
             o->fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
