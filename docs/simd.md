@@ -15,13 +15,19 @@ runtime-supported path.
 
 | Target | `--simd auto` order | Runtime check |
 |---|---|---|
-| x86/x86-64 | AVX512-VNNI, then AVX-VNNI, then AVX512-BW, then AVX2, then SSSE3, then scalar | CPUID; AVX2/VNNI require OS AVX state via XCR0; AVX-VNNI is leaf 7.1 EAX[4]; AVX512-BW needs leaf 7.0 EBX[16] F, EBX[30] BW, EBX[31] VL and XCR0 bits 1,2,5,6,7 (ZMM/opmask state); AVX512-VNNI additionally needs ECX[11] VNNI |
+| x86/x86-64 | AVX512-VNNI, then AVX-VNNI-INT8 (builds with the 16x4 assembly), then AVX-VNNI, then AVX512-BW, then AVX2, then SSSE3, then scalar | CPUID; AVX2/VNNI require OS AVX state via XCR0; AVX-VNNI is leaf 7.1 EAX[4], AVX-VNNI-INT8 leaf 7.1 EDX[4]; AVX512-BW needs leaf 7.0 EBX[16] F, EBX[30] BW, EBX[31] VL and XCR0 bits 1,2,5,6,7 (ZMM/opmask state); AVX512-VNNI additionally needs ECX[11] VNNI |
 | AArch64 | I8MM, then DotProd, then NEON, then scalar | I8MM and DotProd are detected per OS; Advanced SIMD is required by the AArch64 architecture profile |
 | Other targets | scalar | None |
 
 Forcing an unavailable ISA, such as `--simd neon` on x86 or `--simd avx2` on
 a CPU without AVX2, fails instead of silently selecting another path. `sse` is
-an alias for `ssse3`. `avxvnni`, `vnni`, and `avx-vnni` select AVX-VNNI;
+an alias for `ssse3`. `avxvnni-int8` (also `avxvnniint8`, `avx-vnni-int8`,
+`vnni-int8`) selects AVX-VNNI-INT8 (CPUID leaf 7.1 EDX[4], e.g. Arrow Lake and
+Lunar Lake). It multiplies signed bytes directly, so A carries no +128 offset and
+B needs no compensation sums. It only exists as the 16x4 assembly kernel, so it is
+unavailable in builds without it (32-bit, macOS, MinGW); where it is built,
+`auto` prefers it over AVX-VNNI (about 3% faster on a Core Ultra 9 275HX).
+`avxvnni`, `vnni`, and `avx-vnni` select AVX-VNNI;
 `avx512vnni` and `avx512-vnni` select AVX512-VNNI (Zen4-class CPUs expose
 AVX512_VNNI but not the VEX AVX-VNNI flag, so `auto` picks this there).
 `avx512`, `avx512bw`, and `avx512-bw` select the base AVX-512 kernel
@@ -54,7 +60,8 @@ rows and columns stay in vector registers at one time.
 | Scalar | `case33_gemm_xor.cpp` | Exact signed `int8 * int8 -> int32` | Scalar loops over 8x16 | Portable reference; no intrinsics |
 | SSSE3 | `case33_gemm_xor_ssse3.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | Selectable 4x8, 8x8, or 4x16 | Uses `pmaddubsw` and `pmaddwd` |
 | AVX2 | `case33_gemm_xor_avx2.cpp` | Fast unsigned/signed byte multiply plus compensation, or signed emulation for exact mode | 8x16 | Uses `vpmaddubsw` + `vpmaddwd` |
-| AVX-VNNI | `case33_gemm_xor_avxvnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 | Uses one `vpdpbusd` per rank-4 update |
+| AVX-VNNI | `case33_avxvnni_16x4_masm.asm` / `case33_avxvnni_16x4_gas.S` (u8s8); `case33_gemm_xor_avxvnni.cpp` (exact s8s8) | Same u8×s8 semantics as AVX2 fast path | 16x4 assembly (two vertically adjacent 8x4 halves; four column quarters fold into each 8x16 hash tile); 8x16 intrinsics | Port of gemm_xor_benchmark Case 3.5: VEX `vpdpbusd`, each B broadcast shared by two dot products, B packed per 4-column quarter, per-panel compensation subtracted before the panel, milestone XOR interleaved with the last and next dot products. The same generated instructions (`case33_avxvnni_16x4_gen.py`) build as MASM (64-bit MSVC) and GAS (64-bit ELF); other builds, exact s8s8 mode and `CP_AVXVNNI_16X4=0` use the 8x16 intrinsics kernel, one `vpdpbusd` per rank-4 update |
+| AVX-VNNI-INT8 | `case33_avxvnni_16x4_masm.asm` / `case33_avxvnni_16x4_gas.S` | Exact signed `int8 * int8 -> int32` | 16x4 assembly, as AVX-VNNI | `vpdpbssd`: the AVX-VNNI 16x4 kernel without the A offset and compensation; same in u8s8 and exact mode |
 | AVX512-BW | `case33_gemm_xor_avx512bw.cpp` | Same u8×s8 semantics as AVX2 fast path | Two vertically adjacent 8x16 tiles as one 16x16 zmm block | `vpmaddubsw` + `vpmaddwd` (ones) + `vpaddd` at 512 bits, sharing each B broadcast across both tiles; 32 registers so no spills. Single tiles (`CP_AVX512_PAIR=0`) and exact s8s8 mode (no `vpsignb` in AVX-512) use the AVX2 kernel |
 | AVX512-VNNI | `case33_gemm_xor_avx512vnni.cpp` | Same u8×s8 semantics as AVX2 fast path | 8x16 (ymm), or two vertically adjacent 8x16 tiles as one 16x16 zmm block | EVEX `vpdpbusd`; 32 registers so no spills. The zmm pair shares each B broadcast across both tiles; `CP_AVX512_PAIR=0` forces the ymm single-tile form. Exact s8s8 mode always uses the ymm form (no `vpsignb` in AVX-512) |
 | I8MM | `case33_gemm_xor_i8mm.cpp` | Exact signed 2x8 by 8x2 byte matrix multiply `int8 * int8 -> int32` (32 MAC per instruction) | Two 8x8 register tiles, accumulators kept across all KR panels | Uses `vmmlaq_s32` (`smmla`); two packed 4-k groups are interleaved with `vzip1q_s32`/`vzip2q_s32` into the 2x8 operands; optional ARMv8.6 extension |
@@ -81,8 +88,10 @@ sum(A * B) = sum((A + 128) * B) - 128 * sum(B)
 ```
 
 The prepack stage adds 128 to A, and the B preparation computes the per-column
-compensation. This work is only enabled for the AVX-VNNI, AVX2, and SSSE3
-paths.
+compensation. This work is only enabled for the AVX-VNNI, AVX512-VNNI,
+AVX512-BW, AVX2, and SSSE3 paths. AVX-VNNI-INT8's `vpdpbssd` takes two signed
+operands, so `--simd avxvnni-int8` packs plain signed A and skips the
+compensation entirely.
 
 ### DotProd byte arithmetic
 
@@ -156,6 +165,7 @@ baseline.
 | SSSE3 kernel | `-mssse3` | Intrinsics are isolated in its source file |
 | AVX2 kernel | `-mavx2` | `/arch:AVX2` |
 | AVX-VNNI kernel | `-mavx2 -mavxvnni` | `/arch:AVX2` + `__AVXVNNI__` |
+| AVX-VNNI / AVX-VNNI-INT8 16x4 assembly | GAS `.S` (64-bit ELF) | `ml64` (64-bit) |
 | AVX512-BW kernel | `-mavx512f -mavx512bw -mavx512vl` | `/arch:AVX512` |
 | AVX512-VNNI kernel | `-mavx512f -mavx512bw -mavx512vl -mavx512vnni` | `/arch:AVX512` |
 | DotProd kernel | `-march=armv8.2-a+dotprod` | `/arch:armv8.2` |

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the AVX-VNNI 16x4 u8s8 GEMM + milestone-XOR kernel for MASM and GAS.
+"""Generate the AVX-VNNI 16x4 GEMM + milestone-XOR kernels for MASM and GAS.
 
-Port of gemm_xor_benchmark Case 3.5 (cpu/case35_avx_vnni_masm.asm). Both outputs
-carry the same instruction stream; only the dialect and the calling convention
-differ, so MSVC and GCC/Clang builds run identical code:
+Port of gemm_xor_benchmark Case 3.5 (cpu/case35_avx_vnni_masm.asm and
+cpu/case35_vnni_masm.asm). Both outputs carry the same instruction streams; only
+the dialect and the calling convention differ, so MSVC and GCC/Clang builds run
+identical code:
 
     case33_avxvnni_16x4_masm.asm   Windows x64, ml64
     case33_avxvnni_16x4_gas.S      System V x86-64 (ELF), GNU as / LLVM
@@ -12,29 +13,35 @@ Regenerate both after editing this script:
 
     python src/cpu/gemm/case33_avxvnni_16x4_gen.py
 
-C signature:
+Two kernels, identical except for the dot product:
 
+    /* AVX-VNNI: VPDPBUSD, unsigned A+128 times signed B, corrected per panel. */
     void case33_avxvnni_16x4_xor(const int8_t *a, const int8_t *b, int blocks,
                                  uint32_t *out, const int32_t *correction);
+    /* AVX-VNNI-INT8: VPDPBSSD, signed A times signed B; no offset, no correction. */
+    void case33_avxvnni_int8_16x4_xor(const int8_t *a, const int8_t *b, int blocks,
+                                      uint32_t *out);
 
-a           Rows 0..7 of the 16-row tile: one packed 8-row A tile, A+128 as
-            unsigned bytes, [K/128 panel][K/4][8 rows][4 K bytes], 1024 bytes per
-            panel. Rows 8..15 are the next 8-row tile, blocks * 1024 bytes on.
+a           Rows 0..7 of the 16-row tile: one packed 8-row A tile (A+128 as
+            unsigned bytes for AVX-VNNI, plain signed A for AVX-VNNI-INT8),
+            [K/128 panel][K/4][8 rows][4 K bytes], 1024 bytes per panel. Rows 8..15
+            are the next 8-row tile, blocks * 1024 bytes on.
 b           One 4-column B quarter, signed, [K/128 panel][K/4][4 cols][4 K bytes],
             512 contiguous bytes per panel.
 blocks      K / 128 panels (milestones), >= 1.
 out         Per milestone: out[2*ms] = XOR of the 8x4 C block of rows 0..7,
             out[2*ms+1] = XOR of rows 8..15. C is cumulative over K and wraps
             modulo 2^32.
-correction  Per panel and column, 128 * sum(B) over that panel: [K/128][4].
+correction  AVX-VNNI only. Per panel and column, 128 * sum(B) over that panel:
+            [K/128][4].
 
 Schedule, as in Case 3.5:
   * C lives in ymm0..7 (column c: rows 0..7 in ymm<c>, rows 8..15 in ymm<c+4>),
     A rows 0..7 / 8..15 in ymm8 / ymm9. Each B broadcast feeds two dot products,
     and is refilled with the broadcast six columns ahead (six-register ring
     ymm10..15), also across K=4 steps.
-  * Before each panel the correction is subtracted from C; the unsigned*signed
-    dots then restore the exact signed cumulative C.
+  * AVX-VNNI: before each panel the correction is subtracted from C; the
+    unsigned*signed dots then restore the exact signed cumulative C.
   * Each panel is fully unrolled. The final column updates fold C into the
     milestone's vector XOR (ymm12 = [rows 0..7 | rows 8..15], 4 lanes each).
     Except after the last panel, its horizontal reduction and stores are spread
@@ -45,7 +52,6 @@ Schedule, as in Case 3.5:
 
 from pathlib import Path
 
-PROC = "case33_avxvnni_16x4_xor"
 K_STEPS = 32            # K/4 steps per 128-deep panel
 COLS = 4
 COLUMNS = K_STEPS * COLS  # broadcast columns per panel
@@ -53,9 +59,20 @@ A_PANEL = 1024
 B_PANEL = 512
 RING = 6
 
+
+class Kernel:
+    def __init__(self, name, signed):
+        self.name = name
+        self.signed = signed
+
+
+KERNELS = [Kernel("case33_avxvnni_16x4_xor", signed=False),
+           Kernel("case33_avxvnni_int8_16x4_xor", signed=True)]
+
 # Neutral instruction text: Intel operand order, decimal immediates. "VNNI"
-# becomes the explicitly VEX-encoded VPDPBUSD of each dialect (otherwise the
-# assemblers may pick the AVX-512 EVEX form). Labels are "@name".
+# becomes the dot product of the kernel and dialect (VPDPBUSD explicitly VEX
+# encoded, otherwise the assemblers may pick the AVX-512 EVEX form; VPDPBSSD
+# only exists as VEX). Labels are "@name".
 
 
 def vnni(acc, a, b):
@@ -71,7 +88,9 @@ def load_a(step):
             f"vmovdqu ymm9, ymmword ptr [rdx+{step * 32}]"]
 
 
-def correct_panel():
+def correct_panel(kernel):
+    if kernel.signed:
+        return []
     out = []
     for c in range(COLS):
         out += [f"vpbroadcastd ymm14, dword ptr [rcx+{c * 4}]",
@@ -97,12 +116,12 @@ def ring_column(g):
     return out
 
 
-def body():
+def body(kernel):
     out = []
     out += ["vpxor ymm%d, ymm%d, ymm%d" % (i, i, i) for i in range(8)]
 
     # First panel: no previous milestone to finish.
-    out += correct_panel()
+    out += correct_panel(kernel)
     out += [bcast(ring_reg(g), g) for g in range(RING)]
     for g in range(2 * COLS):
         out += ring_column(g)
@@ -111,7 +130,7 @@ def body():
     # Later panels: finish the previous milestone (pending in ymm12) between the
     # first eight column updates, with a four-register ring 14, 15, 10, 11.
     out += ["ALIGN64", "@next:"]
-    out += correct_panel()
+    out += correct_panel(kernel)
     four = [14, 15, 10, 11]
     out += [bcast(four[c], c) for c in range(COLS)]
     finish = [
@@ -169,20 +188,22 @@ def body():
     return out
 
 
-HEADER = ("AVX-VNNI 16x4 u8s8 GEMM + milestone XOR (port of gemm_xor_benchmark Case 3.5).\n"
-          "Generated by case33_avxvnni_16x4_gen.py, together with its MASM/GAS twin; do not edit.")
+HEADER = ("AVX-VNNI / AVX-VNNI-INT8 16x4 GEMM + milestone XOR (port of gemm_xor_benchmark\n"
+          "Case 3.5). Generated by case33_avxvnni_16x4_gen.py, together with its MASM/GAS\n"
+          "twin; do not edit.")
 
 
-def masm():
+def masm_proc(kernel):
+    proc = kernel.name
+    dot = "vpdpbssd " if kernel.signed else "vex vpdpbusd "
     sub = 168  # xmm6..15 (Win64 callee-saved) + alignment
-    lines = [f"; {line}" for line in HEADER.splitlines()] + [
-             "; Windows x64: RCX=a, RDX=b, R8D=blocks, R9=out, [rsp+40]=correction.",
-             "; Kernel registers: R10=a rows 0..7, RDX=a rows 8..15, R11=b, RCX=correction.",
-             "",
-             "CASE33_16X4_TEXT SEGMENT ALIGN(64) 'CODE'",
-             "",
-             f"PUBLIC {PROC}",
-             f"{PROC} PROC FRAME",
+    if kernel.signed:
+        args = "; Windows x64: RCX=a, RDX=b, R8D=blocks, R9=out."
+    else:
+        args = "; Windows x64: RCX=a, RDX=b, R8D=blocks, R9=out, [rsp+40]=correction."
+    lines = [args,
+             f"PUBLIC {proc}",
+             f"{proc} PROC FRAME",
              f"    sub rsp, {sub}",
              f"    .allocstack {sub}"]
     for i in range(6, 16):
@@ -191,66 +212,92 @@ def masm():
                   f"    .savexmm128 xmm{i}, {off}"]
     lines += ["    .endprolog",
               "    mov r10, rcx",
-              "    mov r11, rdx",
-              f"    mov rcx, qword ptr [rsp+{sub + 8 + 32}]",
-              "    mov edx, r8d",
+              "    mov r11, rdx"]
+    if not kernel.signed:
+        lines.append(f"    mov rcx, qword ptr [rsp+{sub + 8 + 32}]")
+    lines += ["    mov edx, r8d",
               "    shl rdx, 10",
               "    add rdx, r10"]
-    for ins in body():
+    for ins in body(kernel):
         if ins == "ALIGN64":
             lines.append("    ALIGN 64")
         elif ins.startswith("@") and ins.endswith(":"):
-            lines.append(f"{PROC}_{ins[1:-1]}:")
+            lines.append(f"{proc}_{ins[1:-1]}:")
         else:
-            ins = ins.replace("VNNI ", "vex vpdpbusd ")
-            ins = ins.replace("@", f"{PROC}_")
+            ins = ins.replace("VNNI ", dot)
+            ins = ins.replace("@", f"{proc}_")
             lines.append(f"    {ins}")
     for i in range(6, 16):
         lines.append(f"    vmovdqu xmm{i}, xmmword ptr [rsp+{(i - 6) * 16}]")
     lines += ["    vzeroupper",
               f"    add rsp, {sub}",
               "    ret",
-              f"{PROC} ENDP",
-              "",
-              "CASE33_16X4_TEXT ENDS",
+              f"{proc} ENDP",
+              ""]
+    return lines
+
+
+def masm():
+    lines = [f"; {line}" for line in HEADER.splitlines()] + [
+             "; Kernel registers: R10=a rows 0..7, RDX=a rows 8..15, R11=b, RCX=correction.",
+             "",
+             "CASE33_16X4_TEXT SEGMENT ALIGN(64) 'CODE'",
+             ""]
+    for kernel in KERNELS:
+        lines += masm_proc(kernel)
+    lines += ["CASE33_16X4_TEXT ENDS",
               "END",
               ""]
     return "\n".join(lines)
 
 
+def gas_proc(kernel):
+    proc = kernel.name
+    dot = "vpdpbssd " if kernel.signed else "{vex} vpdpbusd "
+    if kernel.signed:
+        args = "/* System V x86-64: RDI=a, RSI=b, EDX=blocks, RCX=out. */"
+    else:
+        args = "/* System V x86-64: RDI=a, RSI=b, EDX=blocks, RCX=out, R8=correction. */"
+    lines = [args,
+             "    .p2align 6",
+             f"    .globl {proc}",
+             f"    .type {proc}, @function",
+             f"{proc}:",
+             "    mov r10, rdi",
+             "    mov r11, rsi",
+             "    mov r9, rcx"]
+    if not kernel.signed:
+        lines.append("    mov rcx, r8")
+    lines += ["    mov r8d, edx",
+              "    mov edx, edx",
+              "    shl rdx, 10",
+              "    add rdx, r10"]
+    for ins in body(kernel):
+        if ins == "ALIGN64":
+            lines.append("    .p2align 6")
+        elif ins.startswith("@") and ins.endswith(":"):
+            lines.append(f".L{proc}_{ins[1:-1]}:")
+        else:
+            ins = ins.replace("VNNI ", dot)
+            ins = ins.replace("@", f".L{proc}_")
+            lines.append(f"    {ins}")
+    lines += ["    vzeroupper",
+              "    ret",
+              f"    .size {proc}, .-{proc}",
+              ""]
+    return lines
+
+
 def gas():
-    lines = ["/* " + "\n * ".join(HEADER.splitlines())] + [
-             " * System V x86-64: RDI=a, RSI=b, EDX=blocks, RCX=out, R8=correction.",
+    lines = ["/* " + "\n * ".join(HEADER.splitlines()),
              " * Kernel registers: R10=a rows 0..7, RDX=a rows 8..15, R11=b, RCX=correction. */",
              "",
              "    .intel_syntax noprefix",
              "    .text",
-             "    .p2align 6",
-             f"    .globl {PROC}",
-             f"    .type {PROC}, @function",
-             f"{PROC}:",
-             "    mov r10, rdi",
-             "    mov r11, rsi",
-             "    mov r9, rcx",
-             "    mov rcx, r8",
-             "    mov r8d, edx",
-             "    mov edx, edx",
-             "    shl rdx, 10",
-             "    add rdx, r10"]
-    for ins in body():
-        if ins == "ALIGN64":
-            lines.append("    .p2align 6")
-        elif ins.startswith("@") and ins.endswith(":"):
-            lines.append(f".L{PROC}_{ins[1:-1]}:")
-        else:
-            ins = ins.replace("VNNI ", "{vex} vpdpbusd ")
-            ins = ins.replace("@", f".L{PROC}_")
-            lines.append(f"    {ins}")
-    lines += ["    vzeroupper",
-              "    ret",
-              f"    .size {PROC}, .-{PROC}",
-              "",
-              '    .section .note.GNU-stack,"",@progbits',
+             ""]
+    for kernel in KERNELS:
+        lines += gas_proc(kernel)
+    lines += ['    .section .note.GNU-stack,"",@progbits',
               ""]
     return "\n".join(lines)
 

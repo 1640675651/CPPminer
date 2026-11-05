@@ -179,9 +179,9 @@ static void print_usage(void)
            CP_MOCK_DIFF_QUANTUS_DEFAULT);
     printf("  --prepack MODE       CPU prepack: fused (default), reuse, separate\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
-    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avx512vnni, avxvnni,\n");
-    printf("                       avx512 (base F+BW, alias avx512bw), avx2, ssse3, i8mm,\n");
-    printf("                       dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
+    printf("  --simd ISA           CPU SIMD: auto (default), hybrid, avx512vnni, avxvnni-int8,\n");
+    printf("                       avxvnni, avx512 (base F+BW, alias avx512bw), avx2, ssse3,\n");
+    printf("                       i8mm, dotprod, neon, scalar (also CP_SIMD / CASE33_ISA env)\n");
     printf("                       quantus: hybrid = scalar + avx2 split across SMT siblings,\n");
     printf("                       auto = best available (currently hybrid), avx2 = all\n");
     printf("                       threads AVX2, anything else = scalar; pearl: hybrid = auto\n");
@@ -445,6 +445,9 @@ static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
             else if(!strcmp(isa, "avx512") || !strcmp(isa, "avx512bw") ||
                     !strcmp(isa, "avx512-bw"))
                 o->simd_isa = CP_SIMD_AVX512BW;
+            else if(!strcmp(isa, "avxvnniint8") || !strcmp(isa, "avxvnni-int8") ||
+                    !strcmp(isa, "avx-vnni-int8") || !strcmp(isa, "vnni-int8"))
+                o->simd_isa = CP_SIMD_AVXVNNIINT8;
             else if(!strcmp(isa, "avxvnni") || !strcmp(isa, "vnni") ||
                     !strcmp(isa, "avx-vnni"))
                 o->simd_isa = CP_SIMD_AVXVNNI;
@@ -464,7 +467,7 @@ static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
                 o->simd_isa = CP_SIMD_HYBRID;
             else {
                 fprintf(stderr,
-                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni|avx512|avx2|ssse3|i8mm|dotprod|neon|scalar)\n",
+                        "unknown --simd %s (auto|hybrid|avx512vnni|avxvnni-int8|avxvnni|avx512|avx2|ssse3|i8mm|dotprod|neon|scalar)\n",
                         isa);
                 return 1;
             }
@@ -539,6 +542,9 @@ int cp_options_parse(int argc, char** argv, CpOptions* o)
             else if(!strcmp(env, "avx512") || !strcmp(env, "avx512bw") ||
                     !strcmp(env, "avx512-bw"))
                 o->simd_isa = CP_SIMD_AVX512BW;
+            else if(!strcmp(env, "avxvnniint8") || !strcmp(env, "avxvnni-int8") ||
+                    !strcmp(env, "avx-vnni-int8") || !strcmp(env, "vnni-int8"))
+                o->simd_isa = CP_SIMD_AVXVNNIINT8;
             else if(!strcmp(env, "avxvnni") || !strcmp(env, "vnni") || !strcmp(env, "avx-vnni"))
                 o->simd_isa = CP_SIMD_AVXVNNI;
             else if(!strcmp(env, "avx2")) o->simd_isa = CP_SIMD_AVX2;

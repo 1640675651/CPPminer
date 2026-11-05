@@ -17,6 +17,8 @@ enum class Case33PrepackMode {
 enum class Case33Isa {
     Auto,    /* architecture-specific best ISA, else scalar */
     Avx512Vnni, /* prefer AVX512-VNNI (EVEX vpdpbusd); fall back if unavailable */
+    AvxVnniInt8, /* AVX-VNNI-INT8 vpdpbssd 16x4 asm kernel: signed A, no u8s8 offset or
+                  * B compensation (needs a build with the 16x4 assembly) */
     AvxVnni, /* prefer AVX-VNNI vpdpbusd; fall back if unavailable */
     Avx512Bw, /* prefer base AVX-512 (F+BW, zmm vpmaddubsw); fall back if unavailable */
     Avx2,    /* prefer AVX2 maddubs; fall back if unavailable */
@@ -70,9 +72,10 @@ struct Case33GemmXor {
     /* True when the resolved ISA runs the u8s8 fast path, i.e. A is packed with
      * the +128 offset and B carries compensation sums. ARM kernels are s8s8. */
     bool fast_u8s8_active() const { return use_fast_u8s8_(); }
-    /* True when AVX-VNNI u8s8 runs the 16x4 assembly kernel (Case 3.5 port); packed B is then
-     * quarter-major (each 4-column slice contiguous over K), and hash tiles are still 8x16. */
-    bool avxvnni_16x4_active() const;
+    /* True when a 16x4 assembly kernel (Case 3.5 port) runs: AVX-VNNI u8s8 or AVX-VNNI-INT8.
+     * Packed B is then quarter-major (each 4-column slice contiguous over K), and hash tiles
+     * are still 8x16. */
+    bool tile16x4_active() const;
     Case33SseTile sse_tile() const { return sse_tile_; }
     /* Resolve the requested ISA against compiled and runtime capabilities. */
     bool resolve_runtime_isa();
