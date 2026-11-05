@@ -2,6 +2,9 @@
 #include "cp_algo.h"
 #include "cp_cli.h"
 #include "cp_config.h"
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+#include "cp_cutlass.h"
+#endif
 #include "cp_diagnostics.h"
 #include "cp_state.h"
 #include "cp_worker.h"
@@ -133,6 +136,15 @@ static void print_usage(void)
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
     printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+    printf("  --cuda-mma MODE      CUTLASS warp MMA: auto (default: tensorop80 on sm_80+,\n");
+    printf("                       tensorop on sm_75, dp4a SIMT below), simt, tensorop\n");
+    printf("                       (mma.m8n8k16, 2-stage), tensorop80 (mma.m16n8k32,\n");
+    printf("                       multistage cp.async; sm_80+), tensoropms (multistage\n");
+    printf("                       + m8n8k16; A/B and sm_75 validation)\n");
+    printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128, 256x128 or\n");
+    printf("                       128x256 (= 2 virtual 128x128 CTAs, same hash tiles);\n");
+    printf("                       default 256x128 on sm_75, 128x128 on sm_80+;\n");
+    printf("                       env CP_CUDA_TB sets the same\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif
@@ -409,6 +421,30 @@ static int parse_argv(int argc, char** argv, CpOptions* o, std::string& option)
 #endif
         } else if(!strcmp(argv[i], "--no-cutlass-fused")){
             o->cutlass_fused = 0;
+        } else if(!strcmp(argv[i], "--cuda-mma") && i + 1 < argc){
+            const char* v = argv[++i];
+            if(!strcmp(v, "auto")) o->cuda_mma = 0;
+            else if(!strcmp(v, "simt")) o->cuda_mma = 1;
+            else if(!strcmp(v, "tensorop")) o->cuda_mma = 2;
+            else if(!strcmp(v, "tensorop80")) o->cuda_mma = 3;
+            else if(!strcmp(v, "tensoropms")) o->cuda_mma = 4;
+            else {
+                fprintf(stderr, "--cuda-mma requires auto, simt, tensorop, tensorop80, "
+                                "or tensoropms\n");
+                return 1;
+            }
+        } else if(!strcmp(argv[i], "--cuda-tb") && i + 1 < argc){
+            const char* v = argv[++i];
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+            const int tb = cp_cutlass_tb_parse(v);
+            if(tb < 0){
+                fprintf(stderr, "--cuda-tb requires 128x128, 256x128 or 128x256\n");
+                return 1;
+            }
+            cp_cutlass_set_tb(tb);
+#else
+            (void)v;
+#endif
         } else if(!strcmp(argv[i], "--fused-jackpot")){
             o->fused_jackpot = 1;
         } else if(!strcmp(argv[i], "--no-fused-jackpot")){
