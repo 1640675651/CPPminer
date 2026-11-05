@@ -216,6 +216,20 @@ if(CP_ENABLE_CPU)
             src/cpu/gemm/case33_gemm_xor_avx2.cpp
             src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
         add_compile_definitions(CASE33_BUILD_X86=1)
+        # AVX-VNNI 16x4 kernel (gemm_xor_benchmark Case 3.5 port): one generated instruction
+        # stream, as MASM for MSVC and as GAS for ELF toolchains. Other x86 targets (32-bit,
+        # macOS, MinGW) leave it out and run the 8x16 intrinsics kernel.
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            if(MSVC)
+                enable_language(ASM_MASM)
+                list(APPEND CP_SOURCES src/cpu/gemm/case33_avxvnni_16x4_masm.asm)
+                add_compile_definitions(CP_HAVE_AVXVNNI_16X4_ASM=1)
+            elseif(NOT APPLE AND NOT WIN32)
+                enable_language(ASM)
+                list(APPEND CP_SOURCES src/cpu/gemm/case33_avxvnni_16x4_gas.S)
+                add_compile_definitions(CP_HAVE_AVXVNNI_16X4_ASM=1)
+            endif()
+        endif()
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         add_compile_definitions(CASE33_BUILD_AARCH64=1)
         if(MSVC)
@@ -1044,7 +1058,7 @@ else()
         target_link_libraries(cppminer PRIVATE OpenMP::OpenMP_CXX)
     elseif(NOT APPLE)
         # GNU/Clang on Linux/etc.: -fopenmp is usually enough.
-        target_compile_options(cppminer PRIVATE -fopenmp)
+        target_compile_options(cppminer PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-fopenmp>)
         target_link_options(cppminer PRIVATE -fopenmp)
     else()
         message(FATAL_ERROR
