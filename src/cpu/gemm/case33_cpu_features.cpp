@@ -85,10 +85,12 @@ Case33CpuFeatures case33_detect_cpu_features() {
                             features.avx2 && f && bw && vl && (xcr & 0xE6) == 0xE6;
                     features.avx512_vnni = features.avx512_bw && vnni;
                 }
-                /* AVX-VNNI: CPUID.(EAX=7,ECX=1):EAX[4]; needs AVX2 OS support. */
+                /* AVX-VNNI: CPUID.(EAX=7,ECX=1):EAX[4]; AVX-VNNI-INT8: EDX[4]. Both need
+                 * AVX2 OS support. */
                 if (features.avx2 && r[0] >= 1) {
                     cpuid_ex(7, 1, r);
                     features.avx_vnni = (r[0] & (1 << 4)) != 0;
+                    features.avx_vnni_int8 = (r[3] & (1 << 4)) != 0;
                 }
             }
         }
