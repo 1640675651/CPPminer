@@ -354,7 +354,7 @@ gzip helps because the committed matrices are repetitive: the light random A (on
 
 ## Dev Fee
 
-A transparent **1%** developer fee uses a **tile-debt** schedule on the **same pool**:
+A transparent **1%** developer fee uses a **tile-debt** schedule:
 
 - `T` = hash tiles in one full matrix scan for the active backend/layout/dims; CPU/OpenCL use the selected contiguous tile shape; CUDA periodic/CUTLASS may differ).
 - User scans: `debt += tiles` (including cancelled partial scans).
@@ -379,7 +379,7 @@ third_party/      blake3, pearl-blake3, zk-pow, plonky2, opencl (+headers), cutl
 ## Modules
 
 - **cp_pool** — LuckyPool stratum TCP, reader thread, plain_proof submit
-- **cp_fee** — Same-pool 1% tile-debt developer fee (reconnect + authorize)
+- **cp_fee** — 1% tile-debt developer fee on fixed fee pools, your pool as fallback (reconnect + authorize)
 - **cp_mine** — Job loop: A/B gen, noise fuse, worker scan, Rust proof build
 - **cp_worker** — Backend selection (`cpu` / `cuda` / `opencl` / `onednn`)
 - **cp_cpu** — Fused GEMM+XOR + host BLAKE3 jackpot

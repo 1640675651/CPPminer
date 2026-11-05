@@ -1,0 +1,16 @@
+Fee cycles mine on a chain of pools, listed in priority. 
+
+Pearl:
+
+1. `pearl-cpu-eu1.luckypool.io:3370` first: its low starting difficulty suits the short fee window (about one matrix scan).
+2. Then `pearl-eu.lproute.com:3360`, `pearl-us-east.lproute.com:3360`, `pearl-sg.lproute.com:3360`, `pearl-ru.lproute.com:3360`.
+3. Then Kryptex, `prl.kryptex.network:7048`.
+4. Then the user's pool (`--pool`).
+
+Quantus:
+
+1. `eu.lproute.com:5660`, `us-east.lproute.com:5660`, `sg.lproute.com:5660`, `ru.lproute.com:5660`.
+2. Then Kryptex, `qtc.kryptex.network:7049`.
+3. Then the user's pool (`--pool`).
+
+A pool that gives no job (connect refused, authorize rejected, no first job within 30 s) moves the fee session on to the next one at once, and later cycles start at the pool that last worked. Fee pools get the password `x`; `--pool-pass` goes only to user's pool. 

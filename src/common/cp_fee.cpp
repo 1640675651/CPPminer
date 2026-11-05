@@ -33,6 +33,35 @@ static const unsigned char k_quantus_dev_wallet_enc[] = {
     0x0a,
 };
 
+/* Fixed fee pools, tried in order before the user's pool. A fee window is about one
+ * matrix scan, so the first entry is the CPU port: its starting difficulty (26000)
+ * is far below the GPU ports' (3360: 0.9M-1.5M), which makes the
+ * fee's share count less noisy. Only pearl-eu2 (the same server) also has 3370 open. */
+typedef struct { const char* host; int port; } CpFeePool;
+
+static const CpFeePool k_pearl_fee_pools[] = {
+    {"pearl-cpu-eu1.luckypool.io", 3370},
+    {"pearl-eu.lproute.com", 3360},
+    {"pearl-us-east.lproute.com", 3360},
+    {"pearl-sg.lproute.com", 3360},
+    {"pearl-ru.lproute.com", 3360},
+    /* Kryptex last: its default difficulty (~4.2M) is the highest. The fee wallet is
+     * sent as WALLET.worker on kryptex hosts (authorize_wallet_string). */
+    {"prl.kryptex.network", 7048},
+};
+
+/* Quantus: the same LuckyPool servers (port 5660), then Kryptex. The fee is a 10 s
+ * hashing turn, so starting difficulty matters less than for Pearl. */
+static const CpFeePool k_quantus_fee_pools[] = {
+    {"eu.lproute.com", 5660},
+    {"us-east.lproute.com", 5660},
+    {"sg.lproute.com", 5660},
+    {"ru.lproute.com", 5660},
+    {"qtc.kryptex.network", 7049},
+};
+
+#define CP_FEE_BACKOFF_MAX_CYCLES 64
+
 static char g_user_wallet[256];
 static char g_dev_wallet[256];
 static int g_enabled = 0;
@@ -42,7 +71,52 @@ static uint64_t g_debt = 0;
 static uint64_t g_tiles_per_matrix = 0; /* T: tiles (Pearl) or turn length in us (Quantus) */
 static CpAlgoId g_algo = CP_ALGO_PEARL;
 
+/* Fee pool failover. g_pool_idx counts through the fixed pools; fee_pool_count()
+ * means the user's pool. Each fee cycle starts at the fixed pool that last worked. */
+static int g_pool_idx = 0;
+static int g_pool_good = 0;
+static int g_session_dev = 0;       /* the session being opened or run mines for the fee */
+static int g_session_got_job = 0;
+/* After every fixed pool failed: fee cycles that go straight to the user's pool. */
+static int g_fixed_rest = 0, g_fixed_backoff = 0;
+/* After the user's pool failed too: fee cycles skipped without trying. */
+static int g_skip_rest = 0, g_skip_backoff = 0;
+
 static int time_based(void){ return g_algo == CP_ALGO_QUANTUS; }
+
+static const CpFeePool* fee_pools(void)
+{
+    return g_algo == CP_ALGO_QUANTUS ? k_quantus_fee_pools : k_pearl_fee_pools;
+}
+
+static int fee_pool_count(void)
+{
+    return g_algo == CP_ALGO_QUANTUS
+               ? (int)(sizeof(k_quantus_fee_pools) / sizeof(k_quantus_fee_pools[0]))
+               : (int)(sizeof(k_pearl_fee_pools) / sizeof(k_pearl_fee_pools[0]));
+}
+
+static const CpFeePool* fee_pool(int idx)
+{
+    return idx < fee_pool_count() ? &fee_pools()[idx] : NULL;
+}
+
+static int next_backoff(int cycles)
+{
+    if(cycles <= 0) return 1;
+    return cycles * 2 < CP_FEE_BACKOFF_MAX_CYCLES ? cycles * 2 : CP_FEE_BACKOFF_MAX_CYCLES;
+}
+
+static uint64_t threshold_tiles(void);
+
+/* Settles the current fee cycle as if it had been mined. */
+static void pay_fee_cycle(void)
+{
+    const uint64_t thr = threshold_tiles();
+    if(time_based() || g_debt < thr) g_debt = 0;
+    else g_debt -= thr;
+    g_fee_active = 0;
+}
 
 const char* cp_fee_format(uint64_t units, char* buf, int cap)
 {
@@ -93,6 +167,9 @@ void cp_fee_init(const char* user_wallet, int enable, CpAlgoId algo)
     g_fee_active = 0;
     g_debt = 0;
     g_tiles_per_matrix = 0;
+    g_pool_idx = g_pool_good = 0;
+    g_session_dev = g_session_got_job = 0;
+    g_fixed_rest = g_fixed_backoff = g_skip_rest = g_skip_backoff = 0;
 
     if(enable && !g_enabled){
         if(algo == CP_ALGO_QUANTUS && !g_dev_wallet[0]){
@@ -141,11 +218,25 @@ void cp_fee_prepare_matrix(void)
 {
     if(!g_enabled || g_tiles_per_matrix == 0) return;
     if(!g_fee_active && g_debt >= threshold_tiles()){
-        g_fee_active = 1;
         char a[48], b[48];
-        printf("[fee] debt %s >= 100*T (%s): starting fee cycle\n",
-               cp_fee_format(g_debt, a, sizeof(a)),
-               cp_fee_format(threshold_tiles(), b, sizeof(b)));
+        cp_fee_format(g_debt, a, sizeof(a));
+        cp_fee_format(threshold_tiles(), b, sizeof(b));
+        if(g_skip_rest > 0){
+            g_skip_rest--;
+            pay_fee_cycle();
+            printf("[fee] debt %s >= 100*T (%s): fee cycle skipped (no pool took the fee "
+                   "wallet; %d more to skip)\n", a, b, g_skip_rest);
+            fflush(stdout);
+            return;
+        }
+        g_fee_active = 1;
+        if(g_fixed_rest > 0){
+            g_fixed_rest--;
+            g_pool_idx = fee_pool_count();
+        } else {
+            g_pool_idx = g_pool_good;
+        }
+        printf("[fee] debt %s >= 100*T (%s): starting fee cycle\n", a, b);
         fflush(stdout);
     }
 }
@@ -164,7 +255,10 @@ int cp_fee_needs_switch(void)
 void cp_fee_note_tiles(uint64_t tiles)
 {
     if(!g_enabled || tiles == 0) return;
-    if(g_fee_active){
+    /* Charge by the wallet the work was done under, not the one wanted next: Quantus CPU
+     * threads finish their chunk on the user's session after a fee turn starts, and on
+     * the fee session after it ends. */
+    if(g_auth_is_dev){
         if(tiles > UINT64_MAX / (uint64_t)CP_FEE_PERIOD){
             g_debt = 0;
         } else {
@@ -172,7 +266,7 @@ void cp_fee_note_tiles(uint64_t tiles)
             if(pay >= g_debt) g_debt = 0;
             else g_debt -= pay;
         }
-        if(time_based() ? g_debt == 0 : g_debt < threshold_tiles()){
+        if(g_fee_active && (time_based() ? g_debt == 0 : g_debt < threshold_tiles())){
             char a[48];
             printf("[fee] debt %s: fee cycle complete\n", cp_fee_format(g_debt, a, sizeof(a)));
             fflush(stdout);
@@ -189,3 +283,77 @@ uint64_t cp_fee_tiles_per_matrix(void){ return g_tiles_per_matrix; }
 uint64_t cp_fee_threshold(void){ return threshold_tiles(); }
 int cp_fee_enabled(void){ return g_enabled; }
 int cp_fee_session_is_dev(void){ return g_enabled && g_auth_is_dev; }
+
+void cp_fee_print_mode(void)
+{
+    if(!g_enabled) return;
+    const CpFeePool* p = fee_pool(0);
+    if(p)
+        printf("[mode] dev fee: 1%% on %s:%d (%d backup fee pools, then your pool)\n",
+               p->host, p->port, fee_pool_count() - 1);
+    else
+        printf("[mode] dev fee: 1%% on your pool\n");
+    fflush(stdout);
+}
+
+void cp_fee_session_pool(const char* user_host, int user_port, const char** host, int* port)
+{
+    g_session_dev = cp_fee_next_is_dev();
+    g_session_got_job = 0;
+    const CpFeePool* p = g_session_dev ? fee_pool(g_pool_idx) : NULL;
+    *host = p ? p->host : user_host;
+    *port = p ? p->port : user_port;
+}
+
+int cp_fee_session_on_fee_pool(void)
+{
+    return g_session_dev && fee_pool(g_pool_idx) != NULL;
+}
+
+void cp_fee_session_ok(void)
+{
+    if(!g_session_dev || g_session_got_job) return;
+    g_session_got_job = 1;
+    g_skip_backoff = 0;
+    if(fee_pool(g_pool_idx)){
+        g_pool_good = g_pool_idx;
+        g_fixed_backoff = 0;
+    }
+}
+
+int cp_fee_session_end(void)
+{
+    const int dev = g_session_dev, got_job = g_session_got_job;
+    g_session_dev = g_session_got_job = 0;
+    /* Only a fee session that never got a job counts as failed: one that dropped
+     * mid-cycle reconnects to the same pool. */
+    if(!dev || got_job || !g_fee_active) return 0;
+
+    const CpFeePool* p = fee_pool(g_pool_idx);
+    if(p){
+        g_pool_idx++;
+        const CpFeePool* next = fee_pool(g_pool_idx);
+        if(next){
+            printf("[fee] fee pool %s:%d gave no job; trying %s:%d\n",
+                   p->host, p->port, next->host, next->port);
+        } else {
+            /* Every fixed pool failed: use the user's pool for the next fee cycles too. */
+            g_pool_good = 0;
+            g_fixed_backoff = next_backoff(g_fixed_backoff);
+            g_fixed_rest = g_fixed_backoff;
+            printf("[fee] fee pool %s:%d gave no job; no fee pool reachable, trying your "
+                   "pool (the next %d fee cycles go there too)\n",
+                   p->host, p->port, g_fixed_rest);
+        }
+    } else {
+        /* The user's pool failed under the fee wallet too (e.g. it rejects unknown
+         * wallets): give up this cycle instead of retrying it forever. */
+        pay_fee_cycle();
+        g_skip_backoff = next_backoff(g_skip_backoff);
+        g_skip_rest = g_skip_backoff;
+        printf("[fee] your pool gave no job for the fee wallet; fee cycle skipped "
+               "(next %d fee cycles skipped too)\n", g_skip_rest);
+    }
+    fflush(stdout);
+    return 1;
+}

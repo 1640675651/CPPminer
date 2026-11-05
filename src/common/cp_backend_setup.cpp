@@ -449,8 +449,6 @@ void cp_print_pearl_mode(const CpOptions* o)
            g_plain_verify, g_dry_run, g_max_nonce, g_mock,
            (unsigned)g_cert_version,
            g_cert_version_forced ? " (forced)" : "");
-    if(cp_fee_enabled()){
-        printf("[mode] dev fee: 1%%\n");
-    }
     fflush(stdout);
+    cp_fee_print_mode();
 }

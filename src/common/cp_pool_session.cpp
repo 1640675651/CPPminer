@@ -179,6 +179,25 @@ static void pool_reconnect_wait(void)
 static void pool_session_ok(void)
 {
     g_reconnect_delay_sec = 0;
+    cp_fee_session_ok();
+}
+
+/* Connects to the pool for the next session: the user's pool, or a fee pool while the
+ * dev fee is due. A fee session that fails moves on to the next pool at once. */
+static void pool_session_connect(const char* pool_host, int pool_port, const char* algo_tag)
+{
+    if(cp_fee_session_end()) g_reconnect_delay_sec = 0;
+    while(1){
+        pool_reconnect_wait();
+        const char* host;
+        int port;
+        cp_fee_session_pool(pool_host, pool_port, &host, &port);
+        printf("[main] Connecting to %s:%d%s%s...\n", host, port, algo_tag,
+               cp_fee_session_on_fee_pool() ? " (dev fee pool)" : "");
+        fflush(stdout);
+        if(cp_pool_connect(host, port)) return;
+        if(cp_fee_session_end()) g_reconnect_delay_sec = 0;
+    }
 }
 
 /* CP_JOB_ERROR: mining cannot continue on this backend; stop instead of reconnecting. */
@@ -198,9 +217,8 @@ int cp_run_quantus_pool(const char* pool_host, int pool_port)
 
     cp_qpow_pool_set_active(1);
     printf("[mode] algo=quantus backend=%s\n", cp_worker_backend_name());
-    if(cp_fee_enabled())
-        printf("[mode] dev fee: 1%%\n");
     fflush(stdout);
+    cp_fee_print_mode();
 
 reconnect:
     cp_pool_reader_stop();
@@ -210,12 +228,7 @@ reconnect:
     cp_qpow_pool_clear();
     cur_job_key[0] = 0;
 
-    while(1){
-        pool_reconnect_wait();
-        printf("[main] Connecting to %s:%d (quantus)...\n", pool_host, pool_port);
-        fflush(stdout);
-        if(cp_pool_connect(pool_host, pool_port)) break;
-    }
+    pool_session_connect(pool_host, pool_port, " (quantus)");
 
     const int login_id = msg_id++;
     if(!cp_qpow_pool_send_login(login_id, cp_fee_wallet(), worker_global, agent_global))
@@ -301,14 +314,11 @@ reconnect:
     cp_api_set_pool_connected(0);
     cur_job_key[0] = 0;
 
-    while(1){
-        pool_reconnect_wait();
-        printf("[main] Connecting to %s:%d...\n", pool_host, pool_port); fflush(stdout);
-        if(cp_pool_connect(pool_host, pool_port)) break;
-    }
+    pool_session_connect(pool_host, pool_port, "");
 
+    /* A fee pool gets the default password: --pool-pass belongs to the user's pool. */
     if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global,
-                               pool_pass_global))
+                               cp_fee_session_on_fee_pool() ? "x" : pool_pass_global))
         goto reconnect;
     cp_fee_on_authorized();
     cp_api_set_pool(pool_host, pool_port, 1);
