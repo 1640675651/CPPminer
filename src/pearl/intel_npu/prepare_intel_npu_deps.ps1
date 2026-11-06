@@ -48,6 +48,15 @@ function Invoke-Checked([string]$what, [scriptblock]$cmd) {
     if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" }
 }
 
+# Runs a native command whose failure is an answer, not an error (a probe), and returns its exit code.
+# Windows PowerShell turns every redirected stderr line of a native command into an error record, which
+# $ErrorActionPreference = "Stop" makes fatal, so stderr is dropped here with the preference relaxed.
+function Invoke-Probe([scriptblock]$cmd) {
+    $ErrorActionPreference = "Continue"
+    & $cmd 2>&1 | Out-Null
+    return $LASTEXITCODE
+}
+
 function Import-MsvcEnvironment {
     if ($env:VSCMD_VER -and (Get-Command cl.exe -ErrorAction SilentlyContinue)) { return }
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -68,6 +77,7 @@ function Find-Tool([string]$exe, [string]$vsPattern) {
     if ($cmd) { return $cmd.Source }
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
+        $ErrorActionPreference = "Continue"   # see Invoke-Probe
         foreach ($hit in @(& $vswhere -latest -products * -find $vsPattern 2>$null)) {
             if ($hit -and (Test-Path $hit)) { return $hit }
         }
@@ -76,7 +86,10 @@ function Find-Tool([string]$exe, [string]$vsPattern) {
 }
 
 function Get-Head([string]$repo) {
-    return (git -C $repo rev-parse HEAD 2>$null)
+    $ErrorActionPreference = "Continue"   # no checkout: git's stderr must not stop the script (see Invoke-Probe)
+    $head = git -C $repo rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return $head
 }
 
 function Ensure-Clone([string]$url, [string]$dir, [string]$commit) {
@@ -131,11 +144,13 @@ function Ensure-Compiler {
         throw "NPU_COMPILER_SRC=$CompilerSrc is not an npu_compiler checkout"
     }
     # Apply the patch unless the tree already has it (it is one diff against the pinned commit).
-    git -C $CompilerSrc -c core.longpaths=true apply --reverse --check --whitespace=nowarn $PatchFile 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $applied = Invoke-Probe { git -C $CompilerSrc -c core.longpaths=true apply --reverse --check --whitespace=nowarn $PatchFile }
+    if ($applied -eq 0) {
         Write-Host "=== NPU compiler patch already applied ($CompilerSrc) ==="
     } else {
+        $ErrorActionPreference = "Continue"   # let git's reasons reach the console
         git -C $CompilerSrc -c core.longpaths=true apply --check --whitespace=nowarn $PatchFile
+        $ErrorActionPreference = "Stop"
         if ($LASTEXITCODE -ne 0) {
             throw "npu_compiler_all.diff does not apply to $CompilerSrc (HEAD $(Get-Head $CompilerSrc)); it is made " +
                   "for $CompilerCommit"
@@ -144,13 +159,23 @@ function Ensure-Compiler {
         Write-Host "=== Applied the NPU compiler patch to $CompilerSrc ==="
     }
     if ($NoBuild) { return }
-    if ($Refresh -or -not (Test-Path (Join-Path $CompilerBuild "build.ninja"))) {
+    # LLVM_ENABLE_DIA_SDK=OFF: LLVM turns DIA (PDB reading, unused here) on whenever Visual Studio ships the
+    # DIA SDK, but it also needs the ATL headers, which Build Tools installs do not have by default.
+    $configureArgs = @(
+        "-DCMAKE_BUILD_TYPE=Release", "-DOpenVINODeveloperPackage_DIR=$OvBuild",
+        "-DENABLE_TESTS=OFF", "-DENABLE_FUNCTIONAL_TESTS=OFF", "-DENABLE_PRIVATE_TESTS=OFF",
+        "-DLLVM_ENABLE_DIA_SDK=OFF"
+    )
+    # Configure again when these arguments change, so an existing build tree picks up new ones.
+    $argsStamp = Join-Path $CompilerBuild "cp_configure_args.txt"
+    $argsText = $configureArgs -join "`n"
+    $stale = -not (Test-Path $argsStamp) -or ((Get-Content -Raw $argsStamp).Trim() -ne $argsText)
+    if ($Refresh -or $stale -or -not (Test-Path (Join-Path $CompilerBuild "build.ninja"))) {
         Write-Host "=== Configuring the NPU compiler against $OvBuild ==="
         Invoke-Checked "NPU compiler configure" {
-            & $script:Cmake -S $CompilerSrc -B $CompilerBuild -G Ninja "-DCMAKE_MAKE_PROGRAM=$script:Ninja" `
-                -DCMAKE_BUILD_TYPE=Release "-DOpenVINODeveloperPackage_DIR=$OvBuild" `
-                -DENABLE_TESTS=OFF -DENABLE_FUNCTIONAL_TESTS=OFF -DENABLE_PRIVATE_TESTS=OFF
+            & $script:Cmake -S $CompilerSrc -B $CompilerBuild -G Ninja "-DCMAKE_MAKE_PROGRAM=$script:Ninja" @configureArgs
         }
+        Set-Content -Encoding utf8 -Path $argsStamp -Value $argsText
     }
     Write-Host "=== Building openvino_intel_npu_compiler (long on the first run) ==="
     Invoke-Checked "NPU compiler build" {
