@@ -17,10 +17,11 @@ Anything else is an error, so a release never ships with a missing dependency.
 
 A build with the Intel NPU backend (the exe imports openvino.dll) also gets a second zip,
 <name>_intel_npu_runtime.zip: the OpenVINO NPU plugin, the patched NPU compiler (~85 MB) and the
-NPU kernels, with the same top folder so it extracts over the main one. OpenVINO loads the plugin
-and the compiler at run time (they are not imported, hence NPU_RUNTIME_DLLS). openvino.dll itself
-stays in the main zip: the exe imports it, and cannot delay-load it (OpenVINO's headers import a
-data symbol), so without it the exe would not start at all.
+NPU kernels, under a top folder named like the zip; its contents (kernels\\intel_npu included) go
+next to cppminer.exe. OpenVINO loads the plugin and the compiler at run time (they are not
+imported, hence NPU_RUNTIME_DLLS). openvino.dll itself stays in the main zip: the exe imports it,
+and cannot delay-load it (OpenVINO's headers import a data symbol), so without it the exe would
+not start at all.
 """
 import argparse
 import glob
@@ -275,8 +276,8 @@ def main():
 
     zips = [package(args.out, name, name, files)]
     if npu_files:
-        # Same top folder as the main zip, so it extracts over it.
-        zips.append(package(args.out, name + "_intel_npu_runtime", name, npu_files))
+        npu_name = name + "_intel_npu_runtime"
+        zips.append(package(args.out, npu_name, npu_name, npu_files))
 
     if skipped:
         print("not bundled:")
