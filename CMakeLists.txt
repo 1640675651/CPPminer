@@ -531,7 +531,7 @@ if(CP_ENABLE_INTEL_NPU)
     if(CP_INTEL_NPU_OPENVINO_BIN_DIR)
         set(_cp_npu_runtime)
         foreach(_f openvino.dll openvino_intel_npu_plugin.dll openvino_intel_npu_compiler.dll
-                   openvino_intel_npu_compiler_loader.dll tbb12.dll tbbbind_2_5.dll tbbmalloc.dll plugins.xml
+                   openvino_intel_npu_compiler_loader.dll tbb12.dll
                    libopenvino.so libopenvino_intel_npu_plugin.so libopenvino_intel_npu_compiler.so)
             if(EXISTS "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")
                 list(APPEND _cp_npu_runtime "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")

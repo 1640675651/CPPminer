@@ -458,8 +458,9 @@ extern "C" void cp_pearl_npu_worker_init(int* devices, int ndev) {
     std::string err;
     if (g_eng->init(shape, kernel_dir, cache_root, g_requests, &err) != 0) {
         fprintf(stderr, "[intel-npu] init failed: %s\n", err.c_str());
-        fprintf(stderr, "[intel-npu] needs the patched in-plugin NPU compiler next to openvino.dll "
-                        "(src/pearl/intel_npu/prepare_intel_npu_deps.ps1) and the TileXorAcc kernel in %s\n",
+        fprintf(stderr, "[intel-npu] needs the NPU plugin and the patched NPU compiler next to openvino.dll and the "
+                        "kernels in %s (release: extract the *_intel_npu_runtime.zip over the miner; source build: "
+                        "src/pearl/intel_npu/prepare_intel_npu_deps.ps1)\n",
                 kernel_dir.c_str());
         delete g_eng;
         g_eng = nullptr;

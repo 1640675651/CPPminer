@@ -2,9 +2,9 @@
 """Package a Windows release: cppminer.exe + every non-system DLL it needs + kernels, zipped.
 
 Usage (after build.ps1):
-  python internal/release.py                       # version from CHANGELOG.md, output in dist/
-  python internal/release.py --version v0.5 --suffix windows_x64_cuda
-  python internal/release.py --no-vcrt             # rely on the user's VC++ redistributable
+  python scripts/release.py                       # version from CHANGELOG.md, output in dist/
+  python scripts/release.py --version v0.5 --suffix windows_x64_cuda
+  python scripts/release.py --no-vcrt             # rely on the user's VC++ redistributable
 
 DLLs are found by reading the PE import (and delay-import) tables of the exe, then of every
 DLL that gets bundled, so new dependencies are picked up automatically:
@@ -14,6 +14,13 @@ DLL that gets bundled, so new dependencies are picked up automatically:
   - OpenCL.dll                                     -> skipped (installed by the GPU driver)
   - Windows system DLLs / api-ms-* sets            -> skipped
 Anything else is an error, so a release never ships with a missing dependency.
+
+A build with the Intel NPU backend (the exe imports openvino.dll) also gets a second zip,
+<name>_intel_npu_runtime.zip: the OpenVINO NPU plugin, the patched NPU compiler (~85 MB) and the
+NPU kernels, with the same top folder so it extracts over the main one. OpenVINO loads the plugin
+and the compiler at run time (they are not imported, hence NPU_RUNTIME_DLLS). openvino.dll itself
+stays in the main zip: the exe imports it, and cannot delay-load it (OpenVINO's headers import a
+data symbol), so without it the exe would not start at all.
 """
 import argparse
 import glob
@@ -31,6 +38,11 @@ SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
 DRIVER_DLLS = {"opencl.dll", "nvcuda.dll", "vulkan-1.dll"}
 VCRT_PATTERNS = ("msvcp140", "vcruntime140", "vcomp140", "concrt140")
+# Intel NPU runtime, next to the exe after build.ps1: OpenVINO loads the plugin, which loads the
+# patched compiler through the loader.
+NPU_RUNTIME_DLLS = ("openvino_intel_npu_plugin.dll", "openvino_intel_npu_compiler_loader.dll",
+                    "openvino_intel_npu_compiler.dll")
+NPU_KERNEL_DIR = os.path.join("kernels", "intel_npu")
 
 
 def pe_imports(path):
@@ -134,14 +146,19 @@ def is_system_dll(lname):
     return os.path.isfile(os.path.join(SYSTEM32, lname))
 
 
-def resolve_dlls(exe, bundle_vcrt, bundle_cudart):
-    exe_dir = os.path.dirname(exe)
+def resolve_dlls(roots, exe_dir, bundle_vcrt, bundle_cudart, elsewhere=None):
+    """DLLs needed by the PE files in roots (themselves included unless one is the exe).
+    elsewhere: lower name -> reason, for DLLs shipped in another zip (not followed)."""
     vcrt_dirs = find_vs_redist() if bundle_vcrt else []
     cuda_dirs = find_cuda_bin() if bundle_cudart else []
     bundled = {}   # lower name -> source path
-    skipped = {}   # lower name -> reason
+    skipped = dict(elsewhere or {})   # lower name -> reason
     errors = []
-    queue = [exe]
+    queue = []
+    for root in roots:
+        if not root.lower().endswith(".exe"):
+            bundled[os.path.basename(root).lower()] = root
+        queue.append(root)
     seen_files = set()
     while queue:
         cur = queue.pop()
@@ -221,39 +238,46 @@ def main():
         print(f"{exe} not found; run build.ps1 first", file=sys.stderr)
         return 1
 
-    bundled, skipped, errors = resolve_dlls(exe, not args.no_vcrt, not args.no_cudart)
+    exe_dir = os.path.dirname(exe)
+    vcrt, cudart = not args.no_vcrt, not args.no_cudart
+    has_npu = "openvino.dll" in (n.lower() for n in pe_imports(exe))
+
+    bundled, skipped, errors = resolve_dlls([exe], exe_dir, vcrt, cudart)
+    npu_files = []
+    if has_npu:
+        roots = []
+        for n in NPU_RUNTIME_DLLS:
+            p = os.path.join(exe_dir, n)
+            if os.path.isfile(p):
+                roots.append(p)
+            else:
+                errors.append(f"{n}: Intel NPU runtime file missing next to the exe (run build.ps1 "
+                              f"-Backend ...,IntelNpu)")
+        # Everything the NPU runtime needs that the main zip does not already carry.
+        npu_dlls, _, npu_errors = resolve_dlls(roots, exe_dir, vcrt, cudart,
+                                               elsewhere={n: "main zip" for n in bundled})
+        errors += npu_errors
+        npu_files = [(src, os.path.basename(src)) for src in sorted(npu_dlls.values())]
+        elfs = sorted(glob.glob(os.path.join(exe_dir, NPU_KERNEL_DIR, "*.elf")))
+        if not elfs:
+            errors.append(f"{NPU_KERNEL_DIR}\\*.elf: Intel NPU kernels missing next to the exe")
+        npu_files += [(p, os.path.join(NPU_KERNEL_DIR, os.path.basename(p))) for p in elfs]
     if errors:
         for e in errors:
             print("error: " + e, file=sys.stderr)
         return 1
 
     name = f"cppminer_{args.version}_{args.suffix}"
-    stage = os.path.join(args.out, name)
-    if os.path.isdir(stage):
-        shutil.rmtree(stage)
-    os.makedirs(stage)
-
     files = [(exe, os.path.basename(exe))]
     files += [(src, os.path.basename(src)) for src in sorted(bundled.values())]
-    kernel_dir = os.path.join(os.path.dirname(exe), "kernels")
-    for cl in sorted(glob.glob(os.path.join(kernel_dir, "*.cl"))):
+    for cl in sorted(glob.glob(os.path.join(exe_dir, "kernels", "*.cl"))):
         files.append((cl, os.path.join("kernels", os.path.basename(cl))))
 
-    for src, rel in files:
-        dst = os.path.join(stage, rel)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
+    zips = [package(args.out, name, name, files)]
+    if npu_files:
+        # Same top folder as the main zip, so it extracts over it.
+        zips.append(package(args.out, name + "_intel_npu_runtime", name, npu_files))
 
-    zip_path = os.path.join(args.out, name + ".zip")
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for _, rel in files:
-            z.write(os.path.join(stage, rel), os.path.join(name, rel))
-
-    print(f"{name}:")
-    for src, rel in files:
-        print(f"  {rel:<34} {os.path.getsize(src) / 1048576:8.2f} MiB  <- {src}")
     if skipped:
         print("not bundled:")
         for lname, why in sorted(skipped.items()):
@@ -261,9 +285,34 @@ def main():
                 print(f"  {lname:<34} {why}")
         n_sys = sum(1 for why in skipped.values() if why == "Windows")
         print(f"  ({n_sys} Windows system DLLs)")
-    print(f"zip: {zip_path} ({os.path.getsize(zip_path) / 1048576:.1f} MiB)")
-    print(f"sha256: {sha256(zip_path)}")
+    for zip_path in zips:
+        print(f"zip: {zip_path} ({os.path.getsize(zip_path) / 1048576:.1f} MiB)")
+        print(f"sha256: {sha256(zip_path)}")
     return 0
+
+
+def package(out, zip_name, top, files):
+    """Stages files (source, relative path) in out/zip_name and zips them under top/."""
+    stage = os.path.join(out, zip_name)
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    os.makedirs(stage)
+    for src, rel in files:
+        dst = os.path.join(stage, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    zip_path = os.path.join(out, zip_name + ".zip")
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for _, rel in files:
+            z.write(os.path.join(stage, rel), os.path.join(top, rel))
+
+    print(f"{zip_name}:")
+    for src, rel in files:
+        print(f"  {rel:<50} {os.path.getsize(src) / 1048576:8.2f} MiB  <- {src}")
+    return zip_path
 
 
 if __name__ == "__main__":
