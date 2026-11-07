@@ -177,12 +177,15 @@ function Ensure-Compiler {
         }
         Set-Content -Encoding utf8 -Path $argsStamp -Value $argsText
     }
-    Write-Host "=== Building openvino_intel_npu_compiler (long on the first run) ==="
+    # The plugin loads the compiler through the loader (VCLApi), so the loader is needed at run time too.
+    Write-Host "=== Building openvino_intel_npu_compiler and its loader (long on the first run) ==="
     Invoke-Checked "NPU compiler build" {
-        & $script:Cmake --build $CompilerBuild --parallel --target openvino_intel_npu_compiler
+        & $script:Cmake --build $CompilerBuild --parallel --target openvino_intel_npu_compiler openvino_intel_npu_compiler_loader
     }
-    $dll = Join-Path $OvBin "openvino_intel_npu_compiler.dll"
-    if (-not (Test-Path $dll)) { throw "patched compiler missing after the build: $dll" }
+    foreach ($name in @("openvino_intel_npu_compiler.dll", "openvino_intel_npu_compiler_loader.dll")) {
+        $dll = Join-Path $OvBin $name
+        if (-not (Test-Path $dll)) { throw "$name missing after the build: $dll" }
+    }
 }
 
 $prevPath = $env:Path

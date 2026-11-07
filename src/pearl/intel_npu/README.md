@@ -63,7 +63,8 @@ powershell -ExecutionPolicy Bypass -File src\pearl\intel_npu\prepare_intel_npu_d
    (NPU plugin only, no CPU/GPU plugins, frontends, Python or tests) and builds it.
 2. Clones `npu_compiler` into `third_party/npu_compiler-src` at the pinned commit with its submodules (LLVM among
    them), applies `npu_compiler_all.diff` (skipped when the tree already has it), configures it against OpenVINO's
-   developer package and builds `openvino_intel_npu_compiler`, which lands in OpenVINO's `bin/intel64/Release`.
+   developer package and builds `openvino_intel_npu_compiler` and its loader, which land in OpenVINO's
+   `bin/intel64/Release`.
 3. Writes `third_party/intel_npu/paths.cmake` (OpenVINO build and binary directories) for the CMake build.
 
 Requires Git, MSVC 2022 (C++ tools), CMake 3.24+, Ninja and Python 3. The first run downloads several GB and builds
@@ -90,6 +91,37 @@ the OpenVINO runtime (`openvino.dll`, `openvino_intel_npu_plugin.dll`, `tbb*.dll
 reference on random data and measures the launch rate.
 
 Windows only so far (the patch and the OpenVINO build are tested there).
+
+### Path too long (`RC1109`)
+
+If the `npu_compiler` build stops a few minutes into LLVM with
+
+```
+fatal error RC1109: error creating thirdparty\llvm-project\...\windows_version_resource.rc.res
+```
+
+the checkout path is too long. The resource compiler (`rc.exe`) cannot create files whose path exceeds 259
+characters, even with Windows long paths enabled, and LLVM's deepest output under
+`third_party\npu_compiler-src\build-x86_64\Release` needs 212 of them. The CPPminer root must therefore be at most 47
+characters long (`C:\Users\<name>\Desktop\CPPminer` usually fits; a deeper folder does not).
+
+The fix is to give the compiler a short path through a directory junction. It is a link, so nothing is copied or
+downloaded again, and with `NPU_COMPILER_SRC` set the script uses the checkout as it is:
+
+```powershell
+New-Item -ItemType Junction -Path C:\npuc -Target <CPPminer>\third_party\npu_compiler-src
+Remove-Item -Recurse -Force C:\npuc\build-x86_64   # only if a build was configured under the long path
+$env:NPU_COMPILER_SRC = "C:\npuc"
+powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,IntelNpu
+```
+
+The old build tree has to go because CMake does not reuse a tree configured from another path; at that point it only
+holds a few minutes of work. The finished OpenVINO build is reused. Set `NPU_COMPILER_SRC` again for later builds.
+To remove the junction, use `cmd /c rmdir C:\npuc`: in Windows PowerShell 5.1, `Remove-Item -Recurse` can follow it
+and delete the real checkout.
+
+For a one-off build, `subst N: <CPPminer>` and running `build.ps1` from `N:\` works too (`subst N: /d` removes the
+drive), but the new build tree then expects `N:` on every later build.
 
 ## Run
 
