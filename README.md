@@ -125,6 +125,25 @@ cppminer --backend opencl --list-devices
 cppminer --backend opencl --devices 0 --mock
 ```
 
+### Intel NPU runtime files (release zips)
+
+A Windows release built with the Intel NPU backend comes as two zips. The main one, `cppminer_<version>_<suffix>.zip`, holds `cppminer.exe` with `openvino.dll` and the other DLLs it needs to start. The second, `cppminer_<version>_<suffix>_intel_npu_runtime.zip`, holds what OpenVINO loads only when `--backend intel_npu` starts: the NPU plugin (`openvino_intel_npu_plugin.dll`), the patched NPU compiler (`openvino_intel_npu_compiler.dll`, about 85 MB) and its loader (`openvino_intel_npu_compiler_loader.dll`), plus the SHAVE kernels in `kernels\intel_npu\`.
+
+Extract both, then copy everything inside the runtime zip's top folder into the folder with `cppminer.exe`, keeping the `kernels\intel_npu` subfolder:
+
+```text
+cppminer_<version>_<suffix>\
+  cppminer.exe
+  openvino.dll
+  openvino_intel_npu_plugin.dll            <- from the runtime zip
+  openvino_intel_npu_compiler.dll          <- from the runtime zip
+  openvino_intel_npu_compiler_loader.dll   <- from the runtime zip
+  ...
+  kernels\intel_npu\*.elf                  <- from the runtime zip
+```
+
+Without these files the other backends still work, but `--backend intel_npu` cannot load the NPU plugin or compile its graph. The NPU also needs Intel's stock NPU driver. The first launch compiles the graph, which takes a while, and caches it in `npu_cache\` next to `cppminer.exe`. A build from source with `build.ps1 -Backend ...,IntelNpu` puts all of these files next to `cppminer.exe` itself.
+
 ### Options
 
 Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown option (including one for a backend that is not compiled in), a missing value, or a malformed, out-of-range or too long value stops the miner with status 1 before it starts.
@@ -138,7 +157,7 @@ Options that take a value accept `--opt VALUE` or `--opt=VALUE`. An unknown opti
 | `--worker` | Worker name (default `rig01`). On a `kryptex` pool host the wallet is sent as `WALLET.worker` as well |
 | `--pool-pass STR` | `mining.authorize` password (default `x`). Kryptex reads a custom share difficulty from it: `--pool-pass d=2097152` (their default; `d = hashrate_H/s * target_share_seconds / 4294967296`) |
 | `--threads N` | CPU backend OpenMP threads, Pearl and Quantus. Default: all CPUs the process may use (respects `taskset` / cpusets); `OMP_NUM_THREADS` overrides the default. Pearl threads are pinned physical cores first, then SMT siblings, so N up to the core count gives one thread per core. Set `OMP_PLACES` / `OMP_PROC_BIND` to let the OpenMP runtime place threads instead, `CP_CPU_AFFINITY=0` to disable pinning |
-| `--devices` | CUDA device ids, OpenCL flat index, or wgpu mining-adapter indices (`--list-devices`) |
+| `--devices` | Mine on which device id (`--list-devices`). Multi-GPU pearl mining is not supported yet, you can use one process per GPU. |
 | `--list-devices` | List devices for the selected backend and exit |
 | `--m N`, `--n N` | Matrix rows / columns in units of 1024 (default 128 = 131072; each ≤ 256, `m*n` ≤ 128×128) |
 | `--cpu-gen` | Host matrix prep on GPU paths (OpenCL ~1 GiB VRAM; CUDA debug) |

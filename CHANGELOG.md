@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0 (tentative)
+## v1.0
 ### New features
 - OneDNN backend now supports Xe-HPG and Xe2 GPU with XMX cores with optimized performance
 - Experimental Hexagon backend
