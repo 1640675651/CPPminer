@@ -182,7 +182,7 @@ Unconditional per-tile beat stores work; host scan picks minimum spatial beat (n
 
 | File | Role |
 |------|------|
-| `case5_patches/gemmstone/generator/pieces/case5_blake3.cxx` | Fused BLAKE3 epilogue + compare loop (patched into vendored gemmstone) |
+| `src/gpu/intel/gemm/jit/generator/pieces/case5_blake3.cxx` in the oneDNN fork (vendored to `third_party/gemmstone`) | Fused BLAKE3 epilogue + compare loop |
 | `case33_gemm_onednn.cpp` | Host dump, CPU recompute, safety gate |
 | `case5_gemm_launch.cpp` | Kernel args (`blake3_cmp_dump`, `blake3_b0..b7`, …) |
 | `src/cpu/cp_jackpot.hpp` | Reference `digest_beats_target()` |

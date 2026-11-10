@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Case 5 gemmstone generator TU: all generator pieces + explicit HW instancing.
- * Patched gemmstone pieces live in case5_patches/ and are copied into
- * third_party/gemmstone by prepare_onednn_deps.bat (also invoked from CMake).
+ * The gemmstone pieces (with the Case 5 modifications) come from the case5 oneDNN fork and are
+ * vendored into third_party/gemmstone by prepare_onednn_deps.bat (also invoked from CMake).
  ******************************************************************************/
 
 #include <array>

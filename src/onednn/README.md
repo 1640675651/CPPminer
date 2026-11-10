@@ -15,11 +15,11 @@ cd src\onednn
 prepare_onednn_deps.bat
 ```
 
-Fetches oneDNN into project `third_party/onednn-src` and vendors nGEN/gemmstone under `src/onednn/third_party/` (+ `case5_patches/` overlay).
+The Case 5 modifications to gemmstone and nGEN live in a fork of oneDNN, <https://github.com/1640675651/oneDNN>, branch `v3.13.2-prl-patch` (upstream v3.13.2 plus the Case 5 commits); gemm_xor builds from the same branch. The script clones it into project `third_party/onednn-src` and mirrors nGEN and gemmstone (`include`, `generator`, `selector` with `kernel.db`, `gemmstone_config.hpp`) into `src/onednn/third_party/`. `ONEDNN_SRC=<checkout>` uses a local clone instead (for editing gemmstone); `ONEDNN_REPO` / `ONEDNN_REF` select another repository or branch.
 
 On Linux run `sh prepare_onednn_deps.sh` (same behaviour, `refresh` argument too); CMake does not run it automatically there. Arc (XeHPG) results: [docs/intel_a380_onednn.md](../../docs/intel_a380_onednn.md).
 
-**Important:** `third_party/gemmstone` is generated locally (gitignored). The build applies `case5_patches/` on every configure. If you see errors like `case5TileXorWrap is not a member of gemmstone::GEMMProblem`, patches were not applied:
+**Important:** `third_party/gemmstone` is generated locally (gitignored). The build re-syncs it from the fork on every configure. If you see errors like `case5TileXorWrap is not a member of gemmstone::GEMMProblem`, the vendored copy is not from the fork (or the branch moved): re-fetch it:
 
 ```bat
 cd src\onednn

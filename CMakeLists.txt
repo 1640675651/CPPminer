@@ -378,17 +378,18 @@ endif()
 
 if(CP_ENABLE_ONEDNN)
     set(_ONEDNN_DIR "${CMAKE_SOURCE_DIR}/src/onednn")
+    # src/onednn/third_party/gemmstone mirrors src/gpu/intel/gemm/jit of the case5 oneDNN fork (include,
+    # generator, selector, gemmstone_config.hpp), vendored by src/onednn/prepare_onednn_deps.bat.
     set(_GEMMSTONE_ROOT "${_ONEDNN_DIR}/third_party/gemmstone")
-    set(_ONEDNN_SRC "${CMAKE_SOURCE_DIR}/third_party/onednn-src")
-    set(_ONEDNN_GEMM_JIT "${_ONEDNN_SRC}/src/gpu/intel/gemm/jit")
+    set(_ONEDNN_GEMM_JIT "${_GEMMSTONE_ROOT}")
     set(_ONEDNN_KERNEL_DB "${_ONEDNN_GEMM_JIT}/selector/db/kernel.db")
     set(_ONEDNN_PREP_BAT "${_ONEDNN_DIR}/prepare_onednn_deps.bat")
     set(_ONEDNN_PROBLEM_HPP "${_GEMMSTONE_ROOT}/include/gemmstone/problem.hpp")
     if(WIN32 AND EXISTS "${_ONEDNN_PREP_BAT}")
         if(NOT EXISTS "${_ONEDNN_KERNEL_DB}" OR NOT EXISTS "${_GEMMSTONE_ROOT}/include/gemmstone/generator.hpp")
-            message(STATUS "CP_ENABLE_ONEDNN: running prepare_onednn_deps.bat (fetch + patch gemmstone)")
+            message(STATUS "CP_ENABLE_ONEDNN: running prepare_onednn_deps.bat (fetch the case5 oneDNN fork)")
         else()
-            message(STATUS "CP_ENABLE_ONEDNN: re-applying case5_patches to vendored gemmstone")
+            message(STATUS "CP_ENABLE_ONEDNN: syncing vendored gemmstone from the case5 oneDNN fork")
         endif()
         execute_process(
             COMMAND cmd /c "${_ONEDNN_PREP_BAT}"
@@ -400,7 +401,7 @@ if(CP_ENABLE_ONEDNN)
     endif()
     if(NOT EXISTS "${_ONEDNN_KERNEL_DB}")
         message(FATAL_ERROR
-            "CP_ENABLE_ONEDNN requires oneDNN sources at third_party/onednn-src "
+            "CP_ENABLE_ONEDNN requires the vendored gemmstone at ${_GEMMSTONE_ROOT} "
             "(missing ${_ONEDNN_KERNEL_DB}). Run src/onednn/prepare_onednn_deps.bat")
     endif()
     if(NOT EXISTS "${_ONEDNN_PROBLEM_HPP}")
@@ -411,7 +412,7 @@ if(CP_ENABLE_ONEDNN)
     file(READ "${_ONEDNN_PROBLEM_HPP}" _ONEDNN_PROBLEM_HPP_CONTENT)
     if(NOT _ONEDNN_PROBLEM_HPP_CONTENT MATCHES "case5TileXor")
         message(FATAL_ERROR
-            "Case5 gemmstone patches not applied (case5TileXor missing in problem.hpp). "
+            "Vendored gemmstone is not the case5 fork (case5TileXor missing in problem.hpp). "
             "From repo root run: src/onednn/prepare_onednn_deps.bat refresh")
     endif()
     file(GLOB _GEMMSTONE_PIECE_SOURCES CONFIGURE_DEPENDS

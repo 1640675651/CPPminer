@@ -170,6 +170,9 @@ GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot
     problem.product = product;
     problem.case5TileXor = true;
     problem.case5TileXorNop = xor_nop;
+    // The miner's message: every wrap-GRF fold (fused and separate jackpot) is rotl(slot, 13) ^ x, as in
+    // cp_jackpot's fold_milestones (gemm_xor's Case 5.4-5.6 fold with plain xor; same gemmstone fork).
+    problem.case5WrapFoldRotl = true;
     // Fused jackpot: in-reg fold + Case5.6 BLAKE3 + in-kernel compare (diagnostic dumps digests/beats).
     problem.case5TileXorWrapGrf = fused_jackpot && !xor_nop;
     problem.case5TileXorWrap = fused_jackpot && !xor_nop;
