@@ -31,6 +31,8 @@ struct CatalogCandidate {
     bool pack_b = false;    // B in gemmstone's packed rows: panels of unroll_n columns, pack_b_cp k per column
     int pack_a_cp = 4;      // the prep writes A for 16-row panels with 4 k per dword
     int pack_b_cp = 32;     // the prep writes B per job for any panel width and crosspack (multiple of 4)
+    int pack_a_tile_r = 0;  // packed A tiled inside the panel (gemmstone tileR x tileC); 0 = untiled
+    int pack_a_tile_c = 0;
 };
 
 // CASE5_A_PACKED: unset = packed A for the XeHPG preferred kernel (default), 0 = off,

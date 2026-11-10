@@ -285,11 +285,13 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
     }
     // Case 5.7: the fold16 / wrap message line blocks are written to SLM as they complete and folded after
     // the k loop, which frees the accumulator GRFs during the loop (on XeHPG the 16x64 kernel then fits a
-    // double-buffered packed A: the family kernel's packed_accslm strategy). CASE5_XOR_ACC_SLM=1/0 overrides
-    // the default (on for XeHPG). Set before the selection so the family kernel can pick its strategy.
+    // double-buffered packed A: the family kernel's packed_accslm strategy). Off by default since the packed A
+    // is tiled (2026-11-10): the double buffer fits without it, and the A770 fused scan is faster without the
+    // staging (119.2 vs 118.7 TMAC/s, old untiled kernel with staging 116.5; 210 W, 131072^2 mock, 2 rounds).
+    // CASE5_XOR_ACC_SLM=1 turns it on. Set before the selection so the family kernel can pick its strategy.
     {
         const char *e = std::getenv("CASE5_XOR_ACC_SLM");
-        problem.case5TileXorAccSlm = (e && e[0]) ? (e[0] != '0') : (hw == HW::XeHPG);
+        problem.case5TileXorAccSlm = (e && e[0]) ? (e[0] != '0') : false;
     }
     const auto selection = select_case5_candidates(hw, product, device, problem, dims);
     product.stepping = selection.stepping;
@@ -401,8 +403,26 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 problem.A.layout = MatrixLayout::Pc;
                 problem.A.packSize = strategy.unroll[LoopM];
                 problem.A.crosspack = uint8_t(forceA ? envInt("CASE5_A_CP", 4) : candidate.pack_a_cp);
-                problem.A.tileR = problem.A.tileC = 0;
-                if (forceA) envTile("CASE5_A_TILE", problem.A.tileR, problem.A.tileC);
+                // Tiled panel from the candidate (family kernels: XMX entries since 2026-11-10, see
+                // case5_kernel_select.cpp); CASE5_A_TILE=r,c overrides, CASE5_A_TILE=0,0 = untiled.
+                problem.A.tileR = uint16_t(candidate.pack_a_tile_r);
+                problem.A.tileC = uint16_t(candidate.pack_a_tile_c);
+                if (const char *t = std::getenv("CASE5_A_TILE"); t && t[0])
+                    envTile("CASE5_A_TILE", problem.A.tileR, problem.A.tileC);
+                // gemmstone advances a tiled Pc panel by ka_load * tileR bytes per k step without
+                // skipping to the next tile column, so a tile wider than ka_load is mis-addressed
+                // (gemm_xor, B580 16x64 / 16x128 tiles: wrong results). Refuse it.
+                if (problem.A.tileC > 0 && int(problem.A.tileC) > strategy.ka_load) {
+                    const std::string why = "packed A tile " + std::to_string(problem.A.tileR) + "x"
+                            + std::to_string(problem.A.tileC) + " is wider than ka_load "
+                            + std::to_string(strategy.ka_load) + " (gemmstone mis-addresses it)";
+                    last_err = candidate.label + ": " + why;
+                    if (candidate.from_catalog)
+                        log_candidate_rejection(candidate, why, &rejected);
+                    else if (case5_debug_select())
+                        std::fprintf(stderr, "Case5 rejected %s: %s\n", candidate.label.c_str(), why.c_str());
+                    continue;
+                }
                 problem.A.panelLength = 0;
                 problem.A.setAlignment(problem.A.defaultAlignment(problem.Ta_ext));
             }
@@ -541,6 +561,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->jackpotCoopSlm = problem.case5JackpotCoopSlm;
                 info->aPackRows = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.packSize) : 0;
                 info->aPackCp = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.crosspack) : 0;
+                info->aTileR = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.tileR) : 0;
+                info->aTileC = (problem.A.layout == MatrixLayout::Pc) ? int(problem.A.tileC) : 0;
                 info->xorAccSlm = problem.case5TileXorAccSlm;
                 info->bPackCols = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.packSize) : 0;
                 info->bPackCp = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.crosspack) : 0;

@@ -651,17 +651,22 @@ bool Case33OclPrep::uniform_rows_(int rows, int is_b) {
 }
 
 /* Noisy A in gemmstone's packed layout, panels of a_pack_rows_ rows with 4 k per dword
-   (ocl_noisy_matrix_a_packed16 for 16 rows, ocl_noisy_matrix_a_packed for other heights up to 64). There
-   is no fallback: the GEMM kernel was built for this layout, so a failure fails the attempt. */
+   (ocl_noisy_matrix_a_packed16 for 16 rows, ocl_noisy_matrix_a_packed for other heights up to 64),
+   optionally tiled a_tile_r_ x a_tile_c_ inside the panel (gemmstone A4#r,c; the kernels take the
+   untiled layout as tile P x 64). There is no fallback: the GEMM kernel was built for this layout, so a
+   failure fails the attempt. */
 bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, int K, int out_lda) {
     const int P = a_pack_rows_;
     const bool p16 = P == 16;
     const int unit = p16 ? 64 * 4 : 64; /* NPA_UNROLL default for the 16-row kernel */
     cl_kernel kern = p16 ? k_noisy_a_packed_ : k_noisy_a_packed_any_;
+    const int tR = (a_tile_r_ > 0) ? a_tile_r_ : P;
+    const int tC = (a_tile_c_ > 0) ? a_tile_c_ : 64;
     if (!ready_ || !out || !signal || !kern || P <= 0 || P > 64 || rows <= 0 || rows % P != 0 ||
-        K % unit != 0 || out_lda < K || out_lda % 4 != 0 || R_RANK != 128) {
-        std::fprintf(stderr, "[ocl-prep] packed A: unsupported shape (rows %d, K %d, lda %d, panel %d)\n",
-                     rows, K, out_lda, P);
+        K % unit != 0 || out_lda < K || out_lda % 4 != 0 || R_RANK != 128 || P % tR != 0 ||
+        tC % 4 != 0 || 64 % tC != 0) {
+        std::fprintf(stderr, "[ocl-prep] packed A: unsupported shape (rows %d, K %d, lda %d, panel %d, tile %dx%d)\n",
+                     rows, K, out_lda, P, tR, tC);
         return false;
     }
     if (!build_perm_pairs_(0, K)) {
@@ -688,6 +693,8 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
         err |= clSetKernelArg(kern, arg++, sizeof(int), &P);
     }
     err |= clSetKernelArg(kern, arg++, sizeof(int), &panel_stride_dw);
+    err |= clSetKernelArg(kern, arg++, sizeof(int), &tR);
+    err |= clSetKernelArg(kern, arg++, sizeof(int), &tC);
     const size_t l = 256;
     const size_t g = static_cast<size_t>(rows / P) * l;
     if (err != CL_SUCCESS ||
@@ -739,14 +746,18 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
         const int8_t *pan = packed.data() + static_cast<size_t>(m / P) * static_cast<size_t>(P) *
                                                     static_cast<size_t>(out_lda);
         const int8_t *rr = ref.data() + static_cast<size_t>(m) * static_cast<size_t>(out_lda);
+        const size_t i = static_cast<size_t>(m % P);
         for (int k = 0; k < K; ++k) {
-            if (pan[static_cast<size_t>(k / 4) * static_cast<size_t>(4 * P) + static_cast<size_t>(m % P) * 4u +
-                    static_cast<size_t>(k % 4)] != rr[k]) {
+            // gemmstone's tiled Pc offset (crosspack 4): untiled when tR = P and tC covers K.
+            const size_t kk = static_cast<size_t>(k), r = static_cast<size_t>(tR), c = static_cast<size_t>(tC);
+            const size_t off = (i - i % r) * c + (kk - kk % c) * static_cast<size_t>(P) + (i % r) * 4u +
+                               (kk % c - kk % 4u) * r + kk % 4u;
+            if (pan[off] != rr[k]) {
                 ++bad;
             }
         }
     }
-    std::printf("[ocl-prep] packed A noise check (%dx%d, %d-row panels): %s\n", rows, K, P,
+    std::printf("[ocl-prep] packed A noise check (%dx%d, %d-row panels, tile %dx%d): %s\n", rows, K, P, tR, tC,
                 bad == 0 ? "identical" : "MISMATCH");
     std::fflush(stdout);
     return bad == 0;

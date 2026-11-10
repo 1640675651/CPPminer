@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1 (tentative)
+### Fix & Enhancements
+- OneDNN: code refactor, use a fork of onednn instead of keeping patches
+- OneDNN: tiled A packing for higher GEMM throughput
+- OneDNN: lower XOR overhead on Xe2
+
 ## v1.0
 ### New features
 - OneDNN backend now supports Xe-HPG and Xe2 GPU with XMX cores with optimized performance

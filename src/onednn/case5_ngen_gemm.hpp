@@ -41,6 +41,8 @@ struct DriverInfo {
     int bPackCp = 0;            // ... with this many consecutive k per column (crosspack)
     int aPackRows = 0;          // A in gemmstone packed columns: panels of this many rows (0 = plain)
     int aPackCp = 0;            // ... with this many consecutive k per group (crosspack)
+    int aTileR = 0;             // packed A tiled inside the panel: tileR rows x tileC k per tile (0 = untiled)
+    int aTileC = 0;
     bool xorAccSlm = false;     // Case 5.7: the message line blocks are staged in SLM during the k loop
     bool jackpotCoopSlm = false; // coop jackpot via SLM transpose (CASE5_COOP_OWN=0); default: own-tile SIMD-N
     bool jackpotCoopAudit = false; // CASE5_COOP_AUDIT=1: kernel dumps per-tile digests + messages for a host check

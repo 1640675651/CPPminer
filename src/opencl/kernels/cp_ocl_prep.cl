@@ -503,13 +503,21 @@ ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
  * k..k+3 of row m. Same scheme as ocl_noisy_matrix_a_packed16 below, which stays for P = 16: one
  * 256-item work group per panel, the panel's uniform rows in local memory, per 64-k unit the P x 64-byte
  * signal tile loaded coalesced into local memory, and the unit's P * 16 output dwords written
- * contiguously. Same bytes as ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them). */
+ * contiguously. Same bytes as ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them).
+ *
+ * Tiled panels (gemmstone A4#tile_r,tile_c, the XMX kernels' default since 2026-11-10): inside a panel the
+ * tile_r x tile_c tiles are k-block-major, then row-block, and a tile holds its k groups of 4 one after
+ * another, each with its tile_r rows: dword (k-group g, row r) of a 64-k unit sits at
+ *   (r / tile_r) * tile_r * gc + (g / gc) * gc * P + (g % gc) * tile_r + r % tile_r,   gc = tile_c / 4,
+ * which is g * P + r for the untiled layout (tile_r = P, tile_c = 64; the host passes that for untiled).
+ * Needs P % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0. */
 #ifndef NPAG_PMAX
 #define NPAG_PMAX 64
 #endif
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
 ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __global const uint *pairs,
-                          int rows, int K, __global const char *signal, int P, int panel_stride_dw) {
+                          int rows, int K, __global const char *signal, int P, int panel_stride_dw,
+                          int tile_r, int tile_c) {
     __local uint sig[NPAG_PMAX * 17];  /* 17: no bank conflicts on the transposed read */
     __local uint el32[NPAG_PMAX * 33]; /* 33: row stride against bank conflicts */
     __local uchar p0[64];
@@ -549,7 +557,8 @@ ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __gl
                 const uint v = (sv >> (8 * b)) + (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
                 o |= (v & 0xffu) << (8 * b);
             }
-            unit[j] = o;
+            const int gc = tile_c >> 2; /* k groups per tile */
+            unit[(r / tile_r) * tile_r * gc + (g / gc) * gc * P + (g % gc) * tile_r + r % tile_r] = o;
         }
     }
 }
@@ -563,11 +572,18 @@ ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __gl
  * k..k+3 of row m. One 256-item work group per panel. Per unit of 64 k the signal tile (16 rows x
  * 64 bytes) is loaded with 16 items per row (coalesced) into local memory, and item w = 16 g + r
  * produces the dword of row r, k-group g, so the group's stores are 1 KB contiguous. Same bytes as
- * ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them). Plain OpenCL 1.2. */
+ * ocl_noisy_matrix_rowmajor (CP_OCL_PREP_CHECK=1 compares them). Plain OpenCL 1.2.
+ *
+ * Tiled panels (gemmstone A4#tile_r,tile_c, the XMX kernels' default since 2026-11-10): inside a panel the
+ * tile_r x tile_c tiles are k-block-major, then row-block, and a tile holds its k groups of 4 one after
+ * another, each with its tile_r rows: dword (k-group g, row r) of a 64-k unit sits at
+ *   (r / tile_r) * tile_r * gc + (g / gc) * gc * 16 + (g % gc) * tile_r + r % tile_r,   gc = tile_c / 4,
+ * which is g * 16 + r for the untiled layout (tile_r = P, tile_c = 64; the host passes that for untiled).
+ * Needs 16 % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0. */
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
 ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
                             __global const uint *pairs, int rows, int K,
-                            __global const char *signal, int panel_stride_dw) {
+                            __global const char *signal, int panel_stride_dw, int tile_r, int tile_c) {
     __local uint sig[NPA_UNROLL * 16 * 17]; /* 17: no bank conflicts on the transposed read */
     __local uint el32[16 * 33];             /* 33: row stride against bank conflicts */
     __local uchar p0[NPA_UNROLL * 64];
@@ -585,6 +601,8 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
     __global uint *dst = out + (size_t)panel * (size_t)panel_stride_dw;
     const int r = w & 15;  /* compute and store: row in panel */
     const int g = w >> 4;  /* compute and store: k group of 4 inside a 64-k unit */
+    const int gc = tile_c >> 2; /* k groups per tile; tiled position of (g, r) inside a 64-k unit */
+    const int toff = (r / tile_r) * tile_r * gc + (g / gc) * gc * 16 + (g % gc) * tile_r + r % tile_r;
     const int lr = w >> 4; /* load: row in panel */
     const int ld = w & 15; /* load: dword inside the row's 64 bytes */
     const __local uchar *e = el + r * 132;
@@ -607,7 +625,7 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
                 const uint v = (sv >> (8 * b)) + (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
                 o |= (v & 0xffu) << (8 * b);
             }
-            dst[(size_t)((kb >> 2) + u * 16) * 16 + (size_t)w] = o;
+            dst[(size_t)((kb >> 2) + u * 16) * 16 + (size_t)toff] = o;
         }
     }
 }

@@ -15,6 +15,8 @@ struct Case33OclPrep {
     /* 16: write the noisy A in gemmstone's packed layout (16-row panels, 4 k per dword) instead of
        row-major (oneDNN XeHPG kernel with packed A); 0: row-major. */
     void set_a_pack_rows(int rows) { a_pack_rows_ = rows; }
+    /* Packed A tiled inside its panel (gemmstone A4#r,c): r rows x c k per tile; 0, 0 = untiled. */
+    void set_a_pack_tile(int r, int c) { a_tile_r_ = r; a_tile_c_ = c; }
     /* 64, 32: write the per-job noisy B in gemmstone's packed-rows layout (64-column panels, 32 k per
        column) instead of column-major (oneDNN XeHPG kernel with packed B); 0, 0: column-major. */
     void set_b_pack(int cols, int crosspack) { b_pack_cols_ = cols; b_pack_cp_ = crosspack; }
@@ -149,6 +151,7 @@ private:
     cl_kernel k_noisy_a_packed_ = nullptr;    // noisy A in gemmstone's packed layout (16-row panels)
     cl_kernel k_noisy_a_packed_any_ = nullptr;   // packed A, any panel height (crosspack 4)
     int a_pack_rows_ = 0;                     // packed-A panel height (0 = row-major A)
+    int a_tile_r_ = 0, a_tile_c_ = 0;         // packed-A tile inside the panel (0, 0 = untiled)
     cl_kernel k_noisy_b_packed_ = nullptr;    // noisy B straight into gemmstone packed rows (Q x crosspack)
     int b_pack_cols_ = 0;
     int b_pack_cp_ = 0;

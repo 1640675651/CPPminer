@@ -57,18 +57,23 @@ constexpr char kPreferredXeHPGInt8Xaf[] =
 constexpr char kPreferredXeHPGInt8Af[] =
         "sS32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
 // Packed A (the default on XeHPG, see case5_a_packed_env): A arrives in 16-row panels with 4 consecutive
-// k per dword, so it is block-loaded (sB32) instead of gathered (sS32x2); the gathers needed two buffers
-// to hide their latency, block loads need one, and the scan is ~7% faster (0.638 vs 0.688 s per
-// 131072^2 attempt on the A770).
+// k per dword, so it is block-loaded (sB) instead of gathered (sS32x2); the scan was ~7% faster (0.638 vs
+// 0.688 s per 131072^2 attempt on the A770). Since 2026-11-10 (gemm_xor note.md, *A770: the Xe2 lessons
+// re-tested*) the panel is tiled 8x32 (gemmstone A4#8,32, written by the GPU prep) and double-buffered
+// (`sB32x2`): the loads land in dpas operand order, the k loop's 16 deinterleave movs per step go away and
+// the two buffers are the operands themselves, so the second buffer fits every path with `cb4x2`
+// (untiled it only fit with the SLM message staging and `cb4`). gemm_xor A770 at 210 W, 16384^2 x 4096:
+// pure 229.7 -> 239.0, Case 5 221.1 -> 231.5, fused 5.6 219.7 -> 230.3 TOPS; at 65536^2 Case 5.7 (the
+// miner's old XeHPG kernel) 231.2 -> 235.3. With it the fold uses whole-step chains (xaf everywhere,
+// gemmstone default for XeHPG with a tiled packed A).
 constexpr char kPreferredXeHPGInt8XafPackedA[] =
-        "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
+        "sB32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr char kPreferredXeHPGInt8AfPackedA[] =
-        "sB32 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
-// Case 5.7 on XeHPG: with the fold16 / wrap accumulators in SLM the 16x64 kernel has room for a second
-// register copy of the packed A (`sB32x2`) once the SLM copy of B is single (`cb4`); gemm_xor note.md,
-// *Case 5.7*.
+        "sB32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 af dw vav bo sr bk0 sn dm grf256 sys pab";
+// Case 5.7 on XeHPG (message blocks in SLM, CASE5_XOR_ACC_SLM=1): it was the only path with room for the
+// second A buffer before the tiled panel; now the same strategy as the rest.
 constexpr char kPreferredXeHPGInt8XafPackedAccSlm[] =
-        "sB32x2 sB32 aB wg 16x2 cb4 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
+        "sB32x2 sB32 aB wg 16x2 cb4x2 ks32 k128 xaf dw vav bo sr bk0 sn dm grf256 sys pab";
 constexpr int kPreferredXeHPGUnrollM = 16;
 constexpr int kPreferredXeHPGUnrollN = 64;
 
@@ -100,6 +105,7 @@ struct FamilyKernel {
     int pack_a_max_k;            // pack A only while K <= this (0 = any K)
     int pack_b_cp;               // 0 = never pack B
     int min_align_a, min_align_b;
+    int pack_a_tile_r, pack_a_tile_c;   // packed A tiled inside its panel (gemmstone A4#r,c; 0 = untiled)
     const char *packed_accslm;          // packed A, Case 5.7 (message blocks in SLM, accumulator GRFs free); nullptr = packed
 };
 
@@ -148,9 +154,13 @@ constexpr char kXe2Int8Af[] =
 // packed B alone is neutral (196.9). The first-day "packing does not help on Xe2" came from the 16x64
 // tile with block-load packed A. `+B64@96` prefetches A 96 k ahead in 64-k blocks: the only strategy
 // knob of a 31-variant screen that paid (pure 202-204 vs 199, Case 5 193.9 vs 190.5, Case 5.6 188.9 vs
-// 188.0; other distances 200-203, B prefetch 187). Removing the k loop's 64 A-deinterleave movs with a
-// tiled packed layout (CASE5_A_TILE=16,32) changed nothing; tiles wider than ka_load are mis-addressed
-// by gemmstone and refused (gemm_xor note.md, *B580 kernel-side levers, second pass*).
+// 188.0; other distances 200-203, B prefetch 187). The packed A panel is tiled 16x32 (gemmstone
+// A4#16,32) since 2026-11-10: the loads land in dpas operand order and the k loop's 64 A-deinterleave
+// movs per milestone disappear (6.6 W at full clock). Alone that once looked like nothing: without the
+// movs pass 1 is issued detached from pass 0; gemmstone now makes pass 1 wait for pass 0 when A is tiled
+// on Xe2 (CASE5_WAIT_MID). gemm_xor B580: Case 5 190.5 -> 193.8-194.5 sustained, pure 200.1-202.2 ->
+// 200.7-204.3 (gemm_xor note.md, *The Xe2 fold overlaps the dpas*). Tiles wider than ka_load are
+// mis-addressed by gemmstone and refused. CASE5_A_TILE=0,0 restores the untiled panel.
 constexpr char kXe2Int8AfPackedA[] =
     "sB32x2+B64@96 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys pab";
 [[maybe_unused]] constexpr char kXe2Int8Direct2D48x32Xaf[] =
@@ -158,14 +168,14 @@ constexpr char kXe2Int8AfPackedA[] =
 
 const FamilyKernel kFamilyKernels[] = {
     {HW::Xe2, "xe2-family", "Arc B580", true, 32, 64,
-     kXe2Int8Af, nullptr, kXe2Int8AfPackedA, nullptr, 4, 4096, 32, 16, 4},
+     kXe2Int8Af, nullptr, kXe2Int8AfPackedA, nullptr, 4, 4096, 32, 16, 4, 16, 32},
     {HW::XeHPG, "xehpg-family", "Arc A770", true, kPreferredXeHPGUnrollM, kPreferredXeHPGUnrollN,
      kPreferredXeHPGInt8Xaf, kPreferredXeHPGInt8Af, kPreferredXeHPGInt8XafPackedA,
-     kPreferredXeHPGInt8AfPackedA, 4, 4096, 32, 64, 4, kPreferredXeHPGInt8XafPackedAccSlm},
+     kPreferredXeHPGInt8AfPackedA, 4, 0, 32, 64, 4, 8, 32, kPreferredXeHPGInt8XafPackedAccSlm},
     {HW::Gen12LP, "gen12lp-family", "UHD 770", false, 16, 32,
-     nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1},
+     nullptr, nullptr, kGen12LPInt8Packed, nullptr, 4, 0, 4, 1, 1, 0, 0, nullptr},
     {HW::XeHPG, "xelpg-family", "Xe-LPG 64 EU", false, 32, 32,
-     nullptr, nullptr, kXeLPGInt8Packed, nullptr, 4, 0, 4, 1, 1},
+     nullptr, nullptr, kXeLPGInt8Packed, nullptr, 4, 0, 4, 1, 1, 0, 0, nullptr},
 };
 
 // Keyed by gemmstone's HW family and XMX: Xe-HPG (Arc) and Xe-LPG (Meteor Lake) are both HW::XeHPG,
@@ -476,10 +486,10 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
         // CASE5_XOR_XAF=hybrid). CASE5_XOR_XAF=0 uses the af strategy everywhere.
         const char *xafEnv = std::getenv("CASE5_XOR_XAF");
         const bool useAlt = realFold && xafEnv && xafEnv[0] == '0';
-        // Packed A on XeHPG is single-buffered: at K > 4096 (A panels beyond the 16 MB L2) its block loads
-        // cannot hide the misses and the double-buffered gathers win (A770 pure GEMM, 16384^2: K=8192 194.6
-        // plain vs 176.0 packed A; K=16384 157.4 vs 175.6, but B-only packing gives 203.7 / 169.7), hence
-        // pack_a_max_k. The miner uses K = 4096.
+        // pack_a_max_k: a single-buffered packed A cannot hide the misses of A panels beyond the L2 (K >
+        // 4096 at 16384^2), so the Xe2 entry stops packing A there. The XeHPG entry's tiled, double-buffered
+        // packed A wins at any K (gemm_xor A770 pure GEMM, K = 8192: 222.1 vs 202.8 with B-only packing;
+        // K = 16384: 203.3 vs 169.8), so its limit is 0. The miner uses K = 4096.
         c.pack_a = problem.A.layout == gemmstone::MatrixLayout::T && fk->pack_a_cp > 0
                 && (case5_a_packed_env() == 1
                     || (case5_a_packed_env() != 0 && dims.k > 0
@@ -490,6 +500,8 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
                 && problem.B.layout == gemmstone::MatrixLayout::N;
         c.pack_a_cp = fk->pack_a_cp;
         c.pack_b_cp = fk->pack_b_cp;
+        c.pack_a_tile_r = fk->pack_a_tile_r;
+        c.pack_a_tile_c = fk->pack_a_tile_c;
         const char *s = c.pack_a ? (problem.case5TileXorAccSlm && fk->packed_accslm ? fk->packed_accslm
                                     : useAlt && fk->packed_alt ? fk->packed_alt : fk->packed)
                                  : (useAlt && fk->plain_alt ? fk->plain_alt : fk->plain);

@@ -608,18 +608,24 @@ bool Case33GemmOnednn::upload_a_(const int8_t *a_rowmajor) {
     const size_t bytes = static_cast<size_t>(lda_) *
                          static_cast<size_t>(a_row_major_ ? M_ : K_);
     if (a_row_major_ && info_.aPackRows > 0) {
-        // gemmstone packed columns: panel p of P rows at p * P * lda, element (m, k) at
-        // (k / c) * P * c + (m % P) * c + k % c inside it (P = aPackRows, c = crosspack).
+        // gemmstone packed columns: panel p of P rows at p * P * lda (P = aPackRows, c = crosspack).
+        // Untiled: (k / c) * P * c + (m % P) * c + k % c inside it. Tiled (tR rows x tC k per tile,
+        // gemmstone untile() in layout_utils.cpp): (i - i%tR)*tC + (k - k%tC)*P + (i%tR)*c + (k%tC - k%c)*tR
+        // + k%c with i = m % P, which is the untiled formula for tR = P, tC = K.
         const size_t P = static_cast<size_t>(info_.aPackRows);
         const size_t c = static_cast<size_t>(info_.aPackCp > 0 ? info_.aPackCp : 4);
+        const size_t tR = info_.aTileR > 0 ? static_cast<size_t>(info_.aTileR) : P;
+        const size_t tC = info_.aTileC > 0 ? static_cast<size_t>(info_.aTileC) : static_cast<size_t>(K_);
         a_host_.assign(bytes, 0);
         for (int m = 0; m < M_; ++m) {
             const int8_t *row = a_rowmajor + static_cast<size_t>(m) * static_cast<size_t>(K_);
             int8_t *panel = reinterpret_cast<int8_t *>(a_host_.data()) +
                             (static_cast<size_t>(m) / P) * P * static_cast<size_t>(lda_);
+            const size_t i = static_cast<size_t>(m) % P;
             for (int k = 0; k < K_; ++k) {
-                panel[(static_cast<size_t>(k) / c) * P * c + (static_cast<size_t>(m) % P) * c +
-                      static_cast<size_t>(k) % c] = row[k];
+                const size_t kk = static_cast<size_t>(k);
+                panel[(i - i % tR) * tC + (kk - kk % tC) * P + (i % tR) * c + (kk % tC - kk % c) * tR + kk % c] =
+                        row[k];
             }
         }
         return ocl_.write_buffer(a_buf_, a_host_.data(), bytes);
@@ -728,6 +734,7 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
         return false;
     }
     prep_.set_a_pack_rows(info_.aPackRows);
+    prep_.set_a_pack_tile(info_.aTileR, info_.aTileC);
     return prep_.prepare_attempt_a_gpu(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
                                        lda_, a_row_major_, salted, a_key_out);
 }
