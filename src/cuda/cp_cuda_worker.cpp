@@ -46,6 +46,11 @@ extern "C" void cp_cuda_worker_set_cutlass_fused(int on)
     cp_gpu_set_cutlass_fused(on);
 }
 
+extern "C" void cp_cuda_worker_set_cuda_mma(int mode)
+{
+    cp_gpu_set_cuda_mma(mode);
+}
+
 extern "C" int cp_cuda_worker_handles_matrix_prep(void)
 {
     return 1;

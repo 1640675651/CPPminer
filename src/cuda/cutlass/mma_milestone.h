@@ -1,9 +1,16 @@
 // MmaMilestone: continuous GEMM pipeline with XOR at milestone boundaries.
 //
 // Case 10 — one prologue, continuous gemm_iters-shaped loop, XOR every
-// kMilestoneIters K-tiles. Pre-advance iterators past residue-first so tiles
-// run in order (prefix partial-GEMM XOR). Hot path mirrors MmaPipelined::
-// gemm_iters (countdown + clear_mask).
+// kMilestoneIters K-tiles. Hot path mirrors MmaPipelined::gemm_iters
+// (countdown + clear_mask).
+//
+// kResidueTileIsLast: the milestone XOR is a prefix over K, so K-tiles must be
+// consumed in order. CUTLASS's SIMT dp4a iterator
+// (PredicatedTileIterator2dThreadTile) visits the LAST K-tile first ("residue
+// tile") and then restarts from k = 0, so that first tile is skipped
+// (gemm_k_iterations already counts K/kK in-order tiles). The tensor-op
+// PredicatedTileIterator places its residue tile at k = 0 and runs in order,
+// so nothing may be skipped there.
 #pragma once
 
 #include "cutlass/cutlass.h"
@@ -13,11 +20,13 @@ namespace cutlass {
 namespace gemm {
 namespace threadblock {
 
-template <typename MmaPipelined_, int kMilestoneIters>
+template <typename MmaPipelined_, int kMilestoneIters,
+          bool kResidueTileIsLast = true>
 class MmaMilestone : public MmaPipelined_ {
 public:
   using Base = MmaPipelined_;
   static constexpr int kItersPerMs = kMilestoneIters;
+  static constexpr bool kSkipResidueTile = kResidueTileIsLast;
 
   CUTLASS_DEVICE
   MmaMilestone(typename Base::SharedStorage &shared_storage, int thread_idx,
@@ -35,7 +44,9 @@ public:
     ++iterator_B;
   }
 
-  /// Continuous in-order K pipeline; XOR after each milestone via callback(ms, xv).
+  /// Continuous in-order K pipeline; after each milestone calls cb(ms, accum)
+  /// with the live accumulator fragment (the kernel's hash-tile policy turns
+  /// it into per-hash-tile XOR words).
   template <typename Callback>
   CUTLASS_DEVICE
   void inline_operator(int total_iters, FragmentC &accum, IteratorA iterator_A,
@@ -46,7 +57,8 @@ public:
     using FragmentA = typename Base::FragmentA;
     using FragmentB = typename Base::FragmentB;
 
-    skip_residue_tile(iterator_A, iterator_B);
+    if (kSkipResidueTile)
+      skip_residue_tile(iterator_A, iterator_B);
 
     Base::prologue(iterator_A, iterator_B, total_iters);
     Base::gmem_wait();
@@ -116,22 +128,13 @@ public:
       ++since_ms;
 
       if (since_ms == kMilestoneIters) {
-        uint32_t xv = 0u;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < FragmentC::kElements; ++i)
-          xv ^= static_cast<uint32_t>(accum[i]);
-        cb(ms_idx++, xv);
+        cb(ms_idx++, accum);
         since_ms = 0;
       }
     }
 
-    if (since_ms > 0) {
-      uint32_t xv = 0u;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < FragmentC::kElements; ++i)
-        xv ^= static_cast<uint32_t>(accum[i]);
-      cb(ms_idx, xv);
-    }
+    if (since_ms > 0)
+      cb(ms_idx, accum);
 
     Base::wind_down();
   }

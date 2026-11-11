@@ -120,6 +120,7 @@ int cp_apply_backend_options(CpOptions* o)
 
     if(cp_worker_backend_id() == CP_BACKEND_CUDA){
         if(o->cutlass_fused < 0) o->cutlass_fused = 1;
+        cp_worker_set_cuda_mma(o->cuda_mma);
     } else {
         o->cutlass_fused = 0;
     }
