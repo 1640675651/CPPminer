@@ -15,8 +15,13 @@ extern "C" {
 #endif
 
 /* 1 if dev runs the packed kernel by default (sm_75, sm_8x, sm_12x), 2 if it can run it
- * on request only (sm_90, sm_10x: CP_CUDA_PACKED=1, not measured yet), 0 otherwise. */
+ * on request only (sm_90, sm_10x: CP_CUDA_PACKED=1, not measured yet), 0 otherwise --
+ * including when the binary has no kernel image for the arch (e.g. a --cuda-arch 75
+ * build on an Ampere card, where the m16n8k32 kernel would JIT to an empty stub). */
 int cp_turing_scan_supported(int dev);
+
+/* Description of the packed kernel dev runs, for the startup log. */
+const char* cp_turing_scan_name(int dev);
 
 /* One period batch: rows [row_period0, +row_batch) x cols [col_period0,
  * +col_batch) in 128-row/col periods of packed d_Ap (m x K) and d_BpT (n x K).

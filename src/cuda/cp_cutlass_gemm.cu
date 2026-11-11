@@ -19,27 +19,51 @@
     }                                                                          \
   } while (0)
 
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajor>
-    g_fused_step_major;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajor>
-    g_fused_row_major;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128TensorOp>
-    g_fused_tensorop;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128TensorOp80>
-    g_fused_tensorop80;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128TensorOpMs>
-    g_fused_tensorop_ms;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm256x128TensorOp>
-    g_fused_tensorop_256x128;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256TensorOp>
-    g_fused_tensorop_128x256;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm256x128TensorOp80>
-    g_fused_tensorop80_256x128;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x256TensorOp80>
-    g_fused_tensorop80_128x256;
+/* ---- kind x threadblock tile -> GEMM instantiation ------------------------
+ * The only place that maps the (CP_CUTLASS_MMA_*, CP_CUTLASS_TB_*) enums onto
+ * the Case-10 GEMM types: names, kernel-image checks, the hash-policy
+ * self-test and the launch all go through with_gemm_types(). A tile the kind
+ * does not have (cp_cutlass_kind_has_tb) maps to its 128x128 kernel. */
+template <typename T> struct GemmTag {
+  using type = T;
+};
+
+template <typename Fn>
+static auto with_gemm_types(int kind, int tb, Fn&& fn)
+{
+  using namespace cp_cutlass;
+  switch (kind) {
+  case CP_CUTLASS_MMA_TENSOROP:
+    if (tb == CP_CUTLASS_TB_256x128)
+      return fn(GemmTag<Gemm256x128TensorOp>{});
+    if (tb == CP_CUTLASS_TB_128x256)
+      return fn(GemmTag<Gemm128x256TensorOp>{});
+    return fn(GemmTag<Gemm128x128TensorOp>{});
+  case CP_CUTLASS_MMA_TENSOROP80:
+    if (tb == CP_CUTLASS_TB_256x128)
+      return fn(GemmTag<Gemm256x128TensorOp80>{});
+    if (tb == CP_CUTLASS_TB_128x256)
+      return fn(GemmTag<Gemm128x256TensorOp80>{});
+    return fn(GemmTag<Gemm128x128TensorOp80>{});
+  case CP_CUTLASS_MMA_TENSOROP_MS:
+    return fn(GemmTag<Gemm128x128TensorOpMs>{});
+  default:
+    return fn(GemmTag<Gemm128x128RowMajor>{});
+  }
+}
+
+template <typename T>
+static constexpr bool kIsSimt =
+    std::is_same<T, cp_cutlass::Gemm128x128RowMajor>::value;
+
+/* Per-device cache of small ints (kernel images, defaults); devices past
+ * kMaxCachedDevices are simply recomputed on every call. */
+constexpr int kMaxCachedDevices = 64;
 
 static int g_mma_mode = CP_CUTLASS_MMA_AUTO;
-static int g_tb = -1; /* -1: not yet read from CP_CUDA_TB */
+/* Explicit threadblock tile (--cuda-tb / CP_CUDA_TB): -2 = CP_CUDA_TB not read
+ * yet, -1 = none (per-device default), else a CP_CUTLASS_TB_* value. */
+static int g_tb_override = -2;
 
 int cp_cutlass_tb_parse(const char* s)
 {
@@ -65,39 +89,59 @@ const char* cp_cutlass_tb_name(int tb)
 
 void cp_cutlass_set_tb(int tb)
 {
-  g_tb = (tb >= 0 && tb < CP_CUTLASS_TB_COUNT) ? tb : CP_CUTLASS_TB_128x128;
+  g_tb_override = (tb >= 0 && tb < CP_CUTLASS_TB_COUNT) ? tb : -1;
 }
 
-int cp_cutlass_tb(void)
+int cp_cutlass_tb_override(void)
 {
-  if (g_tb < 0) {
+  if (g_tb_override == -2) {
+    g_tb_override = -1;
     const char* env = getenv("CP_CUDA_TB");
-    /* Default by architecture, measured at 131072^2:
-     *  sm_75 (CMP 50HX, 225 W): 256x128 61.2 vs 128x128 56.9 TMAC/s — the
-     *    2-stage m8n8k16 kernel is bandwidth/power bound, the bigger tile cuts
-     *    global->shared traffic per MAC by 25%;
-     *  sm_86 (RTX 3090, 350 W): 128x128 97 vs 256x128 94-96 — with only one
-     *    256-thread CTA per SM latency hiding loses more than the traffic saves.
-     * sm_80+/89 follow sm_86 until measured otherwise. */
-    int tb = CP_CUTLASS_TB_128x128;
-    int dev = 0, major = 0;
-    if (cudaGetDevice(&dev) == cudaSuccess &&
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-        major == 7)
-      tb = CP_CUTLASS_TB_256x128;
     if (env != nullptr && env[0] != '\0') {
-      tb = cp_cutlass_tb_parse(env);
-      if (tb < 0) {
+      g_tb_override = cp_cutlass_tb_parse(env);
+      if (g_tb_override < 0)
         fprintf(stderr,
                 "[cutlass] CP_CUDA_TB=%s invalid (128x128|256x128|128x256), "
-                "using 128x128\n",
+                "using the per-GPU default\n",
                 env);
-        tb = CP_CUTLASS_TB_128x128;
-      }
     }
-    g_tb = tb;
   }
-  return g_tb;
+  return g_tb_override;
+}
+
+int cp_cutlass_tb_default(int dev)
+{
+  /* Default by architecture, measured at 131072^2:
+   *  sm_75 (CMP 50HX, 225 W): 256x128 61.2 vs 128x128 56.9 TMAC/s — the
+   *    2-stage m8n8k16 kernel is bandwidth/power bound, the bigger tile cuts
+   *    global->shared traffic per MAC by 25%;
+   *  sm_86 (RTX 3090, 350 W): 128x128 97 vs 256x128 94-96 — with only one
+   *    256-thread CTA per SM latency hiding loses more than the traffic saves.
+   * sm_80+/89 follow sm_86 until measured otherwise. Per device, so a mixed
+   * rig gets each card's own default. */
+  static int cache[kMaxCachedDevices];
+  static bool cached[kMaxCachedDevices];
+  const bool cacheable = dev >= 0 && dev < kMaxCachedDevices;
+  if (cacheable && cached[dev])
+    return cache[dev];
+  int major = 0;
+  const int tb =
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) ==
+                  cudaSuccess &&
+              major == 7
+          ? CP_CUTLASS_TB_256x128
+          : CP_CUTLASS_TB_128x128;
+  if (cacheable) {
+    cache[dev] = tb;
+    cached[dev] = true;
+  }
+  return tb;
+}
+
+int cp_cutlass_tb(int dev)
+{
+  const int o = cp_cutlass_tb_override();
+  return o >= 0 ? o : cp_cutlass_tb_default(dev);
 }
 
 int cp_cutlass_kind_has_tb(int kind, int tb)
@@ -162,34 +206,38 @@ static int kernel_ptx_version(int dev)
   return attr.ptxVersion;
 }
 
+/* A kind runs on dev if the GPU has its instruction (dp4a sm_61, mma.m8n8k16
+ * sm_75, mma.m16n8k32 sm_80) AND the image the driver loads for dev was
+ * compiled for at least that arch. FusedKernelEntry's body is compiled out
+ * below kMinCudaArch, so e.g. a --cuda-arch 61 binary on a Turing card, or a
+ * --cuda-arch 75 binary on an Ampere card (JIT from compute_75 PTX), would
+ * otherwise launch an empty kernel that never reports a share. All tiles of a
+ * kind share the guard and the compiled arch list, so the 128x128 kernel
+ * stands for the kind. */
+static int kind_supported_uncached(int dev, int kind)
+{
+  return with_gemm_types(kind, CP_CUTLASS_TB_128x128, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    constexpr int kMinSm = T::kMinCudaArch / 10;
+    return device_sm(dev) >= kMinSm && kernel_ptx_version<T>(dev) >= kMinSm
+               ? 1
+               : 0;
+  });
+}
+
 int cp_cutlass_kind_supported(int dev, int kind)
 {
-  const int sm = device_sm(dev);
-  switch (kind) {
-  case CP_CUTLASS_MMA_SIMT:
-    return sm >= 61;
-  case CP_CUTLASS_MMA_TENSOROP:
-  case CP_CUTLASS_MMA_TENSOROP_MS:
-    /* mma.sync.m8n8k16 s8 exists on sm_75 and every later architecture. */
-    return sm >= 75;
-  case CP_CUTLASS_MMA_TENSOROP80: {
-    using T = cp_cutlass::Gemm128x128TensorOp80;
-    if (sm < T::kMinCudaArch / 10)
-      return 0;
-    static int cache[64];
-    static bool cached[64];
-    if (dev >= 0 && dev < 64) {
-      if (!cached[dev]) {
-        cache[dev] = kernel_ptx_version<T>(dev) >= T::kMinCudaArch / 10;
-        cached[dev] = true;
-      }
-      return cache[dev];
-    }
-    return kernel_ptx_version<T>(dev) >= T::kMinCudaArch / 10;
-  }
-  default:
+  if (kind < CP_CUTLASS_MMA_SIMT || kind >= CP_CUTLASS_MMA_KINDS)
     return 0;
+  static signed char cache[kMaxCachedDevices][CP_CUTLASS_MMA_KINDS];
+  static bool cached[kMaxCachedDevices][CP_CUTLASS_MMA_KINDS];
+  if (dev < 0 || dev >= kMaxCachedDevices)
+    return kind_supported_uncached(dev, kind);
+  if (!cached[dev][kind]) {
+    cache[dev][kind] = static_cast<signed char>(kind_supported_uncached(dev, kind));
+    cached[dev][kind] = true;
   }
+  return cache[dev][kind];
 }
 
 int cp_cutlass_mma_kind(int dev)
@@ -210,75 +258,38 @@ int cp_cutlass_device_ok(int dev)
   return cp_cutlass_kind_supported(dev, cp_cutlass_mma_kind(dev));
 }
 
-template <typename T>
-static void format_tensorop_name(char* buf, size_t len, const char* tag,
-                                 const char* instr)
-{
-  using K = typename T::GemmKernel;
-  snprintf(buf, len,
-           "%s %dx%dx%d / %dx%dx%d / %s / %d-stage%s (%d thr, %d KiB smem)", tag,
-           K::ThreadblockShape::kM, K::ThreadblockShape::kN,
-           K::ThreadblockShape::kK, T::WarpShapeT::kM, T::WarpShapeT::kN,
-           T::WarpShapeT::kK, instr, T::kStages,
-           T::kMultistage ? " cp.async" : "", K::kThreadCount,
-           static_cast<int>(sizeof(typename K::SharedStorage) / 1024));
-}
-
-const char* cp_cutlass_mma_kind_name(int kind)
-{
-  return cp_cutlass_variant_name(kind, cp_cutlass_tb());
-}
-
 const char* cp_cutlass_variant_name(int kind, int tb)
 {
   static char name[CP_CUTLASS_MMA_KINDS][CP_CUTLASS_TB_COUNT][128];
-  if (kind < 0 || kind >= CP_CUTLASS_MMA_KINDS)
+  if (kind < CP_CUTLASS_MMA_SIMT || kind >= CP_CUTLASS_MMA_KINDS)
     kind = CP_CUTLASS_MMA_SIMT;
-  if (!cp_cutlass_kind_has_tb(kind, tb))
+  if (tb < 0 || tb >= CP_CUTLASS_TB_COUNT || !cp_cutlass_kind_has_tb(kind, tb))
     tb = CP_CUTLASS_TB_128x128;
   char* buf = name[kind][tb];
   const size_t len = sizeof(name[0][0]);
   if (buf[0] != '\0')
     return buf;
-  switch (kind) {
-  case CP_CUTLASS_MMA_TENSOROP:
-    if (tb == CP_CUTLASS_TB_256x128)
-      format_tensorop_name<cp_cutlass::Gemm256x128TensorOp>(
-          buf, len, "tensorop", "mma.m8n8k16.s8");
-    else if (tb == CP_CUTLASS_TB_128x256)
-      format_tensorop_name<cp_cutlass::Gemm128x256TensorOp>(
-          buf, len, "tensorop", "mma.m8n8k16.s8");
-    else
-      format_tensorop_name<cp_cutlass::Gemm128x128TensorOp>(
-          buf, len, "tensorop", "mma.m8n8k16.s8");
-    break;
-  case CP_CUTLASS_MMA_TENSOROP80:
-    if (tb == CP_CUTLASS_TB_256x128)
-      format_tensorop_name<cp_cutlass::Gemm256x128TensorOp80>(
-          buf, len, "tensorop80", "mma.m16n8k32.s8");
-    else if (tb == CP_CUTLASS_TB_128x256)
-      format_tensorop_name<cp_cutlass::Gemm128x256TensorOp80>(
-          buf, len, "tensorop80", "mma.m16n8k32.s8");
-    else
-      format_tensorop_name<cp_cutlass::Gemm128x128TensorOp80>(
-          buf, len, "tensorop80", "mma.m16n8k32.s8");
-    break;
-  case CP_CUTLASS_MMA_TENSOROP_MS:
-    format_tensorop_name<cp_cutlass::Gemm128x128TensorOpMs>(
-        buf, len, "tensoropms", "mma.m8n8k16.s8");
-    break;
-  default: {
-    using T = cp_cutlass::Gemm128x128RowMajor;
-    snprintf(buf, len, "simt dp4a %dx%dx%d / %dx%dx%d (%d thr)",
-             T::GemmKernel::ThreadblockShape::kM,
-             T::GemmKernel::ThreadblockShape::kN,
-             T::GemmKernel::ThreadblockShape::kK,
-             T::DefaultMma::Operator::Shape::kM,
-             T::DefaultMma::Operator::Shape::kN,
-             T::DefaultMma::Operator::Shape::kK, T::GemmKernel::kThreadCount);
-    break;
-  }
-  }
+  with_gemm_types(kind, tb, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    using K = typename T::GemmKernel;
+    if constexpr (kIsSimt<T>) {
+      snprintf(buf, len, "simt dp4a %dx%dx%d / %dx%dx%d (%d thr)",
+               K::ThreadblockShape::kM, K::ThreadblockShape::kN,
+               K::ThreadblockShape::kK, T::DefaultMma::Operator::Shape::kM,
+               T::DefaultMma::Operator::Shape::kN,
+               T::DefaultMma::Operator::Shape::kK, K::kThreadCount);
+    } else {
+      snprintf(buf, len,
+               "%s %dx%dx%d / %dx%dx%d / %s / %d-stage%s (%d thr, %d KiB smem)",
+               cp_cutlass_mma_mode_name(kind), K::ThreadblockShape::kM,
+               K::ThreadblockShape::kN, K::ThreadblockShape::kK,
+               T::WarpShapeT::kM, T::WarpShapeT::kN, T::WarpShapeT::kK,
+               T::InstructionShapeT::kM == 16 ? "mma.m16n8k32.s8"
+                                              : "mma.m8n8k16.s8",
+               T::kStages, T::kMultistage ? " cp.async" : "", K::kThreadCount,
+               static_cast<int>(sizeof(typename K::SharedStorage) / 1024));
+    }
+  });
   return buf;
 }
 
@@ -421,24 +432,13 @@ int cp_cutlass_hash_policy_selftest(int dev, int kind, int tb, int* out_tiles)
     *out_tiles = MmaLaneTile128x128::kThreadsPerCta;
   if (!cp_cutlass_kind_has_tb(kind, tb))
     tb = CP_CUTLASS_TB_128x128;
-  switch (kind) {
-  case CP_CUTLASS_MMA_TENSOROP:
-    if (tb == CP_CUTLASS_TB_256x128)
-      return hash_policy_selftest_t<cp_cutlass::Gemm256x128TensorOp>(dev, out_tiles);
-    if (tb == CP_CUTLASS_TB_128x256)
-      return hash_policy_selftest_t<cp_cutlass::Gemm128x256TensorOp>(dev, out_tiles);
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp>(dev, out_tiles);
-  case CP_CUTLASS_MMA_TENSOROP80:
-    if (tb == CP_CUTLASS_TB_256x128)
-      return hash_policy_selftest_t<cp_cutlass::Gemm256x128TensorOp80>(dev, out_tiles);
-    if (tb == CP_CUTLASS_TB_128x256)
-      return hash_policy_selftest_t<cp_cutlass::Gemm128x256TensorOp80>(dev, out_tiles);
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOp80>(dev, out_tiles);
-  case CP_CUTLASS_MMA_TENSOROP_MS:
-    return hash_policy_selftest_t<cp_cutlass::Gemm128x128TensorOpMs>(dev, out_tiles);
-  default:
-    return 0; /* SIMT: the accumulator fragment is the hash tile itself */
-  }
+  return with_gemm_types(kind, tb, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    if constexpr (kIsSimt<T>)
+      return 0; /* SIMT: the accumulator fragment is the hash tile itself */
+    else
+      return hash_policy_selftest_t<T>(dev, out_tiles);
+  });
 }
 
 
@@ -483,11 +483,11 @@ int cp_cutlass_period_batch(
   }
 
   /* Resolve the kernel kind once per device (cudaGetDeviceProperties is slow). */
-  static int kind_cache[64];
-  static int kind_cache_mode[64];
-  static bool kind_cached[64];
+  static int kind_cache[kMaxCachedDevices];
+  static int kind_cache_mode[kMaxCachedDevices];
+  static bool kind_cached[kMaxCachedDevices];
   int kind = CP_CUTLASS_MMA_SIMT;
-  if (dev >= 0 && dev < 64) {
+  if (dev >= 0 && dev < kMaxCachedDevices) {
     if (!kind_cached[dev] || kind_cache_mode[dev] != g_mma_mode) {
       kind_cache[dev] = cp_cutlass_mma_kind(dev);
       kind_cache_mode[dev] = g_mma_mode;
@@ -501,7 +501,7 @@ int cp_cutlass_period_batch(
   /* Threadblock tile: 256x128 needs an even number of 128-row periods in the
    * batch, 128x256 an even number of 128-col periods; otherwise this launch
    * uses the 128x128 kernel of the same kind (identical hash tiles). */
-  int tb = cp_cutlass_tb();
+  int tb = cp_cutlass_tb(dev);
   if (!cp_cutlass_kind_has_tb(kind, tb) || step_major)
     tb = CP_CUTLASS_TB_128x128;
   if ((tb == CP_CUTLASS_TB_256x128 && (row_batch_count % 2) != 0) ||
@@ -521,40 +521,22 @@ int cp_cutlass_period_batch(
 
   int8_t* A = const_cast<int8_t*>(d_A);
   int8_t* B = const_cast<int8_t*>(d_B);
-#define CP_RUN_FUSED(op)                                                       \
-  do {                                                                         \
-    CP_CUTLASS_CHECK((op).initialize(M, N_fat, K, m, n, A, B, d_tile_xor,      \
-                                     cta_cols, tile_count, jackpot));          \
-    st = (op)();                                                               \
-  } while (0)
-
-  cutlass::Status st = cutlass::Status::kErrorInternal;
-  if (step_major) {
-    CP_RUN_FUSED(g_fused_step_major);
-  } else if (kind == CP_CUTLASS_MMA_TENSOROP) {
-    if (tb == CP_CUTLASS_TB_256x128)
-      CP_RUN_FUSED(g_fused_tensorop_256x128);
-    else if (tb == CP_CUTLASS_TB_128x256)
-      CP_RUN_FUSED(g_fused_tensorop_128x256);
-    else
-      CP_RUN_FUSED(g_fused_tensorop);
-  } else if (kind == CP_CUTLASS_MMA_TENSOROP80) {
-    if (tb == CP_CUTLASS_TB_256x128)
-      CP_RUN_FUSED(g_fused_tensorop80_256x128);
-    else if (tb == CP_CUTLASS_TB_128x256)
-      CP_RUN_FUSED(g_fused_tensorop80_128x256);
-    else
-      CP_RUN_FUSED(g_fused_tensorop80);
-  } else if (kind == CP_CUTLASS_MMA_TENSOROP_MS) {
-    CP_RUN_FUSED(g_fused_tensorop_ms);
-  } else {
-    CP_RUN_FUSED(g_fused_row_major);
-  }
-#undef CP_RUN_FUSED
-  if (st != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[cutlass] kernel launch failed status %d\n",
-            static_cast<int>(st));
-    return -1;
-  }
-  return 0;
+  /* The op only holds the kernel Params, so each launch builds its own on the
+   * stack (no shared state between GPUs driven from different threads). */
+  auto run = [&](auto tag) -> int {
+    using T = typename decltype(tag)::type;
+    cp_cutlass::FusedMilestoneGemmOp<T> op;
+    CP_CUTLASS_CHECK(op.initialize(M, N_fat, K, m, n, A, B, d_tile_xor,
+                                   cta_cols, tile_count, jackpot));
+    const cutlass::Status st = op();
+    if (st != cutlass::Status::kSuccess) {
+      fprintf(stderr, "[cutlass] kernel launch failed status %d\n",
+              static_cast<int>(st));
+      return -1;
+    }
+    return 0;
+  };
+  if (step_major)
+    return run(GemmTag<cp_cutlass::Gemm128x128StepMajor>{});
+  return with_gemm_types(kind, tb, run);
 }

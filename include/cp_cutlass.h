@@ -35,15 +35,22 @@ int cp_cutlass_mma_mode(void);
 /* Kernel actually used on this device under the current mode (a kind other
  * than AUTO). */
 int cp_cutlass_mma_kind(int dev);
-/* Name of `kind` with the current threadblock tile (cp_cutlass_tb()). */
-const char* cp_cutlass_mma_kind_name(int kind);
+/* Name of the `kind` kernel with threadblock tile `tb` (128x128 if the kind
+ * has no such tile). */
 const char* cp_cutlass_variant_name(int kind, int tb);
 
-/* Threadblock tile selection. The default comes from the CP_CUDA_TB
- * environment variable (128x128 | 256x128 | 128x256, unset = 128x128);
- * cp_cutlass_set_tb overrides it. */
+/* Threadblock tile selection. An explicit tile (--cuda-tb via
+ * cp_cutlass_set_tb, else the CP_CUDA_TB environment variable: 128x128 |
+ * 256x128 | 128x256) applies to every GPU; without one each GPU uses its
+ * architecture default (256x128 on sm_75, 128x128 otherwise).
+ * cp_cutlass_set_tb(-1) clears the explicit tile. */
 void cp_cutlass_set_tb(int tb);
-int cp_cutlass_tb(void);
+/* Explicit tile, or -1 if none. */
+int cp_cutlass_tb_override(void);
+/* Architecture default for dev. */
+int cp_cutlass_tb_default(int dev);
+/* Tile used on dev: the explicit one if set, else the default. */
+int cp_cutlass_tb(int dev);
 /* Parses "128x128" / "256x128" / "128x256"; -1 if invalid. */
 int cp_cutlass_tb_parse(const char* s);
 const char* cp_cutlass_tb_name(int tb);
@@ -51,8 +58,10 @@ const char* cp_cutlass_tb_name(int tb);
 int cp_cutlass_kind_has_tb(int kind, int tb);
 /* CLI name of a kind/mode ("auto", "simt", "tensorop", "tensorop80", ...). */
 const char* cp_cutlass_mma_mode_name(int mode);
-/* Nonzero if kernel `kind` can run on dev (arch and, for tensorop80, an
- * sm_80+ kernel image in the binary). */
+/* Nonzero if kernel `kind` can run on dev: the GPU has the instruction
+ * (dp4a sm_61, mma.m8n8k16 sm_75, mma.m16n8k32 sm_80) and the binary has a
+ * kernel image for it (a cubin or PTX built for at least that arch; the body
+ * is compiled out below it). */
 int cp_cutlass_kind_supported(int dev, int kind);
 
 /* Returns nonzero if the fused GEMM selected by the MMA mode can run on dev. */
