@@ -21,6 +21,7 @@
 #include "gemm_with_milestone_mainloop.h"
 #include "hash_tile_policy.h"
 #include "mma_milestone.h"
+#include "mma_milestone_multistage.h"
 
 namespace cp_cutlass {
 
@@ -49,6 +50,8 @@ template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
           typename WarpShape, typename InstructionShape, int Stages,
           int Alignment = 1, int EpilogueVectorLength = 1>
 struct GemmTypesCommon {
+  static constexpr int kMinCudaArch = ArchTag::kMinComputeCapability * 10;
+  static constexpr bool kMultistage = false;
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, EpilogueVectorLength, ElementAccumulator, ElementCompute>;
   /* Group 8 N-tiles per M step. With the default (1) a launch walks all 32
@@ -101,20 +104,34 @@ struct GemmTypesCase10
    * k = 0). See MmaMilestone. */
   static constexpr bool kResidueTileIsLast =
       std::is_same<OpClassTag, cutlass::arch::OpClassSimt>::value;
-  using MmaPipelined = typename Base::DefaultGemmKernel::Mma;
-  using Mma = cutlass::gemm::threadblock::MmaMilestone<
-      MmaPipelined, kItersPerMilestone, kResidueTileIsLast>;
+  /* CUTLASS's own threadblock mainloop for this configuration: MmaPipelined
+   * (2 stages, Sm61/Sm75) or MmaMultistage (cp.async, Sm80 tag, >= 3 stages).
+   * The milestone mainloop mirrors whichever it is. */
+  using DefaultMma = typename Base::DefaultGemmKernel::Mma;
+  static constexpr bool kMultistage =
+      cutlass::gemm::threadblock::IsMmaMultistage<DefaultMma>::value;
+  using Mma = typename std::conditional<
+      kMultistage,
+      cutlass::gemm::threadblock::MmaMilestoneMultistage<DefaultMma,
+                                                         kItersPerMilestone>,
+      cutlass::gemm::threadblock::MmaMilestone<DefaultMma, kItersPerMilestone,
+                                               kResidueTileIsLast>>::type;
   using GemmKernel = cutlass::gemm::kernel::InlineXorKernel<
       Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle,
       HashTilePolicy>;
+  using WarpShapeT = WarpShape;
+  using InstructionShapeT = InstructionShape;
+  static constexpr int kStages = Stages;
+  /* Lowest __CUDA_ARCH__ the kernel body is compiled for (FusedKernelEntry),
+   * set by the warp instruction rather than the CUTLASS arch tag: dp4a sm_61,
+   * mma.m8n8k16 sm_75 (also under the Sm80 multistage tag: cp.async falls
+   * back to synchronous copies), mma.m16n8k32 sm_80 -- below that the kernel
+   * is an empty stub, so sm_75 SASS/PTX carries no m16n8k32 code. */
+  static constexpr int kMinCudaArch =
+      std::is_same<OpClassTag, cutlass::arch::OpClassSimt>::value ? 610
+      : InstructionShape::kM >= 16                                ? 800
+                                                                  : 750;
 };
-
-/* Tensor-op hash-tile policy for a given warp shape (threadblock 128x128). */
-template <typename WarpShape>
-using HashTileTensorOpFor =
-    HashTileTensorOp<WarpShape, cutlass::gemm::GemmShape<128 / WarpShape::kM,
-                                                         128 / WarpShape::kN, 1>,
-                     WarpShape::kM / 8, WarpShape::kN / 8>;
 
 /* Case 9: wind_down per milestone — required for step-major (non-contiguous K). */
 template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
@@ -148,17 +165,66 @@ using Gemm128x128RowMajor = GemmTypesCase10<
  * reduce-scatter), 2-stage MmaPipelined, 16-byte A/B accesses, milestone every
  * 2 K-tiles. */
 using TensorOpWarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+using TensorOpInstructionShape = cutlass::gemm::GemmShape<8, 8, 16>;
 using Gemm128x128TensorOp = GemmTypesCase10<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
     cutlass::gemm::GemmShape<128, 128, 64>, TensorOpWarpShape,
-    cutlass::gemm::GemmShape<8, 8, 16>, 2, 16,
-    HashTileTensorOpFor<TensorOpWarpShape>, 4>;
+    TensorOpInstructionShape, 2, 16,
+    HashTileTensorOpFor<TensorOpWarpShape, TensorOpInstructionShape>, 4>;
+
+/* Ampere/Ada int8 tensor cores: mma.sync.m16n8k32.s8 (full-rate IMMA on
+ * sm_80/86/89; m8n8k16 runs at half rate there) and the multistage cp.async
+ * mainloop (MmaMilestoneMultistage). 128x128x64 CTA, 64x64x64 warps (4 warps,
+ * two virtual hash tiles per lane), milestone every 2 K-tiles.
+ * Stages: 3 -> 48 KiB smem per CTA, i.e. 2 CTAs (8 warps) per SM on sm_86/89
+ * (100 KiB smem/SM, 64K regs = 2 x 128 thr x 255 regs); 4 stages would need
+ * 64 KiB and drop to 1 CTA/SM there. Override with -DCP_SM80_STAGES=N. */
+#ifndef CP_SM80_STAGES
+#define CP_SM80_STAGES 3
+#endif
+using TensorOp80WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+using TensorOp80InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+using Gemm128x128TensorOp80 = GemmTypesCase10<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    cutlass::gemm::GemmShape<128, 128, 64>, TensorOp80WarpShape,
+    TensorOp80InstructionShape, CP_SM80_STAGES, 16,
+    HashTileTensorOpFor<TensorOp80WarpShape, TensorOp80InstructionShape>, 4>;
+
+/* Same multistage mainloop with the sm_75 instruction (mma.m8n8k16): runs on
+ * sm_75+ (synchronous copies below sm_80). Validates MmaMilestoneMultistage's
+ * K schedule on Turing and separates pipeline from instruction gains on
+ * Ampere/Ada (--cuda-mma tensoropms). */
+using Gemm128x128TensorOpMs = GemmTypesCase10<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    cutlass::gemm::GemmShape<128, 128, 64>, TensorOpWarpShape,
+    TensorOpInstructionShape, CP_SM80_STAGES, 16,
+    HashTileTensorOpFor<TensorOpWarpShape, TensorOpInstructionShape>, 4>;
 
 using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
     cutlass::gemm::GemmShape<128, 128, 32>,
     cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
     true, true>;
+
+/* Kernel entry (replaces cutlass::Kernel): the body is compiled only for
+ * __CUDA_ARCH__ >= GemmTypesT::kMinCudaArch, so e.g. the m16n8k32 kernel is an
+ * empty stub in sm_75 SASS/PTX. Host code checks cudaFuncAttributes::
+ * ptxVersion before dispatching to it (cp_cutlass_gemm.cu). */
+template <typename GemmTypesT>
+__global__ void
+FusedKernelEntry(typename GemmTypesT::GemmKernel::Params params) {
+#if defined(__CUDA_ARCH__)
+  if constexpr (__CUDA_ARCH__ >= GemmTypesT::kMinCudaArch) {
+    using GemmKernel = typename GemmTypesT::GemmKernel;
+    extern __shared__ int SharedStorageBase[];
+    typename GemmKernel::SharedStorage *shared_storage =
+        reinterpret_cast<typename GemmKernel::SharedStorage *>(
+            SharedStorageBase);
+    GemmKernel op;
+    op(params, *shared_storage);
+  }
+#endif
+}
 
 template <typename GemmTypesT>
 struct FusedMilestoneGemmOp {
@@ -223,7 +289,23 @@ struct FusedMilestoneGemmOp {
         ThreadblockSwizzle().get_grid_shape(params.grid_tiled_shape);
     dim3 block(GemmKernel::kThreadCount, 1, 1);
     int smem = static_cast<int>(sizeof(typename GemmKernel::SharedStorage));
-    cutlass::Kernel<GemmKernel><<<grid, block, smem>>>(params);
+    auto kernel = FusedKernelEntry<GemmTypesT>;
+    if (smem >= (48 << 10)) {
+      cudaError_t e = cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      if (e != cudaSuccess)
+        return cutlass::Status::kErrorInternal;
+    }
+    if (GemmTypesT::kMultistage) {
+      /* Multistage kernels keep 48 KiB of operand stages per CTA and bypass
+       * L1 (cp.async.cg); ask for the max shared-memory carveout so two CTAs
+       * fit per SM (2 x 49 KiB of 100 KiB on sm_86/89). Only a hint. */
+      cudaFuncSetAttribute(kernel,
+                           cudaFuncAttributePreferredSharedMemoryCarveout,
+                           cudaSharedmemCarveoutMaxShared);
+      cudaGetLastError();
+    }
+    kernel<<<grid, block, smem>>>(params);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? cutlass::Status::kSuccess
                                 : cutlass::Status::kErrorInternal;
