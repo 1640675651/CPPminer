@@ -23,6 +23,7 @@
 #include "cp_noise.h"
 #include "cp_cutlass.h"
 #include "cp_turing_scan.h"
+#include "mma_lane_tile.h"
 #include "cp_proof.h"
 #include "cp_share_witness.h"
 #include "plain_proof_kernel.cuh"
@@ -304,34 +305,84 @@ static int gpu_probe_cublas_int8(GpuCtx* g)
 }
 #endif /* CP_ENABLE_CUBLAS */
 
+/* Row-major noisy operands required (--align-test-prod reads noisy rows
+ * directly and checks the packed kernel on packed copies); set before
+ * cp_gpu_init so the packed layout is never chosen. */
+static int g_force_row_major = 0;
+/* cp_gpu_init has printed the per-GPU kernel lines. */
+static int g_kernels_announced = 0;
+
 /* Packed operands + the packed scan kernel when every GPU in use runs a fused
  * tensor-op path the kernel supports. CP_CUDA_PACKED=0 keeps the CUTLASS kernel,
- * CP_CUDA_PACKED=1 also enables it where it is not measured yet (sm_90, sm_10x).
- * Must be settled before a job builds its noisy B^T. */
-static void update_packed_layout(void)
+ * CP_CUDA_PACKED=1 also enables it where it is not measured yet (sm_90, sm_10x)
+ * and next to an explicit --cuda-mma / --cuda-tb. Without CP_CUDA_PACKED=1 an
+ * explicit --cuda-mma or --cuda-tb selects that CUTLASS kernel (it would
+ * otherwise be silently replaced by the packed one). */
+static int packed_layout_wanted(void)
 {
     const char* env = getenv("CP_CUDA_PACKED");
-    int on = g_ngpu > 0 && g_cutlass_fused && !g_step_major_ap && !g_contiguous &&
-             !(env && !strcmp(env, "0"));
-    for(int i = 0; i < g_ngpu && on; i++){
+    const int force_off = env && !strcmp(env, "0");
+    const int force_on = env && !strcmp(env, "1");
+    if(g_ngpu <= 0 || !g_cutlass_fused || g_step_major_ap || g_contiguous ||
+       g_force_row_major || force_off)
+        return 0;
+    if(!force_on && (cp_cutlass_mma_mode() != CP_CUTLASS_MMA_AUTO ||
+                     cp_cutlass_tb_override() >= 0))
+        return 0;
+    for(int i = 0; i < g_ngpu; i++){
         const int kind = cp_cutlass_mma_kind(g_gpus[i].dev);
         const int sup = cp_turing_scan_supported(g_gpus[i].dev);
-        on = (kind == CP_CUTLASS_MMA_TENSOROP || kind == CP_CUTLASS_MMA_TENSOROP80) &&
-             (sup == 1 || (sup == 2 && env && !strcmp(env, "1")));
+        if(!((kind == CP_CUTLASS_MMA_TENSOROP || kind == CP_CUTLASS_MMA_TENSOROP80) &&
+             (sup == 1 || (sup == 2 && force_on))))
+            return 0;
     }
+    return 1;
+}
+
+/* One line per GPU naming the scan kernel that actually runs. */
+static void print_gpu_kernels(void)
+{
+    const int explicit_sel = cp_cutlass_mma_mode() != CP_CUTLASS_MMA_AUTO ||
+                             cp_cutlass_tb_override() >= 0;
+    for(int i = 0; i < g_ngpu; i++){
+        const GpuCtx* g = &g_gpus[i];
+        if(!g->use_cutlass_fused) continue;
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, g->dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, g->dev);
+        if(g->use_turing && g_packed_ab){
+            printf("[gpu] GPU%d: sm_%d%d -> %s (CP_CUDA_PACKED=0 for CUTLASS)\n", g->dev,
+                   major, minor, cp_turing_scan_name(g->dev));
+        } else {
+            const int kind = g_step_major_ap ? CP_CUTLASS_MMA_SIMT : cp_cutlass_mma_kind(g->dev);
+            printf("[gpu] GPU%d: sm_%d%d -> CUTLASS %s%s\n", g->dev, major, minor,
+                   g_step_major_ap ? "simt dp4a step-major (Case 9)"
+                                   : cp_cutlass_variant_name(kind, cp_cutlass_tb(g->dev)),
+                   explicit_sel ? "" : " (auto)");
+        }
+    }
+    fflush(stdout);
+}
+
+/* Must be settled before a job builds its noisy B^T. */
+static void update_packed_layout(void)
+{
+    const int on = packed_layout_wanted();
     for(int i = 0; i < g_ngpu; i++)
         g_gpus[i].use_turing = on;
     if(on && (g_row_period_batch & 1)){
         /* 256-row CTAs: row periods are scanned in pairs. */
+        const int prev = g_row_period_batch;
         g_row_period_batch = g_row_period_batch < CP_ROW_PERIOD_BATCH_MAX ?
                              g_row_period_batch + 1 : g_row_period_batch - 1;
-    }
-    if(on && !g_packed_ab){
-        printf("[gpu] packed-operand scan kernel (sm_75 m8n8k16 / sm_8x, sm_12x m16n8k32) "
-               "(CP_CUDA_PACKED=0 for the CUTLASS kernel)\n");
+        printf("[gpu] packed scan kernel: row-period batch %d -> %d (rows come in pairs)\n",
+               prev, g_row_period_batch);
         fflush(stdout);
     }
+    const int changed = on != g_packed_ab;
     g_packed_ab = on;
+    if(changed && g_kernels_announced)
+        print_gpu_kernels();
 }
 
 static void sync_ap_layout(void)
@@ -448,6 +499,24 @@ void cp_gpu_init(int* devs, int ndev)
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
         CU_CHECK(cudaSetDevice(g->dev));
+        {
+            /* No loadable image at all (binary built for other archs, or PTX
+             * newer than the driver can JIT): say so instead of failing on
+             * the first kernel or blaming the MMA mode. */
+            cudaFuncAttributes fa;
+            const cudaError_t ie = cudaFuncGetAttributes(&fa, cp_gen_random_matrix_kernel);
+            if(ie != cudaSuccess){
+                int major = 0, minor = 0;
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, g->dev);
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, g->dev);
+                fprintf(stderr,
+                        "[gpu] GPU%d (sm_%d%d): no kernel in this binary can run here (%s) "
+                        "Rebuild with --cuda-arch including %d%d, or update the driver if "
+                        "it reports an unsupported toolchain\n",
+                        g->dev, major, minor, cudaGetErrorString(ie), major, minor);
+                exit(1);
+            }
+        }
         if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
             fprintf(stderr,
                     "[gpu] GPU%d: --cutlass-fused --cuda-mma %s not supported here "
@@ -480,19 +549,13 @@ void cp_gpu_init(int* devs, int ndev)
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
                : (g->use_cublas_period ? "cuBLAS int8 period GEMM"
                                        : "CUDA period GEMM"));
-        if(g->use_cutlass_fused){
-            cudaDeviceProp prop;
-            CU_CHECK(cudaGetDeviceProperties(&prop, g->dev));
-            printf("[gpu] GPU%d: sm_%d%d -> CUTLASS mma %s%s\n", g->dev,
-                   prop.major, prop.minor,
-                   cp_cutlass_mma_kind_name(cp_cutlass_mma_kind(g->dev)),
-                   cp_cutlass_mma_mode() == CP_CUTLASS_MMA_AUTO ? " (auto)" : "");
-        }
         fflush(stdout);
     }
     sync_tile_config();
     sync_ap_layout();
     update_packed_layout();
+    print_gpu_kernels();
+    g_kernels_announced = 1;
 }
 
 int cp_gpu_list_devices(void)
@@ -560,6 +623,8 @@ void cp_gpu_shutdown(void)
     g_zero_b.ready = 0;
     g_attempt_a.valid = 0;
     g_ngpu = 0;
+    g_packed_ab = 0;
+    g_kernels_announced = 0;
 }
 
 static void ensure_buffers(GpuCtx* g, int m, int n)
@@ -1356,6 +1421,131 @@ typedef struct {
     int tb;
 } CutlassVariant;
 
+/* ---- hit-coordinate check (--align-test-prod) ----------------------------
+ * The tile-xor dumps prove the transcript words; this proves the in-kernel
+ * BLAKE3/target check and the reported (t_rows, t_cols) of each kernel's
+ * mining path. From a reference dump the test computes every hash tile's
+ * digest, sets the bound to the smallest one so exactly one known tile hits,
+ * and requires each kernel to report that tile's MmaLaneTile128x128 origin. */
+static const uint32_t kAlignTestKey8[8] = {
+    0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+    0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+
+__global__ void cp_test_tile_digest_kernel(const uint32_t* words16, size_t tiles,
+                                           const uint32_t* key8, uint32_t* digest8)
+{
+    const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if(t >= tiles) return;
+    b3_compress64(key8, words16 + t * 16, digest8 + t * 8);
+}
+
+/* a <= b as the kernels compare digest and bound (word 7 most significant). */
+static int digest_le(const uint32_t a[8], const uint32_t b[8])
+{
+    for(int w = 7; w >= 0; w--){
+        if(a[w] != b[w]) return a[w] < b[w];
+    }
+    return 1;
+}
+
+/* 16-word transcripts (rotl-13 fold of the 32 milestone words) of every tile
+ * of a [step][tile] tile-xor dump. */
+static void fold_tile_xor_dump(const uint32_t* dump, size_t tiles, uint32_t* words16)
+{
+    const int num_steps = K_DIM / R_RANK;
+    for(size_t t = 0; t < tiles; t++){
+        uint32_t* w = words16 + t * 16;
+        memset(w, 0, 16 * sizeof(uint32_t));
+        for(int s = 0; s < num_steps; s++)
+            w[s % 16] = ((w[s % 16] << 13) | (w[s % 16] >> 19)) ^ dump[(size_t)s * tiles + t];
+    }
+}
+
+/* Rounds of the hit check; each uses another key, so the single hit lands on
+ * a different tile (CTA, warp, lane) each time. */
+enum { kAlignHitRounds = 4 };
+
+/* Picks the tile with the smallest digest under key round `round` (written
+ * to g->d_a_key8): *bound = its digest, *hit = its index. Returns -1 if the
+ * minimum is not unique (no single expected hit). */
+static int align_pick_single_hit(GpuCtx* g, const uint32_t* h_words16, size_t tiles, int round,
+                                 uint32_t bound[8], size_t* hit)
+{
+    uint32_t* d_w = NULL;
+    uint32_t* d_d = NULL;
+    uint32_t key8[8];
+    memcpy(key8, kAlignTestKey8, sizeof(key8));
+    key8[0] ^= 0x9e3779b9u * (uint32_t)round;
+    uint32_t* h_d = (uint32_t*)malloc(tiles * 8 * sizeof(uint32_t));
+    if(!h_d) return -1;
+    CU_CHECK(cudaMalloc(&d_w, tiles * 16 * sizeof(uint32_t)));
+    CU_CHECK(cudaMalloc(&d_d, tiles * 8 * sizeof(uint32_t)));
+    CU_CHECK(cudaMemcpy(d_w, h_words16, tiles * 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_a_key8, key8, sizeof(key8), cudaMemcpyHostToDevice));
+    cp_test_tile_digest_kernel<<<(unsigned)((tiles + 255) / 256), 256>>>(d_w, tiles, g->d_a_key8,
+                                                                          d_d);
+    CU_CHECK(cudaGetLastError());
+    CU_CHECK(cudaMemcpy(h_d, d_d, tiles * 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    cudaFree(d_w);
+    cudaFree(d_d);
+    size_t best = 0;
+    for(size_t t = 1; t < tiles; t++)
+        if(!digest_le(h_d + best * 8, h_d + t * 8)) best = t;
+    int unique = 1;
+    for(size_t t = 0; t < tiles; t++)
+        if(t != best && digest_le(h_d + t * 8, h_d + best * 8)) unique = 0;
+    memcpy(bound, h_d + best * 8, 8 * sizeof(uint32_t));
+    *hit = best;
+    free(h_d);
+    return unique ? 0 : -1;
+}
+
+/* Hit coordinates of hash tile `tile` of a dump laid out [cta][vt] with
+ * `col_batch` CTAs per row, for a panel starting at (row_period0, col_period0). */
+static void align_expected_hit(size_t tile, int col_batch, int row_period0, int col_period0,
+                               int* t_rows, int* t_cols)
+{
+    const int cta = (int)(tile / MmaLaneTile128x128::kThreadsPerCta);
+    const int vt = (int)(tile % MmaLaneTile128x128::kThreadsPerCta);
+    MmaLaneTile128x128::thread_cell_global((row_period0 + cta / col_batch) * CP_CUTLASS_CTA_M,
+                                           (col_period0 + cta % col_batch) * CP_CUTLASS_CTA_N,
+                                           vt, *t_rows, *t_cols);
+}
+
+static CpCutlassJackpotLaunch align_jackpot_launch(GpuCtx* g, const uint32_t bound[8],
+                                                   int row_period0, int col_period0)
+{
+    CpCutlassJackpotLaunch jp;
+    for(int i = 0; i < 8; i++) jp.bound[i] = bound[i];
+    jp.d_a_key8 = g->d_a_key8;
+    jp.d_found = g->d_found;
+    jp.d_out_t_rows = g->d_out_t_rows;
+    jp.d_out_t_cols = g->d_out_t_cols;
+    jp.row_period0 = row_period0;
+    jp.col_period0 = col_period0;
+    CU_CHECK(cudaMemset(g->d_found, 0, sizeof(int)));
+    CU_CHECK(cudaMemset(g->d_out_t_rows, 0xff, sizeof(int)));
+    CU_CHECK(cudaMemset(g->d_out_t_cols, 0xff, sizeof(int)));
+    return jp;
+}
+
+/* After a jackpot launch: 0 if exactly the expected hit was reported. */
+static int align_check_hit(GpuCtx* g, const char* label, int exp_rows, int exp_cols)
+{
+    int found = 0, t_rows = -1, t_cols = -1;
+    CU_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cudaMemcpy(&found, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(&t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(&t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
+    if(found != 1 || t_rows != exp_rows || t_cols != exp_cols){
+        fprintf(stderr, "[align-test-prod] %s hit: found=%d t_rows=%d t_cols=%d, expected "
+                "found=1 t_rows=%d t_cols=%d\n", label, found, t_rows, t_cols, exp_rows,
+                exp_cols);
+        return -1;
+    }
+    return 0;
+}
+
 int cp_gpu_run_alignment_tests(int dev, int m, int n)
 {
     int devs[1] = {dev};
@@ -1384,12 +1574,11 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
            m, n, K_DIM, dev);
     fflush(stdout);
 
+    /* The checks below read noisy rows directly: keep the row-major layout (and
+     * the user's row-period batch) and test the packed kernel on packed copies. */
+    g_force_row_major = 1;
     cp_gpu_init(devs, 1);
     GpuCtx* g = &g_gpus[0];
-    /* The checks below read noisy rows directly: keep the row-major layout and
-     * test the Turing kernel on packed copies instead. */
-    g_packed_ab = 0;
-    g->use_turing = 0;
     ensure_buffers(g, m, n);
     ensure_bt_sig(g, szBpT);
     gpu_a_sig_invalidate(g);
@@ -1619,7 +1808,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
             const size_t words = bytes / sizeof(uint32_t);
             const int num_steps = K_DIM / R_RANK;
             const int saved_mode = cp_cutlass_mma_mode();
-            const int saved_tb = cp_cutlass_tb();
+            const int saved_tb = cp_cutlass_tb_override();
             uint32_t* d_x = NULL;
             uint32_t* h_x[kMaxVariants] = {NULL};
             CU_CHECK(cudaMalloc(&d_x, bytes));
@@ -1729,6 +1918,44 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     }
                 }
             }
+            if(xrc == 0){
+                /* Mining path of every variant: in-kernel target check and hit
+                 * coordinates against the one tile below the bound. */
+                uint32_t* h_w16 = (uint32_t*)malloc(tiles * 16 * sizeof(uint32_t));
+                if(!h_w16) xrc = -1;
+                else fold_tile_xor_dump(h_x[0], tiles, h_w16);
+                for(int round = 0; round < kAlignHitRounds && xrc == 0; round++){
+                    uint32_t bound[8];
+                    size_t hit = 0;
+                    if(align_pick_single_hit(g, h_w16, tiles, round, bound, &hit) != 0){
+                        fprintf(stderr, "[align-test-prod] no unique minimum digest\n");
+                        xrc = -1;
+                        break;
+                    }
+                    int exp_rows = 0, exp_cols = 0;
+                    align_expected_hit(hit, cb, 1, 1, &exp_rows, &exp_cols);
+                    for(int k = 0; k < nk && xrc == 0; k++){
+                        char label[64];
+                        snprintf(label, sizeof(label), "CUTLASS %s/%s",
+                                 cp_cutlass_mma_mode_name(kinds[k]), cp_cutlass_tb_name(tbs[k]));
+                        cp_cutlass_set_mma_mode(kinds[k]);
+                        cp_cutlass_set_tb(tbs[k]);
+                        const CpCutlassJackpotLaunch jp = align_jackpot_launch(g, bound, 1, 1);
+                        if(cp_cutlass_period_batch(g->dev, g->d_Ap, g->d_BpT, m, n, 1, 1, rb,
+                                                   cb, 0, NULL, tiles, &jp) != 0 ||
+                           align_check_hit(g, label, exp_rows, exp_cols) != 0)
+                            xrc = -1;
+                    }
+                    if(xrc == 0){
+                        printf("[align-test-prod] CUTLASS jackpot hit (tile %zu -> t_rows=%d "
+                               "t_cols=%d) OK on all %d variants\n", hit, exp_rows, exp_cols, nk);
+                        fflush(stdout);
+                    }
+                }
+                cp_cutlass_set_mma_mode(saved_mode);
+                cp_cutlass_set_tb(saved_tb);
+                free(h_w16);
+            }
             if(xrc == 0 && cp_turing_scan_supported(g->dev) &&
                2 + rb <= m / CP_CUTLASS_CTA_M){
                 /* Turing kernel on packed copies of the operands vs the SIMT CUTLASS
@@ -1767,29 +1994,55 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
                     CU_CHECK(cudaMemcpy(h_ref, d_x, bytes, cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(h_tw, d_tw, twords * sizeof(uint32_t),
                                         cudaMemcpyDeviceToHost));
+                    uint32_t* h_w16 = (uint32_t*)malloc(tiles * 16 * sizeof(uint32_t));
                     size_t bad = 0;
-                    for(size_t t = 0; t < tiles; t++){
-                        uint32_t w[16] = {0};
-                        for(int s = 0; s < num_steps; s++)
-                            w[s % 16] = ((w[s % 16] << 13) | (w[s % 16] >> 19)) ^
-                                        h_ref[(size_t)s * tiles + t];
-                        if(memcmp(w, h_tw + t * 16, sizeof(w)) != 0){
-                            if(!bad)
-                                fprintf(stderr, "[align-test-prod] Turing tile %zu (cta %zu vt %zu) "
-                                        "word0 %08x expected %08x\n", t, t / 256, t % 256,
-                                        h_tw[t * 16], w[0]);
-                            bad++;
+                    if(!h_w16){
+                        xrc = -1;
+                    } else {
+                        fold_tile_xor_dump(h_ref, tiles, h_w16);
+                        for(size_t t = 0; t < tiles; t++){
+                            if(memcmp(h_w16 + t * 16, h_tw + t * 16, 16 * sizeof(uint32_t)) != 0){
+                                if(!bad)
+                                    fprintf(stderr, "[align-test-prod] packed tile %zu (cta %zu "
+                                            "vt %zu) word0 %08x expected %08x\n", t, t / 256,
+                                            t % 256, h_tw[t * 16], h_w16[t * 16]);
+                                bad++;
+                            }
                         }
                     }
                     if(bad){
                         fprintf(stderr, "[align-test-prod] packed scan kernel vs CUTLASS simt: "
                                 "%zu/%zu hash tiles differ\n", bad, tiles);
                         xrc = -1;
-                    } else {
-                        printf("[align-test-prod] packed scan kernel vs CUTLASS simt transcript "
-                               "OK (%zu hash tiles x 16 words, %.3fs)\n", tiles, cp_now_sec() - t0);
+                    } else if(xrc == 0){
+                        printf("[align-test-prod] %s vs CUTLASS simt transcript OK "
+                               "(%zu hash tiles x 16 words, %.3fs)\n",
+                               cp_turing_scan_name(g->dev), tiles, cp_now_sec() - t0);
                         fflush(stdout);
+                        /* Mining path: hit coordinates of the one tile below the bound. */
+                        for(int round = 0; round < kAlignHitRounds && xrc == 0; round++){
+                            uint32_t bound[8];
+                            size_t hit = 0;
+                            int exp_rows = 0, exp_cols = 0;
+                            if(align_pick_single_hit(g, h_w16, tiles, round, bound, &hit) != 0){
+                                fprintf(stderr, "[align-test-prod] no unique minimum digest\n");
+                                xrc = -1;
+                                break;
+                            }
+                            align_expected_hit(hit, cb, trp0, 1, &exp_rows, &exp_cols);
+                            const CpCutlassJackpotLaunch jp =
+                                align_jackpot_launch(g, bound, trp0, 1);
+                            if(cp_turing_period_batch(g->dev, d_pa, d_pb, m, n, trp0, 1, rb, cb,
+                                                      &jp, NULL) != 0 ||
+                               align_check_hit(g, "packed", exp_rows, exp_cols) != 0)
+                                xrc = -1;
+                            else
+                                printf("[align-test-prod] packed jackpot hit (tile %zu -> "
+                                       "t_rows=%d t_cols=%d) OK\n", hit, exp_rows, exp_cols);
+                            fflush(stdout);
+                        }
                     }
+                    free(h_w16);
                 }
                 cudaFree(d_pa);
                 cudaFree(d_pb);
@@ -1813,6 +2066,7 @@ done:
     free(h_Bt);
     free(h_e_ar);
     cp_gpu_shutdown();
+    g_force_row_major = 0;
     if(rc == 0){
         printf("[align-test-prod] GPU pipeline OK\n");
         fflush(stdout);

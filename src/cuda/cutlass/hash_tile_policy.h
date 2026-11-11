@@ -34,6 +34,26 @@
 
 namespace cp_cutlass {
 
+/* One halving step of the hash-tile reduce-scatter (HashTileTensorOp and the
+ * packed scan kernels): lanes with (lane & kMask) keep the upper half of the
+ * kCount partials and receive their partner's copy of it.
+ * 4 instructions per pair (SEL, SEL, SHFL, LOP3). A LOP3 bitwise mux with
+ * an all-ones/zeros lane mask instead of the SELs measured the same in SASS
+ * (sm_86: 437 instructions per milestone either way), so the plain form
+ * stays. */
+template <int kCount, int kMask>
+CUTLASS_DEVICE void reduce_scatter_step(uint32_t *w, int lane) {
+  constexpr int kHalf = kCount / 2;
+  bool const hi = (lane & kMask) != 0;
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < kHalf; ++i) {
+    uint32_t const send = hi ? w[i] : w[i + kHalf];
+    uint32_t const keep = hi ? w[i + kHalf] : w[i];
+    uint32_t const recv = __shfl_xor_sync(0xffffffffu, send, kMask);
+    w[i] = keep ^ recv;
+  }
+}
+
 /* SIMT (dp4a) kernel: one hash tile per thread, FragmentC is the hash tile. */
 struct HashTileSimt {
   static constexpr int kTilesPerThread = 1;
@@ -187,25 +207,6 @@ struct HashTileTensorOp {
     /* SIMT warp inside the warp's virtual 128x128 CTA (see virtual_cta). */
     int const simt_warp = (warp_m * kHalves + h) % 4 + 4 * (warp_n % 2);
     return simt_warp * 32 + simt_lane;
-  }
-
-private:
-  /* One halving step: lanes with (lane & kMask) keep the upper half.
-   * 4 instructions per pair (SEL, SEL, SHFL, LOP3). A LOP3 bitwise mux with
-   * an all-ones/zeros lane mask instead of the SELs measured the same in SASS
-   * (sm_86: 437 instructions per milestone either way), so the plain form
-   * stays. */
-  template <int kCount, int kMask>
-  CUTLASS_DEVICE static void reduce_scatter_step(uint32_t *w, int lane) {
-    constexpr int kHalf = kCount / 2;
-    bool const hi = (lane & kMask) != 0;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kHalf; ++i) {
-      uint32_t const send = hi ? w[i] : w[i + kHalf];
-      uint32_t const keep = hi ? w[i + kHalf] : w[i];
-      uint32_t const recv = __shfl_xor_sync(0xffffffffu, send, kMask);
-      w[i] = keep ^ recv;
-    }
   }
 };
 

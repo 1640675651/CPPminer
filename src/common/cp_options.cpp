@@ -143,8 +143,12 @@ static void print_usage(void)
     printf("                       + m8n8k16; A/B and sm_75 validation)\n");
     printf("  --cuda-tb TILE       tensorop/tensorop80 threadblock: 128x128, 256x128 or\n");
     printf("                       128x256 (= 2 virtual 128x128 CTAs, same hash tiles);\n");
-    printf("                       default 256x128 on sm_75, 128x128 on sm_80+;\n");
+    printf("                       default per GPU: 256x128 on sm_75, 128x128 on sm_80+;\n");
     printf("                       env CP_CUDA_TB sets the same\n");
+    printf("                       With neither option, sm_75/8x/12x run the packed-operand\n");
+    printf("                       scan kernel; an explicit --cuda-mma/--cuda-tb selects\n");
+    printf("                       that CUTLASS kernel (env CP_CUDA_PACKED=0/1 forces\n");
+    printf("                       CUTLASS / packed)\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
 #endif

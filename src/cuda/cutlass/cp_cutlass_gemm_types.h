@@ -161,7 +161,7 @@ using Gemm128x128RowMajor = GemmTypesCase10<
     /*Alignment=*/4>;
 
 /* Turing+ int8 tensor cores (IMMA, mma.sync.m8n8k16.s8): 128x128x64 CTA,
- * 32x64x64 warps (8 warps = 256 threads, one hash tile per thread after the
+ * 64x64x64 warps (4 warps = 128 threads, two hash tiles per lane after the
  * reduce-scatter), 2-stage MmaPipelined, 16-byte A/B accesses, milestone every
  * 2 K-tiles. */
 using TensorOpWarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
@@ -325,19 +325,18 @@ struct FusedMilestoneGemmOp {
     return cutlass::Status::kSuccess;
   }
 
-  cutlass::Status operator()() {
-    using GemmKernel = typename GemmTypesT::GemmKernel;
-    using ThreadblockSwizzle = typename GemmTypesT::ThreadblockSwizzle;
-    dim3 grid =
-        ThreadblockSwizzle().get_grid_shape(params.grid_tiled_shape);
-    dim3 block(GemmKernel::kThreadCount, 1, 1);
-    int smem = static_cast<int>(sizeof(typename GemmKernel::SharedStorage));
+  static constexpr int kSmemBytes = static_cast<int>(
+      sizeof(typename GemmTypesT::GemmKernel::SharedStorage));
+
+  /* Function attributes are per device; set them on the first launch on each
+   * device instead of paying two driver calls on every period batch. */
+  static cudaError_t set_kernel_attributes() {
     auto kernel = FusedKernelEntry<GemmTypesT>;
-    if (smem >= (48 << 10)) {
+    if (kSmemBytes >= (48 << 10)) {
       cudaError_t e = cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
       if (e != cudaSuccess)
-        return cutlass::Status::kErrorInternal;
+        return e;
     }
     if (GemmTypesT::kMultistage) {
       /* Multistage kernels keep 48 KiB of operand stages per CTA and bypass
@@ -348,7 +347,33 @@ struct FusedMilestoneGemmOp {
                            cudaSharedmemCarveoutMaxShared);
       cudaGetLastError();
     }
-    kernel<<<grid, block, smem>>>(params);
+    return cudaSuccess;
+  }
+
+  static cudaError_t ensure_kernel_attributes() {
+    constexpr int kMaxCachedDevices = 64;
+    static bool done[kMaxCachedDevices];
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess)
+      return cudaErrorInvalidDevice;
+    if (dev >= 0 && dev < kMaxCachedDevices && done[dev])
+      return cudaSuccess;
+    cudaError_t e = set_kernel_attributes();
+    if (e == cudaSuccess && dev >= 0 && dev < kMaxCachedDevices)
+      done[dev] = true;
+    return e;
+  }
+
+  cutlass::Status operator()() {
+    using GemmKernel = typename GemmTypesT::GemmKernel;
+    using ThreadblockSwizzle = typename GemmTypesT::ThreadblockSwizzle;
+    dim3 grid =
+        ThreadblockSwizzle().get_grid_shape(params.grid_tiled_shape);
+    dim3 block(GemmKernel::kThreadCount, 1, 1);
+    auto kernel = FusedKernelEntry<GemmTypesT>;
+    if (ensure_kernel_attributes() != cudaSuccess)
+      return cutlass::Status::kErrorInternal;
+    kernel<<<grid, block, kSmemBytes>>>(params);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? cutlass::Status::kSuccess
                                 : cutlass::Status::kErrorInternal;

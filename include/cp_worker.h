@@ -95,7 +95,9 @@ void cp_worker_set_row_period_batch(int batch);
 void cp_worker_set_col_period_batch(int batch); /* alias of set_period_batch on OpenCL/Pearl */
 void cp_worker_set_step_major_ap(int on);
 void cp_worker_set_cutlass_fused(int on);
-/* 0 = auto (tensor cores on sm_75+), 1 = simt dp4a, 2 = tensorop (CUDA only). */
+/* CUDA only, CP_CUTLASS_MMA_*: 0 = auto (tensor cores on sm_75+), 1 = simt
+ * dp4a, 2 = tensorop (m8n8k16), 3 = tensorop80 (m16n8k32, sm_80+),
+ * 4 = tensoropms (multistage + m8n8k16). */
 void cp_worker_set_cuda_mma(int mode);
 void cp_worker_set_onednn_fused_jackpot(int on);
 

@@ -15,9 +15,11 @@
 #include <cuda_runtime.h>
 
 #include "cp_config.h"
+#include "cp_cutlass_jackpot.cuh"
 #include "cp_gpu.cuh"
 #include "cp_turing_layout.cuh"
 #include "cp_turing_scan.h"
+#include "hash_tile_policy.h"
 
 namespace {
 
@@ -27,7 +29,7 @@ constexpr int kMilestones = K_DIM / R_RANK;
 constexpr int kTilesPerMilestone = R_RANK / kBK;
 constexpr int kStageA = kBM * kBK;      /* 8 KB */
 constexpr int kStageB = kBN * kBK;      /* 4 KB */
-constexpr int kWords = 16;
+constexpr int kWords = CP_CUTLASS_JACKPOT_WORDS;
 constexpr int kSmem = 2 * (kStageA + kStageB) + 2 * kWords * kThreads * 4;  /* 56 KB */
 
 static_assert(kTilesPerMilestone == 4, "loop is unrolled for 4 k-tiles per milestone");
@@ -80,23 +82,55 @@ __device__ __forceinline__ int4 ldg_cg(const int8_t* p)
     return v;
 }
 
-__device__ __forceinline__ uint32_t rotl32(uint32_t x, int n)
+/* Milestone fold shared by both kernels: reduce-scatter the lane's 16 partial
+ * hash-tile XORs (HashTileTensorOp's three steps) so the lane owns the full
+ * word of its two hash tiles, then fold them into transcript word idx (rotl
+ * 13, as cp_cutlass_jackpot_fold_step). tr = [2 tiles x 16 words][kThreads]
+ * in shared memory. */
+__device__ __forceinline__ void fold_milestone(uint32_t* tr, int tid, int lane, int idx,
+                                               uint32_t (&part)[16])
 {
-    return (x << n) | (x >> (32 - n));
+    cp_cutlass::reduce_scatter_step<16, 8>(part, lane);
+    cp_cutlass::reduce_scatter_step<8, 4>(part, lane);
+    cp_cutlass::reduce_scatter_step<4, 1>(part, lane);
+    uint32_t* t0 = tr + idx * kThreads + tid;
+    uint32_t* t1 = tr + (kWords + idx) * kThreads + tid;
+    *t0 = cp_cutlass_rotl32(*t0, CP_CUTLASS_JACKPOT_LROT) ^ part[0];
+    *t1 = cp_cutlass_rotl32(*t1, CP_CUTLASS_JACKPOT_LROT) ^ part[1];
 }
 
-/* One halving step of the reduce-scatter: lanes with (lane & kMask) keep the
- * upper half. */
-template <int kCount, int kMask>
-__device__ __forceinline__ void rs_step(uint32_t* w, int lane)
+/* Tail shared by both kernels: the two hash tiles this lane owns after the
+ * reduce-scatter (HashTileTensorOp::virtual_thread) as their virtual 128x128
+ * CTA and virtual SIMT thread, so the dump index, the BLAKE3/target check and
+ * the hit coordinates are exactly the CUTLASS kernel's (cp_cutlass_jackpot_try
+ * -> MmaLaneTile128x128). */
+__device__ __forceinline__ void emit_hash_tiles(const TuringParams& p, const uint32_t* tr,
+                                                int tid, int lane, int wm, int wn, int rb,
+                                                int cb)
 {
-    constexpr int kHalf = kCount / 2;
-    const bool hi = (lane & kMask) != 0;
+    const int b0 = lane & 1, b1 = (lane >> 1) & 1, b2 = (lane >> 2) & 1;
+    const int b3 = (lane >> 3) & 1, b4 = (lane >> 4) & 1;
+    const int vr = rb * 2 + (wm >> 1), vc = cb; /* global virtual 128x128 CTA */
 #pragma unroll
-    for (int i = 0; i < kHalf; ++i) {
-        const uint32_t send = hi ? w[i] : w[i + kHalf];
-        const uint32_t keep = hi ? w[i + kHalf] : w[i];
-        w[i] = keep ^ __shfl_xor_sync(0xffffffffu, send, kMask);
+    for (int t = 0; t < 2; ++t) {
+        const int j = (b3 * 4 + b2 * 2 + b0) * 2 + t;
+        const int h = j >> 3, aa = (j >> 2) & 1, bb = j & 3;
+        const int gm = aa * 2 + b4, gn = bb * 2 + b1;
+        const int simt_warp = ((wm * 2 + h) & 3) + 4 * wn;
+        const int simt_lane = (gn >> 1) * 8 + gm * 2 + (gn & 1);
+        const int vt = simt_warp * 32 + simt_lane;
+        uint32_t msg[kWords];
+#pragma unroll
+        for (int w = 0; w < kWords; ++w) msg[w] = tr[(t * kWords + w) * kThreads + tid];
+        if (p.dump_words) {
+            const int cta = (vr - 2 * p.row_block0) * p.col_blocks + (vc - p.col_block0);
+            const size_t tile = (size_t)cta * CutlassJackpotTile::kThreadsPerCta + vt;
+#pragma unroll
+            for (int w = 0; w < kWords; ++w) p.dump_words[tile * kWords + w] = msg[w];
+        }
+        if (p.found && p.a_key8)
+            cp_cutlass_jackpot_try(msg, p.a_key8, p.bound, vr, vc, vt, p.found, p.out_t_rows,
+                                   p.out_t_cols);
     }
 }
 
@@ -189,15 +223,7 @@ __global__ void __launch_bounds__(kThreads, 1) cp_turing_scan_kernel(TuringParam
                 imma(acc[mi][ni][0], acc[mi][ni][1], fa[mi], fb[ni]);
             }
     };
-    auto fold = [&](int idx, uint32_t(&part)[16]) {
-        rs_step<16, 8>(part, lane);
-        rs_step<8, 4>(part, lane);
-        rs_step<4, 1>(part, lane);
-        uint32_t* t0 = tr + idx * kThreads + tid;
-        uint32_t* t1 = tr + (kWords + idx) * kThreads + tid;
-        *t0 = rotl32(*t0, 13) ^ part[0];
-        *t1 = rotl32(*t1, 13) ^ part[1];
-    };
+    auto fold = [&](int idx, uint32_t(&part)[16]) { fold_milestone(tr, tid, lane, idx, part); };
     load_frags(0, 0, a[0], b[0]);
 
     uint32_t part[16];
@@ -229,46 +255,7 @@ __global__ void __launch_bounds__(kThreads, 1) cp_turing_scan_kernel(TuringParam
     fold(kWords - 1, part);
 
     if (p.found && *p.found != 0 && !p.dump_words) return;
-
-    /* The two hash tiles this lane owns after the reduce-scatter
-     * (HashTileTensorOp::virtual_thread). */
-    const int b0 = lane & 1, b1 = (lane >> 1) & 1, b2 = (lane >> 2) & 1;
-    const int b3 = (lane >> 3) & 1, b4 = (lane >> 4) & 1;
-    const int vr = rb * 2 + (wm >> 1), vc = cb;  /* global virtual 128x128 CTA */
-#pragma unroll
-    for (int t = 0; t < 2; ++t) {
-        const int j = (b3 * 4 + b2 * 2 + b0) * 2 + t;
-        const int h = j >> 3, aa = (j >> 2) & 1, bb = j & 3;
-        const int gm = aa * 2 + b4, gn = bb * 2 + b1;
-        const int simt_warp = ((wm * 2 + h) & 3) + 4 * wn;
-        const int simt_lane = (gn >> 1) * 8 + gm * 2 + (gn & 1);
-        uint32_t msg[kWords];
-#pragma unroll
-        for (int w = 0; w < kWords; ++w) msg[w] = tr[(t * kWords + w) * kThreads + tid];
-        if (p.dump_words) {
-            const int cta = (vr - 2 * p.row_block0) * p.col_blocks + (vc - p.col_block0);
-            const size_t tile = (size_t)cta * 256 + simt_warp * 32 + simt_lane;
-#pragma unroll
-            for (int w = 0; w < kWords; ++w) p.dump_words[tile * kWords + w] = msg[w];
-        }
-        if (!p.found || !p.a_key8) continue;
-        uint32_t key[8], d[8];
-#pragma unroll
-        for (int w = 0; w < 8; ++w) key[w] = p.a_key8[w];
-        b3_compress64(key, msg, d);
-        bool ok = true;
-#pragma unroll
-        for (int w = 7; w >= 0; --w) {
-            if (d[w] != p.bound[w]) {
-                ok = d[w] < p.bound[w];
-                break;
-            }
-        }
-        if (ok && atomicCAS(p.found, 0, 1) == 0) {
-            *p.out_t_rows = vr * 128 + (simt_warp & 3) * 32 + gm * 4;
-            *p.out_t_cols = vc * 128 + (simt_warp >> 2) * 64 + gn * 4;
-        }
-    }
+    emit_hash_tiles(p, tr, tid, lane, wm, wn, rb, cb);
 #endif
 }
 
@@ -393,15 +380,7 @@ __global__ void __launch_bounds__(kThreads, 1) cp_ampere_scan_kernel(TuringParam
                 mma16832(acc[mi][ni], A[mi], B[ni][0], B[ni][1]);
             }
     };
-    auto fold = [&](int idx, uint32_t(&part)[16]) {
-        rs_step<16, 8>(part, lane);
-        rs_step<8, 4>(part, lane);
-        rs_step<4, 1>(part, lane);
-        uint32_t* t0 = tr + idx * kThreads + tid;
-        uint32_t* t1 = tr + (kWords + idx) * kThreads + tid;
-        *t0 = rotl32(*t0, 13) ^ part[0];
-        *t1 = rotl32(*t1, 13) ^ part[1];
-    };
+    auto fold = [&](int idx, uint32_t(&part)[16]) { fold_milestone(tr, tid, lane, idx, part); };
 
 #pragma unroll
     for (int s = 0; s < kStages80 - 1; ++s) issue(s);
@@ -430,44 +409,7 @@ __global__ void __launch_bounds__(kThreads, 1) cp_ampere_scan_kernel(TuringParam
     fold(kWords - 1, part);
 
     if (p.found && *p.found != 0 && !p.dump_words) return;
-
-    const int b0 = lane & 1, b1 = (lane >> 1) & 1, b2 = (lane >> 2) & 1;
-    const int b3 = (lane >> 3) & 1, b4 = (lane >> 4) & 1;
-    const int vr = rb * 2 + (wm >> 1), vc = cb;
-#pragma unroll
-    for (int t = 0; t < 2; ++t) {
-        const int j = (b3 * 4 + b2 * 2 + b0) * 2 + t;
-        const int h = j >> 3, aa = (j >> 2) & 1, bb = j & 3;
-        const int gm = aa * 2 + b4, gn = bb * 2 + b1;
-        const int simt_warp = ((wm * 2 + h) & 3) + 4 * wn;
-        const int simt_lane = (gn >> 1) * 8 + gm * 2 + (gn & 1);
-        uint32_t msg[kWords];
-#pragma unroll
-        for (int w = 0; w < kWords; ++w) msg[w] = tr[(t * kWords + w) * kThreads + tid];
-        if (p.dump_words) {
-            const int cta = (vr - 2 * p.row_block0) * p.col_blocks + (vc - p.col_block0);
-            const size_t tile = (size_t)cta * 256 + simt_warp * 32 + simt_lane;
-#pragma unroll
-            for (int w = 0; w < kWords; ++w) p.dump_words[tile * kWords + w] = msg[w];
-        }
-        if (!p.found || !p.a_key8) continue;
-        uint32_t key[8], d[8];
-#pragma unroll
-        for (int w = 0; w < 8; ++w) key[w] = p.a_key8[w];
-        b3_compress64(key, msg, d);
-        bool ok = true;
-#pragma unroll
-        for (int w = 7; w >= 0; --w) {
-            if (d[w] != p.bound[w]) {
-                ok = d[w] < p.bound[w];
-                break;
-            }
-        }
-        if (ok && atomicCAS(p.found, 0, 1) == 0) {
-            *p.out_t_rows = vr * 128 + (simt_warp & 3) * 32 + gm * 4;
-            *p.out_t_cols = vc * 128 + (simt_warp >> 2) * 64 + gn * 4;
-        }
-    }
+    emit_hash_tiles(p, tr, tid, lane, wm, wn, rb, cb);
 #endif
 }
 
@@ -479,17 +421,106 @@ __global__ void cp_turing_pack_kernel(const int8_t* src, int8_t* dst, int rows, 
     dst[cp_turing_packed_offset(row, l, K_DIM, blk)] = src[i];
 }
 
+/* Which packed kernel a device runs. */
+enum PackedKernel { kPackedNone = 0, kPackedM8 = 1, kPackedM16 = 2 };
+
+/* PTX version of the image of `fn` loaded on dev (0 if none). Both kernels
+ * have their bodies compiled out below their arch (750 / 800), so e.g. a
+ * --cuda-arch 75 binary on an Ampere card would JIT an empty m16n8k32 kernel
+ * from the compute_75 PTX; this is how that is detected. */
+static int kernel_ptx_version(int dev, const void* fn)
+{
+    int prev = -1;
+    cudaGetDevice(&prev);
+    if (prev != dev && cudaSetDevice(dev) != cudaSuccess) return 0;
+    cudaFuncAttributes attr;
+    const cudaError_t e = cudaFuncGetAttributes(&attr, fn);
+    if (prev >= 0 && prev != dev) cudaSetDevice(prev);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return attr.ptxVersion;
+}
+
+struct PackedDeviceInfo {
+    int kernel;  /* PackedKernel */
+    int support; /* cp_turing_scan_supported() */
+};
+
+static PackedDeviceInfo packed_device_info_uncached(int dev)
+{
+    PackedDeviceInfo info{kPackedNone, 0};
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return info;
+    const int sm = prop.major * 10 + prop.minor;
+    /* sm_75: m8n8k16 kernel. sm_8x (Ampere/Ada) and sm_12x (Blackwell GeForce): m16n8k32
+     * kernel, the same mma.sync/cp.async/ldmatrix path. Datacenter Hopper/Blackwell
+     * (sm_90/sm_10x) can run it too but keep CUTLASS unless asked (2 = opt-in).
+     * Without a kernel image for the arch the packed path is off (the CUTLASS
+     * kinds do the same check and fall back on their own). */
+    if (sm >= 80) {
+        if (kernel_ptx_version(dev, (const void*)cp_ampere_scan_kernel) >= 80)
+            info.kernel = kPackedM16;
+    } else if (sm == 75) {
+        if (kernel_ptx_version(dev, (const void*)cp_turing_scan_kernel) >= 75)
+            info.kernel = kPackedM8;
+    }
+    if (info.kernel != kPackedNone)
+        info.support = (sm == 75 || prop.major == 8 || prop.major == 12) ? 1 : 2;
+    return info;
+}
+
+constexpr int kMaxCachedDevices = 64;
+
+static PackedDeviceInfo packed_device_info(int dev)
+{
+    static PackedDeviceInfo cache[kMaxCachedDevices];
+    static bool cached[kMaxCachedDevices];
+    if (dev < 0 || dev >= kMaxCachedDevices) return packed_device_info_uncached(dev);
+    if (!cached[dev]) {
+        cache[dev] = packed_device_info_uncached(dev);
+        cached[dev] = true;
+    }
+    return cache[dev];
+}
+
+/* Dynamic shared memory above 48 KiB needs the opt-in attribute, set per
+ * device; devices past the cache are set on every launch. */
+static cudaError_t ensure_kernel_attributes(int dev, int kernel)
+{
+    static bool done[kMaxCachedDevices];
+    const bool cacheable = dev >= 0 && dev < kMaxCachedDevices;
+    if (cacheable && done[dev]) return cudaSuccess;
+    const cudaError_t e =
+        kernel == kPackedM16
+            ? cudaFuncSetAttribute(cp_ampere_scan_kernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem80)
+            : cudaFuncSetAttribute(cp_turing_scan_kernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+    if (e == cudaSuccess && cacheable) done[dev] = true;
+    return e;
+}
+
 }  // namespace
 
 extern "C" int cp_turing_scan_supported(int dev)
 {
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
-    /* sm_75: m8n8k16 kernel. sm_8x (Ampere/Ada) and sm_12x (Blackwell GeForce): m16n8k32
-     * kernel, the same mma.sync/cp.async/ldmatrix path. Datacenter Hopper/Blackwell
-     * (sm_90/sm_10x) can run it too but keep CUTLASS unless asked (2 = opt-in). */
-    if ((prop.major == 7 && prop.minor == 5) || prop.major == 8 || prop.major == 12) return 1;
-    return prop.major >= 9 ? 2 : 0;
+    return packed_device_info(dev).support;
+}
+
+extern "C" const char* cp_turing_scan_name(int dev)
+{
+    switch (packed_device_info(dev).kernel) {
+    case kPackedM16:
+        return "packed 256x128x32 / 64x64x32 / mma.m16n8k32.s8 / 4-stage cp.async "
+               "(256 thr, 80 KiB smem)";
+    case kPackedM8:
+        return "packed 256x128x32 / 64x64x32 / mma.m8n8k16.s8 / 2-stage "
+               "(256 thr, 56 KiB smem)";
+    default:
+        return "packed (not available)";
+    }
 }
 
 extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m,
@@ -503,22 +534,13 @@ extern "C" int cp_turing_period_batch(int dev, const int8_t* d_Ap, const int8_t*
                 row_period0, row_batch, m);
         return -1;
     }
-    static bool attr_set[64];
-    static bool sm80[64];
-    if (dev >= 0 && dev < 64 && !attr_set[dev]) {
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return -1;
-        sm80[dev] = prop.major >= 8;
-        if (cudaFuncSetAttribute(cp_turing_scan_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem) != cudaSuccess)
-            return -1;
-        if (sm80[dev] &&
-            cudaFuncSetAttribute(cp_ampere_scan_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem80) != cudaSuccess)
-            return -1;
-        attr_set[dev] = true;
+    const int kernel = packed_device_info(dev).kernel;
+    if (kernel == kPackedNone) {
+        fprintf(stderr, "[turing] GPU%d: no packed scan kernel image for this arch\n", dev);
+        return -1;
     }
-    const bool use80 = dev >= 0 && dev < 64 && sm80[dev];
+    if (ensure_kernel_attributes(dev, kernel) != cudaSuccess) return -1;
+    const bool use80 = kernel == kPackedM16;
     TuringParams p{};
     p.A = d_Ap;
     p.B = d_BpT;
