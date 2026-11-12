@@ -10,6 +10,7 @@
 /third_party/quantus-miner/
 /third_party/onednn-src/
 /third_party/.case5_onednn_tag
+/third_party/.case5_onednn_ref
 /third_party/cutlass/
 /third_party/cutlass_override/
 /third_party/opencl-headers/

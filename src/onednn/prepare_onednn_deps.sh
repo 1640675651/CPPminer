@@ -39,13 +39,25 @@ mirror() {   # mirror <src dir> <dst dir>
     fi
 }
 
+# 0 = the clone is at the remote branch tip, or that cannot be checked (offline, ONEDNN_OFFLINE set,
+# ONEDNN_REF is not a branch); 1 = the branch has moved since the clone, so re-fetch.
+branch_current() {
+    [ -n "${ONEDNN_OFFLINE:-}" ] && return 0
+    remote_head="$(GIT_TERMINAL_PROMPT=0 git ls-remote "$ONEDNN_REPO" "refs/heads/$ONEDNN_REF" 2>/dev/null | cut -f1)" || true
+    [ -z "$remote_head" ] && return 0
+    local_head="$(git -C "$1" rev-parse HEAD 2>/dev/null || true)"
+    [ "$remote_head" = "$local_head" ] && return 0
+    echo "$ONEDNN_REF moved on $ONEDNN_REPO ($local_head -> $remote_head), re-fetching."
+    return 1
+}
+
 if [ -n "${ONEDNN_SRC:-}" ]; then
     ROOT="$ONEDNN_SRC"
 else
     ROOT="$FETCH_DIR"
     WANT="$ONEDNN_REPO $ONEDNN_REF"
     HAVE="$(tr -d '\r' < "$FETCH_STAMP" 2>/dev/null || true)"   # the .bat writes CRLF
-    if [ "$REFRESH" = 1 ] || [ "$HAVE" != "$WANT" ] || ! valid_root "$ROOT"; then
+    if [ "$REFRESH" = 1 ] || [ "$HAVE" != "$WANT" ] || ! valid_root "$ROOT" || ! branch_current "$ROOT"; then
         rm -rf "$ROOT" "$FETCH_STAMP"
         mkdir -p "$(dirname "$ROOT")"
         echo "Cloning $ONEDNN_REPO ($ONEDNN_REF) into $ROOT ..."

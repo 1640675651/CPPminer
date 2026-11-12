@@ -72,7 +72,10 @@ set "HAVE="
 if exist "!FETCH_STAMP!" set /p HAVE=<"!FETCH_STAMP!"
 if "!REFRESH!"=="0" if "!HAVE!"=="!WANT!" (
     call :validate_onednn_root "!ONEDNN_FETCH_DIR!"
-    if not errorlevel 1 exit /b 0
+    if not errorlevel 1 (
+        call :branch_current
+        if not errorlevel 1 exit /b 0
+    )
 )
 where git >nul 2>&1
 if errorlevel 1 (
@@ -92,6 +95,20 @@ call :validate_onednn_root "!ONEDNN_FETCH_DIR!"
 if errorlevel 1 exit /b 1
 echo !WANT!> "!FETCH_STAMP!"
 exit /b 0
+
+REM 0 = the clone is at the remote branch tip, or that cannot be checked (offline, ONEDNN_OFFLINE set,
+REM ONEDNN_REF is not a branch); 1 = the branch has moved since the clone, so re-fetch.
+:branch_current
+if defined ONEDNN_OFFLINE exit /b 0
+set "GIT_TERMINAL_PROMPT=0"
+set "REMOTE_HEAD="
+set "LOCAL_HEAD="
+for /f %%h in ('git ls-remote "!ONEDNN_REPO!" "refs/heads/!ONEDNN_REF!" 2^>nul') do set "REMOTE_HEAD=%%h"
+if not defined REMOTE_HEAD exit /b 0
+for /f %%h in ('git -C "!ONEDNN_FETCH_DIR!" rev-parse HEAD 2^>nul') do set "LOCAL_HEAD=%%h"
+if "!REMOTE_HEAD!"=="!LOCAL_HEAD!" exit /b 0
+echo !ONEDNN_REF! moved on !ONEDNN_REPO! ^(!LOCAL_HEAD! -^> !REMOTE_HEAD!^), re-fetching.
+exit /b 1
 
 :mirror
 robocopy "%~1" "%~2" /MIR /NFL /NDL /NJH /NJS /nc /ns /np >nul
