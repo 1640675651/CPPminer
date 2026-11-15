@@ -510,14 +510,15 @@ ocl_noisy_matrix_rowmajor_sg(__global char *out, __global const uchar *el_rows,
  * another, each with its tile_r rows: dword (k-group g, row r) of a 64-k unit sits at
  *   (r / tile_r) * tile_r * gc + (g / gc) * gc * P + (g % gc) * tile_r + r % tile_r,   gc = tile_c / 4,
  * which is g * P + r for the untiled layout (tile_r = P, tile_c = 64; the host passes that for untiled).
- * Needs P % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0. */
+ * Needs P % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0.
+ * sig_from_buf = 0 (constant-signal mining): every signal dword is sig_const and `signal` is not read. */
 #ifndef NPAG_PMAX
 #define NPAG_PMAX 64
 #endif
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
 ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __global const uint *pairs,
                           int rows, int K, __global const char *signal, int P, int panel_stride_dw,
-                          int tile_r, int tile_c) {
+                          int tile_r, int tile_c, int sig_from_buf, uint sig_const) {
     __local uint sig[NPAG_PMAX * 17];  /* 17: no bank conflicts on the transposed read */
     __local uint el32[NPAG_PMAX * 33]; /* 33: row stride against bank conflicts */
     __local uchar p0[64];
@@ -537,8 +538,9 @@ ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __gl
         barrier(CLK_LOCAL_MEM_FENCE); /* the previous iteration's readers are done */
         for (int i = w; i < P * 16; i += 256) {
             const int lr = i >> 4, ld = i & 15; /* row, dword inside the row's 64 bytes */
-            sig[lr * 17 + ld] = *(const __global uint *)(signal + (size_t)(row0 + lr) * (size_t)K +
-                                                         (size_t)(kb + ld * 4));
+            sig[lr * 17 + ld] = sig_from_buf ? *(const __global uint *)(signal + (size_t)(row0 + lr) * (size_t)K +
+                                                                        (size_t)(kb + ld * 4))
+                                             : sig_const;
         }
         if (w < 64) {
             p0[w] = (uchar)pairs[(size_t)(kb + w) * 2];
@@ -579,11 +581,13 @@ ocl_noisy_matrix_a_packed(__global uint *out, __global const uint *el_rows, __gl
  * another, each with its tile_r rows: dword (k-group g, row r) of a 64-k unit sits at
  *   (r / tile_r) * tile_r * gc + (g / gc) * gc * 16 + (g % gc) * tile_r + r % tile_r,   gc = tile_c / 4,
  * which is g * 16 + r for the untiled layout (tile_r = P, tile_c = 64; the host passes that for untiled).
- * Needs 16 % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0. */
+ * Needs 16 % tile_r == 0, 64 % tile_c == 0, tile_c % 4 == 0.
+ * sig_from_buf = 0 (constant-signal mining): every signal dword is sig_const and `signal` is not read. */
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
 ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
                             __global const uint *pairs, int rows, int K,
-                            __global const char *signal, int panel_stride_dw, int tile_r, int tile_c) {
+                            __global const char *signal, int panel_stride_dw, int tile_r, int tile_c,
+                            int sig_from_buf, uint sig_const) {
     __local uint sig[NPA_UNROLL * 16 * 17]; /* 17: no bank conflicts on the transposed read */
     __local uint el32[16 * 33];             /* 33: row stride against bank conflicts */
     __local uchar p0[NPA_UNROLL * 64];
@@ -609,8 +613,9 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
     for (int kb = 0; kb < K; kb += 64 * NPA_UNROLL) {
         barrier(CLK_LOCAL_MEM_FENCE); /* the previous iteration's readers are done */
         for (int u = 0; u < NPA_UNROLL; ++u) {
-            sig[(u * 16 + lr) * 17 + ld] = *(const __global uint *)(
-                    signal + (size_t)(row0 + lr) * (size_t)K + (size_t)(kb + u * 64 + ld * 4));
+            sig[(u * 16 + lr) * 17 + ld] = sig_from_buf ? *(const __global uint *)(
+                    signal + (size_t)(row0 + lr) * (size_t)K + (size_t)(kb + u * 64 + ld * 4))
+                                                        : sig_const;
         }
         for (int i = w; i < 64 * NPA_UNROLL; i += 256) {
             p0[i] = (uchar)pairs[(size_t)(kb + i) * 2];
@@ -640,13 +645,14 @@ ocl_noisy_matrix_a_packed16(__global uint *out, __global const uint *el_rows,
  * (Q <= NPB_QMAX, cp % 4 == 0, 64 % cp == 0, K % 64 == 0). Same bytes as ocl_noisy_matrix_colmajor
  * followed by a repack, without the column-major copy. One work group of 256 per panel: the panel's
  * uniform rows stay in local memory; inside a 64-k unit the panel's 16 * Q output dwords are contiguous,
- * so consecutive work items write consecutive dwords. */
+ * so consecutive work items write consecutive dwords. sig_const: the signal dword added to every
+ * output dword (0 = zero B; constant-signal mining passes 0x40404040). */
 #ifndef NPB_QMAX
 #define NPB_QMAX 64
 #endif
 __kernel void ocl_noisy_matrix_b_packed(__global uint *out, __global const uint *el_rows,
                                         __global const uint *pairs, int cols, int K, int Q, int cp,
-                                        int panel_stride_dw) {
+                                        int panel_stride_dw, uint sig_const) {
     __local uint el32[NPB_QMAX * 33]; /* 33: row stride against bank conflicts */
     __local uchar p0[64];
     __local uchar p1[64];
@@ -679,7 +685,7 @@ __kernel void ocl_noisy_matrix_b_packed(__global uint *out, __global const uint 
             const __local uchar *e = el + c * 132;
             uint o = 0;
             for (int b = 0; b < 4; ++b) {
-                const uint v = (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
+                const uint v = (sig_const >> (8 * b)) + (uint)e[p0[kl + b]] - (uint)e[p1[kl + b]];
                 o |= (v & 0xffu) << (8 * b);
             }
             unit[j] = o;

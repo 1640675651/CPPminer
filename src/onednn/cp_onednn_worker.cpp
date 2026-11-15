@@ -34,6 +34,11 @@ struct ZeroBCache {
     int salted = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<int8_t> B_noisy;
+    /* Constant-64 mode (g_gemm.const64()): B is all 64, so the share witness carries B^T's sub-roots and
+       root (the blocks are synthesized); the committed A has m_proof = m + 1 rows. */
+    int m_proof = 0;
+    uint8_t bt_root[32]{};
+    std::vector<uint8_t> bt_subroots;
 } g_zero_b;
 
 static Case33GemmOnednn g_gemm;
@@ -85,6 +90,22 @@ static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
     g_zero_b.n = n;
     g_zero_b.use_gpu_prep = 1;
     g_zero_b.B_noisy.clear();
+    g_zero_b.m_proof = m;
+    g_zero_b.bt_subroots.clear();
+
+    if (g_gemm.const64()) {
+        /* B committed as the all-64 matrix (hashed on the GPU), noisy B = 64 + noise. */
+        if (!g_gemm.prepare_job_gpu_const64(m, n, K_DIM, job_key, g_zero_b.salted,
+                                            g_zero_b.b_noise_seed, g_zero_b.bt_root,
+                                            &g_zero_b.bt_subroots)) {
+            g_zero_b.ready = 0;
+            fprintf(stderr, "[onednn] prepare_job_gpu (constant-64) failed\n");
+            return -2;
+        }
+        g_zero_b.m_proof = m + 1;
+        g_zero_b.ready = 1;
+        return 0;
+    }
 
     pearl_b_noise_seed_from_bt(job_key, NULL, n, K_DIM, g_zero_b.salted, g_zero_b.b_noise_seed);
     if (!g_gemm.prepare_job_gpu(m, n, K_DIM, g_zero_b.b_noise_seed)) {
@@ -303,6 +324,11 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     g_gemm.set_row_period_batch(g_row_period_batch);
     g_gemm.set_col_period_batch(g_col_period_batch);
     g_gemm.set_fused_jackpot(g_fused_jackpot != 0);
+    /* CP_ONEDNN_CONST64=0: zero B and row pokes of the scanned A (the pre-2026-11-15 operands). */
+    {
+        const char *c = getenv("CP_ONEDNN_CONST64");
+        g_gemm.set_const64(!(c && c[0] == '0'));
+    }
     resolve_gemm_layout();
     case5_ngen::set_hash_tile_filter(&hash_tile_provable);
     if (!g_gemm.init_context(g_device_index, g_platform_filter)) {
@@ -343,7 +369,11 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     printf("[onednn] %s\n", g_gemm.backend());
     printf("[onednn] hash tile: %dx%d logical (unroll %dx%d, split=%s)\n", di.xorSubM, di.xorSubN,
            di.unrollM, di.unrollN, case5_ngen::case5_xor_subtile_split_mode_name());
-    if (g_gemm.gpu_prep_ready()) {
+    if (g_gemm.const64()) {
+        printf("[onednn] matrix prep: constant-64 operands (signal A and B = 64, one dummy row of A "
+               "outside the GEMM, no signal A buffer; u8 GEMM; %s)\n",
+               case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major));
+    } else if (g_gemm.gpu_prep_ready()) {
         printf("[onednn] matrix prep: GPU-only A/B prep (%s, no matrix D2H on scan path)\n",
                case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major));
     } else {
@@ -370,7 +400,12 @@ extern "C" void cp_onednn_worker_begin_job(const uint8_t job_key[32], int m, int
     g_zero_b.ready = 0;
     g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     if (zero_b_prepare_job(job_key, m, n) == 0) {
-        if (g_zero_b.use_gpu_prep) {
+        if (g_gemm.const64()) {
+            printf("[onednn] constant-64: GPU noisy B on device layout=%s (salted=%d), committed A "
+                   "%dx%d = %d scanned rows + 1 dummy row\n",
+                   case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
+                   g_zero_b.salted, g_zero_b.m_proof, K_DIM, m);
+        } else if (g_zero_b.use_gpu_prep) {
             printf("[onednn] zero-B: GPU noisy B on device layout=%s (salted=%d)\n",
                    case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
                    g_zero_b.salted);
@@ -566,9 +601,17 @@ extern "C" int cp_onednn_worker_mine_attempt(
     return 0;
 }
 
+extern "C" int cp_onednn_worker_proof_rows(int m) {
+    return (g_context_ready && g_gemm.const64()) ? m + 1 : m;
+}
+
 extern "C" int cp_onednn_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig) {
     (void)h_Bt_sig;
     if (!h_A_sig) {
+        return -1;
+    }
+    if (g_gemm.const64()) {
+        fprintf(stderr, "[onednn] constant-64 mode has no signal A buffer (shares use the witness)\n");
         return -1;
     }
     if (!g_gemm.gpu_prep_ready()) {
@@ -597,7 +640,7 @@ extern "C" int cp_onednn_worker_fetch_share_witness(int t_rows, int t_cols, int 
     if (!g_zero_b.ready || !g_zero_b.use_gpu_prep || num_subroots < 0) {
         return -1;
     }
-    const int m = g_zero_b.m;
+    const int m = g_zero_b.m_proof > 0 ? g_zero_b.m_proof : g_zero_b.m;
 
     CpShareWitness *w = static_cast<CpShareWitness *>(calloc(1, sizeof(CpShareWitness)));
     if (!w) {
@@ -626,7 +669,41 @@ extern "C" int cp_onednn_worker_fetch_share_witness(int t_rows, int t_cols, int 
         cp_share_witness_free(w);
         return -1;
     }
-    /* B^T is all-zero: bt_subroots stays NULL and the proof uses host-cached zero sub-roots. */
+    if (g_gemm.const64()) {
+        /* B^T is all 64: its sub-roots and root from the per-job GPU commitment, the blocks covering the
+           tile's columns synthesized (64 up to n * K, zero padding after). */
+        const int n = g_zero_b.n;
+        const int nbt = cp_proof_witness_blocks(tile_layout, 1, t_cols, n, K_DIM, w->bt_block_idx,
+                                                CP_WITNESS_MAX_BLOCKS);
+        const size_t nsub = g_zero_b.bt_subroots.size() / 32;
+        if (nbt <= 0 || nsub == 0) {
+            fprintf(stderr, "[onednn] share witness: no B^T blocks for t_cols=%d layout=%d\n", t_cols,
+                    tile_layout);
+            cp_share_witness_free(w);
+            return -1;
+        }
+        w->bt_num_blocks = static_cast<size_t>(nbt);
+        w->bt_blocks = static_cast<uint8_t *>(malloc(static_cast<size_t>(nbt) * CP_WITNESS_BLOCK_BYTES));
+        w->bt_subroots = static_cast<uint8_t *>(malloc(nsub * 32));
+        if (!w->bt_blocks || !w->bt_subroots) {
+            cp_share_witness_free(w);
+            return -1;
+        }
+        const size_t raw_bt = static_cast<size_t>(n) * static_cast<size_t>(K_DIM);
+        for (int i = 0; i < nbt; ++i) {
+            const size_t off = static_cast<size_t>(w->bt_block_idx[i]) * CP_WITNESS_BLOCK_BYTES;
+            uint8_t *dst = w->bt_blocks + static_cast<size_t>(i) * CP_WITNESS_BLOCK_BYTES;
+            const size_t fill = off >= raw_bt ? 0
+                                : (raw_bt - off < CP_WITNESS_BLOCK_BYTES ? raw_bt - off
+                                                                         : CP_WITNESS_BLOCK_BYTES);
+            memset(dst, 64, fill);
+            memset(dst + fill, 0, CP_WITNESS_BLOCK_BYTES - fill);
+        }
+        memcpy(w->bt_subroots, g_zero_b.bt_subroots.data(), nsub * 32);
+        w->bt_num_subroots = nsub;
+        memcpy(w->bt_root, g_zero_b.bt_root, 32);
+    }
+    /* Otherwise B^T is all-zero: bt_subroots stays NULL and the proof uses host-cached zero sub-roots. */
     *out = w;
     return 0;
 }

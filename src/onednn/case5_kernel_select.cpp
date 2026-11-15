@@ -476,7 +476,8 @@ Case5CandidateList select_case5_candidates(HW hw, const Product &product, cl_dev
     const FamilyKernel *fk = device_override(device, hw);
     if (!fk) fk = family_kernel(hw, result.systolic_hw);
     if (fk && case5_prefer_measured_default() && (!fk->systolic || result.systolic_hw)
-            && problem.Ta == Type::s8 && problem.Tb == Type::s8
+            && (problem.Ta == Type::s8 || problem.Ta == Type::u8)   // u8: constant-64 operands
+            && problem.Ta == problem.Tb
             && problem.A.alignment >= fk->min_align_a && problem.B.alignment >= fk->min_align_b) {
         CatalogCandidate c;
         c.label = fk->label;

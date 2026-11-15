@@ -1009,6 +1009,15 @@ extern "C" int cp_worker_supports_share_witness(void)
     return 0;
 }
 
+extern "C" int cp_worker_proof_rows(int m)
+{
+#if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
+    if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
+        return cp_onednn_worker_proof_rows(m);
+#endif
+    return m;
+}
+
 extern "C" int cp_worker_needs_host_bt(void)
 {
     /* The CPU, OpenCL, oneDNN, wgpu, Hexagon and Intel NPU workers build noisy B from the zero-B seed

@@ -18,6 +18,11 @@ struct Case33GemmOnednn {
     void set_row_period_batch(int batch);
     void set_col_period_batch(int batch);
     void set_fused_jackpot(bool fused);
+    /* Constant-64 operands (before init_context): signal A and B are 64 except one dummy row of A that
+       the GEMM never reads, operands go to the GEMM as u8. Falls back to the plain mode when the kernel
+       or the GPU prep cannot do it (const64() tells which one runs). */
+    void set_const64(bool on) { const64_req_ = on; }
+    bool const64() const { return const64_; }
     // The jackpot mode in use after init_context (Xe2 falls back to the separate jackpot).
     bool fused_jackpot() const { return fused_jackpot_; }
     void set_gemm_layout(bool a_row_major, bool b_row_major);
@@ -27,6 +32,11 @@ struct Case33GemmOnednn {
     bool init_context(int device_index = 0, int platform_filter = -1);
     bool prepare_job(int M, int N, int K, const int8_t *b_rowmajor);
     bool prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]);
+    /* Constant-64 mode: commitment of the all-64 B on the GPU (root and sub-roots for the share witness),
+       B's noise seed, and the per-job noisy B. */
+    bool prepare_job_gpu_const64(int M, int N, int K, const uint8_t job_key[32], int salted,
+                                 uint8_t b_noise_seed[32], uint8_t bt_root[32],
+                                 std::vector<uint8_t> *bt_subroots);
     bool prepare_attempt_a(const int8_t *a_rowmajor);
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
                              const uint8_t b_noise_seed[32], int salted, uint8_t a_key_out[32]);
@@ -100,6 +110,8 @@ private:
     bool context_ready_ = false;
     bool available_ = false;
     bool prep_ready_ = false;
+    bool const64_req_ = false;
+    bool const64_ = false;
     OpenClContext ocl_;
     Case33OclPrep prep_;
 

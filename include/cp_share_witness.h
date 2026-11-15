@@ -25,6 +25,10 @@ typedef struct CpShareWitness {
     uint8_t bt_root[32];
     uint8_t* bt_subroots;
     size_t bt_num_subroots;
+    /* Optional B^T blocks (constant-signal mining: B^T is not zero). NULL = all-zero B^T. */
+    uint8_t* bt_blocks;
+    uint32_t bt_block_idx[CP_WITNESS_MAX_BLOCKS];
+    size_t bt_num_blocks;
 } CpShareWitness;
 
 static inline void cp_share_witness_free(CpShareWitness* w)
@@ -33,6 +37,7 @@ static inline void cp_share_witness_free(CpShareWitness* w)
     free(w->a_subroots);
     free(w->a_blocks);
     free(w->bt_subroots);
+    free(w->bt_blocks);
     free(w);
 }
 
