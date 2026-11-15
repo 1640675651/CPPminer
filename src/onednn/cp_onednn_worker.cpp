@@ -399,16 +399,18 @@ extern "C" void cp_onednn_worker_begin_job(const uint8_t job_key[32], int m, int
     }
     g_zero_b.ready = 0;
     g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
+    const double job_t0 = cp_now_sec();
     if (zero_b_prepare_job(job_key, m, n) == 0) {
+        const double job_ms = (cp_now_sec() - job_t0) * 1e3;   /* host wall time; B's noise may still run */
         if (g_gemm.const64()) {
             printf("[onednn] constant-64: GPU noisy B on device layout=%s (salted=%d), committed A "
-                   "%dx%d = %d scanned rows + 1 dummy row\n",
+                   "%dx%d = %d scanned rows + 1 dummy row; job prep %.1f ms\n",
                    case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
-                   g_zero_b.salted, g_zero_b.m_proof, K_DIM, m);
+                   g_zero_b.salted, g_zero_b.m_proof, K_DIM, m, job_ms);
         } else if (g_zero_b.use_gpu_prep) {
-            printf("[onednn] zero-B: GPU noisy B on device layout=%s (salted=%d)\n",
+            printf("[onednn] zero-B: GPU noisy B on device layout=%s (salted=%d); job prep %.1f ms\n",
                    case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
-                   g_zero_b.salted);
+                   g_zero_b.salted, job_ms);
         } else {
             printf("[onednn] zero-B: host noise + device B upload layout=%s (salted=%d)\n",
                    case5_ngen::case5_device_layout_name(g_a_row_major, g_b_row_major),
