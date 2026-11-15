@@ -1,10 +1,17 @@
 # Changelog
 
 ## v1.1 (tentative)
+### New features
+- CUDA backend now support RTX 20-50 series
+- Multi GPU (TODO)
+
 ### Fix & Enhancements
 - OneDNN: code refactor, use a fork of onednn instead of keeping patches
 - OneDNN: tiled A packing for higher GEMM throughput
 - OneDNN: lower XOR overhead on Xe2
+- OneDNN: use constant, unsigned matrix, remove 512MiB A buffer and reduce power
+- CPU: use 16x4 tile to reduce B broadcast overhead and remove register spilling
+- CPU: interleave XOR with dot product instructions
 
 ## v1.0
 ### New features

@@ -160,11 +160,14 @@ inline void d_mt_store_root_words(__local uint* smem, int smem_cols, __global uc
 }
 
 /* group_base: first 256-chunk group this launch covers (0 for the full matrix; the incremental
- * per-nonce update launches one group). The last-group logic uses the matrix size, not the grid. */
-__kernel void ocl_keyed_chunk_roots(__global const uchar* mat, ulong raw_len, ulong pad_len,
-                                    __global const uchar* job_key, __global uchar* roots_out,
-                                    int num_chunks, int group_base) {
-    __local uint smem_leaves[CP_MT_CV_WORDS * CP_MT_THREADS];
+ * per-nonce update launches one group). The last-group logic uses the matrix size, not the grid.
+ * fill_end (a multiple of 1024): bytes [0, fill_end) all equal the low byte of fill_word and are not
+ * loaded; byte i >= fill_end is mat[i - fill_end] (zero from raw_len on). fill_end = 0 is the plain
+ * matrix hash. */
+inline void d_mt_keyed_chunk_roots(__local uint* smem_leaves, __global const uchar* mat, ulong raw_len,
+                                   ulong pad_len, __global const uchar* job_key,
+                                   __global uchar* roots_out, int num_chunks, int group_base,
+                                   ulong fill_end, uint fill_word) {
     const int tid = get_local_id(0);
     const int bid = group_base + (int)get_group_id(0);
     const int num_grid_blocks = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
@@ -178,7 +181,12 @@ __kernel void ocl_keyed_chunk_roots(__global const uchar* mat, ulong raw_len, ul
         if (off + (ulong)len > pad_len) {
             len = (int)(pad_len - off);
         }
-        d_b3_keyed_chunk_cv_glob(job_key, (ulong)global_chunk, mat, off, raw_len, len, cv);
+        if (len == D_B3_CHUNK && off + (ulong)D_B3_CHUNK <= fill_end) {
+            d_b3_keyed_chunk_cv_fill(job_key, (ulong)global_chunk, fill_word, cv);
+        } else {
+            d_b3_keyed_chunk_cv_glob(job_key, (ulong)global_chunk, mat, off - fill_end,
+                                     raw_len - fill_end, len, cv);
+        }
         for (int i = 0; i < 8; i++) {
             d_mt_set_leaf_word(smem_leaves, i, tid, CP_MT_THREADS, d_b3_load32_priv(cv + 4 * i));
         }
@@ -211,6 +219,24 @@ __kernel void ocl_keyed_chunk_roots(__global const uchar* mat, ulong raw_len, ul
     }
 
     d_mt_store_root_words(smem_leaves, CP_MT_THREADS, roots_out, bid);
+}
+
+__kernel void ocl_keyed_chunk_roots(__global const uchar* mat, ulong raw_len, ulong pad_len,
+                                    __global const uchar* job_key, __global uchar* roots_out,
+                                    int num_chunks, int group_base) {
+    __local uint smem_leaves[CP_MT_CV_WORDS * CP_MT_THREADS];
+    d_mt_keyed_chunk_roots(smem_leaves, mat, raw_len, pad_len, job_key, roots_out, num_chunks,
+                           group_base, 0, 0u);
+}
+
+/* Constant-signal matrices: see d_mt_keyed_chunk_roots (fill_end % 1024 == 0, fill_end <= raw_len). */
+__kernel void ocl_keyed_chunk_roots_fill(__global const uchar* tail, ulong raw_len, ulong pad_len,
+                                         __global const uchar* job_key, __global uchar* roots_out,
+                                         int num_chunks, int group_base, ulong fill_end,
+                                         uint fill_word) {
+    __local uint smem_leaves[CP_MT_CV_WORDS * CP_MT_THREADS];
+    d_mt_keyed_chunk_roots(smem_leaves, tail, raw_len, pad_len, job_key, roots_out, num_chunks,
+                           group_base, fill_end, fill_word);
 }
 
 __kernel void ocl_compute_blake_mt(__global const uchar* job_key, __global uchar* roots,

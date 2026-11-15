@@ -244,6 +244,33 @@ inline void d_b3_keyed_chunk_cv_glob(__global const uchar *key, ulong chunk_idx,
     }
 }
 
+/* Chunk CV of a full 1 KB chunk whose bytes all equal the low byte of fill_word (fill_word = byte *
+   0x01010101): no loads. Constant-signal mining (gemmstone backend): every byte of B and every row of A
+   but the dummy row is 64. */
+inline void d_b3_keyed_chunk_cv_fill(__global const uchar *key, ulong chunk_idx, uint fill_word,
+                                     uchar cv_out[32]) {
+    uint kw[8];
+    d_b3_key_words_g(key, kw);
+    uint cv[8];
+    for (int i = 0; i < 8; i++) {
+        cv[i] = kw[i];
+    }
+    #pragma unroll 1
+    for (int b = 0; b < D_B3_CHUNK / D_B3_BLOCK; b++) {
+        uint m[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            m[i] = fill_word;
+        }
+        const uint fl = D_B3_KEYED | (b == 0 ? D_B3_CHUNK_START : 0u) |
+                        (b == D_B3_CHUNK / D_B3_BLOCK - 1 ? D_B3_CHUNK_END : 0u);
+        d_b3_compress_words(cv, m, D_B3_BLOCK, chunk_idx, fl);
+    }
+    for (int i = 0; i < 8; i++) {
+        d_b3_store32_priv(cv_out + 4 * i, cv[i]);
+    }
+}
+
 typedef struct {
     uint cv[8];
     ulong chunk_counter;

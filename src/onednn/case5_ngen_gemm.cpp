@@ -151,10 +151,10 @@ void fill_xor_subtile_driver_info(DriverInfo &out, const XorSubtileDims &xsd) {
 }
 
 GEMMProblem makeProblem(const Product &product, bool xor_nop, bool fused_jackpot,
-                        bool a_row_major, bool b_row_major) {
+                        bool a_row_major, bool b_row_major, bool unsigned_ab) {
     GEMMProblem problem;
-    problem.Ta = problem.Ta_ext = Type::s8;
-    problem.Tb = problem.Tb_ext = Type::s8;
+    problem.Ta = problem.Ta_ext = unsigned_ab ? Type::u8 : Type::s8;
+    problem.Tb = problem.Tb_ext = unsigned_ab ? Type::u8 : Type::s8;
     problem.Tc = problem.Tc_ext = Type::s32;
     problem.Ts = Type::f32;
     problem.alpha = 1;
@@ -263,7 +263,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                                   bool xor_nop, bool fused_jackpot) {
     set_binary_packaging(hw, device);
 
-    auto problem = makeProblem(product, xor_nop, fused_jackpot, dims.a_row_major, dims.b_row_major);
+    auto problem = makeProblem(product, xor_nop, fused_jackpot, dims.a_row_major, dims.b_row_major,
+                               dims.unsigned_ab);
     const bool a_row_major = dims.a_row_major, b_row_major = dims.b_row_major;
     // Operand alignment from the actual leading dimensions (buffers are page aligned, offsets 0),
     // as oneDNN does before catalog matching. Without this the catalog entries that require
@@ -399,7 +400,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             // force it onto every candidate (timing experiments, CASE5_*_CP / CASE5_*_TILE).
             const bool forceA = case5_a_packed_env() == 1;
             if ((candidate.pack_a || forceA)
-                    && problem.A.layout == MatrixLayout::T && problem.Ta == Type::s8) {
+                    && problem.A.layout == MatrixLayout::T
+                    && (problem.Ta == Type::s8 || problem.Ta == Type::u8)) {
                 problem.A.layout = MatrixLayout::Pc;
                 problem.A.packSize = strategy.unroll[LoopM];
                 problem.A.crosspack = uint8_t(forceA ? envInt("CASE5_A_CP", 4) : candidate.pack_a_cp);
@@ -428,7 +430,8 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
             }
             const bool forceB = case5_b_packed_env() == 1;
             if ((candidate.pack_b || forceB)
-                    && problem.B.layout == MatrixLayout::N && problem.Tb == Type::s8) {
+                    && problem.B.layout == MatrixLayout::N
+                    && (problem.Tb == Type::s8 || problem.Tb == Type::u8)) {
                 problem.B.layout = MatrixLayout::Pr;
                 problem.B.packSize = strategy.unroll[LoopN];
                 problem.B.crosspack = uint8_t(forceB ? envInt("CASE5_B_CP", 32) : candidate.pack_b_cp);
@@ -566,6 +569,7 @@ cl_kernel build_igemm_kernel_impl(cl_context ctx, cl_device_id device, Product p
                 info->xorAccSlm = problem.case5TileXorAccSlm;
                 info->bPackCols = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.packSize) : 0;
                 info->bPackCp = (problem.B.layout == MatrixLayout::Pr) ? int(problem.B.crosspack) : 0;
+                info->unsignedAB = (problem.Ta == Type::u8);
                 info->strategyNameOwned = candidate.label;
                 info->strategyName = info->strategyNameOwned.c_str();
                 if (!candidate.from_catalog) {

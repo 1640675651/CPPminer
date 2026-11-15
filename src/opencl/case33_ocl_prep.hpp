@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct Case33OclPrep {
     Case33OclPrep() = default;
@@ -21,6 +22,19 @@ struct Case33OclPrep {
        column) instead of column-major (oneDNN XeHPG kernel with packed B); 0, 0: column-major. */
     void set_b_pack(int cols, int crosspack) { b_pack_cols_ = cols; b_pack_cp_ = crosspack; }
     bool ensure_noisy_scratch(size_t bytes);
+
+    /* Constant-signal mining (gemmstone backend, CP_ONEDNN_CONST64): signal B is `value` everywhere and
+       signal A is `value` in every GEMM row; A has one more row (the last, the dummy row), random per
+       attempt, which changes A's commitment and so its noise seed, and which the GEMM never reads. No
+       signal A buffer exists (only the dummy row, K bytes). 0 = off (the default; the OpenCL backend never
+       sets it). Needs the packed A and B layouts. `m` stays the GEMM row count in every call; the
+       protocol matrix has m + 1 rows. */
+    void set_const_signal(int value) { const_sig_ = value; }
+    int const_signal() const { return const_sig_; }
+    /* Keyed digest of an n x K matrix whose bytes all equal const_signal() (signal B), and its sub-roots
+       (32 bytes per 256-chunk group, host copy) for the share witness. */
+    bool const_matrix_keyed_hash(int n, int K, const uint8_t job_key[32], uint8_t root[32],
+                                 std::vector<uint8_t> *subroots);
 
     bool prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K, int blocks_k,
                        int macro_cols);
@@ -66,7 +80,7 @@ struct Case33OclPrep {
     int a_witness_subroots() const { return a_witness_valid_ ? a_num_subroots_ : -1; }
     bool read_A_witness(size_t sz_a, const uint32_t *block_idx, int num_blocks,
                         size_t block_bytes, uint8_t *blocks_out, uint8_t *subroots_out,
-                        uint8_t root_out[32]) const;
+                        uint8_t root_out[32]) const;   /* constant signal: sz_a = (m + 1) * K */
 
     cl_mem noisy_scratch_buffer() const { return d_noisy_scratch_; }
     /* 32 bytes on the device: the last attempt's A noise seed, which is also the scan's jackpot key.
@@ -96,6 +110,21 @@ private:
     bool hash_signal_a_(size_t raw_len, size_t pad_len, const uint8_t job_key[32],
                         uint8_t out[32]);
     bool merkle_finish_root_(int num_subroots);
+    /* Chunk roots of groups group_first .. last of a raw_len-byte matrix whose bytes below fill_end
+       (a multiple of 1024) are the constant signal and whose bytes from fill_end on are tail[i -
+       fill_end], into roots_out[group]. */
+    bool fill_chunk_roots_(cl_mem tail, size_t raw_len, size_t fill_end, int group_first,
+                           cl_mem roots_out);
+    /* Constant signal: commitment of the (m + 1) x K signal A, in full the first time for a job key and
+       dimensions, afterwards only the dummy row's group; root in d_merkle_roots_, sub-roots in
+       d_a_subroots_. */
+    bool commit_const_a_(const uint8_t job_key[32], int m, int K);
+    bool prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
+                                  const uint8_t job_key[32], const uint8_t b_noise_seed[32], int m,
+                                  int K, int lda, int salted, uint8_t a_key_out[32]);
+    /* Once per process: the fill path against the host BLAKE3 digest of the same bytes. */
+    bool const_hash_selftest_(const uint8_t job_key[32], int K);
+    bool gen_random_(cl_mem dst, uint64_t rng_seed, int total);
     /* A's noise seed from the root in d_merkle_roots_ into d_noise_seed_ / d_a_key_ (and the root
        into d_a_root_), on the GPU; a_key_out (optional) receives a host copy. */
     bool derive_a_noise_seed_(const uint8_t b_noise_seed[32], int m, int salted, uint8_t *a_key_out);
@@ -137,6 +166,7 @@ private:
     cl_kernel k_gen_random16_ = nullptr; // optional: 16 elements per work item
     cl_kernel k_build_pairs_ = nullptr;
     cl_kernel k_keyed_chunk_roots_ = nullptr;
+    cl_kernel k_keyed_chunk_roots_fill_ = nullptr; // constant-signal commitments
     cl_kernel k_compute_blake_mt_ = nullptr;
     cl_kernel k_reduce_roots_ = nullptr;
     cl_kernel k_fused_prepack_a_ = nullptr;
@@ -165,6 +195,13 @@ private:
     int seed_mode_ = -1;                      // -1 = not verified yet, 1 = device, 0 = host
 
     cl_mem d_A_sig_ = nullptr;
+    int const_sig_ = 0;          // constant-signal mining (0 = off)
+    cl_mem d_dummy_ = nullptr;   // constant signal: the dummy row of signal A (K bytes)
+    size_t dummy_cap_ = 0;
+    bool const_a_init_ = false;  // constant signal: full commitment done for const_a_m_/k_, a_hash_key_
+    int const_a_m_ = 0;
+    int const_a_k_ = 0;
+    int const_selftest_ = 0;     // 0 not run, 1 passed, -1 failed
     cl_mem d_job_key_ = nullptr;
     cl_mem d_noise_seed_ = nullptr;
     cl_mem d_a_key_ = nullptr;   // the last attempt's A noise seed (jackpot key)

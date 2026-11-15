@@ -78,6 +78,50 @@ remain diagnostics: only TN gets the family kernels.
 
 See [docs/prep.md](../../docs/prep.md) for the full write-up, including PR #27.
 
+### Constant-64 operands (default since 2026-11-15)
+
+The committed signal matrices are constant: B is 64 everywhere, and A is 64 in all of its m scanned
+rows plus **one dummy row** (row m, so the proof's A has m + 1 rows). The dummy row gets K fresh random
+values in [-64, 63] every attempt (`ocl_gen_random_matrix` over a K-byte buffer, from the attempt seed);
+that changes A's commitment and so A's noise seed, which is what the row pokes did before. The GEMM never
+reads the dummy row and no tile can contain it, so every operand byte the GEMM sees is 64 + noise, in
+[1, 127]. The GEMM is built for **u8 x u8** (same results on [1, 127]).
+
+Why: Arc power under the cap depends on the operand bytes. With both operands 64 + noise every product is
+positive and bit 7 never toggles; at the same power the card clocks higher (gemm_xor note.md, "Constant
+matrix 64": A770 +8..10%, B580 +5% at the power cap; u8 instead of s8 is another +1.5% on the B580).
+
+How (no signal A buffer at all):
+- Commitments hash the constant without a buffer: `ocl_keyed_chunk_roots_fill` (cp_ocl_merkle.cl) treats
+  bytes below `fill_end` as the constant and reads the rest from a small buffer. B (all 64) is hashed once
+  per job; its root gives B's noise seed (`pearl_b_noise_seed_from_root`) and its sub-roots go into the share
+  witness. A is hashed in full on the first attempt of a job, then only the dummy row's 256-chunk group.
+  A one-time self-test compares the fill path with the host BLAKE3 digest of the same bytes.
+- Noisy matrices: the packed A and B kernels add the constant instead of reading a signal
+  (`sig_from_buf = 0` / `sig_const = 0x40404040`), so the mode needs the packed layouts (A770 and B580
+  family kernels); other kernels fall back to the zero-B mode with a message.
+- Share witness: A blocks and B^T blocks are synthesized on the host (64s; the dummy row from its buffer),
+  sub-roots and roots come from the GPU commitments. `cp_worker_proof_rows()` gives the share queue m + 1.
+- zk-pow accepts any m (no divisibility rule; tiles must only lie inside the matrix) and signal values in
+  [-64, 64], so the constant 64 is legal.
+
+`CP_ONEDNN_CONST64=0` restores the zero-B / row-poke mode described below. Tested 2026-11-15 on the A770
+and B580: mock shares verify, `CP_OCL_PREP_CHECK=1` (self-test, noise, seeds, incremental commitment) and
+`CASE5_COOP_AUDIT=1` (every tile of the u8 GEMM recomputed on the host) clean.
+
+Miner throughput, 75 s `--mock --mock-diff 80` runs, attempts after the first 20 s, 2 interleaved rounds
+(A770 at a 140 W Sysman limit, B580 at ~99 W; fused jackpot):
+
+| | constant-64 | zero B (`CP_ONEDNN_CONST64=0`) | |
+|---|---:|---:|---:|
+| A770 end-to-end TMAC/s (clock) | 90.3 (1459 MHz) | 84.2 (1360 MHz) | +7.2% |
+| B580 end-to-end TMAC/s (clock) | 82.8 (2198 MHz) | 77.5 (2053 MHz) | +6.7% |
+
+Same power in both modes: the gain is clock. At a 210 W limit the A770 runs near its 2000 MHz ceiling, so
+expect much less there (about +2% by the harness measurements).
+
+### Zero B and row pokes (`CP_ONEDNN_CONST64=0`, OpenCL backend)
+
 Per nonce the GPU builds the noisy A (131072 x 4096, 512 MB). The random signal A_sig starts as
 zeros (`clEnqueueFillBuffer`) and is hashed in full once; every nonce replaces one random row (the values
 the full generator `ocl_gen_random_matrix16` gives that row for the nonce's seed, run over just that row) and

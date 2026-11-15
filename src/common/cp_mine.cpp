@@ -145,8 +145,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         tiles_at_prev_share = 0;
 
         if (g_share_queue) {
-            const CpShareJobCtx share_ctx = {sock, msg_id, g_m_active, g_n_active, cert_version,
-                                             hdr_path, proof_path};
+            /* the proof covers the committed A, which may have a dummy row past the scanned ones */
+            const CpShareJobCtx share_ctx = {sock, msg_id, cp_worker_proof_rows(g_m_active),
+                                             g_n_active, cert_version, hdr_path, proof_path};
             cp_share_queue_begin_job(g_share_queue, &share_ctx, job_key);
         }
 

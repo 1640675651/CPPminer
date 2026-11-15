@@ -175,6 +175,9 @@ int cp_worker_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig);
 /* Non-zero when shares are proven from device Merkle sub-roots (cp_worker_fetch_share_witness)
  * instead of host signal matrices; the miner then allocates no host A/B buffers. */
 int cp_worker_supports_share_witness(void);
+/* Rows of the committed (proven) A for a scan of m rows: m + 1 when the backend appends a dummy row
+ * that the GEMM never reads (gemmstone constant-64 mode), else m. */
+int cp_worker_proof_rows(int m);
 /* Non-zero when the miner must keep a host signal B^T (h_BpT_global). Zero when B^T is always
  * all-zero and proofs pass bt=NULL to cp_proof_build, or when shares use device witnesses. */
 int cp_worker_needs_host_bt(void);

@@ -139,6 +139,10 @@ std::string cp_ocl_kernel_dir() {
 
 Case33OclPrep::~Case33OclPrep() {
     release_kernels_();
+    if (d_dummy_) {
+        clReleaseMemObject(d_dummy_);
+        d_dummy_ = nullptr;
+    }
     if (d_A_sig_) {
         clReleaseMemObject(d_A_sig_);
         d_A_sig_ = nullptr;
@@ -269,6 +273,7 @@ bool Case33OclPrep::create_kernels_() {
     k_gen_random16_ = mk("ocl_gen_random_matrix16");
     k_build_pairs_ = mk("ocl_build_perm_pairs");
     k_keyed_chunk_roots_ = mk("ocl_keyed_chunk_roots");
+    k_keyed_chunk_roots_fill_ = mk("ocl_keyed_chunk_roots_fill");
     k_compute_blake_mt_ = mk("ocl_compute_blake_mt");
     k_reduce_roots_ = mk("ocl_reduce_roots");
     k_fused_prepack_a_ = fused_prepack_ ? mk("ocl_fused_prepack_a") : nullptr;
@@ -331,6 +336,10 @@ void Case33OclPrep::release_kernels_() {
     if (k_keyed_chunk_roots_) {
         clReleaseKernel(k_keyed_chunk_roots_);
         k_keyed_chunk_roots_ = nullptr;
+    }
+    if (k_keyed_chunk_roots_fill_) {
+        clReleaseKernel(k_keyed_chunk_roots_fill_);
+        k_keyed_chunk_roots_fill_ = nullptr;
     }
     if (k_compute_blake_mt_) {
         clReleaseKernel(k_compute_blake_mt_);
@@ -455,7 +464,8 @@ bool Case33OclPrep::ensure_buffers(int m, int n, int k) {
     if (!ready_) {
         return false;
     }
-    const size_t szA = static_cast<size_t>(m) * static_cast<size_t>(k);
+    /* constant signal: the committed A has one more row (the dummy row) */
+    const size_t szA = static_cast<size_t>(m + (const_sig_ ? 1 : 0)) * static_cast<size_t>(k);
     const size_t szB = static_cast<size_t>(n) * static_cast<size_t>(k);
     const size_t raw_max = szA > szB ? szA : szB;
     const size_t pad_max = (raw_max + 1023) / 1024 * 1024;
@@ -465,7 +475,20 @@ bool Case33OclPrep::ensure_buffers(int m, int n, int k) {
         merkle_need = 32;
     }
 
-    if (m > m_cap_ || !d_A_sig_) {
+    if (const_sig_) {
+        /* no signal A buffer: only the dummy row */
+        if (!d_dummy_ || dummy_cap_ < static_cast<size_t>(k)) {
+            if (d_dummy_) {
+                clReleaseMemObject(d_dummy_);
+            }
+            d_dummy_ = ocl_->alloc_buffer(static_cast<size_t>(k), CL_MEM_READ_WRITE);
+            dummy_cap_ = d_dummy_ ? static_cast<size_t>(k) : 0;
+            const_a_init_ = false;
+        }
+        if (m > m_cap_) {
+            m_cap_ = m;
+        }
+    } else if (m > m_cap_ || !d_A_sig_) {
         if (d_A_sig_) {
             clReleaseMemObject(d_A_sig_);
         }
@@ -484,9 +507,10 @@ bool Case33OclPrep::ensure_buffers(int m, int n, int k) {
         d_a_subroots_ = ocl_->alloc_buffer(merkle_need, CL_MEM_READ_WRITE);
         merkle_cap_ = merkle_need;
         a_witness_valid_ = false;
+        const_a_init_ = false;
     }
     n_cap_ = n;
-    return d_A_sig_ && d_merkle_roots_ && d_a_subroots_;
+    return (const_sig_ ? d_dummy_ != nullptr : d_A_sig_ != nullptr) && d_merkle_roots_ && d_a_subroots_;
 }
 
 bool Case33OclPrep::ensure_noisy_scratch(size_t bytes) {
@@ -506,6 +530,10 @@ bool Case33OclPrep::ensure_noisy_scratch(size_t bytes) {
 }
 
 bool Case33OclPrep::gen_random_a_(uint64_t rng_seed, int total) {
+    return gen_random_(d_A_sig_, rng_seed, total);
+}
+
+bool Case33OclPrep::gen_random_(cl_mem dst, uint64_t rng_seed, int total) {
     const int matrix_tag = 0;
     const cl_ulong rng_ul = static_cast<cl_ulong>(rng_seed);
     const bool wide = k_gen_random16_ && (total % 16) == 0;
@@ -514,7 +542,7 @@ bool Case33OclPrep::gen_random_a_(uint64_t rng_seed, int total) {
     err |= clSetKernelArg(k, 0, sizeof(cl_ulong), &rng_ul);
     err |= clSetKernelArg(k, 1, sizeof(int), &matrix_tag);
     err |= clSetKernelArg(k, 2, sizeof(int), &total);
-    err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_A_sig_);
+    err |= clSetKernelArg(k, 3, sizeof(cl_mem), &dst);
     if (err != CL_SUCCESS) {
         return false;
     }
@@ -695,6 +723,10 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
     err |= clSetKernelArg(kern, arg++, sizeof(int), &panel_stride_dw);
     err |= clSetKernelArg(kern, arg++, sizeof(int), &tR);
     err |= clSetKernelArg(kern, arg++, sizeof(int), &tC);
+    const cl_int sig_from_buf = const_sig_ ? 0 : 1;   /* constant signal: `signal` is not read */
+    const cl_uint sig_word = 0x01010101u * static_cast<uint8_t>(const_sig_);
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_int), &sig_from_buf);
+    err |= clSetKernelArg(kern, arg++, sizeof(cl_uint), &sig_word);
     const size_t l = 256;
     const size_t g = static_cast<size_t>(rows / P) * l;
     if (err != CL_SUCCESS ||
@@ -717,7 +749,7 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
         return false;
     }
     const int rank = R_RANK;
-    const int is_b = 0, has_signal = 1;
+    const int is_b = 0, has_signal = const_sig_ ? 0 : 1;   /* constant signal: added below */
     err = CL_SUCCESS;
     err |= clSetKernelArg(k_noisy_rowmajor_, 0, sizeof(cl_mem), &d_noisy_scratch_);
     err |= clSetKernelArg(k_noisy_rowmajor_, 1, sizeof(cl_mem), &d_noise_seed_);
@@ -752,7 +784,7 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
             const size_t kk = static_cast<size_t>(k), r = static_cast<size_t>(tR), c = static_cast<size_t>(tC);
             const size_t off = (i - i % r) * c + (kk - kk % c) * static_cast<size_t>(P) + (i % r) * 4u +
                                (kk % c - kk % 4u) * r + kk % 4u;
-            if (pan[off] != rr[k]) {
+            if (pan[off] != static_cast<int8_t>(rr[k] + const_sig_)) {
                 ++bad;
             }
         }
@@ -1619,6 +1651,8 @@ bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
     err |= clSetKernelArg(k_noisy_b_packed_, 5, sizeof(int), &Q);
     err |= clSetKernelArg(k_noisy_b_packed_, 6, sizeof(int), &cp);
     err |= clSetKernelArg(k_noisy_b_packed_, 7, sizeof(int), &panel_stride_dw);
+    const cl_uint sig_word = 0x01010101u * static_cast<uint8_t>(const_sig_);   /* 0: zero B */
+    err |= clSetKernelArg(k_noisy_b_packed_, 8, sizeof(cl_uint), &sig_word);
     const size_t l = 256;
     const size_t g = static_cast<size_t>(n / Q) * l;
     if (err != CL_SUCCESS ||
@@ -1651,7 +1685,7 @@ bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
         for (int k = 0; k < K; ++k) {
             if (pan[static_cast<size_t>(k / cp) * static_cast<size_t>(Q * cp) +
                     static_cast<size_t>(c % Q) * static_cast<size_t>(cp) + static_cast<size_t>(k % cp)] !=
-                col[k]) {
+                static_cast<int8_t>(col[k] + const_sig_)) {
                 ++bad;
             }
         }
@@ -1666,6 +1700,10 @@ bool Case33OclPrep::prepare_job_b_packed_(cl_mem b_buf, int n, int K, int ldb) {
 
 bool Case33OclPrep::prepare_job_b_gpu(cl_mem b_buf, const uint8_t b_noise_seed[32], int n, int K,
                                       int ldb, bool b_row_major) {
+    if (const_sig_ && (b_row_major || b_pack_cols_ <= 0)) {
+        std::fprintf(stderr, "[ocl-prep] constant signal needs the packed B layout\n");
+        return false;
+    }
     if (b_row_major) {
         if (!ready_ || !b_buf || !b_noise_seed || n <= 0 || K <= 0 || ldb < n) {
             return false;
@@ -1682,6 +1720,14 @@ bool Case33OclPrep::prepare_attempt_a_gpu(cl_mem a_buf, const uint8_t *ab_seed, 
                                           const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                                           int m, int K, int lda, bool a_row_major, int salted,
                                           uint8_t a_key_out[32]) {
+    if (const_sig_) {
+        if (!a_row_major || a_pack_rows_ <= 0) {
+            std::fprintf(stderr, "[ocl-prep] constant signal needs the packed A layout\n");
+            return false;
+        }
+        return prepare_attempt_a_const_(a_buf, ab_seed, ab_seed_len, job_key, b_noise_seed, m, K, lda,
+                                        salted, a_key_out);
+    }
     if (a_row_major) {
         return prepare_attempt_a_rowmajor(a_buf, ab_seed, ab_seed_len, job_key, b_noise_seed, m, K,
                                           lda, salted, a_key_out);
@@ -1823,8 +1869,40 @@ bool Case33OclPrep::read_A_sig(int8_t *h_A_sig, size_t bytes) const {
 bool Case33OclPrep::read_A_witness(size_t sz_a, const uint32_t *block_idx, int num_blocks,
                                    size_t block_bytes, uint8_t *blocks_out,
                                    uint8_t *subroots_out, uint8_t root_out[32]) const {
-    if (!a_witness_valid_ || !d_A_sig_ || (num_blocks > 0 && (!block_idx || !blocks_out))) {
+    if (!a_witness_valid_ || (!d_A_sig_ && !const_sig_) ||
+        (num_blocks > 0 && (!block_idx || !blocks_out))) {
         return false;
+    }
+    if (const_sig_) {
+        /* Rows below the dummy row are the constant; the dummy row (the last K bytes of sz_a) comes from
+           d_dummy_; bytes past sz_a are zero padding. */
+        const size_t K = static_cast<size_t>(const_a_k_);
+        if (K == 0 || sz_a < K || !d_dummy_) {
+            return false;
+        }
+        const size_t fill_end = sz_a - K;
+        std::vector<uint8_t> dummy;
+        for (int i = 0; i < num_blocks; ++i) {
+            const size_t off = static_cast<size_t>(block_idx[i]) * block_bytes;
+            uint8_t *dst = blocks_out + static_cast<size_t>(i) * block_bytes;
+            for (size_t j = 0; j < block_bytes; ++j) {
+                const size_t g = off + j;
+                if (g < fill_end) {
+                    dst[j] = static_cast<uint8_t>(const_sig_);
+                } else if (g < sz_a) {
+                    if (dummy.empty()) {
+                        dummy.resize(K);
+                        if (!ocl_->read_buffer(d_dummy_, dummy.data(), K)) {
+                            return false;
+                        }
+                    }
+                    dst[j] = dummy[g - fill_end];
+                } else {
+                    dst[j] = 0;
+                }
+            }
+        }
+        num_blocks = 0;   /* nothing to read from a signal A buffer below */
     }
     for (int i = 0; i < num_blocks; ++i) {
         const size_t off = static_cast<size_t>(block_idx[i]) * block_bytes;
@@ -1852,6 +1930,194 @@ bool Case33OclPrep::read_A_witness(size_t sz_a, const uint32_t *block_idx, int n
         memcpy(root_out, a_root_, 32);
     }
     return true;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Constant-signal mining (set_const_signal): signal B is the constant everywhere, signal A is the
+ * constant in its m GEMM rows plus one random dummy row (row m) per attempt. The commitments hash the
+ * constant without a buffer (ocl_keyed_chunk_roots_fill); A's is incremental: the first attempt of a
+ * job hashes all groups, later attempts only the dummy row's group (K % 1024 == 0 puts the dummy row in
+ * groups of its own when m * K / 1024 is a multiple of 256, else it shares the last group).
+ * --------------------------------------------------------------------------------------------- */
+bool Case33OclPrep::fill_chunk_roots_(cl_mem tail, size_t raw_len, size_t fill_end, int group_first,
+                                      cl_mem roots_out) {
+    const size_t pad_len = (raw_len + 1023) / 1024 * 1024;
+    const int num_chunks = static_cast<int>(pad_len / 1024);
+    const int num_subroots = (num_chunks + 255) / 256;
+    if (!k_keyed_chunk_roots_fill_ || !tail || !roots_out || fill_end % 1024 != 0 || fill_end > raw_len ||
+        group_first < 0 || group_first >= num_subroots) {
+        return false;
+    }
+    const cl_ulong raw_ul = static_cast<cl_ulong>(raw_len), pad_ul = static_cast<cl_ulong>(pad_len);
+    const cl_ulong fill_ul = static_cast<cl_ulong>(fill_end);
+    const cl_uint word = 0x01010101u * static_cast<uint8_t>(const_sig_);
+    cl_kernel k = k_keyed_chunk_roots_fill_;
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(k, 0, sizeof(cl_mem), &tail);
+    err |= clSetKernelArg(k, 1, sizeof(cl_ulong), &raw_ul);
+    err |= clSetKernelArg(k, 2, sizeof(cl_ulong), &pad_ul);
+    err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_job_key_);
+    err |= clSetKernelArg(k, 4, sizeof(cl_mem), &roots_out);
+    err |= clSetKernelArg(k, 5, sizeof(int), &num_chunks);
+    err |= clSetKernelArg(k, 6, sizeof(int), &group_first);
+    err |= clSetKernelArg(k, 7, sizeof(cl_ulong), &fill_ul);
+    err |= clSetKernelArg(k, 8, sizeof(cl_uint), &word);
+    if (err != CL_SUCCESS) {
+        return false;
+    }
+    const size_t g = static_cast<size_t>(num_subroots - group_first) * 256, l = 256;
+    return clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, nullptr) == CL_SUCCESS;
+}
+
+bool Case33OclPrep::const_matrix_keyed_hash(int n, int K, const uint8_t job_key[32], uint8_t root[32],
+                                            std::vector<uint8_t> *subroots) {
+    if (!ready_ || !const_sig_ || n <= 0 || K <= 0 || !job_key || !root) {
+        return false;
+    }
+    if (!ensure_buffers(m_cap_ > 0 ? m_cap_ : 1, n, K) || !set_job_key_(job_key) ||
+        !const_hash_selftest_(job_key, K)) {
+        return false;
+    }
+    const size_t raw = static_cast<size_t>(n) * static_cast<size_t>(K);
+    const size_t fill_end = raw / 1024 * 1024;
+    const int num_chunks = static_cast<int>((raw + 1023) / 1024);
+    const int num_subroots = (num_chunks + 255) / 256;
+    if (num_chunks <= 1 || fill_end != raw) {
+        std::fprintf(stderr, "[ocl-prep] constant matrix hash: unsupported size %dx%d\n", n, K);
+        return false;
+    }
+    if (!fill_chunk_roots_(d_dummy_, raw, fill_end, 0, d_merkle_roots_)) {
+        return false;
+    }
+    if (subroots) {
+        subroots->resize(static_cast<size_t>(num_subroots) * 32);
+        if (!ocl_->read_buffer(d_merkle_roots_, subroots->data(), subroots->size())) {
+            return false;
+        }
+    }
+    if (!merkle_finish_root_(num_subroots)) {
+        return false;
+    }
+    clFinish(ocl_->queue);
+    return ocl_->read_buffer(d_merkle_roots_, root, 32);
+}
+
+bool Case33OclPrep::commit_const_a_(const uint8_t job_key[32], int m, int K) {
+    const size_t raw = static_cast<size_t>(m + 1) * static_cast<size_t>(K);
+    const size_t fill_end = static_cast<size_t>(m) * static_cast<size_t>(K);
+    const int num_chunks = static_cast<int>((raw + 1023) / 1024);
+    const int num_subroots = (num_chunks + 255) / 256;
+    if (num_chunks <= 1 || fill_end % 1024 != 0) {
+        std::fprintf(stderr, "[ocl-prep] constant signal: unsupported A size %dx%d\n", m + 1, K);
+        return false;
+    }
+    if (!set_job_key_(job_key)) {
+        return false;
+    }
+    const bool full = !const_a_init_ || const_a_m_ != m || const_a_k_ != K || !a_witness_valid_ ||
+                      memcmp(a_hash_key_, job_key, 32) != 0;
+    const int first = full ? 0 : static_cast<int>((fill_end / 1024) / 256);
+    a_witness_valid_ = false;
+    /* the stored sub-roots are updated in place; the reduction runs on a copy */
+    if (!fill_chunk_roots_(d_dummy_, raw, fill_end, first, d_a_subroots_) ||
+        !ocl_->copy_buffer(d_a_subroots_, 0, d_merkle_roots_, 0, static_cast<size_t>(num_subroots) * 32) ||
+        !merkle_finish_root_(num_subroots)) {
+        const_a_init_ = false;
+        return false;
+    }
+    const_a_init_ = true;
+    const_a_m_ = m;
+    const_a_k_ = K;
+    memcpy(a_hash_key_, job_key, 32);
+    a_num_subroots_ = num_subroots;
+    a_witness_valid_ = true;
+    if (prep_check_enabled() && !full) {
+        /* CP_OCL_PREP_CHECK=1: the incremental root against a full recomputation (into the reduction
+           scratch only; the stored sub-roots stay). */
+        uint8_t inc[32], all[32];
+        if (!ocl_->read_buffer(d_merkle_roots_, inc, 32) ||
+            !fill_chunk_roots_(d_dummy_, raw, fill_end, 0, d_merkle_roots_) ||
+            !merkle_finish_root_(num_subroots) || !ocl_->read_buffer(d_merkle_roots_, all, 32)) {
+            return false;
+        }
+        const bool same = memcmp(inc, all, 32) == 0;
+        std::printf("[ocl-prep] constant-signal incremental commitment check: %s\n",
+                    same ? "identical" : "MISMATCH");
+        std::fflush(stdout);
+        if (!same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Case33OclPrep::const_hash_selftest_(const uint8_t job_key[32], int K) {
+    if (const_selftest_ != 0) {
+        return const_selftest_ > 0;
+    }
+    const_selftest_ = -1;
+    /* three full groups of the constant, then one row of random bytes from d_dummy_: the fill path, the
+       tail path and a short last group, against the host digest of the same bytes */
+    const size_t fill_end = 3u * 256u * 1024u;
+    const size_t raw = fill_end + static_cast<size_t>(K);
+    const int num_subroots = static_cast<int>(((raw + 1023) / 1024 + 255) / 256);
+    if (!d_dummy_ || dummy_cap_ < static_cast<size_t>(K) || merkle_cap_ < static_cast<size_t>(num_subroots) * 32 ||
+        !set_job_key_(job_key) || !gen_random_(d_dummy_, 0x5EEDC0DE64ull, K)) {
+        std::fprintf(stderr, "[ocl-prep] constant-signal hash self-test: setup failed\n");
+        return false;
+    }
+    uint8_t dev[32], host[32];
+    if (!fill_chunk_roots_(d_dummy_, raw, fill_end, 0, d_merkle_roots_) ||
+        !merkle_finish_root_(num_subroots) || clFinish(ocl_->queue) != CL_SUCCESS ||
+        !ocl_->read_buffer(d_merkle_roots_, dev, 32)) {
+        std::fprintf(stderr, "[ocl-prep] constant-signal hash self-test: kernel failed\n");
+        return false;
+    }
+    std::vector<uint8_t> bytes((raw + 1023) / 1024 * 1024, 0);
+    memset(bytes.data(), const_sig_, fill_end);
+    if (!ocl_->read_buffer(d_dummy_, bytes.data() + fill_end, static_cast<size_t>(K))) {
+        return false;
+    }
+    pearl_keyed_matrix_digest(bytes.data(), bytes.size(), job_key, host);
+    const bool same = memcmp(dev, host, 32) == 0;
+    std::printf("[ocl-prep] constant-signal hash self-test: %s\n", same ? "identical" : "MISMATCH");
+    std::fflush(stdout);
+    const_selftest_ = same ? 1 : -1;
+    const_a_init_ = false;   /* d_merkle_roots_ was used as scratch */
+    return same;
+}
+
+bool Case33OclPrep::prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
+                                             const uint8_t job_key[32], const uint8_t b_noise_seed[32],
+                                             int m, int K, int lda, int salted, uint8_t a_key_out[32]) {
+    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed || m <= 0 || K <= 0) {
+        return false;
+    }
+    if (!ensure_buffers(m, 1, K) || !const_hash_selftest_(job_key, K)) {
+        return false;
+    }
+    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    /* The dummy row: K signal bytes in [-64, 63] from the attempt seed (ocl_gen_random_matrix, tag 0). */
+    const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
+    if (!gen_random_(d_dummy_, rng_seed, K)) {
+        std::fprintf(stderr, "[ocl-prep] dummy row generation failed\n");
+        return false;
+    }
+    if (!commit_const_a_(job_key, m, K)) {
+        return false;
+    }
+    const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    /* the protocol matrix has m + 1 rows */
+    if (!derive_a_noise_seed_(b_noise_seed, m + 1, salted, a_key_out)) {
+        return false;
+    }
+    const bool ok = noisy_matrix_a_packed_(a_buf, d_dummy_, m, K, lda);
+    if (prep_timing_enabled()) {
+        clFinish(ocl_->queue);
+        std::printf("[ocl-prep] A constant signal: dummy row + commitment %.1fms, noise %.1fms\n",
+                    (t1 - t0) * 1e3, (cp_now_sec() - t1) * 1e3);
+    }
+    return ok;
 }
 
 bool Case33OclPrep::align_gen_random(cl_mem dst, uint64_t rng_seed, int matrix_tag,

@@ -39,6 +39,8 @@ int cp_onednn_worker_mine_attempt(
 int cp_onednn_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig);
 /* 1 when A is generated and hashed on the device (prep kernels built); decided at init. */
 int cp_onednn_worker_gpu_prep_ready(void);
+/* m + 1 in constant-64 mode (the committed A has a dummy row after the m scanned rows), else m. */
+int cp_onednn_worker_proof_rows(int m);
 /* GPU-prep share witness (A sub-roots + covering blocks; B^T all-zero). Allocates *out. */
 int cp_onednn_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
                                          CpShareWitness **out);

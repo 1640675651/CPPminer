@@ -39,6 +39,7 @@ struct DriverInfo {
     bool jackpotCoop = false; // fused jackpot: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM (no tile_xor traffic)
     int bPackCols = 0;          // B in gemmstone packed rows: panels of this many columns (0 = plain)
     int bPackCp = 0;            // ... with this many consecutive k per column (crosspack)
+    bool unsignedAB = false;    // built for u8 x u8 operands (BuildParams::unsigned_ab)
     int aPackRows = 0;          // A in gemmstone packed columns: panels of this many rows (0 = plain)
     int aPackCp = 0;            // ... with this many consecutive k per group (crosspack)
     int aTileR = 0;             // packed A tiled inside the panel: tileR rows x tileC k per tile (0 = untiled)
@@ -105,6 +106,9 @@ struct BuildParams {
     int ldc = 0;
     bool a_row_major = true;
     bool b_row_major = false;
+    // u8 x u8 dpas instead of s8 x s8 (constant-64 operands, CP_ONEDNN_CONST64): same results while every
+    // operand byte is 0..127, less power on Xe2.
+    bool unsigned_ab = false;
 };
 
 // Build OpenCL kernel via gemmstone. Caller owns with clReleaseKernel.

@@ -11,6 +11,7 @@
 #include "case5_xor_tile.hpp"
 #include "cp_config.h"
 #include "cp_jackpot.hpp"
+#include "cp_noise.h"
 #include "cp_state.h"
 #include "cp_util.h"
 #include "onednn_intel_devices.hpp"
@@ -530,10 +531,31 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
                                   : case5_ngen::pad_ld_int8(build_dims.k);
     build_dims.ldc = case5_ngen::pad_ld_int8(build_dims.m);
 
+    // The GPU prep first: the constant-64 mode needs it (no host path) and builds a u8 kernel.
+    prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
+    if (!prep_ready_) {
+        std::fprintf(stderr, "[onednn] GPU matrix prep init failed; using CPU fallback\n");
+    }
+    const64_ = const64_req_ && prep_ready_ && a_row_major_ && !b_row_major_;
+    build_dims.unsigned_ab = const64_;
+
     std::string ngen_err;
     kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,
                                              &ngen_err, false, fused_jackpot_, a_row_major_,
                                              b_row_major_);
+    // Constant-64 needs the packed A and B layouts (their prep kernels add the constant).
+    if (kernel_ && const64_ && (info_.aPackRows <= 0 || info_.bPackCols <= 0 || !info_.unsignedAB)) {
+        std::fprintf(stderr, "[gemmstone] constant-64 operands need packed A and B (kernel %s: apack=%d "
+                             "bpack=%d); mining with zero B and row pokes instead\n",
+                     info_.strategyName ? info_.strategyName : "?", info_.aPackRows, info_.bPackCols);
+        clReleaseKernel(kernel_);
+        kernel_ = nullptr;
+        const64_ = false;
+        build_dims.unsigned_ab = false;
+        kernel_ = case5_ngen::build_igemm_kernel(ocl_.context, ocl_.device, &build_dims, &info_,
+                                                 &ngen_err, false, fused_jackpot_, a_row_major_,
+                                                 b_row_major_);
+    }
     // Xe2 has the fused jackpot only on kernels with the own-tile judge (the family kernel); when none
     // of the candidates qualifies, mine with the separate jackpot instead of not at all.
     if (!kernel_ && fused_jackpot_ && case5_ngen::is_xe2_device(ocl_.context, ocl_.device)) {
@@ -581,17 +603,14 @@ bool Case33GemmOnednn::init_context(int device_index, int platform_filter) {
     case5_ngen::case5_gemm_layout_name(a_row_major_, b_row_major_, layout_name, sizeof(layout_name));
     std::snprintf(backend_, sizeof(backend_),
                   "oneDNN gemmstone %s/%s %s%s layout=%s unroll %dx%d xor %dx%d wg %dx%d "
-                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d apack=%d bpack=%dx%d",
+                  "sg %d ms=%d fold=%d tiles=%dx%d hash=%dx%d slm=%d apack=%d bpack=%dx%d%s",
                   info_.hwName, info_.strategyName, scan_mode, info_.xorAccSlm ? "+slmAcc" : "", layout_name, info_.unrollM,
                   info_.unrollN, info_.xorSubM, info_.xorSubN, info_.wgM, info_.wgN,
                   info_.subgroupSize, num_milestones_, tile_xor_folded_() ? folded_msg_words_ : 0,
                   tile_rows_, tile_cols_, hash_tile_rows_, hash_tile_cols_, info_.slm, info_.aPackRows,
-                  info_.bPackCols, info_.bPackCp);
+                  info_.bPackCols, info_.bPackCp, const64_ ? " u8 const64" : "");
     context_ready_ = true;
-    prep_ready_ = prep_.init(&ocl_, cp_ocl_kernel_dir(), false);
-    if (!prep_ready_) {
-        std::fprintf(stderr, "[onednn] GPU matrix prep init failed; using CPU fallback\n");
-    }
+    prep_.set_const_signal(const64_ ? 64 : 0);
     if (!build_jackpot_kernel_()) {
         std::fprintf(stderr, "[onednn] GPU jackpot kernel init failed\n");
         return false;
@@ -710,6 +729,31 @@ bool Case33GemmOnednn::prepare_job_gpu(int M, int N, int K, const uint8_t b_nois
     return true;
 }
 
+bool Case33GemmOnednn::prepare_job_gpu_const64(int M, int N, int K, const uint8_t job_key[32],
+                                               int salted, uint8_t b_noise_seed[32],
+                                               uint8_t bt_root[32],
+                                               std::vector<uint8_t> *bt_subroots) {
+    available_ = false;
+    if (!const64_ || !context_ready_ || !kernel_ || !prep_ready_ || !job_key || !b_noise_seed ||
+        !bt_root) {
+        return false;
+    }
+    if (!setup_dims_(M, N, K) || !ensure_matrix_bufs_()) {
+        return false;
+    }
+    if (!prep_.const_matrix_keyed_hash(N_, K_, job_key, bt_root, bt_subroots)) {
+        std::fprintf(stderr, "[onednn] constant-64 B commitment failed\n");
+        return false;
+    }
+    pearl_b_noise_seed_from_root(job_key, bt_root, N_, salted, b_noise_seed);
+    prep_.set_b_pack(info_.bPackCols, info_.bPackCp);
+    if (!prep_.prepare_job_b_gpu(b_buf_, b_noise_seed, N_, K_, ldb_, b_row_major_)) {
+        return false;
+    }
+    available_ = true;
+    return true;
+}
+
 bool Case33GemmOnednn::prepare_attempt_a(const int8_t *a_rowmajor) {
     if (!available_ || !a_rowmajor) {
         return false;
@@ -745,7 +789,7 @@ bool Case33GemmOnednn::read_A_witness(const uint32_t *block_idx, int num_blocks,
     if (!prep_ready_ || M_ <= 0 || K_ <= 0) {
         return false;
     }
-    return prep_.read_A_witness(static_cast<size_t>(M_) * static_cast<size_t>(K_), block_idx,
+    return prep_.read_A_witness(static_cast<size_t>(M_ + (const64_ ? 1 : 0)) * static_cast<size_t>(K_), block_idx,
                                 num_blocks, block_bytes, blocks_out, subroots_out, root_out);
 }
 
@@ -930,8 +974,8 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
     }
 
     gemmstone::GEMMProblem problem;
-    problem.Ta = problem.Ta_ext = gemmstone::Type::s8;
-    problem.Tb = problem.Tb_ext = gemmstone::Type::s8;
+    problem.Ta = problem.Ta_ext = info_.unsignedAB ? gemmstone::Type::u8 : gemmstone::Type::s8;
+    problem.Tb = problem.Tb_ext = info_.unsignedAB ? gemmstone::Type::u8 : gemmstone::Type::s8;
     problem.Tc = problem.Tc_ext = gemmstone::Type::s32;
     problem.Ts = gemmstone::Type::f32;
     problem.alpha = 1;
