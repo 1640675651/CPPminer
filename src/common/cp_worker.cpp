@@ -1011,6 +1011,10 @@ extern "C" int cp_worker_supports_share_witness(void)
 
 extern "C" int cp_worker_proof_rows(int m)
 {
+#if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
+    if(cp_worker_backend_id() == CP_BACKEND_OPENCL)
+        return cp_opencl_worker_proof_rows(m);
+#endif
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
     if(cp_worker_backend_id() == CP_BACKEND_ONEDNN)
         return cp_onednn_worker_proof_rows(m);

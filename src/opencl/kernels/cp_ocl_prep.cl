@@ -104,11 +104,12 @@ __kernel void ocl_build_perm_pairs(int is_b, __global const uchar *noise_seed, i
     }
 }
 
-/* Coalesced B: one WG per (jm, kb, tc); matches prepack_b_coalesced on host. */
+/* Coalesced B: one WG per (jm, kb, tc); matches prepack_b_coalesced on host. Without a signal
+   buffer every element's signal is sig_const (0 = zero B; constant-signal mining passes 64). */
 __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const uchar *b_noise_seed,
                                   __global const uint *pairs, int N, int K, int rank,
                                   int blocks_k, int macro_cols, int has_signal,
-                                  __global const char *b_signal_colmajor) {
+                                  __global const char *b_signal_colmajor, int sig_const) {
     const int g = get_group_id(0);
     const int tc = g % MICRO_N;
     const int kb = (g / MICRO_N) % blocks_k;
@@ -128,7 +129,7 @@ __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const ucha
         const int l = k0 + t;
         int pos = (int)(char)el[pairs[(size_t)l * 2]];
         int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
-        int sig = 0;
+        int sig = sig_const;
         if (has_signal) {
             sig = (int)b_signal_colmajor[(size_t)ncol * (size_t)K + (size_t)l];
         }
@@ -151,10 +152,12 @@ __kernel void ocl_fused_prepack_b(__global uchar *b_pre_out, __global const ucha
     }
 }
 
-/* Coalesced A: one WG per (im, kb, tr); matches prepack_a_coalesced on host. */
+/* Coalesced A: one WG per (im, kb, tr); matches prepack_a_coalesced on host. sig_from_buf = 0
+   (constant-signal mining): every signal element is sig_const and a_signal is not read. */
 __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const uchar *a_noise_seed,
                                   __global const uint *pairs, __global const char *a_signal,
-                                  int M, int K, int rank, int blocks_k, int macro_rows) {
+                                  int M, int K, int rank, int blocks_k, int macro_rows,
+                                  int sig_from_buf, int sig_const) {
     const int g = get_group_id(0);
     const int tr = g % MICRO_M;
     const int kb = (g / MICRO_M) % blocks_k;
@@ -174,7 +177,7 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
         const int l = k0 + t;
         int pos = (int)(char)el[pairs[(size_t)l * 2]];
         int neg = (int)(char)el[pairs[(size_t)l * 2 + 1]];
-        int sig = (int)a_signal[(size_t)nrow * (size_t)K + (size_t)l];
+        const int sig = sig_from_buf ? (int)a_signal[(size_t)nrow * (size_t)K + (size_t)l] : sig_const;
         stripe[row][t] = (uchar)((char)(sig + (pos - neg)));
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -212,7 +215,7 @@ __kernel void ocl_fused_prepack_a(__global uchar *a_pre_out, __global const ucha
 __kernel __attribute__((reqd_work_group_size(FPA_WG, 1, 1))) void
 ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
                        __global const uint *pairs, __global const char *a_signal, int K,
-                       int blocks_k) {
+                       int blocks_k, int sig_from_buf, uint sig_word) {
     __local uint sig[FPA_ROWS * FPA_SW];
     __local uint el[FPA_ROWS * FPA_EW];
     __local uchar p0[KR];
@@ -231,8 +234,10 @@ ocl_fused_prepack_a_wg(__global uint *a_pre_out, __global const uint *el_rows,
     for (int i = t; i < FPA_ROWS * (KR / 16); i += FPA_WG) {
         const int r = i / (KR / 16);
         const int c = i % (KR / 16);
-        const uint4 v =
-                *(__global const uint4 *)(a_signal + (size_t)(row0 + r) * (size_t)K + k0 + c * 16);
+        /* constant-signal mining (sig_from_buf = 0): every signal dword is sig_word */
+        const uint4 v = sig_from_buf
+                ? *(__global const uint4 *)(a_signal + (size_t)(row0 + r) * (size_t)K + k0 + c * 16)
+                : (uint4)(sig_word);
         __local uint *d = sig + r * FPA_SW + c * 4;
         d[0] = v.x;
         d[1] = v.y;

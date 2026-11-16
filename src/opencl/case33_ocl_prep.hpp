@@ -119,6 +119,10 @@ private:
        dimensions, afterwards only the dummy row's group; root in d_merkle_roots_, sub-roots in
        d_a_subroots_. */
     bool commit_const_a_(const uint8_t job_key[32], int m, int K);
+    /* Constant signal, per attempt: a new dummy row, A's commitment and its noise seed (m + 1 rows). */
+    bool const_attempt_signal_(const uint8_t *ab_seed, int ab_seed_len, const uint8_t job_key[32],
+                               const uint8_t b_noise_seed[32], int m, int K, int salted,
+                               uint8_t a_key_out[32]);
     bool prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
                                   const uint8_t job_key[32], const uint8_t b_noise_seed[32], int m,
                                   int K, int lda, int salted, uint8_t a_key_out[32]);

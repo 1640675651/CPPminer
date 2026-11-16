@@ -140,7 +140,8 @@ OpenCL always handles matrix prep in the worker (`cp_opencl_worker_handles_matri
 
 | Mode | CLI | Prep | Typical footprint |
 |------|-----|------|-------------------|
-| **GPU prep** (default) | `--backend opencl` | Device random A + hash + fused prepack | **no host matrices + ~1.5 GiB VRAM** |
+| **GPU prep** (default) | `--backend opencl` | Constant-64 operands: dummy row + incremental hash + fused prepack | **no host matrices + ~1 GiB VRAM** |
+| GPU prep, zero B | `CP_OCL_CONST64=0` | Device random A + hash + fused prepack | no host matrices + ~1.5 GiB VRAM |
 | **Host prep** | `--backend opencl --cpu-gen` | CPU noisy + coalesced prepack → H2D | **~2–2.5 GiB host + ~1 GiB VRAM** |
 
 Scan does **not** allocate a device C matrix: GEMM, tile XOR, and jackpot are fused; host only reads a found-flag (+ coords on hit).
@@ -164,7 +165,8 @@ Scan does **not** allocate a device C matrix: GEMM, tile XOR, and jackpot are fu
 |--------|------:|-----------:|:--------:|:-----------:|
 | `a_buf_` (coalesced A) | m × k | 512 MiB | yes | yes |
 | `b_buf_` (coalesced B) | n × k | 512 MiB | yes | yes |
-| `d_A_sig_` (device signal A) | m × k | 512 MiB | yes | no |
+| `d_A_sig_` (device signal A) | m × k | 512 MiB | only with `CP_OCL_CONST64=0` | no |
+| `d_dummy_` (constant-64: the dummy row of signal A) | k | 4 KiB | yes (default) | no |
 | `d_pairs_` | K × 2 × 4 | 32 KiB | yes | yes (prep init) |
 | `d_merkle_roots_` | see below | ~64 KiB | yes | no |
 | `d_a_subroots_` (A sub-roots kept for the share witness) | same as merkle | ~64 KiB | yes | no |
@@ -184,7 +186,10 @@ Coalesced `a_buf_` / `b_buf_` byte count equals row-major `m×k` / `n×k` (`case
 
 ## OpenCL GPU prep (default)
 
-Steady state (production):
+Constant-64 operands (default since 2026-11-15; same scheme as the oneDNN backend, see
+`src/onednn/README.md` "Constant-64 operands"): signal B is 64 everywhere, signal A is 64 in its m scanned
+rows plus one dummy row (row m, random per nonce) that the GEMM never reads, so the proof's A has m + 1 rows.
+No signal A buffer exists. Steady state (production):
 
 ```
 HOST
@@ -192,20 +197,27 @@ HOST
 DEVICE
   a_buf_                512 MiB   GEMM A
   b_buf_                512 MiB   GEMM B (job)
-  d_A_sig_              512 MiB   random A + hash source + witness blocks on hit
+  d_dummy_                4 KiB   the dummy row
   d_pairs_ / merkle     ~0.1 MiB  (merkle scratch + saved A sub-roots)
 ─────────────────────────────────────
-host                    ~0 MiB matrices
-VRAM                    ~1536 MiB
-combined                ~1.5 GiB
+host                    ~0 MiB matrices (+ B^T sub-roots, 64 KiB per job)
+VRAM                    ~1024 MiB
+combined                ~1.0 GiB
 ```
 
 Flow:
 
-1. Job: GPU builds noisy B into `b_buf_` (and keeps `d_A_sig_` capacity).
-2. Each nonce: GPU random A → keyed hash (A sub-roots copied to `d_a_subroots_` before the root reduction) → fused prepack into `a_buf_` (source stays in `d_A_sig_`).
-3. Scan: fused GEMM+XOR+jackpot; no full tile-XOR buffer.
-4. Share: D2H only A's sub-roots (64 KiB) and the ≤ 8 blocks of `d_A_sig_` holding the tile rows (≤ 2 MiB) into a `CpShareWitness`. B^T is proven from host-cached zero sub-roots.
+1. Job: GPU hashes the all-64 B (no buffer read; sub-roots and root kept on the host for the witness), derives
+   B's noise seed from the root and builds noisy B = 64 + noise into `b_buf_`.
+2. Each nonce: new dummy row → A's commitment (all groups on the first nonce of a job, then only the dummy row's
+   group) → A's noise seed with m + 1 rows → fused prepack of 64 + noise into `a_buf_`.
+3. Scan: fused GEMM+XOR+jackpot; no full tile-XOR buffer. Dot instructions with a sign mode run as u8.
+4. Share: D2H only A's sub-roots (64 KiB); the A and B^T blocks holding the tile's rows / columns are
+   synthesized on the host (64s), B^T's sub-roots come from the job.
+
+With `CP_OCL_CONST64=0` (zero B, row pokes): `d_A_sig_` (512 MiB, ~1.5 GiB VRAM in all); each nonce rewrites one
+random row of it and rehashes that row's group; the witness reads its blocks from `d_A_sig_`, and B^T is proven
+from host-cached zero sub-roots.
 
 `g_zero_b.B_noisy` is cleared on the GPU-prep path. `h_A_scan` / `h_B_scan` are not allocated (OpenCL handles prep).
 
@@ -239,7 +251,7 @@ On share, only A is handed off (`handoff_bt=0`; no host B^T); reclaim runs every
 | Item | Behavior |
 |------|----------|
 | Queue depth | **1** (single ownership slot) |
-| GPU prep | Enqueue a **share witness** (A sub-roots + ≤ 8 blocks); no host matrix is loaned |
+| GPU prep | Enqueue a **share witness** (A sub-roots + ≤ 8 blocks; constant-64 also B^T sub-roots + blocks); no host matrix is loaned |
 | `--cpu-gen` | Hand off **A only**; proof hashes it in place, B^T from cached zero sub-roots |
 | Copy | **None** — pointer move; mining waits if the next hit arrives before proof returns the buffer |
 | Proof scratch | < 1 MiB on the proof thread plus the witness (see *Share proof memory*) |
@@ -252,7 +264,7 @@ oneDNN reuses `Case33OclPrep` for matrix prep, so its GPU-prep path keeps A's su
 
 | Mode | Host signal | Share proof |
 |------|-------------|-------------|
-| **GPU prep** (default) | none | `CpShareWitness` (A sub-roots + ≤ 8 blocks of `d_A_sig_`), B^T from cached zero sub-roots |
+| **GPU prep** (default) | none | Constant-64 (default): `CpShareWitness` with A and B^T sub-roots, blocks synthesized; no `d_A_sig_` (only the 4 KiB dummy row). `CP_ONEDNN_CONST64=0`: A sub-roots + ≤ 8 blocks of `d_A_sig_`, B^T from cached zero sub-roots |
 | **Host fallback** (prep kernels failed) | `h_Ap_global` (512 MiB) + `a_host_` / `b_host_` upload staging + `g_zero_b.B_noisy` | Host A hashed in place, `bt = NULL` |
 
 No `h_BpT_global` is allocated in either mode.

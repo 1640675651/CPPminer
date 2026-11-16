@@ -54,6 +54,8 @@ int cp_opencl_worker_mine_attempt(
 
 int cp_opencl_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig);
 /* GPU-prep share witness (A sub-roots + covering blocks; B^T all-zero). Allocates *out. */
+/* m + 1 in constant-64 mode (the committed A has a dummy row after the m scanned rows), else m. */
+int cp_opencl_worker_proof_rows(int m);
 int cp_opencl_worker_fetch_share_witness(int t_rows, int t_cols, int tile_layout,
                                          CpShareWitness **out);
 

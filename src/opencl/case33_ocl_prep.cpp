@@ -1483,7 +1483,7 @@ bool Case33OclPrep::prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], 
     if (!ready_ || !b_buf || !b_noise_seed) {
         return false;
     }
-    if (!d_A_sig_) {
+    if (!(const_sig_ ? d_dummy_ : d_A_sig_)) {
         return false;
     }
     if (!ocl_->write_buffer(d_noise_seed_, b_noise_seed, 32)) {
@@ -1512,7 +1512,8 @@ bool Case33OclPrep::prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], 
     }
 
     const int has_signal = 0;
-    cl_mem dummy_sig = d_A_sig_;
+    const int sig_const = const_sig_;   /* 0: zero B */
+    cl_mem dummy_sig = const_sig_ ? d_dummy_ : d_A_sig_;
     err = CL_SUCCESS;
     err |= clSetKernelArg(k_fused_prepack_b_, 0, sizeof(cl_mem), &b_buf);
     err |= clSetKernelArg(k_fused_prepack_b_, 1, sizeof(cl_mem), &d_noise_seed_);
@@ -1524,6 +1525,7 @@ bool Case33OclPrep::prepare_job_b(cl_mem b_buf, const uint8_t b_noise_seed[32], 
     err |= clSetKernelArg(k_fused_prepack_b_, 7, sizeof(int), &macro_cols);
     err |= clSetKernelArg(k_fused_prepack_b_, 8, sizeof(int), &has_signal);
     err |= clSetKernelArg(k_fused_prepack_b_, 9, sizeof(cl_mem), &dummy_sig);
+    err |= clSetKernelArg(k_fused_prepack_b_, 10, sizeof(int), &sig_const);
     if (err != CL_SUCCESS) {
         return false;
     }
@@ -1550,6 +1552,19 @@ bool Case33OclPrep::prepare_attempt_a(cl_mem a_buf, const uint8_t *ab_seed, int 
                                       uint8_t a_key_out[32]) {
     if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed) {
         return false;
+    }
+    if (const_sig_) {
+        const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+        if (!const_attempt_signal_(ab_seed, ab_seed_len, job_key, b_noise_seed, m, K, salted, a_key_out)) {
+            return false;
+        }
+        const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+        const bool ok = fused_prepack_a(a_buf, m, K, blocks_k, macro_rows);
+        if (prep_timing_enabled()) {
+            std::printf("[ocl-prep] A constant signal: dummy row + commitment %.1fms, prepack %.1fms\n",
+                        (t1 - t0) * 1e3, (cp_now_sec() - t1) * 1e3);
+        }
+        return ok;
     }
     if (!ensure_buffers(m, 1, K)) {
         return false;
@@ -1754,15 +1769,22 @@ bool Case33OclPrep::fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, in
                                             int blocks_k, int macro_rows) {
     int rank = R_RANK;
     const int micro_m = case32::kMacroM / case32::kMR;
+    /* constant signal: no signal buffer is read (d_dummy_ only fills the argument) */
+    cl_mem sig_buf = const_sig_ ? d_dummy_ : d_A_sig_;
+    const cl_int sig_from_buf = const_sig_ ? 0 : 1;
+    const cl_int sig_const = const_sig_;
+    const cl_uint sig_word = 0x01010101u * static_cast<uint8_t>(const_sig_);
     cl_int err = CL_SUCCESS;
     size_t g2 = 0, l2 = 0;
     if (k == k_fused_prepack_a_wg_) {
         err |= clSetKernelArg(k, 0, sizeof(cl_mem), &a_buf);
         err |= clSetKernelArg(k, 1, sizeof(cl_mem), &d_el_rows_);
         err |= clSetKernelArg(k, 2, sizeof(cl_mem), &d_pairs_);
-        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_A_sig_);
+        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &sig_buf);
         err |= clSetKernelArg(k, 4, sizeof(int), &K);
         err |= clSetKernelArg(k, 5, sizeof(int), &blocks_k);
+        err |= clSetKernelArg(k, 6, sizeof(cl_int), &sig_from_buf);
+        err |= clSetKernelArg(k, 7, sizeof(cl_uint), &sig_word);
         l2 = 256;
         g2 = static_cast<size_t>(macro_rows) * static_cast<size_t>(blocks_k) *
              static_cast<size_t>(fpa_split_) * l2;
@@ -1770,12 +1792,14 @@ bool Case33OclPrep::fused_prepack_a_launch_(cl_kernel k, cl_mem a_buf, int m, in
         err |= clSetKernelArg(k, 0, sizeof(cl_mem), &a_buf);
         err |= clSetKernelArg(k, 1, sizeof(cl_mem), &d_noise_seed_);
         err |= clSetKernelArg(k, 2, sizeof(cl_mem), &d_pairs_);
-        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &d_A_sig_);
+        err |= clSetKernelArg(k, 3, sizeof(cl_mem), &sig_buf);
         err |= clSetKernelArg(k, 4, sizeof(int), &m);
         err |= clSetKernelArg(k, 5, sizeof(int), &K);
         err |= clSetKernelArg(k, 6, sizeof(int), &rank);
         err |= clSetKernelArg(k, 7, sizeof(int), &blocks_k);
         err |= clSetKernelArg(k, 8, sizeof(int), &macro_rows);
+        err |= clSetKernelArg(k, 9, sizeof(cl_int), &sig_from_buf);
+        err |= clSetKernelArg(k, 10, sizeof(cl_int), &sig_const);
         l2 = case32::kMR;
         g2 = static_cast<size_t>(macro_rows) * static_cast<size_t>(blocks_k) *
              static_cast<size_t>(micro_m) * l2;
@@ -2087,16 +2111,15 @@ bool Case33OclPrep::const_hash_selftest_(const uint8_t job_key[32], int K) {
     return same;
 }
 
-bool Case33OclPrep::prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
-                                             const uint8_t job_key[32], const uint8_t b_noise_seed[32],
-                                             int m, int K, int lda, int salted, uint8_t a_key_out[32]) {
-    if (!ready_ || !a_buf || !ab_seed || !job_key || !b_noise_seed || m <= 0 || K <= 0) {
+bool Case33OclPrep::const_attempt_signal_(const uint8_t *ab_seed, int ab_seed_len,
+                                          const uint8_t job_key[32], const uint8_t b_noise_seed[32],
+                                          int m, int K, int salted, uint8_t a_key_out[32]) {
+    if (!ready_ || !const_sig_ || !ab_seed || !job_key || !b_noise_seed || m <= 0 || K <= 0) {
         return false;
     }
     if (!ensure_buffers(m, 1, K) || !const_hash_selftest_(job_key, K)) {
         return false;
     }
-    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
     /* The dummy row: K signal bytes in [-64, 63] from the attempt seed (ocl_gen_random_matrix, tag 0). */
     const uint64_t rng_seed = pearl_seed_to_u64(ab_seed, ab_seed_len);
     if (!gen_random_(d_dummy_, rng_seed, K)) {
@@ -2106,11 +2129,21 @@ bool Case33OclPrep::prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_see
     if (!commit_const_a_(job_key, m, K)) {
         return false;
     }
-    const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
     /* the protocol matrix has m + 1 rows */
-    if (!derive_a_noise_seed_(b_noise_seed, m + 1, salted, a_key_out)) {
+    return derive_a_noise_seed_(b_noise_seed, m + 1, salted, a_key_out);
+}
+
+bool Case33OclPrep::prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_seed, int ab_seed_len,
+                                             const uint8_t job_key[32], const uint8_t b_noise_seed[32],
+                                             int m, int K, int lda, int salted, uint8_t a_key_out[32]) {
+    if (!a_buf) {
         return false;
     }
+    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    if (!const_attempt_signal_(ab_seed, ab_seed_len, job_key, b_noise_seed, m, K, salted, a_key_out)) {
+        return false;
+    }
+    const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
     const bool ok = noisy_matrix_a_packed_(a_buf, d_dummy_, m, K, lda);
     if (prep_timing_enabled()) {
         clFinish(ocl_->queue);

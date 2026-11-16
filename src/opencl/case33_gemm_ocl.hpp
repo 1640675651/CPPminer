@@ -51,6 +51,11 @@ struct Case33GemmOcl {
     bool use_lds() const { return use_lds_; }
     /* Register double-buffered k-group loop (CASE32_PIPELINE). Default off. */
     void set_double_buffer(int on);
+    /* Constant-64 operands (before init_context; GPU prep only): signal A and B are 64 except one
+       dummy row of A that the GEMM never reads; the dot instructions with a sign mode run as u8.
+       const64() tells whether it is active. */
+    void set_const64(bool on) { const64_req_ = on; }
+    bool const64() const { return const64_; }
     bool double_buffer() const { return double_buffer_; }
 
 
@@ -62,6 +67,11 @@ struct Case33GemmOcl {
 
     /* GPU prep path: noise + coalesced prepack directly into device GEMM buffers. */
     bool prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_seed[32]);
+    /* Constant-64: the all-64 B's commitment (root, sub-roots for the share witness), its noise seed
+       and the per-job noisy B. */
+    bool prepare_job_gpu_const64(int M, int N, int K, const uint8_t job_key[32], int salted,
+                                 uint8_t b_noise_seed[32], uint8_t bt_root[32],
+                                 std::vector<uint8_t> *bt_subroots);
     bool prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
                              const uint8_t job_key[32], const uint8_t b_noise_seed[32],
                              int salted, uint8_t a_key_out[32]);
@@ -167,6 +177,8 @@ private:
 
     bool use_lds_ = false;
     bool double_buffer_ = false;
+    bool const64_req_ = false;
+    bool const64_ = false;   // also builds the GEMM with CASE32_UNSIGNED
     int reqd_wg_size_ = 0; /* > 0: kernel built with reqd_work_group_size(n,1,1) */
 
     Case32OclDotBackend adopted_backend_ = Case32OclDotBackend::Scalar;

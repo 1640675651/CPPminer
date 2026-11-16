@@ -41,6 +41,11 @@ struct ZeroBCache {
     int salted = 0;
     uint8_t b_noise_seed[32]{};
     std::vector<int8_t> B_noisy;
+    /* Constant-64 mode (g_gemm.const64()): B is all 64, so the share witness carries B^T's sub-roots and
+       root (blocks synthesized); the committed A has m_proof = m + 1 rows. */
+    int m_proof = 0;
+    uint8_t bt_root[32]{};
+    std::vector<uint8_t> bt_subroots;
 } g_zero_b;
 
 static Case33GemmOcl g_gemm;
@@ -135,6 +140,22 @@ static int zero_b_prepare_job_gpu(const uint8_t job_key[32], int m, int n) {
     g_zero_b.n = n;
     g_zero_b.use_cpu_prep = 0;
     g_zero_b.B_noisy.clear();
+    g_zero_b.m_proof = m;
+    g_zero_b.bt_subroots.clear();
+
+    if (g_gemm.const64()) {
+        /* B committed as the all-64 matrix (hashed on the GPU), noisy B = 64 + noise. */
+        if (!g_gemm.prepare_job_gpu_const64(m, n, K_DIM, job_key, g_zero_b.salted,
+                                            g_zero_b.b_noise_seed, g_zero_b.bt_root,
+                                            &g_zero_b.bt_subroots)) {
+            g_zero_b.ready = 0;
+            fprintf(stderr, "[ocl] prepare_job_gpu (constant-64) failed\n");
+            return -2;
+        }
+        g_zero_b.m_proof = m + 1;
+        g_zero_b.ready = 1;
+        return 0;
+    }
 
     /* The keyed digest of the all-zero B^T on the GPU (~2 ms on an R9700 vs 0.78 s on the
        CPU per job); CP_OCL_ZERO_B_CHECK=1 compares it with the CPU path. */
@@ -447,6 +468,11 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
     g_gemm.set_use_lds(g_use_lds);
     g_gemm.set_double_buffer(g_double_buffer);
     cp_opencl_configure_tile(g_device_index, g_platform_filter);
+    /* CP_OCL_CONST64=0: zero B and row pokes of the scanned A (the pre-2026-11-15 operands). */
+    {
+        const char *c = getenv("CP_OCL_CONST64");
+        g_gemm.set_const64(!(c && c[0] == '0'));
+    }
     if (!g_gemm.init_context(kernel_path.c_str(), g_device_index, g_platform_filter,
                              !g_cpu_matrix_gen)) {
         fprintf(stderr, "[ocl] OpenCL init failed (kernel=%s)\n", kernel_path.c_str());
@@ -490,6 +516,9 @@ extern "C" void cp_opencl_worker_init(int *devices, int ndev) {
            g_gemm.macro_batch() * case32::hash_tiles_per_macro());
     if (g_cpu_matrix_gen) {
         printf("[ocl] host matrix prep (--cpu-gen)\n");
+    } else if (g_gemm.const64()) {
+        printf("[ocl] constant-64 operands (signal A and B = 64, one dummy row of A outside the GEMM, "
+               "no signal A buffer; u8 dot where the instruction has a sign mode)\n");
     } else {
         printf("[ocl] zero-B GPU prep (default); --cpu-gen for host prep (~1 GiB VRAM)\n");
     }
@@ -510,13 +539,19 @@ extern "C" void cp_opencl_worker_begin_job(const uint8_t job_key[32], int m, int
     g_zero_b.ready = 0;
     g_zero_b.salted = (cert_version >= 3) ? 1 : 0;
     const int cpu_prep = g_cpu_matrix_gen;
+    const double job_t0 = cp_now_sec();
     if (zero_b_prepare_job(job_key, m, n, cpu_prep) == 0) {
-        if (cpu_prep) {
+        const double job_ms = (cp_now_sec() - job_t0) * 1e3;
+        if (!cpu_prep && g_gemm.const64()) {
+            printf("[ocl] constant-64: GPU noise + fused prepack, B on device (salted=%d), committed A "
+                   "%dx%d = %d scanned rows + 1 dummy row; job prep %.1f ms\n",
+                   g_zero_b.salted, g_zero_b.m_proof, K_DIM, m, job_ms);
+        } else if (cpu_prep) {
             printf("[ocl] zero-B: host noise + prepack, B cached on device (salted=%d)\n",
                    g_zero_b.salted);
         } else {
-            printf("[ocl] zero-B: GPU noise + fused prepack, B on device (salted=%d)\n",
-                   g_zero_b.salted);
+            printf("[ocl] zero-B: GPU noise + fused prepack, B on device (salted=%d); job prep %.1f ms\n",
+                   g_zero_b.salted, job_ms);
         }
         fflush(stdout);
     }
@@ -704,9 +739,17 @@ extern "C" int cp_opencl_worker_mine_attempt(
     return 0;
 }
 
+extern "C" int cp_opencl_worker_proof_rows(int m) {
+    return (g_context_ready && g_gemm.const64()) ? m + 1 : m;
+}
+
 extern "C" int cp_opencl_worker_fetch_share_signals(int8_t *h_A_sig, int8_t *h_Bt_sig) {
     (void)h_Bt_sig;
     if (!h_A_sig) {
+        return -1;
+    }
+    if (g_gemm.const64()) {
+        fprintf(stderr, "[ocl] constant-64 mode has no signal A buffer (shares use the witness)\n");
         return -1;
     }
     if (!g_gemm.read_A_sig(h_A_sig)) {
@@ -727,7 +770,7 @@ extern "C" int cp_opencl_worker_fetch_share_witness(int t_rows, int t_cols, int 
     if (!g_zero_b.ready || g_zero_b.use_cpu_prep || num_subroots < 0) {
         return -1;
     }
-    const int m = g_zero_b.m;
+    const int m = g_zero_b.m_proof > 0 ? g_zero_b.m_proof : g_zero_b.m;
 
     CpShareWitness *w = static_cast<CpShareWitness *>(calloc(1, sizeof(CpShareWitness)));
     if (!w) {
@@ -756,7 +799,41 @@ extern "C" int cp_opencl_worker_fetch_share_witness(int t_rows, int t_cols, int 
         cp_share_witness_free(w);
         return -1;
     }
-    /* B^T is all-zero: bt_subroots stays NULL and the proof uses host-cached zero sub-roots. */
+    if (g_gemm.const64()) {
+        /* B^T is all 64: sub-roots and root from the per-job GPU commitment, the blocks covering the
+           tile's columns synthesized (64 up to n * K, zero padding after). */
+        const int n = g_zero_b.n;
+        const int nbt = cp_proof_witness_blocks(tile_layout, 1, t_cols, n, K_DIM, w->bt_block_idx,
+                                                CP_WITNESS_MAX_BLOCKS);
+        const size_t nsub = g_zero_b.bt_subroots.size() / 32;
+        if (nbt <= 0 || nsub == 0) {
+            fprintf(stderr, "[ocl] share witness: no B^T blocks for t_cols=%d layout=%d\n", t_cols,
+                    tile_layout);
+            cp_share_witness_free(w);
+            return -1;
+        }
+        w->bt_num_blocks = static_cast<size_t>(nbt);
+        w->bt_blocks = static_cast<uint8_t *>(malloc(static_cast<size_t>(nbt) * CP_WITNESS_BLOCK_BYTES));
+        w->bt_subroots = static_cast<uint8_t *>(malloc(nsub * 32));
+        if (!w->bt_blocks || !w->bt_subroots) {
+            cp_share_witness_free(w);
+            return -1;
+        }
+        const size_t raw_bt = static_cast<size_t>(n) * static_cast<size_t>(K_DIM);
+        for (int i = 0; i < nbt; ++i) {
+            const size_t off = static_cast<size_t>(w->bt_block_idx[i]) * CP_WITNESS_BLOCK_BYTES;
+            uint8_t *dst = w->bt_blocks + static_cast<size_t>(i) * CP_WITNESS_BLOCK_BYTES;
+            const size_t fill = off >= raw_bt ? 0
+                                : (raw_bt - off < CP_WITNESS_BLOCK_BYTES ? raw_bt - off
+                                                                         : CP_WITNESS_BLOCK_BYTES);
+            memset(dst, 64, fill);
+            memset(dst + fill, 0, CP_WITNESS_BLOCK_BYTES - fill);
+        }
+        memcpy(w->bt_subroots, g_zero_b.bt_subroots.data(), nsub * 32);
+        w->bt_num_subroots = nsub;
+        memcpy(w->bt_root, g_zero_b.bt_root, 32);
+    }
+    /* Otherwise B^T is all-zero: bt_subroots stays NULL and the proof uses host-cached zero sub-roots. */
     *out = w;
     return 0;
 }

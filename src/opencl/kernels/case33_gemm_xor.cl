@@ -234,6 +234,14 @@ inline bool digest_beats_target(const uint digest[8], __global const uint *bound
 #define CASE32_CPM_PANEL 0
 #endif
 
+/* CASE32_UNSIGNED (constant-64 mining: every operand byte is in [1, 127]): the dot instructions that
+   take a sign mode per operand run as u8 x u8 (KHR dot_acc_sat on uchar4, RDNA3 sudot4 with unsigned
+   flags). Same results; Intel Xe2 draws less power for u8 matrix products. The other paths (gfx9 sdot4,
+   v_dot4c, the scalar and cpm nests) keep their signed form, which gives the same values on [1, 127]. */
+#ifndef CASE32_UNSIGNED
+#define CASE32_UNSIGNED 0
+#endif
+
 inline int case32_dot4(int acc, int a_pack, int b_pack) {
 #if defined(CASE32_USE_ASM_DOT)
     __asm volatile("v_dot4c_i32_i8 %0, %1, %2" : "+v"(acc) : "v"(a_pack), "v"(b_pack));
@@ -243,11 +251,19 @@ inline int case32_dot4(int acc, int a_pack, int b_pack) {
      * sudot4 with both operands marked signed. The older sdot4 and v_dot4c
      * forms need dot1-insts, which gfx11 does not have, so on a Radeon 780M
      * the accelerated path fell through to the scalar 4x MAC nest. */
+#if CASE32_UNSIGNED
+    return __builtin_amdgcn_sudot4(false, a_pack, false, b_pack, acc, false);
+#else
     return __builtin_amdgcn_sudot4(true, a_pack, true, b_pack, acc, false);
+#endif
 #elif defined(CASE32_USE_BUILTIN_SDOT4)
     return __builtin_amdgcn_sdot4(a_pack, b_pack, acc, false);
 #elif defined(CASE32_USE_DOT)
+#if CASE32_UNSIGNED
+    return (int)dot_acc_sat(as_uchar4(a_pack), as_uchar4(b_pack), (uint)acc);
+#else
     return dot_acc_sat(as_char4(a_pack), as_char4(b_pack), acc);
+#endif
 #else
     char4 a = as_char4(a_pack);
     char4 b = as_char4(b_pack);

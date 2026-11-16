@@ -3,6 +3,7 @@
 #include "case32_layout.hpp"
 #include "case32_prepack.hpp"
 #include "cp_config.h"
+#include "cp_noise.h"
 
 #include <cctype>
 #include <cstdio>
@@ -319,6 +320,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
         if (reqd_wg_size_ > 0) {
             build_opts += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
         }
+        if (const64_) {
+            build_opts += " -DCASE32_UNSIGNED=1";   /* constant-64 operands: u8 dot forms */
+        }
         /* Scalar/cpm nest: never let the compiler auto-enable KHR DPI (case36 / beignet-fix). */
         if (gcn) {
             build_opts += " -DCASE32_NO_DPI=1 -DCASE32_GCN_MAD24=1";
@@ -408,6 +412,9 @@ bool Case33GemmOcl::build_kernel_(const char *kernel_cl_path) {
                 }
                 if (reqd_wg_size_ > 0) {
                     build_opts2 += " -DCASE32_REQD_WG=" + std::to_string(reqd_wg_size_);
+                }
+                if (const64_) {
+                    build_opts2 += " -DCASE32_UNSIGNED=1";
                 }
                 if (ocl_.build_program_from_file(kernel_cl_path, build_opts2.c_str(), true)) {
                     return adopt_kernel(label);
@@ -515,6 +522,7 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,
     if (!ocl_.init(device_index, platform_filter)) {
         return false;
     }
+    const64_ = const64_req_ && gpu_prep;   /* the constant mode has no host prep path */
     if (!build_kernel_(kernel_cl_path)) {
         return false;
     }
@@ -526,6 +534,7 @@ bool Case33GemmOcl::init_context(const char *kernel_cl_path, int device_index,
             std::fprintf(stderr, "[ocl] prep kernel init failed\n");
             return false;
         }
+        prep_.set_const_signal(const64_ ? 64 : 0);
     } else {
         std::printf("[ocl] skipping GPU prep kernels (--cpu-gen)\n");
     }
@@ -608,9 +617,9 @@ bool Case33GemmOcl::prepare_job(int M, int N, int K, const int8_t *b_colmajor) {
                        : dot_kind_short(adopted_backend_, issue_mode_,
                                         resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s s8s8",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, hash tile %dx%d KR=%d %s %s",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
-                  case32::kKR, dot_kind);
+                  case32::kKR, dot_kind, const64_ ? "u8u8 const64" : "s8s8");
     available_ = true;
     return true;
 }
@@ -659,11 +668,29 @@ bool Case33GemmOcl::prepare_job_gpu(int M, int N, int K, const uint8_t b_noise_s
                        : dot_kind_short(adopted_backend_, issue_mode_,
                                         resolved_cpm_type_ == Case32OclCpmType::Int);
     std::snprintf(backend_, sizeof(backend_),
-                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s s8s8 GPU-prep",
+                  "OpenCL %dx%d macro batch=%d fused GEMM+XOR+jackpot, register tile %dx%d, hash tile %dx%d KR=%d %s %s GPU-prep",
                   case32::kMacroM, case32::kMacroN, macro_batch_, case32::kMR, case32::kNR,
-                  case32::hash_tile_mr(), case32::hash_tile_nr(), case32::kKR, dot_kind);
+                  case32::hash_tile_mr(), case32::hash_tile_nr(), case32::kKR, dot_kind,
+                  const64_ ? "u8u8 const64" : "s8s8");
     available_ = true;
     return true;
+}
+
+bool Case33GemmOcl::prepare_job_gpu_const64(int M, int N, int K, const uint8_t job_key[32],
+                                            int salted, uint8_t b_noise_seed[32], uint8_t bt_root[32],
+                                            std::vector<uint8_t> *bt_subroots) {
+    available_ = false;
+    if (!const64_ || !context_ready_ || !kernel_ || !prep_.ready() || !job_key || !b_noise_seed ||
+        !bt_root) {
+        return false;
+    }
+    if (!prep_.ensure_buffers(M, N, K) ||
+        !prep_.const_matrix_keyed_hash(N, K, job_key, bt_root, bt_subroots)) {
+        std::fprintf(stderr, "[ocl] constant-64 B commitment failed\n");
+        return false;
+    }
+    pearl_b_noise_seed_from_root(job_key, bt_root, N, salted, b_noise_seed);
+    return prepare_job_gpu(M, N, K, b_noise_seed);
 }
 
 bool Case33GemmOcl::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_len,
@@ -690,8 +717,9 @@ bool Case33GemmOcl::read_A_witness(const uint32_t *block_idx, int num_blocks,
     if (M_ <= 0 || K_ <= 0) {
         return false;
     }
-    return prep_.read_A_witness(static_cast<size_t>(M_) * static_cast<size_t>(K_), block_idx,
-                                num_blocks, block_bytes, blocks_out, subroots_out, root_out);
+    /* constant-64: the committed A has the dummy row after the M_ GEMM rows */
+    return prep_.read_A_witness(static_cast<size_t>(M_ + (const64_ ? 1 : 0)) * static_cast<size_t>(K_),
+                                block_idx, num_blocks, block_bytes, blocks_out, subroots_out, root_out);
 }
 
 bool Case33GemmOcl::prepare_attempt_a(const int8_t *a_rowmajor) {
