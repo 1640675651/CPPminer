@@ -6,14 +6,18 @@
 - Multi GPU (TODO)
 
 ### Fix & Enhancements
-- OneDNN, OpenCL: use constant, unsigned matrix, remove 512MiB A buffer and reduce power
-- OneDNN: code refactor, use a fork of onednn instead of keeping patches
-- OneDNN: tiled A packing for higher GEMM throughput
-- OneDNN: lower XOR overhead on Xe2
-- OneDNN: taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
-- OneDNN: 65536^2 GEMM panels with the fused jackpot on all Arc GPUs (Xe2 used 32768^2)
-- CPU: use 16x4 tile to reduce B broadcast overhead and remove register spilling
+- Improved OneDNN and OpenCL efficiency
 - CPU: interleave XOR with dot product instructions
+- CPU: use 16x4 tile to reduce B broadcast overhead and eliminate register spilling
+
+### Pearl OneDNN
+- use constant, unsigned matrix, remove 512MiB A buffer and reduce power
+- code refactor, use a fork of onednn instead of keeping patches
+- tiled A packing for higher GEMM throughput
+- lower XOR overhead on Xe2
+- taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
+- 65536^2 GEMM panels with the fused jackpot on all Arc GPUs (Xe2 used 32768^2)
+- keep two GEMM panels in flight with the fused jackpot
 
 ## v1.0
 ### New features

@@ -592,8 +592,8 @@ bool OpenClContext::init_xfer_kernels_() const {
         ext.find("cl_intel_unified_shared_memory") == std::string::npos) {
         return false;
     }
-    auto alloc_fn = reinterpret_cast<cp_clHostMemAllocINTEL_fn>(
-            clGetExtensionFunctionAddressForPlatform(platform, "clHostMemAllocINTEL"));
+    usm_alloc_fn_ = clGetExtensionFunctionAddressForPlatform(platform, "clHostMemAllocINTEL");
+    auto alloc_fn = reinterpret_cast<cp_clHostMemAllocINTEL_fn>(usm_alloc_fn_);
     usm_free_fn_ = clGetExtensionFunctionAddressForPlatform(platform, "clMemBlockingFreeINTEL");
     usm_arg_fn_ = clGetExtensionFunctionAddressForPlatform(platform, "clSetKernelArgMemPointerINTEL");
     if (!alloc_fn || !usm_free_fn_ || !usm_arg_fn_) {
@@ -616,6 +616,8 @@ bool OpenClContext::init_xfer_kernels_() const {
     if (!xfer_down_ || err != CL_SUCCESS) return false;
     xfer_dd_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
     if (!xfer_dd_ || err != CL_SUCCESS) return false;
+    xfer_async_ = clCreateKernel(xfer_prog_, "cp_xfer_copy", &err);
+    if (!xfer_async_ || err != CL_SUCCESS) return false;
     auto set_ptr = reinterpret_cast<cp_clSetKernelArgMemPointerINTEL_fn>(usm_arg_fn_);
     return set_ptr(xfer_up_, 0, xfer_host_) == CL_SUCCESS &&
            set_ptr(xfer_down_, 2, xfer_host_) == CL_SUCCESS;
@@ -626,6 +628,8 @@ void OpenClContext::release_xfer_() const {
     if (xfer_down_) clReleaseKernel(xfer_down_);
     if (xfer_dd_) clReleaseKernel(xfer_dd_);
     xfer_dd_ = nullptr;
+    if (xfer_async_) clReleaseKernel(xfer_async_);
+    xfer_async_ = nullptr;
     if (xfer_prog_) clReleaseProgram(xfer_prog_);
     xfer_up_ = xfer_down_ = nullptr;
     xfer_prog_ = nullptr;
@@ -709,6 +713,62 @@ bool OpenClContext::copy_buffer(cl_mem src, size_t src_offset, cl_mem dst, size_
     }
     if (err != CL_SUCCESS) {
         log_cl_error("kernel copy", err);
+        return false;
+    }
+    return true;
+}
+
+void *OpenClContext::read_host_alloc(size_t bytes) const {
+    if (bytes == 0) {
+        return nullptr;
+    }
+    if (xfer_kernels_on_() && usm_alloc_fn_) {
+        cl_int err = CL_SUCCESS;
+        void *p = reinterpret_cast<cp_clHostMemAllocINTEL_fn>(usm_alloc_fn_)(context, nullptr, bytes, 0, &err);
+        return (p && err == CL_SUCCESS) ? p : nullptr;
+    }
+    return std::calloc(1, bytes);
+}
+
+void OpenClContext::read_host_free(void *host) const {
+    if (!host) {
+        return;
+    }
+    if (xfer_kernels_on_() && usm_free_fn_ && context) {
+        reinterpret_cast<cp_clMemBlockingFreeINTEL_fn>(usm_free_fn_)(context, host);
+        return;
+    }
+    std::free(host);
+}
+
+bool OpenClContext::enqueue_read_async(cl_mem buf, size_t offset, size_t bytes, void *host,
+                                       cl_event *ev) const {
+    if (!host || !ev) {
+        return false;
+    }
+    if (stage_small_xfer_(buf, bytes, /*device_write=*/false) && xfer_async_) {
+        std::lock_guard<std::mutex> lock(*xfer_mu_);
+        const cl_ulong soff = offset, doff = 0;
+        const cl_uint n = static_cast<cl_uint>(bytes);
+        auto set_ptr = reinterpret_cast<cp_clSetKernelArgMemPointerINTEL_fn>(usm_arg_fn_);
+        cl_int err = clSetKernelArg(xfer_async_, 0, sizeof(cl_mem), &buf);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_async_, 1, sizeof(soff), &soff);
+        if (err == CL_SUCCESS) err = set_ptr(xfer_async_, 2, host);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_async_, 3, sizeof(doff), &doff);
+        if (err == CL_SUCCESS) err = clSetKernelArg(xfer_async_, 4, sizeof(n), &n);
+        if (err == CL_SUCCESS) {
+            const size_t lws = 64, gws = (bytes + lws - 1) / lws * lws;
+            err = clEnqueueNDRangeKernel(queue, xfer_async_, 1, nullptr, &gws, &lws, 0, nullptr, ev);
+        }
+        if (err != CL_SUCCESS) {
+            log_cl_error("kernel read (async)", err);
+            return false;
+        }
+        return true;
+    }
+    const cl_int err = clEnqueueReadBuffer(queue, buf, CL_FALSE, offset, bytes, host, 0, nullptr, ev);
+    if (err != CL_SUCCESS) {
+        log_cl_error("clEnqueueReadBuffer (async)", err);
         return false;
     }
     return true;

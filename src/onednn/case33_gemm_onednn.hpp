@@ -92,6 +92,10 @@ private:
     int scan_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
                         uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
                         const std::function<void(uint64_t)> &on_progress);
+    bool ensure_fused_pipeline_(int panel_count);
+    int scan_fused_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
+                              uint64_t *out_tiles_scanned, const std::function<bool()> &should_cancel,
+                              const std::function<void(uint64_t)> &on_progress);
     bool run_gemm_jackpot_panel_(int m_panel, int n_panel, int64_t offset_a_rows,
                                  int64_t offset_b_cols, int panel_tile_count, int panel_tile_cols,
                                  int tr_base, int tc_base, int *out_found, int *out_t_rows = nullptr,
@@ -160,6 +164,15 @@ private:
     cl_mem pipe_tile_xor_[2] = {};
     int pipe_tile_xor_cap_ = 0;
     int pipe_found_host_[2] = {};
+    /* Pipelined fused scan (in-order queue, two panels in flight): per-panel tile arguments uploaded once
+       per attempt, a zero block for the found flag / coordinate resets, and per-slot host copies of
+       found_buf_[32..47] (flag, pad, coordinates) filled by asynchronous reads. */
+    cl_mem fpipe_args_buf_ = nullptr;
+    cl_mem fpipe_zero_buf_ = nullptr;
+    int fpipe_args_cap_ = 0;
+    std::vector<uint32_t> fpipe_args_host_;   // what fpipe_args_buf_ holds (empty: unknown)
+    void *fpipe_host_[2] = {};
+    bool fpipe_args_staged_ = false;   // enqueue_gemm_panel_ skips its per-panel argument write
     cl_program jackpot_program_ = nullptr;
     cl_kernel jackpot_kernel_ = nullptr;
     cl_kernel blake3_kernel_ = nullptr;

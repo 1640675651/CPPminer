@@ -299,7 +299,7 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 | Device | ISA | Hashrate | Power (W) |
 |--------|-----|----------|-----------|
-| Radeon Pro 5500M | DP4A | 5.4 TH/s | 50 |
+| Radeon Pro 5500M | DP4A | 5.5 TH/s | 50 |
 
 ### Intel GPU (OneDNN)
 
@@ -307,8 +307,8 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 |--------|-----|----------|-----------|
 | UHD 770 | DP4A | 1.4 TH/s | 13 |
 | Xe-LPG 64EU (Core Ultra 9 275HX) | DP4A | 3.5 TH/s | 14 |
-| ARC B580 | DPAS | 101 TH/s | 200 |
-| ARC A770 | DPAS | 124 TH/s | 210 |
+| ARC B580 | DPAS | 104 TH/s | 200 |
+| ARC A770 | DPAS | 124 TH/s | 205 |
 
 ### Other GPU (OpenCL)
 | Device | ISA | Tile size | Hashrate |

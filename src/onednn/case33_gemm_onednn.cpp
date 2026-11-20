@@ -230,6 +230,18 @@ Case33GemmOnednn::~Case33GemmOnednn() {
         clReleaseCommandQueue(pipe_queue_);
         pipe_queue_ = nullptr;
     }
+    for (cl_mem *buf : {&fpipe_args_buf_, &fpipe_zero_buf_}) {
+        if (*buf) {
+            clReleaseMemObject(*buf);
+            *buf = nullptr;
+        }
+    }
+    fpipe_args_cap_ = 0;
+    fpipe_args_host_.clear();
+    for (void *&h : fpipe_host_) {
+        ocl_.read_host_free(h);
+        h = nullptr;
+    }
 }
 
 bool Case33GemmOnednn::setup_dims_(int M, int N, int K) {
@@ -834,6 +846,7 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     if (!available_ || !kernel_) {
         return false;
     }
+    const double trace_in = cp_now_sec();
     if (fused_jackpot_) {
         if (!found_buf_ || !bound_buf_) {
             return false;
@@ -861,11 +874,20 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
         const char *v = std::getenv("CP_ONEDNN_PANEL_WATCH");
         return (v && v[0]) ? std::atof(v) : 0.0;
     }();
+    // CP_ONEDNN_PANEL_TRACE=1 (debug; GPU times need CP_OCL_QUEUE_PROFILING=1): one stderr line per panel
+    // with the GEMM's device start / end (ns, device clock) and the host times (s) at entry, after the
+    // enqueue and after the wait, to measure the gaps between launches (the pipelined fused scan prints the
+    // same lines). Profiling and these waits lengthen the synchronous loop's gaps (UHD 770: 48.40 vs 48.21 s).
+    static const bool trace = [] {
+        const char *v = std::getenv("CP_ONEDNN_PANEL_TRACE");
+        return v && v[0] == '1';
+    }();
     cl_event watch_ev = nullptr;
     const double watch_t0 = cp_now_sec();
     if (!enqueue_gemm_panel_(ocl_.queue, fused_jackpot_ ? nullptr : tile_xor_buf_, m_panel, n_panel,
                              offset_a_rows, offset_b_cols, panel_tile_count, panel_tile_cols,
-                             tr_base, tc_base, 0, nullptr, watch_ms > 0 ? &watch_ev : nullptr)) {
+                             tr_base, tc_base, 0, nullptr,
+                             (watch_ms > 0 || trace) ? &watch_ev : nullptr)) {
         return false;
     }
     const double watch_t1 = cp_now_sec();
@@ -878,7 +900,17 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
             return false;
         }
     }
-    if (watch_ev) {
+    if (watch_ev && trace) {
+        const double trace_done = cp_now_sec();
+        clWaitForEvents(1, &watch_ev);
+        cl_ulong st = 0, en = 0;
+        clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr);
+        clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr);
+        std::fprintf(stderr, "[panel-trace] tr=%d tc=%d gpu_start=%llu gpu_end=%llu host_in=%.6f host_enq=%.6f host_done=%.6f\n",
+                     tr_base, tc_base, static_cast<unsigned long long>(st), static_cast<unsigned long long>(en),
+                     trace_in, watch_t1, trace_done);
+    }
+    if (watch_ev && watch_ms > 0) {
         const double watch_t2 = cp_now_sec();
         if ((watch_t2 - watch_t0) * 1e3 > watch_ms) {
             cl_ulong q = 0, sb = 0, st = 0, en = 0;
@@ -899,6 +931,8 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
                 std::fprintf(stderr, " (no profiling: set CP_OCL_QUEUE_PROFILING=1)\n");
             std::fflush(stderr);
         }
+    }
+    if (watch_ev) {
         clReleaseEvent(watch_ev);
     }
 
@@ -938,7 +972,8 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
         bufs.found_flag = found_buf_;
         bufs.tr_base = tr_base;
         bufs.tc_base = tc_base;
-        if (info_.jackpotArgsInBuf) {
+        // fpipe_args_staged_: the pipelined fused scan has already enqueued this panel's argument copy.
+        if (info_.jackpotArgsInBuf && !fpipe_args_staged_) {
             // Wrap-GRF fused jackpot: the kernel reads this panel's tile arguments from the found buffer
             // (cooperative-path layout; the key before them is staged once at scan start).
             uint32_t args[4] = {static_cast<uint32_t>(panel_tile_cols), static_cast<uint32_t>(tr_base),
@@ -953,7 +988,8 @@ bool Case33GemmOnednn::enqueue_gemm_panel_(cl_command_queue queue, cl_mem tile_x
             // The key words before them were filled once at scan start (scan_for_share).
             uint32_t args[4] = {static_cast<uint32_t>(panel_tile_cols), static_cast<uint32_t>(tr_base),
                                 static_cast<uint32_t>(tc_base), static_cast<uint32_t>(panel_tile_count)};
-            if (!ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff + 32)) {
+            if (!fpipe_args_staged_ &&
+                !ocl_.write_buffer(found_buf_, args, sizeof(args), kJackpotCoopArgsOff + 32)) {
                 return false;
             }
             if (info_.jackpotCoopAudit) {   // the audit may have reallocated the found buffer: restage the key
@@ -1649,6 +1685,187 @@ int Case33GemmOnednn::scan_pipelined_(int *out_found, int *out_t_rows, int *out_
     return 1;
 }
 
+bool Case33GemmOnednn::ensure_fused_pipeline_(int panel_count) {
+    if (!fpipe_zero_buf_) {
+        fpipe_zero_buf_ = ocl_.alloc_buffer(16, CL_MEM_READ_WRITE);
+        const uint32_t zero[4] = {};
+        if (!fpipe_zero_buf_ || !ocl_.write_buffer(fpipe_zero_buf_, zero, sizeof(zero))) {
+            return false;
+        }
+    }
+    if (!fpipe_args_buf_ || fpipe_args_cap_ < panel_count) {
+        if (fpipe_args_buf_) {
+            clReleaseMemObject(fpipe_args_buf_);
+        }
+        fpipe_args_buf_ = ocl_.alloc_buffer(static_cast<size_t>(panel_count) * 16, CL_MEM_READ_WRITE);
+        fpipe_args_host_.clear();   // the new buffer holds nothing yet
+        if (!fpipe_args_buf_) {
+            fpipe_args_cap_ = 0;
+            return false;
+        }
+        fpipe_args_cap_ = panel_count;
+    }
+    for (void *&h : fpipe_host_) {
+        if (!h && !(h = ocl_.read_host_alloc(16))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Fused jackpot with two panels in flight (the OpenCL backend's scheme). The synchronous loop finishes the
+ * queue after every panel, reads the found flag and writes the next panel's resets and tile arguments, each a
+ * transfer the host waits for: the GPU idles ~0.2-0.6 ms per panel boundary (more with queue profiling on).
+ * 2026-11-19, mock mining against CASE5_PIPELINE=0: A770 +0.42% (gaps 1.34 -> 0.03 ms traced), UHD 770 +0.1%,
+ * B580 neutral (-0.06% over 7 rounds: at its power cap the removed idle time comes back as clock). Here every
+ * per-panel step is queued on the in-order queue without a host wait: the tile arguments of all panels are
+ * uploaded when they change (they depend only on the sizes), each panel copies its 16 bytes to
+ * found_buf_[96..111] and zeros the found flag / coordinates on the device, and found_buf_[32..47] (flag, pad,
+ * coordinates) is read back asynchronously into a per-slot host block. The host waits only for the previous
+ * panel's read, so the next panel is always queued behind the running one. After a hit the one panel already
+ * queued runs to completion (no early-out in the kernel); its writes cannot reach the hit's snapshot.
+ * Returns 1 done, 0 error/cancel, -1 not available (the synchronous loop runs instead). */
+int Case33GemmOnednn::scan_fused_pipelined_(int *out_found, int *out_t_rows, int *out_t_cols,
+                                            uint64_t *out_tiles_scanned,
+                                            const std::function<bool()> &should_cancel,
+                                            const std::function<void(uint64_t)> &on_progress) {
+    struct Panel {
+        int m, n, tile_count, tile_cols, tr_base, tc_base;
+        int64_t off_a, off_b;
+    };
+    std::vector<Panel> panels;
+    std::vector<uint32_t> args;
+    for (int rpi0 = 0; rpi0 < hash_tile_rows_; rpi0 += row_period_batch_) {
+        const int row_batch = std::min(row_period_batch_, hash_tile_rows_ - rpi0);
+        for (int cpi0 = 0; cpi0 < hash_tile_cols_; cpi0 += col_period_batch_) {
+            const int col_batch = std::min(col_period_batch_, hash_tile_cols_ - cpi0);
+            Panel p{};
+            p.m = row_batch * info_.xorSubM;
+            p.n = col_batch * info_.xorSubN;
+            int tile_rows = 0;
+            compute_tile_grid_(p.m, p.n, tile_rows, p.tile_cols, p.tile_count);
+            p.tr_base = rpi0;
+            p.tc_base = cpi0;
+            p.off_a = static_cast<int64_t>(rpi0) * info_.xorSubM;
+            p.off_b = static_cast<int64_t>(cpi0) * info_.xorSubN;
+            panels.push_back(p);
+            args.insert(args.end(), {static_cast<uint32_t>(p.tile_cols), static_cast<uint32_t>(p.tr_base),
+                                     static_cast<uint32_t>(p.tc_base), static_cast<uint32_t>(p.tile_count)});
+        }
+    }
+    const bool args_in_buf = info_.jackpotCoop || info_.jackpotArgsInBuf;
+    if (panels.empty() || !ensure_jackpot_bufs_() || !ensure_fused_pipeline_(static_cast<int>(panels.size()))) {
+        return -1;
+    }
+    // The panel arguments depend only on the problem and panel sizes: upload them when they change (a
+    // blocking write every attempt cost ~0.3 ms at the attempt boundary).
+    if (args_in_buf && args != fpipe_args_host_) {
+        fpipe_args_host_.clear();
+        if (!ocl_.write_buffer(fpipe_args_buf_, args.data(), args.size() * sizeof(uint32_t))) {
+            return 0;
+        }
+        fpipe_args_host_ = args;
+    }
+
+    static const bool trace = [] {   // CP_ONEDNN_PANEL_TRACE=1: same lines as the synchronous path
+        const char *v = std::getenv("CP_ONEDNN_PANEL_TRACE");
+        return v && v[0] == '1';
+    }();
+    auto release = [](cl_event &e) {
+        if (e) {
+            clReleaseEvent(e);
+            e = nullptr;
+        }
+    };
+    cl_event rd_ev[2] = {}, gemm_ev[2] = {};
+    double host_in[2] = {}, host_enq[2] = {};
+    uint64_t tiles_scanned = 0;
+    int found = 0, found_rows = -1, found_cols = -1;
+    bool ok = true;
+    // Settles panel j (slot s): its read is complete. Returns false on a wait error.
+    auto settle = [&](size_t j, int s) {
+        if (clWaitForEvents(1, &rd_ev[s]) != CL_SUCCESS) {
+            return false;
+        }
+        if (trace && gemm_ev[s]) {
+            cl_ulong st = 0, en = 0;
+            clGetEventProfilingInfo(gemm_ev[s], CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr);
+            clGetEventProfilingInfo(gemm_ev[s], CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr);
+            std::fprintf(stderr, "[panel-trace] tr=%d tc=%d gpu_start=%llu gpu_end=%llu host_in=%.6f host_enq=%.6f host_done=%.6f\n",
+                         panels[j].tr_base, panels[j].tc_base, static_cast<unsigned long long>(st),
+                         static_cast<unsigned long long>(en), host_in[s], host_enq[s], cp_now_sec());
+        }
+        release(rd_ev[s]);
+        release(gemm_ev[s]);
+        tiles_scanned += static_cast<uint64_t>(panels[j].tile_count);
+        if (on_progress) {
+            on_progress(tiles_scanned);
+        }
+        uint32_t snap[4];
+        std::memcpy(snap, fpipe_host_[s], sizeof(snap));
+        if (snap[0] != 0) {
+            found = 1;
+            found_rows = static_cast<int>(snap[2]);
+            found_cols = static_cast<int>(snap[3]);
+        }
+        return true;
+    };
+
+    fpipe_args_staged_ = args_in_buf;
+    for (size_t i = 0; i < panels.size() && !found && ok; ++i) {
+        if (should_cancel && should_cancel()) {
+            ok = false;
+            break;
+        }
+        const int s = static_cast<int>(i & 1);
+        const Panel &p = panels[i];
+        host_in[s] = cp_now_sec();
+        // Device-side resets and this panel's tile arguments, queued behind the previous panel.
+        ok = ocl_.copy_buffer(fpipe_zero_buf_, 0, found_buf_, jackpot_found_flag_off(/*fused=*/true), 4) &&
+             ocl_.copy_buffer(fpipe_zero_buf_, 0, found_buf_, kJackpotFoundCoordsOff, 8) &&
+             (!args_in_buf || ocl_.copy_buffer(fpipe_args_buf_, i * 16, found_buf_, kJackpotCoopArgsOff + 32, 16)) &&
+             enqueue_gemm_panel_(ocl_.queue, nullptr, p.m, p.n, p.off_a, p.off_b, p.tile_count, p.tile_cols,
+                                 p.tr_base, p.tc_base, 0, nullptr, trace ? &gemm_ev[s] : nullptr) &&
+             ocl_.enqueue_read_async(found_buf_, jackpot_found_flag_off(/*fused=*/true), 16, fpipe_host_[s],
+                                     &rd_ev[s]);
+        host_enq[s] = cp_now_sec();
+        if (!ok) {
+            break;
+        }
+        clFlush(ocl_.queue);
+        if (i >= 1) {
+            ok = settle(i - 1, s ^ 1);
+        }
+    }
+    if (ok && !found && rd_ev[(panels.size() - 1) & 1]) {
+        ok = settle(panels.size() - 1, static_cast<int>((panels.size() - 1) & 1));
+    }
+    fpipe_args_staged_ = false;
+    clFinish(ocl_.queue);   // the panel queued after a hit, and everything on error / cancel
+    for (int s = 0; s < 2; ++s) {
+        release(rd_ev[s]);
+        release(gemm_ev[s]);
+    }
+    if (!ok) {
+        return 0;
+    }
+    if (out_tiles_scanned) {
+        *out_tiles_scanned = tiles_scanned;
+    }
+    if (out_found) {
+        *out_found = found;
+    }
+    if (found) {
+        if (out_t_rows) {
+            *out_t_rows = found_rows;
+        }
+        if (out_t_cols) {
+            *out_t_cols = found_cols;
+        }
+    }
+    return 1;
+}
+
 bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t bound[8],
                                       int *out_found, int *out_t_rows, int *out_t_cols,
                                       uint64_t *out_tiles_scanned,
@@ -1730,6 +1947,15 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             return rc != 0;
         }
         /* rc < 0: pipeline resources unavailable, use the synchronous loop. */
+    }
+    // Fused jackpot: two panels in flight (CASE5_PIPELINE=0: synchronous loop). The coop audit reads every
+    // panel's digests after it, so it keeps the synchronous loop.
+    if (fused_jackpot_ && pipeline_enabled() && !info_.jackpotCoopAudit) {
+        const int rc = scan_fused_pipelined_(out_found, out_t_rows, out_t_cols, out_tiles_scanned,
+                                             should_cancel, on_progress);
+        if (rc >= 0) {
+            return rc != 0;
+        }
     }
 
     const int row_periods = hash_tile_rows_;

@@ -92,6 +92,13 @@ struct OpenClContext {
        small-transfer kernel path active it runs as a copy kernel on the compute engine, so no copy
        engine wait is involved; otherwise (or above 16 MB) it is clEnqueueCopyBuffer. */
     bool copy_buffer(cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t bytes) const;
+    /* Small reads that are only enqueued, for pipelined loops: the bytes are in `host` once *ev has
+       completed (clWaitForEvents). `host` must come from read_host_alloc and stay alive until then. On the
+       small-transfer kernel path (above) the copy is a kernel into that host USM block; otherwise it is a
+       non-blocking clEnqueueReadBuffer into ordinary host memory. */
+    void *read_host_alloc(size_t bytes) const;
+    void read_host_free(void *host) const;
+    bool enqueue_read_async(cl_mem buf, size_t offset, size_t bytes, void *host, cl_event *ev) const;
     cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
 
     static std::string error_string(cl_int err);
@@ -119,6 +126,8 @@ private:
     mutable cl_kernel xfer_up_ = nullptr;   /* host USM -> cl_mem */
     mutable cl_kernel xfer_down_ = nullptr; /* cl_mem -> host USM */
     mutable cl_kernel xfer_dd_ = nullptr;   /* cl_mem -> cl_mem */
+    mutable cl_kernel xfer_async_ = nullptr; /* cl_mem -> caller's host USM block, not waited for */
+    mutable void *usm_alloc_fn_ = nullptr;
     mutable void *usm_free_fn_ = nullptr;
     mutable void *usm_arg_fn_ = nullptr;
     std::shared_ptr<std::mutex> xfer_mu_ = std::make_shared<std::mutex>();
