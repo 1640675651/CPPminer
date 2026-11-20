@@ -59,6 +59,8 @@ struct Case33GemmOnednn {
     uint64_t device_global_mem() const; // CL_DEVICE_GLOBAL_MEM_SIZE (0 if unknown)
     const case5_ngen::DriverInfo &driver_info() const { return info_; }
     bool gpu_prep_ready() const { return prep_ready_; }
+    /* Host time at which the GPU finished this attempt's prep (async prep, fused jackpot); 0 if unknown. */
+    double prep_done_sec() const { return prep_.attempt_done_sec(); }
 
 private:
     bool setup_dims_(int M, int N, int K);

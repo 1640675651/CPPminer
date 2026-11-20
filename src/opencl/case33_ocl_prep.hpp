@@ -2,9 +2,12 @@
 
 #include "opencl_context.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct Case33OclPrep {
@@ -99,6 +102,17 @@ struct Case33OclPrep {
     cl_mem signal_A_buffer() const { return d_A_sig_; }
 
     bool ready() const { return ready_; }
+    /* Async attempt prep (the oneDNN fused scan, whose GEMM runs on the same in-order queue): the constant-
+       signal attempt prep returns once its kernels are enqueued, without the clFinish after the dummy row and
+       after the packed A, so the first panel queues behind it and the scan setup overlaps the rebuild. Any
+       later host read of the prep buffers is a blocking transfer on that queue. */
+    void set_attempt_async(bool on) { attempt_async_ = on; }
+    /* Async attempt prep: host time (cp_now_sec) at which the GPU finished the last prep kernel, from a
+       completion callback on its event (no wait, no queue profiling); 0 if not known (synchronous prep, or
+       the callback has not run). */
+    double attempt_done_sec() const { return attempt_done_sec_.load(std::memory_order_acquire); }
+    /* CP_ONEDNN_PANEL_TRACE=1: print the traced prep kernels' device times ([prep-trace]); waits for them. */
+    void flush_trace();
 
 private:
     bool build_program_(const std::string &kernel_dir);
@@ -200,6 +214,16 @@ private:
 
     cl_mem d_A_sig_ = nullptr;
     int const_sig_ = 0;          // constant-signal mining (0 = off)
+    /* CP_ONEDNN_PANEL_TRACE=1: events of the per-attempt A prep kernels, printed by flush_trace (debug). */
+    bool trace_attempt_ = false;
+    std::deque<std::pair<const char *, cl_event>> trace_events_;
+    cl_event *trace_ev_(const char *name);
+    bool attempt_async_ = false;     // set_attempt_async
+    bool attempt_nofinish_ = false;  // inside an async attempt prep
+    cl_event attempt_done_ev_ = nullptr;          // last kernel of the async attempt prep (retained)
+    std::atomic<double> attempt_done_sec_{0.0};   // set by its completion callback
+    void watch_attempt_done_(cl_event ev, bool owned);
+    bool enqueue_noisy_a_packed_(cl_kernel kern, size_t g, size_t l);
     cl_mem d_dummy_ = nullptr;   // constant signal: the dummy row of signal A (K bytes)
     size_t dummy_cap_ = 0;
     bool const_a_init_ = false;  // constant signal: full commitment done for const_a_m_/k_, a_hash_key_

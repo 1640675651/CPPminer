@@ -32,6 +32,16 @@ bool prep_timing_enabled() {
     return on;
 }
 
+/* CP_ONEDNN_PANEL_TRACE=1 (with CP_OCL_QUEUE_PROFILING=1): the per-attempt A prep records an event per kernel
+   and prints [prep-trace] / [prep-host] lines (debug; see Case33OclPrep::trace_ev_). */
+bool prep_trace_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CP_ONEDNN_PANEL_TRACE");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
 /* CP_OCL_PREP_WG=0 keeps the per-row noise kernel. */
 bool prep_wg_enabled() {
     static const bool on = [] {
@@ -138,6 +148,11 @@ std::string cp_ocl_kernel_dir() {
 }
 
 Case33OclPrep::~Case33OclPrep() {
+    if (attempt_done_ev_) {
+        clWaitForEvents(1, &attempt_done_ev_);   // its callback may still run
+        clReleaseEvent(attempt_done_ev_);
+        attempt_done_ev_ = nullptr;
+    }
     release_kernels_();
     if (d_dummy_) {
         clReleaseMemObject(d_dummy_);
@@ -549,11 +564,13 @@ bool Case33OclPrep::gen_random_(cl_mem dst, uint64_t rng_seed, int total) {
     const size_t items = wide ? static_cast<size_t>(total / 16) : static_cast<size_t>(total);
     const size_t l = 256;
     const size_t g = (items + l - 1) / l * l;
-    if (clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, nullptr)
+    if (clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, trace_ev_("gen_random"))
             != CL_SUCCESS) {
         return false;
     }
-    clFinish(ocl_->queue);
+    if (!attempt_nofinish_) {   // async attempt prep: the next kernels are on the same in-order queue
+        clFinish(ocl_->queue);
+    }
     return true;
 }
 
@@ -574,7 +591,7 @@ bool Case33OclPrep::build_perm_pairs_(int is_b, int K) {
     }
     const size_t g = static_cast<size_t>(pair_groups);
     err = clEnqueueNDRangeKernel(ocl_->queue, k_build_pairs_, 1, nullptr, &g, nullptr, 0, nullptr,
-                                 nullptr);
+                                 trace_ev_("build_pairs"));
     return err == CL_SUCCESS;
 }
 
@@ -653,7 +670,7 @@ bool Case33OclPrep::uniform_rows_(int rows, int is_b) {
         const size_t gb = (static_cast<size_t>(rows) * 4 + lb - 1) / lb * lb;
         if (err == CL_SUCCESS &&
             clEnqueueNDRangeKernel(ocl_->queue, k_uniform_rows_b3_, 1, nullptr, &gb, &lb, 0,
-                                   nullptr, nullptr) == CL_SUCCESS) {
+                                   nullptr, trace_ev_("uniform_rows_b3")) == CL_SUCCESS) {
             if (prep_check_enabled()) {
                 return uniform_rows_check_(rows, is_b);
             }
@@ -675,7 +692,7 @@ bool Case33OclPrep::uniform_rows_(int rows, int is_b) {
     const size_t lu = 64;
     const size_t gu = (static_cast<size_t>(rows) + lu - 1) / lu * lu;
     return clEnqueueNDRangeKernel(ocl_->queue, k_uniform_rows_, 1, nullptr, &gu, &lu, 0, nullptr,
-                                  nullptr) == CL_SUCCESS;
+                                  trace_ev_("uniform_rows")) == CL_SUCCESS;
 }
 
 /* Noisy A in gemmstone's packed layout, panels of a_pack_rows_ rows with 4 k per dword
@@ -683,6 +700,35 @@ bool Case33OclPrep::uniform_rows_(int rows, int is_b) {
    optionally tiled a_tile_r_ x a_tile_c_ inside the panel (gemmstone A4#r,c; the kernels take the
    untiled layout as tile P x 64). There is no fallback: the GEMM kernel was built for this layout, so a
    failure fails the attempt. */
+// The packed A launch. In an async attempt prep its event also carries the completion callback that timestamps
+// the end of the prep (watch_attempt_done_).
+bool Case33OclPrep::enqueue_noisy_a_packed_(cl_kernel kern, size_t g, size_t l) {
+    cl_event *trace = trace_ev_("noisy_a_packed");
+    cl_event own = nullptr;
+    cl_event *ev = trace ? trace : (attempt_nofinish_ ? &own : nullptr);
+    if (clEnqueueNDRangeKernel(ocl_->queue, kern, 1, nullptr, &g, &l, 0, nullptr, ev) != CL_SUCCESS) {
+        return false;
+    }
+    if (attempt_nofinish_ && ev && *ev) {
+        watch_attempt_done_(*ev, /*owned=*/ev == &own);
+    }
+    return true;
+}
+
+static void CL_CALLBACK attempt_done_cb(cl_event, cl_int, void *user) {
+    static_cast<std::atomic<double> *>(user)->store(cp_now_sec(), std::memory_order_release);
+}
+
+void Case33OclPrep::watch_attempt_done_(cl_event ev, bool owned) {
+    if (!owned) {
+        clRetainEvent(ev);   // the trace list releases its own reference
+    }
+    attempt_done_ev_ = ev;
+    if (clSetEventCallback(ev, CL_COMPLETE, attempt_done_cb, &attempt_done_sec_) != CL_SUCCESS) {
+        attempt_done_sec_.store(0.0, std::memory_order_release);
+    }
+}
+
 bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, int K, int out_lda) {
     const int P = a_pack_rows_;
     const bool p16 = P == 16;
@@ -730,11 +776,13 @@ bool Case33OclPrep::noisy_matrix_a_packed_(cl_mem out, cl_mem signal, int rows, 
     const size_t l = 256;
     const size_t g = static_cast<size_t>(rows / P) * l;
     if (err != CL_SUCCESS ||
-        clEnqueueNDRangeKernel(ocl_->queue, kern, 1, nullptr, &g, &l, 0, nullptr, nullptr) != CL_SUCCESS) {
+        !enqueue_noisy_a_packed_(kern, g, l)) {
         std::fprintf(stderr, "[ocl-prep] packed A (%d-row panels) launch failed\n", P);
         return false;
     }
-    clFinish(ocl_->queue);
+    if (!attempt_nofinish_ || prep_timing_enabled()) {   // async attempt prep: the scan queues behind it
+        clFinish(ocl_->queue);
+    }
     if (prep_timing_enabled()) {
         std::printf("[ocl-prep]   uniform rows %.1fms, noise (packed A) %.1fms\n", (t1 - t0) * 1e3,
                     (cp_now_sec() - t1) * 1e3);
@@ -1131,7 +1179,8 @@ bool Case33OclPrep::derive_a_noise_seed_(const uint8_t b_noise_seed[32], int m, 
         err |= clSetKernelArg(k_a_noise_seed_, 6, sizeof(cl_mem), &d_a_root_);
         const size_t g = 1, l = 1;
         if (err == CL_SUCCESS)
-            err = clEnqueueNDRangeKernel(ocl_->queue, k_a_noise_seed_, 1, nullptr, &g, &l, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(ocl_->queue, k_a_noise_seed_, 1, nullptr, &g, &l, 0, nullptr,
+                                         trace_ev_("a_noise_seed"));
         if (err != CL_SUCCESS) {
             std::fprintf(stderr, "[ocl-prep] noise seed kernel failed (%d); deriving it on the host\n", err);
             seed_mode_ = 0;
@@ -1190,7 +1239,7 @@ bool Case33OclPrep::merkle_finish_root_(int num_subroots) {
     const size_t g = static_cast<size_t>(num_mt_blocks) * 256;
     const size_t l = 256;
     err = clEnqueueNDRangeKernel(ocl_->queue, k_compute_blake_mt_, 1, nullptr, &g, &l, 0, nullptr,
-                                 nullptr);
+                                 trace_ev_("merkle_mt"));
     if (err != CL_SUCCESS) {
         return false;
     }
@@ -1206,7 +1255,7 @@ bool Case33OclPrep::merkle_finish_root_(int num_subroots) {
         const size_t g2 = 256;
         const size_t l2 = 256;
         err = clEnqueueNDRangeKernel(ocl_->queue, k_reduce_roots_, 1, nullptr, &g2, &l2, 0, nullptr,
-                                     nullptr);
+                                     trace_ev_("reduce_roots"));
     }
     return err == CL_SUCCESS;
 }
@@ -1990,7 +2039,8 @@ bool Case33OclPrep::fill_chunk_roots_(cl_mem tail, size_t raw_len, size_t fill_e
         return false;
     }
     const size_t g = static_cast<size_t>(num_subroots - group_first) * 256, l = 256;
-    return clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, nullptr) == CL_SUCCESS;
+    return clEnqueueNDRangeKernel(ocl_->queue, k, 1, nullptr, &g, &l, 0, nullptr, trace_ev_("chunk_roots"))
+           == CL_SUCCESS;
 }
 
 bool Case33OclPrep::const_matrix_keyed_hash(int n, int K, const uint8_t job_key[32], uint8_t root[32],
@@ -2139,18 +2189,64 @@ bool Case33OclPrep::prepare_attempt_a_const_(cl_mem a_buf, const uint8_t *ab_see
     if (!a_buf) {
         return false;
     }
-    const double t0 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    const double t0 = (prep_timing_enabled() || prep_trace_enabled()) ? cp_now_sec() : 0.0;
+    trace_attempt_ = prep_trace_enabled();
+    attempt_nofinish_ = attempt_async_;
+    if (attempt_done_ev_) {   // the previous attempt's prep finished long ago (its scan followed it)
+        clWaitForEvents(1, &attempt_done_ev_);
+        clReleaseEvent(attempt_done_ev_);
+        attempt_done_ev_ = nullptr;
+    }
+    attempt_done_sec_.store(0.0, std::memory_order_release);
     if (!const_attempt_signal_(ab_seed, ab_seed_len, job_key, b_noise_seed, m, K, salted, a_key_out)) {
+        trace_attempt_ = false;
+        attempt_nofinish_ = false;
         return false;
     }
-    const double t1 = prep_timing_enabled() ? cp_now_sec() : 0.0;
+    const double t1 = (prep_timing_enabled() || prep_trace_enabled()) ? cp_now_sec() : 0.0;
     const bool ok = noisy_matrix_a_packed_(a_buf, d_dummy_, m, K, lda);
+    const bool async = attempt_nofinish_;
+    attempt_nofinish_ = false;
+    if (trace_attempt_) {
+        trace_attempt_ = false;
+        // noise_done = the host returns (async: the kernels are only enqueued; their events print at the
+        // first panel of the scan, see flush_trace).
+        std::fprintf(stderr, "[prep-host] start=%.6f signal_done=%.6f noise_done=%.6f\n", t0, t1, cp_now_sec());
+        if (!async) {
+            flush_trace();
+        }
+    }
     if (prep_timing_enabled()) {
         clFinish(ocl_->queue);
         std::printf("[ocl-prep] A constant signal: dummy row + commitment %.1fms, noise %.1fms\n",
                     (t1 - t0) * 1e3, (cp_now_sec() - t1) * 1e3);
     }
     return ok;
+}
+
+cl_event *Case33OclPrep::trace_ev_(const char *name) {
+    if (!trace_attempt_) {
+        return nullptr;
+    }
+    trace_events_.emplace_back(name, nullptr);
+    return &trace_events_.back().second;
+}
+
+void Case33OclPrep::flush_trace() {
+    for (auto &e : trace_events_) {
+        if (!e.second) {
+            continue;
+        }
+        clWaitForEvents(1, &e.second);   // not clFinish: that would also wait for queued panels
+        cl_ulong st = 0, en = 0;
+        clGetEventProfilingInfo(e.second, CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr);
+        clGetEventProfilingInfo(e.second, CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr);
+        std::fprintf(stderr, "[prep-trace] %s gpu_start=%llu gpu_end=%llu\n", e.first,
+                     static_cast<unsigned long long>(st), static_cast<unsigned long long>(en));
+        clReleaseEvent(e.second);
+    }
+    trace_events_.clear();
+    std::fflush(stderr);
 }
 
 bool Case33OclPrep::align_gen_random(cl_mem dst, uint64_t rng_seed, int matrix_tag,

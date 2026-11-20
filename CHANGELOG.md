@@ -18,6 +18,7 @@
 - taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
 - 65536^2 GEMM panels with the fused jackpot on all Arc GPUs (Xe2 used 32768^2)
 - keep two GEMM panels in flight with the fused jackpot
+- queue the first panel after the matrix preparation instead of waiting for it
 
 ## v1.0
 ### New features

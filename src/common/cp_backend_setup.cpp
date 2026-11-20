@@ -106,7 +106,8 @@ int cp_apply_backend_options(CpOptions* o)
 #if (defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL) || (defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN)
     /* Default off on both backends. low saves a CPU core on oneDNN, but the A770 driver's sleeping wait
      * can miss its wake-up and stall a scan for ~70 s (arc-ocl-stall); on the OpenCL backend it also
-     * cost 3.6% to the wake-up latency. */
+     * cost 3.6% to the wake-up latency. oneDNN fused scan on the A770 (2026-11-19): -1.36% with the old
+     * synchronous loop, -0.24% with two panels in flight and the async attempt prep. */
     cp_ocl_set_queue_throttle(o->ocl_throttle);
 #endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU

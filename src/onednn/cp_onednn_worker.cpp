@@ -564,7 +564,17 @@ extern "C" int cp_onednn_worker_mine_attempt(
             []() -> bool { return cp_job_should_cancel() != 0; },
             [&](uint64_t cur) { tiles.store(cur, std::memory_order_relaxed); });
 
-    const double scan_sec = cp_now_sec() - scan_t0;
+    double scan_sec = cp_now_sec() - scan_t0;
+    /* Async prep (fused jackpot): the host returned once the prep kernels were queued, and the GPU finished them
+       inside the scan. Split at their completion (callback time) so prep / scan mean what they did before. */
+    double prep_sec_log = prep_sec;
+    {
+        const double prep_done = g_gemm.prep_done_sec();
+        if (prep_done > attempt_t0 && prep_done < scan_t0 + scan_sec) {
+            prep_sec_log = prep_done - attempt_t0;
+            scan_sec = scan_t0 + scan_sec - prep_done;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(progress_mu);
         scan_done.store(true, std::memory_order_relaxed);
@@ -581,11 +591,11 @@ extern "C" int cp_onednn_worker_mine_attempt(
     const double post_sec = 0.0;
 
     if (cp_job_should_cancel()) {
-        cp_log_attempt_timing("onednn", prep_sec, scan_sec, tiles_scanned, post_sec);
+        cp_log_attempt_timing("onednn", prep_sec_log, scan_sec, tiles_scanned, post_sec);
         return -1;
     }
     if (!ok) {
-        cp_log_attempt_timing("onednn", prep_sec, scan_sec, tiles_scanned, post_sec);
+        cp_log_attempt_timing("onednn", prep_sec_log, scan_sec, tiles_scanned, post_sec);
         return -1;
     }
 
@@ -598,11 +608,11 @@ extern "C" int cp_onednn_worker_mine_attempt(
         if (out_t_cols) {
             *out_t_cols = hit_cols;
         }
-        cp_log_attempt_timing("onednn", prep_sec, scan_sec, tiles_scanned, post_sec);
+        cp_log_attempt_timing("onednn", prep_sec_log, scan_sec, tiles_scanned, post_sec);
         return 1;
     }
 
-    cp_log_attempt_timing("onednn", prep_sec, scan_sec, tiles_scanned, post_sec);
+    cp_log_attempt_timing("onednn", prep_sec_log, scan_sec, tiles_scanned, post_sec);
     return 0;
 }
 

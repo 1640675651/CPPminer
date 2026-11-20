@@ -27,6 +27,16 @@
 
 namespace {
 
+/* CASE5_PREP_ASYNC=0: the fused scan waits for the attempt prep again (clFinish after the dummy row, after the
+   packed A and at scan start, blocking found-flag reset), as before 2026-11-19. */
+bool prep_async_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("CASE5_PREP_ASYNC");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
 /* CASE5_PIPELINE=0 keeps the synchronous GEMM -> jackpot -> read loop. */
 bool pipeline_enabled() {
     static const bool on = [] {
@@ -791,6 +801,9 @@ bool Case33GemmOnednn::prepare_attempt_gpu(const uint8_t *ab_seed, int ab_seed_l
     }
     prep_.set_a_pack_rows(info_.aPackRows);
     prep_.set_a_pack_tile(info_.aTileR, info_.aTileC);
+    // Fused jackpot: the scan runs on the prep's in-order queue, so the prep does not wait for its kernels and
+    // the first panel queues behind the A rebuild (2026-11-19: ~1.6 ms of GPU idle per attempt before).
+    prep_.set_attempt_async(fused_jackpot_ && prep_async_enabled());
     return prep_.prepare_attempt_a_gpu(a_buf_, ab_seed, ab_seed_len, job_key, b_noise_seed, M_, K_,
                                        lda_, a_row_major_, salted, a_key_out);
 }
@@ -902,6 +915,9 @@ bool Case33GemmOnednn::run_gemm_panel_(int m_panel, int n_panel, int64_t offset_
     }
     if (watch_ev && trace) {
         const double trace_done = cp_now_sec();
+        if (tr_base == 0 && tc_base == 0) {
+            prep_.flush_trace();
+        }
         clWaitForEvents(1, &watch_ev);
         cl_ulong st = 0, en = 0;
         clGetEventProfilingInfo(watch_ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr);
@@ -1788,6 +1804,9 @@ int Case33GemmOnednn::scan_fused_pipelined_(int *out_found, int *out_t_rows, int
             return false;
         }
         if (trace && gemm_ev[s]) {
+            if (panels[j].tr_base == 0 && panels[j].tc_base == 0) {
+                prep_.flush_trace();   // this attempt's prep kernels, before its first panel
+            }
             cl_ulong st = 0, en = 0;
             clGetEventProfilingInfo(gemm_ev[s], CL_PROFILING_COMMAND_START, sizeof(st), &st, nullptr);
             clGetEventProfilingInfo(gemm_ev[s], CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr);
@@ -1902,7 +1921,11 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
         if (!prep_ready_ || !prep_.a_key_buffer()) {
             return false;
         }
-        clFinish(ocl_.queue);   // prep's seed kernel is complete before other queues read the key
+        // The separate jackpot pipeline reads the key on another queue: the prep must be complete. The fused
+        // scan stays on the prep's in-order queue and does not wait.
+        if (!fused_jackpot_ || !prep_async_enabled()) {
+            clFinish(ocl_.queue);
+        }
     } else {
         std::memcpy(scan_jackpot_key_, a_key8, sizeof(scan_jackpot_key_));
         if (!ocl_.write_buffer(a_key_buf_, a_key8, 8 * sizeof(uint32_t))) {
@@ -1933,9 +1956,10 @@ bool Case33GemmOnednn::scan_for_share(const uint32_t a_key8[8], const uint32_t b
             }
         }
     }
+    // The fused loops reset the found flag before every panel; the separate jackpot flag is reset here.
     const int zero = 0;
-    if (!ocl_.write_buffer(found_buf_, &zero, sizeof(zero),
-                           jackpot_found_flag_off(fused_jackpot_))) {
+    if ((!fused_jackpot_ || !prep_async_enabled()) &&
+        !ocl_.write_buffer(found_buf_, &zero, sizeof(zero), jackpot_found_flag_off(fused_jackpot_))) {
         return false;
     }
 
