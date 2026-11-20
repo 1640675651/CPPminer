@@ -347,11 +347,14 @@ extern "C" void cp_onednn_worker_init(int *devices, int ndev) {
     configure_hash_tile_from_kernel();
     const auto &di = g_gemm.driver_info();
     if (di.strategy.systolic) {
-        // 4096x4096-tile panels (4 per 131072^2 attempt) need two 1 GiB tile_xor buffers with the
-        // folded message; use them only on cards with >= 12 GiB (A770 16 GB: +0.8% over 2048).
+        // 4096x4096-tile panels (65536^2 GEMM, 4 per 131072^2 attempt): +0.8% on the A770, +0.4% on the
+        // B580 (2026-11-19, mock scan 103.29 -> 103.69 TMAC/s) over 2048. The separate jackpot needs a 1 GiB
+        // tile_xor panel buffer with the folded message at that size, so it keeps the >= 12 GiB check; the
+        // fused jackpot judges in the kernel and allocates no tile_xor buffer (the B580's 12 GB report just
+        // under 12 GiB, which kept it on 2048 before).
         const uint64_t mem = g_gemm.device_global_mem();
-        const int batch = (di.fold16 && mem >= (12ull << 30)) ? CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM
-                                                              : CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT;
+        const bool large = g_gemm.fused_jackpot() || (di.fold16 && mem >= (12ull << 30));
+        const int batch = large ? CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM : CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT;
         if (g_row_batch_auto)
             cp_onednn_worker_set_row_period_batch(batch);
         if (g_col_batch_auto)

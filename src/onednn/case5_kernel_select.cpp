@@ -161,8 +161,12 @@ constexpr char kXe2Int8Af[] =
 // on Xe2 (CASE5_WAIT_MID). gemm_xor B580: Case 5 190.5 -> 193.8-194.5 sustained, pure 200.1-202.2 ->
 // 200.7-204.3 (gemm_xor note.md, *The Xe2 fold overlaps the dpas*). Tiles wider than ka_load are
 // mis-addressed by gemmstone and refused. CASE5_A_TILE=0,0 restores the untiled panel.
+// Walk: boustrophedon (`bo`) instead of Hilbert (`hi`) since 2026-11-19, with the slice target scaled by 1.75
+// (8 m-groups; case5_gemm_launch.cpp, case5_bslice_scale). gemm_xor B580, sustained at the default limit,
+// constant-64 u8: Case 5.5 +1.0%, Case 5.6 +1.2%, pure +0.2%; output byte-identical (gemm_xor experiments.md,
+// *Walk order: the larger slices as defaults*). The plain-A strategy above keeps Hilbert (not measured).
 constexpr char kXe2Int8AfPackedA[] =
-    "sB32x2+B64@96 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav hi pt sr br bk0 sm sn dm grf256 sys pab";
+    "sB32x2+B64@96 sB32 aB wg 8x4 cb4x2 ks32 k128 af vav bo pt sr br bk0 sm sn dm grf256 sys pab";
 [[maybe_unused]] constexpr char kXe2Int8Direct2D48x32Xaf[] =
         "at32x2+m64@96 am32x2+m64@96 aB wg 8x4 xaf vav hi pt sr br sb128 bk0 sm sn grf256 sys k128";
 
