@@ -1,6 +1,11 @@
 #include "case5_gemm_launch.hpp"
+#include "case5_walk.hpp"
 
 #include <algorithm>
+#include <map>
+#include <stdexcept>
+#include <tuple>
+#include <vector>
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
@@ -107,6 +112,7 @@ struct WalkOrderArgs {
     int32_t bslice = 0;
     bool has_bthresh = false;
     int32_t bthresh = 0;
+    const char *bsource = "";   // where the boustrophedon pair came from (CASE5_DEBUG_LAUNCH)
     bool has_kv_config = false;
     uint32_t kv_config = 0;
     bool has_k_recip = false;
@@ -114,6 +120,48 @@ struct WalkOrderArgs {
     bool has_group_stride = false;
     uint32_t group_stride = 0;
 };
+
+// ---- Boustrophedon walk (arithmetic in case5_walk.hpp) --------------------------------------------
+
+using case5_walk::BoustrophedonPair;
+using case5_walk::derive_boustrophedon;
+
+// Scale of the m-slice target (same as gemm_xor's case5_gemm_launch.cpp). Taller slices save power on the
+// XMX cards and the power cap turns that into clock (gemm_xor 2026-11-19, default limits, constant-64 u8,
+// sustained): A770 at 65536^2 slices of 10 instead of 6 +1.8% Case 5.5 / +1.7% Case 5.6, B580 at 16384^2
+// slices of 8 instead of Hilbert +1.0% / +1.2%. 1.75 gives 10 on the A770 and 8 on the B580. Only the m-slice target is
+// scaled: grids sliced along n (many more m-groups than n-groups) keep the gemmstone default, nothing was
+// measured there. CASE5_BSLICE_SCALE=<x> overrides it (1 = the gemmstone default); dp4a devices keep 1.
+double case5_bslice_scale(HW hw, const GEMMStrategy &strategy) {
+    if (const char *v = std::getenv("CASE5_BSLICE_SCALE")) {
+        const double x = std::atof(v);
+        if (x > 0) return x;
+    }
+    return (strategy.systolic && (hw == HW::XeHPG || hw == HW::Xe2)) ? 1.75 : 1.0;
+}
+
+// case5_walk::boustrophedon_map_ok, cached per grid and pair (a 256 x 512 grid takes about a millisecond;
+// launches repeat the same few).
+bool boustrophedon_pair_ok(uint32_t groups_m, uint32_t groups_n, const BoustrophedonPair &p) {
+    static std::map<std::tuple<uint32_t, uint32_t, int32_t, int32_t>, bool> cache;
+    const auto key = std::make_tuple(groups_m, groups_n, p.slice, p.thresh);
+    const auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    const bool ok = case5_walk::boustrophedon_map_ok(groups_m, groups_n, p);
+    cache.emplace(key, ok);
+    return ok;
+}
+
+void warn_bad_boustrophedon_pair(uint32_t groups_m, uint32_t groups_n, const BoustrophedonPair &p,
+        const char *what) {
+    static std::map<std::tuple<uint32_t, uint32_t, int32_t, int32_t>, bool> warned;
+    if (!warned.emplace(std::make_tuple(groups_m, groups_n, p.slice, p.thresh), true).second) return;
+    std::fprintf(stderr,
+            "Case5 walk: %s pair bslice=%d bthresh=%d does not map the %ux%u group grid one to one "
+            "(groups repeated or outside the grid); not used\n",
+            what, p.slice, p.thresh, groups_m, groups_n);
+    std::fflush(stderr);
+}
 
 WalkOrderArgs compute_walk_order_args(const GEMMStrategy &strategy, const CommonDriverInfo &info,
         int eu_count, HW hw, int m, int n, int k, const size_t gws[2], const size_t lws[2]) {
@@ -172,88 +220,55 @@ WalkOrderArgs compute_walk_order_args(const GEMMStrategy &strategy, const Common
         out.hilbert_bail = 1;
     } else if (info.isBoustrophedon()) {
         const double bias = double(info.wg[0] * info.unroll[0]) / double(info.wg[1] * info.unroll[1]);
-        const double sm = std::sqrt(double(concurrent_tg) / bias);
-        const double sn = std::sqrt(double(concurrent_tg) * bias);
+        const double scale = case5_bslice_scale(hw, strategy);
 
-        int32_t slice = 0;
-        int32_t thresh = 0;
-        bool ok = false;
+        // Candidates in order of preference: the CASE5_BSLICE / CASE5_BTHRESH override (tuning), the
+        // default with the scaled m-slice target, the unscaled default (gemmstone / oneDNN). The first
+        // pair that maps every work group to its own tile is launched; the decode is replayed on the host
+        // (boustrophedon_pair_ok) because a bad pair writes stray tiles and can fault the GPU.
+        BoustrophedonPair scaled = derive_boustrophedon(groups_m, groups_n, concurrent_tg, bias, scale);
+        const BoustrophedonPair plain = derive_boustrophedon(groups_m, groups_n, concurrent_tg, bias, 1.0);
+        BoustrophedonPair chosen = scaled;
+        const char *source = (scaled.slice != plain.slice || scaled.thresh != plain.thresh) ? "scaled default"
+                                                                                             : "default";
 
-        for (bool nslice : {groups_m > groups_n, groups_m <= groups_n}) {
-            double s = nslice ? sn : sm;
-            auto sf = int(std::floor(s));
-            auto sc = int(std::ceil(s));
-            if (concurrent_tg % sc == 0) {
-                s = sf = sc;
-            }
-            if (concurrent_tg % (sc + 1) == 0) {
-                s = sf = sc = sc + 1;
-            }
-
-            const int gc = nslice ? int(groups_n) : int(groups_m);
-            const int gco = nslice ? int(groups_m) : int(groups_n);
-
-            for (int srange = 0; srange <= 2 && !ok; ++srange) {
-                int s0 = (srange < 2) ? sc : sf;
-                const bool up = (srange == 1);
-                const int s1 = s0 + (up ? 1 : -1);
-                if (s1 <= 0) {
-                    continue;
-                }
-
-                const auto rem = gc % s0;
-                if (!rem || up) {
-                    thresh = gc / s0 - rem;
-                } else {
-                    thresh = div_up(gc, s0) - (s0 - rem);
-                }
-
-                ok = (thresh >= 0) && (gco >= 2 * std::max(s0, s1));
-                slice = s0;
-                if (!up) {
-                    if (thresh > 0) {
-                        thresh = -thresh;
-                    } else {
-                        slice--;
-                        thresh = gc;
-                    }
-                }
-                if (nslice) {
-                    slice *= -1;
-                }
-            }
-
-            if (ok) {
-                break;
-            }
+        // CASE5_BSLICE / CASE5_BTHRESH: override the slice / threshold (tuning). CASE5_BSLICE replaces the
+        // slice only and keeps the threshold derived for the default slice, the way the 2026-11 tuning runs
+        // used it; on grids sliced along n (many more m-groups than n-groups) a positive slice with that
+        // threshold maps groups twice, and the replay below rejects it.
+        BoustrophedonPair env = scaled;
+        bool has_env = false;
+        if (const char *bs = std::getenv("CASE5_BSLICE")) {
+            if (bs[0]) { env.slice = std::atoi(bs); has_env = true; }
+        }
+        if (const char *bt = std::getenv("CASE5_BTHRESH")) {
+            if (bt[0]) { env.thresh = std::atoi(bt); has_env = true; }
         }
 
-        if (!ok) {
-            const bool nslice = (groups_m > groups_n);
-            const double s = nslice ? sn : sm;
-            const int gc = nslice ? int(groups_n) : int(groups_m);
-
-            if (gc < s * 1.5) {
-                slice = gc;
-            } else {
-                slice = gc / div_up(gc, int(std::round(s)));
+        if (has_env && boustrophedon_pair_ok(groups_m, groups_n, env)) {
+            chosen = env;
+            source = "CASE5_BSLICE/CASE5_BTHRESH";
+        } else {
+            if (has_env) warn_bad_boustrophedon_pair(groups_m, groups_n, env, "CASE5_BSLICE/CASE5_BTHRESH");
+            if (!boustrophedon_pair_ok(groups_m, groups_n, scaled)) {
+                warn_bad_boustrophedon_pair(groups_m, groups_n, scaled, "scaled default");
+                if (!boustrophedon_pair_ok(groups_m, groups_n, plain)) {
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                            "Case5 walk: no valid boustrophedon pair for the %ux%u group grid (default %d,%d)",
+                            groups_m, groups_n, plain.slice, plain.thresh);
+                    throw std::runtime_error(msg);
+                }
+                chosen = plain;
+                source = "default";
             }
-
-            thresh = std::max(0, (gc / slice) - (gc % slice));
-            if (nslice) {
-                slice *= -1;
-            }
-        }
-
-        if (slice == 0) {
-            slice = 1;
-            thresh = int(groups_m);
         }
 
         out.has_bslice = true;
-        out.bslice = slice;
+        out.bslice = chosen.slice;
         out.has_bthresh = true;
-        out.bthresh = thresh;
+        out.bthresh = chosen.thresh;
+        out.bsource = source;
     }
 
     if (info.kParallelVariable()) {
@@ -329,16 +344,6 @@ WalkOrderArgs compute_walk_order_args(const GEMMStrategy &strategy, const Common
         }
         out.has_group_stride = true;
         out.group_stride = group_count;
-    }
-
-    // CASE5_BSLICE / CASE5_BTHRESH: override the boustrophedon slice parameters (tuning).
-    if (out.has_bslice) {
-        if (const char *bs = std::getenv("CASE5_BSLICE")) {
-            if (bs[0]) out.bslice = std::atoi(bs);
-        }
-        if (const char *bt = std::getenv("CASE5_BTHRESH")) {
-            if (bt[0]) out.bthresh = std::atoi(bt);
-        }
     }
 
     return out;
@@ -582,9 +587,9 @@ cl_int bind_case5_kernel_args(cl_kernel kernel, const DriverInfo &info,
     if (case5_debug_launch()) {
         std::fprintf(stderr,
                 "Case5 launch walk-order: wg_gws=(%zu,%zu) wg_lws=(%zu,%zu) "
-                "gcm=%u gcn=%u bslice=%d bthresh=%d\n",
+                "gcm=%u gcn=%u bslice=%d bthresh=%d%s%s\n",
                 wg_gws[0], wg_gws[1], wg_lws[0], wg_lws[1], walk.group_count_m, walk.group_count_n,
-                walk.bslice, walk.bthresh);
+                walk.bslice, walk.bthresh, walk.bsource[0] ? " from " : "", walk.bsource);
         std::fflush(stderr);
     }
 

@@ -2,14 +2,16 @@
 
 ## v1.1 (tentative)
 ### New features
-- CUDA backend now support RTX 20-50 series
+- CUDA backend now support RTX 20-50 series (TODO)
 - Multi GPU (TODO)
 
 ### Fix & Enhancements
+- OneDNN, OpenCL: use constant, unsigned matrix, remove 512MiB A buffer and reduce power
 - OneDNN: code refactor, use a fork of onednn instead of keeping patches
 - OneDNN: tiled A packing for higher GEMM throughput
 - OneDNN: lower XOR overhead on Xe2
-- OneDNN: use constant, unsigned matrix, remove 512MiB A buffer and reduce power
+- OneDNN: taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
+- OneDNN: 65536^2 GEMM panels with the fused jackpot on all Arc GPUs (Xe2 used 32768^2)
 - CPU: use 16x4 tile to reduce B broadcast overhead and remove register spilling
 - CPU: interleave XOR with dot product instructions
 

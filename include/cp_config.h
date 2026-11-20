@@ -64,8 +64,8 @@
  * 131072^2 attempt). 4096x4096 (256x256 tiles) cost the fused jackpot a host round trip per short panel;
  * 16384x16384 made the UHD 770 hash rate less steady. */
 #define CP_ONEDNN_DP4A_PANEL_MN 8192
-/* Cards with >= 12 GiB: 4096x4096-tile panels (65536^2 GEMM, 4 per attempt), +0.8% on the A770
- * (fewer kernel boundaries; idle 2.2 -> 0.4 ms per attempt). */
+/* Fused jackpot, or separate jackpot on cards with >= 12 GiB: 4096x4096-tile panels (65536^2 GEMM, 4 per
+ * attempt), +0.8% on the A770 (fewer kernel boundaries; idle 2.2 -> 0.4 ms per attempt), +0.4% on the B580. */
 #define CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM 4096
 /* oneDNN panel batch limit (hash tiles per dimension); larger than the generic launch window. */
 #define CP_ONEDNN_PERIOD_BATCH_MAX 4096
