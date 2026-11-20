@@ -3,7 +3,10 @@
 #define CP_MT_THREADS 256
 #define CP_MT_CV_WORDS 8
 
-inline int d_mt_ilog2_ceil(uint n) {
+/* static: a plain C99 inline has no external definition; the AMD Windows driver
+   declines to inline large helpers (e.g. d_mt_keyed_chunk_roots), and linking then
+   fails with "undefined hidden symbol". */
+static inline int d_mt_ilog2_ceil(uint n) {
     if (n <= 1) {
         return 0;
     }
@@ -14,19 +17,19 @@ inline int d_mt_ilog2_ceil(uint n) {
     return lg;
 }
 
-inline uint d_mt_leaf_word(__local uint* smem, int word, int leaf, int smem_cols) {
+static inline uint d_mt_leaf_word(__local uint* smem, int word, int leaf, int smem_cols) {
     return smem[(size_t)word * (size_t)smem_cols + (size_t)leaf];
 }
 
-inline void d_mt_set_leaf_word(__local uint* smem, int word, int leaf, int smem_cols, uint v) {
+static inline void d_mt_set_leaf_word(__local uint* smem, int word, int leaf, int smem_cols, uint v) {
     smem[(size_t)word * (size_t)smem_cols + (size_t)leaf] = v;
 }
 
-inline void d_mt_load_key_g(__global const uchar *job_key, uint *key) {
+static inline void d_mt_load_key_g(__global const uchar *job_key, uint *key) {
     d_b3_key_words_g(job_key, key);
 }
 
-inline void d_mt_parent_cv(const uint *key, const uint *left, const uint *right,
+static inline void d_mt_parent_cv(const uint *key, const uint *left, const uint *right,
                            int as_root, uint *out) {
     uint cv[8];
     for (int i = 0; i < 8; i++) {
@@ -44,7 +47,7 @@ inline void d_mt_parent_cv(const uint *key, const uint *left, const uint *right,
     }
 }
 
-inline void d_mt_compute_perfect(__local uint* smem, int num_leaves, int smem_cols,
+static inline void d_mt_compute_perfect(__local uint* smem, int num_leaves, int smem_cols,
                                  const uint key[8], int consider_root) {
     const int tid = get_local_id(0);
     for (int level_size = num_leaves; level_size > 1; level_size >>= 1) {
@@ -68,7 +71,7 @@ inline void d_mt_compute_perfect(__local uint* smem, int num_leaves, int smem_co
     }
 }
 
-inline void d_mt_compute_blake(__local uint* smem, int num_leaves, int smem_cols,
+static inline void d_mt_compute_blake(__local uint* smem, int num_leaves, int smem_cols,
                                const uint key[8], int consider_root) {
     const int tid = get_local_id(0);
     int offset = 0;
@@ -149,7 +152,7 @@ inline void d_mt_compute_blake(__local uint* smem, int num_leaves, int smem_cols
     barrier(CLK_LOCAL_MEM_FENCE);
 }
 
-inline void d_mt_store_root_words(__local uint* smem, int smem_cols, __global uchar* roots_out,
+static inline void d_mt_store_root_words(__local uint* smem, int smem_cols, __global uchar* roots_out,
                                   int root_index) {
     const int tid = get_local_id(0);
     if (tid >= CP_MT_CV_WORDS) {
@@ -164,7 +167,7 @@ inline void d_mt_store_root_words(__local uint* smem, int smem_cols, __global uc
  * fill_end (a multiple of 1024): bytes [0, fill_end) all equal the low byte of fill_word and are not
  * loaded; byte i >= fill_end is mat[i - fill_end] (zero from raw_len on). fill_end = 0 is the plain
  * matrix hash. */
-inline void d_mt_keyed_chunk_roots(__local uint* smem_leaves, __global const uchar* mat, ulong raw_len,
+static inline void d_mt_keyed_chunk_roots(__local uint* smem_leaves, __global const uchar* mat, ulong raw_len,
                                    ulong pad_len, __global const uchar* job_key,
                                    __global uchar* roots_out, int num_chunks, int group_base,
                                    ulong fill_end, uint fill_word) {
