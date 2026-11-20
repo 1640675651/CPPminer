@@ -570,7 +570,9 @@ if(CP_ENABLE_INTEL_NPU)
 endif()
 
 if(CP_ENABLE_CUDA)
-    target_link_libraries(cppminer PRIVATE CUDA::cudart)
+    # Static runtime: no cudart64_*.dll to ship, and the binary runs on any driver of its CUDA
+    # major version or newer (a CUDA 12 build also runs on CUDA 13 drivers).
+    target_link_libraries(cppminer PRIVATE CUDA::cudart_static)
     if(CP_ENABLE_CUBLAS)
         target_link_libraries(cppminer PRIVATE CUDA::cublas)
     endif()
