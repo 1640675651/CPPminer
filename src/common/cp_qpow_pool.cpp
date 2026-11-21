@@ -4,6 +4,7 @@
 #include "cp_json_text.hpp"
 #include "cp_pool.h"
 #include "cp_util.h"
+#include "cp_version.h"
 
 #include <atomic>
 #include <cstring>
@@ -71,7 +72,7 @@ int cp_qpow_pool_send_login(int msg_id, const char* login, const char* worker,
         ",\"method\":\"login\",\"params\":{\"login\":\"" +
         cp_json_escape(ident.c_str()) + "\",\"pass\":\"" +
         cp_json_escape(w.empty() ? "x" : w.c_str()) + "\",\"agent\":\"" +
-        cp_json_escape(agent ? agent : "cppminer/1.0") + "\"}}";
+        cp_json_escape(agent ? agent : CP_AGENT_DEFAULT) + "\"}}";
     printf("[net] Quantus login (login=wallet.worker, pass=worker)\n");
     fflush(stdout);
     return cp_send_json(cp_pool_socket(), msg.c_str());

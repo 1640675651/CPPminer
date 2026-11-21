@@ -1,4 +1,5 @@
 #include "cp_state.h"
+#include "cp_version.h"
 
 int g_cutlass_fused = 0;
 int g_m_active = M_DIM;
@@ -8,7 +9,7 @@ int8_t* h_Ap_global = NULL;
 int8_t* h_BpT_global = NULL;
 char wallet_global[256] = {0};
 char worker_global[64] = "rig01";
-char agent_global[64] = "CPPminer/1.1";
+char agent_global[64] = CP_AGENT_DEFAULT;
 char pool_pass_global[128] = "x";
 int g_dry_run = 0;
 int g_plain_verify = 0;

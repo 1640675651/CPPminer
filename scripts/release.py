@@ -2,7 +2,7 @@
 """Package a Windows release: cppminer.exe + every non-system DLL it needs + kernels, zipped.
 
 Usage (after build.ps1):
-  python scripts/release.py                       # version from CHANGELOG.md, output in dist/
+  python scripts/release.py                       # version from include/cp_version.h, output in dist/
   python scripts/release.py --version v0.5 --suffix windows_x64_cuda
   python scripts/release.py --no-vcrt             # rely on the user's VC++ redistributable
 
@@ -210,12 +210,12 @@ def resolve_dlls(roots, exe_dir, bundle_vcrt, bundle_cudart, elsewhere=None):
 
 
 def default_version():
+    """"v" + CP_VERSION from include/cp_version.h, the version the miner itself reports."""
     try:
-        with open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
-            for line in f:
-                m = re.match(r"##\s+(v[\w.\-]+)", line)
-                if m:
-                    return m.group(1)
+        with open(os.path.join(ROOT, "include", "cp_version.h"), encoding="utf-8") as f:
+            m = re.search(r'#define\s+CP_VERSION\s+"([^"]+)"', f.read())
+            if m:
+                return "v" + m.group(1)
     except OSError:
         pass
     return "dev"

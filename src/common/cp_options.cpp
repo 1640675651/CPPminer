@@ -4,6 +4,7 @@
 #include "cp_config.h"
 #include "cp_diagnostics.h"
 #include "cp_state.h"
+#include "cp_version.h"
 #include "cp_worker.h"
 
 #if defined(CP_ENABLE_ONEDNN) && CP_ENABLE_ONEDNN
@@ -19,7 +20,7 @@
 
 static void print_usage(void)
 {
-    printf("CPPminer - multi-algo LuckyPool miner (pearl / quantus)\n");
+    printf("CPPminer " CP_VERSION " - multi-algo LuckyPool miner (pearl / quantus)\n");
     printf("  --algo NAME        pearl (default) or quantus\n");
     {
         char pb[64], qb[64];
@@ -31,7 +32,7 @@ static void print_usage(void)
     printf("  --pool URI         stratum+tcp://host:port (required for quantus unless --mock)\n");
     printf("  --wallet ADDR      wallet address\n");
     printf("  --worker NAME      worker name (default: rig01)\n");
-    printf("  --agent NAME       agent string (default: CPPminer/1.0)\n");
+    printf("  --agent NAME       agent string (default: " CP_AGENT_DEFAULT ")\n");
     printf("  --pool-pass STR    mining.authorize password (default: x); Kryptex custom\n");
     printf("                     share difficulty: d=N (default d=2097152)\n");
     printf("  --api-port N       HTTP stats API on this port: /summary (JSON) and /hiveos\n");
