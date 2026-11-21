@@ -540,6 +540,13 @@ extern "C" void cp_worker_apply_backend_defaults(void)
          layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8 || layout == CP_TILE_LAYOUT_CONTIGUOUS_16x16 ||
          layout == CP_TILE_LAYOUT_CONTIGUOUS_4x64);
     pearl_set_contiguous_tiles(contiguous);
+#if defined(CP_ENABLE_CPU) && CP_ENABLE_CPU
+    if(cp_worker_backend_id() == CP_BACKEND_CPU) {
+        /* 16x16 hash tile: two 8x16 micro tiles, or four 16x4 quarters (Case33GemmXor). */
+        cp_pp_set_hash_tile(16, 16);
+        pearl_set_contiguous_tile_shape(16, 16);
+    }
+#endif
 #if defined(CP_ENABLE_WGPU) && CP_ENABLE_WGPU
     if(cp_worker_backend_id() == CP_BACKEND_WGPU && g_algo == 0) {
         /* Match the fused kernel's hash tile: jackpot scale, MAC accounting, proof layout. */
@@ -832,7 +839,7 @@ extern "C" int cp_contiguous_tile_layout_for_shape(int mr, int w)
 extern "C" int cp_worker_default_tile_layout(void)
 {
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
-        return CP_TILE_LAYOUT_CONTIGUOUS;
+        return CP_TILE_LAYOUT_CONTIGUOUS_16x16;
     if(cp_worker_backend_id() == CP_BACKEND_HEXAGON)
         return CP_TILE_LAYOUT_CONTIGUOUS_4x64;
     if(cp_worker_backend_id() == CP_BACKEND_INTEL_NPU)

@@ -38,6 +38,8 @@ constexpr int kNR = Case33GemmXor::kNR;
 constexpr int kKR = Case33GemmXor::kKR;
 constexpr int kTileRows = Case33GemmXor::kTileRows;
 constexpr int kTileCols = Case33GemmXor::kTileCols;
+static_assert(kTileRows == 2 * kMR && kTileCols == kNR,
+              "16x16 hash tile = two vertically adjacent 8x16 micro tiles");
 constexpr int kMacroM = Case33GemmXor::kMacroM;
 constexpr int kMacroN = Case33GemmXor::kMacroN;
 constexpr int kMicroPerMacroM = kMacroM / kMR;
@@ -261,9 +263,10 @@ void compute_b_compensation_milestones(const int8_t *b, int K, int N, int num_mi
     }
 }
 
+/* XOR of one 8x16 micro tile (half of a 16x16 hash tile). */
 uint32_t xor_tile(const int32_t *tile_c) {
     uint32_t x = 0u;
-    for (int i = 0; i < kTileRows * kTileCols; ++i) {
+    for (int i = 0; i < kMR * kNR; ++i) {
         x ^= static_cast<uint32_t>(tile_c[i]);
     }
     return x;
@@ -446,8 +449,8 @@ void micro_gemm_xor_milestones_pair(const int8_t *a_base0, const int8_t *a_base1
  * AVX-VNNI, AVX2 and SSSE3 u8s8, and AVX-VNNI-INT8 s8s8 (its only kernel). The u8s8 ones run
  * in the fast mode only (exact s8s8 keeps the 8x16 kernels), and CP_AVXVNNI_16X4=0,
  * CP_AVX2_16X4=0 or CP_SSSE3_16X4=0 falls back to that ISA's 8x16 kernel, as do builds
- * without the assembly. Hash tiles stay 8x16: each 16x4 tile yields an 8x4 XOR for rows 0..7
- * and one for rows 8..15, and four column quarters fold into a hash tile. */
+ * without the assembly. Hash tiles are 16x16: each 16x4 kernel call XORs its block's milestone
+ * words straight into the tile's [K/128] array, so the four column quarters need no fold pass. */
 bool env_enabled(const char *name) {
     const char *env = std::getenv(name);
     return !(env && std::atoi(env) == 0);
@@ -547,22 +550,22 @@ extern "C" void case33_ssse3_16x4_xor(const int8_t *a, const int8_t *b, int bloc
                                       uint32_t *out, const int32_t *correction);
 
 /* One 16x4 tile over all of K: rows 0-7 from the packed 8-row tile a, rows 8-15 from the next
- * one; halves[2 * kb] and [2 * kb + 1] get the two 8x4 XORs after panel kb. correction: the
- * quarter's (build_corrections_16x4) for the u8s8 kernels, else unused. */
+ * one; tile_xor[kb] ^= the XOR of its 64 cells after panel kb. correction: the quarter's
+ * (build_corrections_16x4) for the u8s8 kernels, else unused. */
 inline void run_16x4(Tile16x4 kernel, const int8_t *a, const int8_t *b_quarter, int blocks_k,
-                     const int32_t *correction, uint32_t *halves) {
+                     const int32_t *correction, uint32_t *tile_xor) {
     switch (kernel) {
     case Tile16x4::S8S8:
-        case33_avxvnni_int8_16x4_xor(a, b_quarter, blocks_k, halves);
+        case33_avxvnni_int8_16x4_xor(a, b_quarter, blocks_k, tile_xor);
         break;
     case Tile16x4::U8S8:
-        case33_avxvnni_16x4_xor(a, b_quarter, blocks_k, halves, correction);
+        case33_avxvnni_16x4_xor(a, b_quarter, blocks_k, tile_xor, correction);
         break;
     case Tile16x4::Avx2U8S8:
-        case33_avx2_16x4_xor(a, b_quarter, blocks_k, halves, correction);
+        case33_avx2_16x4_xor(a, b_quarter, blocks_k, tile_xor, correction);
         break;
     case Tile16x4::Ssse3U8S8:
-        case33_ssse3_16x4_xor(a, b_quarter, blocks_k, halves, correction);
+        case33_ssse3_16x4_xor(a, b_quarter, blocks_k, tile_xor, correction);
         break;
     default:
         break;
@@ -574,43 +577,41 @@ inline void run_16x4(Tile16x4 kernel, const int8_t *a, const int8_t *b_quarter, 
  *     sweeps the macro's eight 16-row groups while it is hot in L1, and A streams from L2;
  *   - AVX2 / SSSE3, rows-outer: each 16-row A strip (64 KiB at K=4096) stays cache-resident
  *     while the macro's B quarters stream (Case 3.5 measured 0.97 vs 0.87 TOPS for AVX2).
- * The quarters' XORs fold into 8x16 hash tiles; emit(tile_row, tile_col, milestone_xor) runs
- * for each once its four quarters are done. corrections: the u8s8 kernels'
- * (build_corrections_16x4), null for s8s8. Returns false as soon as stop() or emit asks to
- * stop. */
+ * Each kernel call XORs its block into its 16x16 hash tile's milestone words;
+ * emit(hash_row, tile_col, milestone_xor) runs for each tile (hash_row in 16-row units) once
+ * its four quarters are done. corrections: the u8s8 kernels' (build_corrections_16x4), null
+ * for s8s8. Returns false as soon as stop() or emit asks to stop. */
 template <typename Emit, typename Stop>
 bool macro_16x4(Tile16x4 kernel, const int8_t *a_pre, const int8_t *b_pre, int blocks_k,
                 int im, int jm, const int32_t *corrections, Emit &&emit, Stop &&stop) {
+    constexpr int kHashPerMacroM = kMacroM / kTileRows;
     const size_t a_tile_stride = static_cast<size_t>(blocks_k) * kPanelA;
     const size_t quarter_bytes = static_cast<size_t>(blocks_k) * kQuarterPanel;
     const size_t quarter_corr = static_cast<size_t>(blocks_k) * kQuarterCols;
     const int tr0 = im * kMicroPerMacroM;
-    const auto quarter = [&](int tc_global, int q, int t, uint32_t *halves) {
+    const int hr0 = im * kHashPerMacroM;
+    /* h: hash-tile row in the macro (8-row A tiles 2h and 2h+1). */
+    const auto quarter = [&](int tc_global, int q, int h, uint32_t *tile_xor) {
         const size_t qi = static_cast<size_t>(tc_global) * kQuarters + q;
-        run_16x4(kernel, a_pre + static_cast<size_t>(tr0 + t) * a_tile_stride,
+        run_16x4(kernel, a_pre + static_cast<size_t>(tr0 + 2 * h) * a_tile_stride,
                  b_pre + qi * quarter_bytes, blocks_k,
                  kernel != Tile16x4::S8S8 && corrections ? corrections + qi * quarter_corr
                                                          : nullptr,
-                 halves);
+                 tile_xor);
     };
-    uint32_t halves[2 * kNumMilestones];
 
     if (kernel == Tile16x4::Avx2U8S8 || kernel == Tile16x4::Ssse3U8S8) {
-        for (int t = 0; t < kMicroPerMacroM; t += 2) {
+        for (int h = 0; h < kHashPerMacroM; ++h) {
             for (int tc = 0; tc < kMicroPerMacroN; ++tc) {
                 if (stop()) {
                     return false;
                 }
                 const int tc_global = jm * kMicroPerMacroN + tc;
-                uint32_t acc[2][kNumMilestones] = {};
+                uint32_t acc[kNumMilestones] = {};
                 for (int q = 0; q < kQuarters; ++q) {
-                    quarter(tc_global, q, t, halves);
-                    for (int ms = 0; ms < blocks_k; ++ms) {
-                        acc[0][ms] ^= halves[2 * ms];
-                        acc[1][ms] ^= halves[2 * ms + 1];
-                    }
+                    quarter(tc_global, q, h, acc);
                 }
-                if (!emit(tr0 + t, tc_global, acc[0]) || !emit(tr0 + t + 1, tc_global, acc[1])) {
+                if (!emit(hr0 + h, tc_global, acc)) {
                     return false;
                 }
             }
@@ -623,18 +624,14 @@ bool macro_16x4(Tile16x4 kernel, const int8_t *a_pre, const int8_t *b_pre, int b
             return false;
         }
         const int tc_global = jm * kMicroPerMacroN + tc;
-        uint32_t acc[kMicroPerMacroM][kNumMilestones] = {};
+        uint32_t acc[kHashPerMacroM][kNumMilestones] = {};
         for (int q = 0; q < kQuarters; ++q) {
-            for (int t = 0; t < kMicroPerMacroM; t += 2) {
-                quarter(tc_global, q, t, halves);
-                for (int ms = 0; ms < blocks_k; ++ms) {
-                    acc[t][ms] ^= halves[2 * ms];
-                    acc[t + 1][ms] ^= halves[2 * ms + 1];
-                }
+            for (int h = 0; h < kHashPerMacroM; ++h) {
+                quarter(tc_global, q, h, acc[h]);
             }
         }
-        for (int t = 0; t < kMicroPerMacroM; ++t) {
-            if (!emit(tr0 + t, tc_global, acc[t])) {
+        for (int h = 0; h < kHashPerMacroM; ++h) {
+            if (!emit(hr0 + h, tc_global, acc[h])) {
                 return false;
             }
         }
@@ -642,6 +639,39 @@ bool macro_16x4(Tile16x4 kernel, const int8_t *a_pre, const int8_t *b_pre, int b
     return true;
 }
 #endif
+
+/* One 16x16 hash tile with the 8x16 kernels: micro tiles a_base (rows 0-7) and the next A tile
+ * (rows 8-15) against b_base, as one pair call where the ISA has one, then XORed into
+ * hash_xor[kNumMilestones]. Without xor_after_milestone (GEMM only) hash_xor is all zero. */
+void hash_tile_8x16(const int8_t *a_base, size_t a_tile_stride, const int8_t *b_base,
+                    int blocks_k, int blocks_per_milestone, int num_milestones, int N,
+                    int micro_col0, const int32_t *b_comp_ms, bool use_fast_u8s8,
+                    Case33Isa isa, Case33SseTile sse_tile, bool pair, bool xor_after_milestone,
+                    uint32_t *hash_xor) {
+    /* With tile_count 1, tile 0's milestones land in [0, kNumMilestones) and tile 1's in
+     * [kNumMilestones, 2 * kNumMilestones). */
+    uint32_t halves[2 * kNumMilestones] = {};
+    if (pair) {
+        micro_gemm_xor_milestones_pair(a_base, a_base + a_tile_stride, b_base, blocks_k,
+                                       blocks_per_milestone, num_milestones, N, micro_col0,
+                                       /*spatial_tile_id0=*/0,
+                                       /*spatial_tile_id1=*/kNumMilestones,
+                                       /*tile_count=*/1, b_comp_ms, use_fast_u8s8, isa,
+                                       xor_after_milestone, halves);
+    } else {
+        for (int r = 0; r < 2; ++r) {
+            micro_gemm_xor_milestones(a_base + r * a_tile_stride, b_base, blocks_k,
+                                      blocks_per_milestone, num_milestones, N, micro_col0,
+                                      /*spatial_tile_id=*/static_cast<size_t>(r) *
+                                              kNumMilestones,
+                                      /*tile_count=*/1, b_comp_ms, use_fast_u8s8, isa,
+                                      sse_tile, xor_after_milestone, halves);
+        }
+    }
+    for (int ms = 0; ms < kNumMilestones; ++ms) {
+        hash_xor[ms] = halves[ms] ^ halves[kNumMilestones + ms];
+    }
+}
 
 // Case 3.2 macro schedule: 2D OpenMP (dynamic) over macro blocks, tc outer / tr inner (B reuse).
 void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, int blocks_k,
@@ -670,8 +700,8 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
         for (int mb = 0; mb < macro_blocks; ++mb) {
             macro_16x4(
                     tile16x4, a_pre, b_pre, blocks_k, mb % macro_rows, mb / macro_rows, b_comp_ms,
-                    [&](int tr, int tc, const uint32_t *ms_xor) {
-                        const size_t id = static_cast<size_t>(tr) * tile_cols + tc;
+                    [&](int hr, int tc, const uint32_t *ms_xor) {
+                        const size_t id = static_cast<size_t>(hr) * tile_cols + tc;
                         for (int ms = 0; ms < kNumMilestones; ++ms) {
                             dst[static_cast<size_t>(ms) * tile_count + id] = ms_xor[ms];
                         }
@@ -696,7 +726,6 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
         const int im = mb % macro_rows;
         const int col0 = jm * kMacroN;
         const int tc0 = jm * kMicroPerMacroN;
-        const int row0 = im * kMacroM;
         const int tr0 = im * kMicroPerMacroM;
 
         for (int tc = 0; tc < kMicroPerMacroN; ++tc) {
@@ -705,34 +734,24 @@ void run_hardcoded_macro_xor(const int8_t *a_pre, const int8_t *b_pre, int N, in
             const int8_t *b_base =
                     b_pre + static_cast<size_t>(tc_global) * b_tile_stride;
 
-            for (int tr = 0; tr < kMicroPerMacroM;) {
+            /* 8x16 micro tiles tr and tr+1 form one 16x16 hash tile. */
+            for (int tr = 0; tr < kMicroPerMacroM; tr += 2) {
                 const int tr_global = tr0 + tr;
-                const int micro_row0 = row0 + tr * kMR;
-                (void)micro_row0;
                 const int8_t *a_base =
                         a_pre + static_cast<size_t>(tr_global) * a_tile_stride;
                 const size_t spatial_tile_id =
-                        static_cast<size_t>(tr_global) * static_cast<size_t>(tile_cols) +
+                        static_cast<size_t>(tr_global / 2) * static_cast<size_t>(tile_cols) +
                         static_cast<size_t>(tc_global);
-
-                if (pair && tr + 1 < kMicroPerMacroM) {
-                    /* Tiles tr and tr+1: next A row-tile, same B; tile ids differ by one
-                     * tile row. */
-                    micro_gemm_xor_milestones_pair(
-                            a_base, a_base + a_tile_stride, b_base, blocks_k,
-                            blocks_per_milestone, num_milestones, N, micro_col0,
-                            spatial_tile_id, spatial_tile_id + static_cast<size_t>(tile_cols),
-                            tile_count, b_comp_ms, use_fast_u8s8, isa, xor_after_milestone,
-                            out->data());
-                    tr += 2;
-                    continue;
+                uint32_t hash_xor[kNumMilestones];
+                hash_tile_8x16(a_base, a_tile_stride, b_base, blocks_k, blocks_per_milestone,
+                               num_milestones, N, micro_col0, b_comp_ms, use_fast_u8s8, isa,
+                               sse_tile, pair, xor_after_milestone, hash_xor);
+                if (xor_after_milestone) {
+                    for (int ms = 0; ms < kNumMilestones; ++ms) {
+                        (*out)[static_cast<size_t>(ms) * tile_count + spatial_tile_id] =
+                                hash_xor[ms];
+                    }
                 }
-
-                micro_gemm_xor_milestones(
-                        a_base, b_base, blocks_k, blocks_per_milestone, num_milestones,
-                        N, micro_col0, spatial_tile_id, tile_count, b_comp_ms,
-                        use_fast_u8s8, isa, sse_tile, xor_after_milestone, out->data());
-                ++tr;
             }
         }
     }
@@ -777,8 +796,8 @@ bool run_online_tile_scan(
         for (int mb = 0; mb < macro_blocks; ++mb) {
             const bool done = macro_16x4(
                     tile16x4, a_pre, b_pre, blocks_k, mb % macro_rows, mb / macro_rows, b_comp_ms,
-                    [&](int tr, int tc, const uint32_t *ms_xor) {
-                        return on_tile(ms_xor, tr * kMR, tc * kNR);
+                    [&](int hr, int tc, const uint32_t *ms_xor) {
+                        return on_tile(ms_xor, hr * kTileRows, tc * kTileCols);
                     },
                     [&] {
                         if (stop.load(std::memory_order_relaxed)) {
@@ -827,7 +846,8 @@ bool run_online_tile_scan(
             const int8_t *b_base =
                     b_pre + static_cast<size_t>(tc_global) * b_tile_stride;
 
-            for (int tr = 0; tr < kMicroPerMacroM;) {
+            /* 8x16 micro tiles tr and tr+1 form one 16x16 hash tile. */
+            for (int tr = 0; tr < kMicroPerMacroM; tr += 2) {
                 if (stop.load(std::memory_order_relaxed)) {
                     break;
                 }
@@ -840,39 +860,14 @@ bool run_online_tile_scan(
                 const int micro_row0 = row0 + tr * kMR;
                 const int8_t *a_base =
                         a_pre + static_cast<size_t>(tr_global) * a_tile_stride;
-
-                if (pair && tr + 1 < kMicroPerMacroM) {
-                    /* Two tiles per call; tile 0's milestones land in [0, kNumMilestones),
-                     * tile 1's in [kNumMilestones, 2*kNumMilestones). on_tile order is
-                     * unchanged (tr, then tr+1). */
-                    uint32_t milestone_xor2[2 * kNumMilestones] = {};
-                    micro_gemm_xor_milestones_pair(
-                            a_base, a_base + a_tile_stride, b_base, blocks_k,
-                            blocks_per_milestone, num_milestones, N, micro_col0,
-                            /*spatial_tile_id0=*/0, /*spatial_tile_id1=*/kNumMilestones,
-                            /*tile_count=*/1, b_comp_ms, use_fast_u8s8, isa, true,
-                            milestone_xor2);
-                    if (!on_tile(milestone_xor2, micro_row0, micro_col0) ||
-                        !on_tile(milestone_xor2 + kNumMilestones, micro_row0 + kMR,
-                                 micro_col0)) {
-                        stop.store(1, std::memory_order_relaxed);
-                        break;
-                    }
-                    tr += 2;
-                    continue;
-                }
-
-                uint32_t milestone_xor[kNumMilestones] = {};
-                micro_gemm_xor_milestones(
-                        a_base, b_base, blocks_k, blocks_per_milestone, num_milestones, N,
-                        micro_col0, /*spatial_tile_id=*/0, /*tile_count=*/1, b_comp_ms,
-                        use_fast_u8s8, isa, sse_tile, true, milestone_xor);
-
-                if (!on_tile(milestone_xor, micro_row0, micro_col0)) {
+                uint32_t hash_xor[kNumMilestones];
+                hash_tile_8x16(a_base, a_tile_stride, b_base, blocks_k, blocks_per_milestone,
+                               num_milestones, N, micro_col0, b_comp_ms, use_fast_u8s8, isa,
+                               sse_tile, pair, true, hash_xor);
+                if (!on_tile(hash_xor, micro_row0, micro_col0)) {
                     stop.store(1, std::memory_order_relaxed);
                     break;
                 }
-                ++tr;
             }
         }
     }
@@ -1119,7 +1114,7 @@ void Case33GemmXor::update_backend_label_() {
                            : kernel == Tile16x4::Avx2U8S8  ? "AVX2"
                                                            : "SSSE3";
         std::snprintf(backend_buf_, sizeof(backend_buf_),
-                      "ukernel %s %dx%d 2D-par fused-K %s+XOR, %s 16x4 asm (8x16 hash tiles), "
+                      "ukernel %s %dx%d 2D-par fused-K %s+XOR, %s 16x4 asm (16x16 hash tiles), "
                       "%s KR=%d%s",
                       par, kMacroM, kMacroN, int8 ? "s8s8" : dot, name,
                       vnni ? "interleaved XOR" : "rows-outer", kKR, prepack);

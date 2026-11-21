@@ -282,7 +282,7 @@ Proof building (`cp_proof_build` / `build_plain_proof_b64` in `rust/cp-proof-ffi
 | 5 contiguous 16×16 | 16 | 16 | `PEARL_CONTIGUOUS_16x16_CONFIG` |
 | 6 contiguous 4×64 | 4 | 64 | `PEARL_CONTIGUOUS_4x64_CONFIG` |
 
-Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x4` and `--ocl-tile 4x8` both use the contiguous 4×8 layout 4. The Hexagon backend uses layout 6: each 4×64 half of its 4×128 HVX register tile, at zk-pow's limit of h·w = 256.
+Row/column patterns are defined in `rust/cp-proof-ffi/src/lib.rs`. OpenCL `--ocl-tile 4x4` and `--ocl-tile 4x8` both use the contiguous 4×8 layout 4. The Hexagon backend uses layout 6: each 4×64 half of its 4×128 HVX register tile, at zk-pow's limit of h·w = 256. The CPU and Intel NPU backends use layout 5.
 
 ### `PlainProof` payload
 

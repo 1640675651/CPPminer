@@ -16,6 +16,8 @@ With current constants (`include/cp_config.h`):
 | MACs / hash tile | **524 288** | `8 × 16 × 4096` |
 
 Implementation: `cp_pp_macs_per_hash_tile()`, `cp_pp_mac_rate_from_tiles()` in `src/common/cp_util.cpp`.
+Backends with another hash tile override `PP_HASH_H` × `PP_HASH_W` through `cp_pp_set_hash_tile()`
+(e.g. CPU and Intel NPU 16 × 16, Hexagon 4 × 64), so the MACs per tile follow the active shape.
 
 Rates are printed as TMAC/s when ≥ 10¹² MAC/s (`cp_pp_fmt_mac_rate`).
 

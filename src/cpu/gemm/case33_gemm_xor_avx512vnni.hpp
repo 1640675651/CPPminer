@@ -5,7 +5,7 @@
 
 /* AVX512-VNNI ukernel entry (compiled with -mavx512f -mavx512bw -mavx512vl -mavx512vnni,
  * MSVC /arch:AVX512). Call only after runtime CPUID confirms AVX512F/BW/VL/VNNI and
- * XCR0 ZMM/opmask state. Same packed A/B layout, 8x16 hash tile, KR milestone XOR
+ * XCR0 ZMM/opmask state. Same packed A/B layout, 8x16 micro tile, KR milestone XOR
  * schedule and epilogue as the AVX-VNNI kernel; only the encoding (EVEX, 32 regs) differs. */
 void case33_avx512vnni_micro_gemm_xor_fused_k(
         const std::int8_t *a_base, const std::int8_t *b_base, int blocks_k,

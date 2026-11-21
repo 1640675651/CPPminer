@@ -18,7 +18,7 @@
 
 /* Base AVX-512 (AVX512F + AVX512BW) micro-kernel for CPUs without AVX512_VNNI, mainly
  * Skylake-X / Skylake-SP class parts. Same structure as the AVX512-VNNI zmm pair kernel:
- * two vertically adjacent 8x16 hash tiles (rows r..r+7 and r+8..r+15 of the same 16 columns)
+ * two vertically adjacent 8x16 micro tiles (rows r..r+7 and r+8..r+15 of the same 16 columns)
  * held as one 16x16 register block, one zmm accumulator per column with lanes 0-7 = tile 0
  * rows and lanes 8-15 = tile 1 rows, so every B broadcast feeds both tiles.
  *

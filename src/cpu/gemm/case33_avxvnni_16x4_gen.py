@@ -34,9 +34,10 @@ a           Rows 0..7 of the 16-row tile: one packed 8-row A tile (A+128 as
 b           One 4-column B quarter, signed, [K/128 panel][K/4][4 cols][4 K bytes],
             512 contiguous bytes per panel.
 blocks      K / 128 panels (milestones), >= 1.
-out         Per milestone: out[2*ms] = XOR of the 8x4 C block of rows 0..7,
-            out[2*ms+1] = XOR of rows 8..15. C is cumulative over K and wraps
-            modulo 2^32.
+out         Per milestone: out[ms] ^= XOR of the 16x4 C block (all 64 cells), so
+            the four column quarters of a 16x16 hash tile accumulate into one
+            zeroed [K/128] array with no fold pass. C is cumulative over K and
+            wraps modulo 2^32.
 correction  u8s8 kernels only. Per panel and column, 128 * sum(B) over that panel:
             [K/128][4].
 
@@ -54,8 +55,8 @@ AVX-VNNI schedule, as in Case 3.5:
   * AVX-VNNI: before each panel the correction is subtracted from C; the
     unsigned*signed dots then restore the exact signed cumulative C.
   * Each panel is fully unrolled. The final column updates fold C into the
-    milestone's vector XOR (ymm12 = [rows 0..7 | rows 8..15], 4 lanes each).
-    Except after the last panel, its horizontal reduction and stores are spread
+    milestone's vector XOR (xmm12, 4 lanes covering all 16 rows).
+    Except after the last panel, its horizontal reduction and XOR into out are spread
     over the next panel's first eight column updates, using ymm13; those use a
     four-register ring (ymm14, 15, 10, 11) before the six-register ring resumes.
   * No stack spills. No load reaches past the last panel of A or B.
@@ -148,14 +149,14 @@ def body(kernel):
     four = [14, 15, 10, 11]
     out += [bcast(four[c], c) for c in range(COLS)]
     finish = [
-        ["vpshufd ymm13, ymm12, 78"],          # swap 64-bit halves per lane
-        ["vpxor ymm12, ymm12, ymm13"],
-        ["vpshufd ymm13, ymm12, 177"],         # swap neighbouring dwords
-        ["vpxor ymm12, ymm12, ymm13"],         # every dword = XOR of its 128-bit half
-        ["vmovd dword ptr [r9], xmm12"],       # rows 0..7
-        ["vextracti128 xmm13, ymm12, 1"],
-        ["vmovd dword ptr [r9+4], xmm13"],     # rows 8..15
-        ["add r9, 8"],
+        ["vpshufd xmm13, xmm12, 78"],          # swap 64-bit halves
+        ["vpxor xmm12, xmm12, xmm13"],
+        ["vpshufd xmm13, xmm12, 177"],         # swap neighbouring dwords
+        ["vpxor xmm12, xmm12, xmm13"],         # every dword = XOR of the 16x4 block
+        ["vmovd eax, xmm12"],
+        ["xor dword ptr [r9], eax"],           # accumulate into the hash tile's word
+        [],
+        ["add r9, 4"],
     ]
     for g in range(2 * COLS):
         if g % COLS == 0:
@@ -173,8 +174,7 @@ def body(kernel):
         out += ring_column(g)
 
     # Last K step: fold each column into the milestone XOR as soon as it is final.
-    # ymm12/13 are free (their ring slots had nothing left to load); ymm14/15
-    # are free once columns 0 and 1 are done.
+    # ymm12/13 are free (their ring slots had nothing left to load).
     g = last
     r = [ring_reg(g + c) for c in range(COLS)]
     out += load_a(g // COLS)
@@ -190,10 +190,10 @@ def body(kernel):
             "vpxor ymm12, ymm12, ymm3",
             vnni(7, 9, r[3]),
             "vpxor ymm13, ymm13, ymm7",
-            # [rows 0..7 | rows 8..15], each 128-bit half reduced to four lanes
-            "vperm2i128 ymm14, ymm12, ymm13, 32",
-            "vperm2i128 ymm15, ymm12, ymm13, 49",
-            "vpxor ymm12, ymm14, ymm15"]
+            # all 16 rows, then both 128-bit halves into four lanes
+            "vpxor ymm12, ymm12, ymm13",
+            "vextracti128 xmm13, ymm12, 1",
+            "vpxor xmm12, xmm12, xmm13"]
     out += [f"add r10, {A_PANEL}", f"add rdx, {A_PANEL}", f"add r11, {B_PANEL}",
             "dec r8d", "jnz @next"]
 
@@ -243,16 +243,15 @@ def avx2_body(_kernel):
             "dec eax", "jnz @step"]
     out += ["vpxor ymm10, ymm0, ymm1", "vpxor ymm11, ymm2, ymm3", "vpxor ymm10, ymm10, ymm11",
             "vpxor ymm12, ymm4, ymm5", "vpxor ymm13, ymm6, ymm7", "vpxor ymm12, ymm12, ymm13",
-            # [rows 0..7 | rows 8..15], each 128-bit half reduced to one dword
-            "vperm2i128 ymm13, ymm10, ymm12, 32",
-            "vperm2i128 ymm14, ymm10, ymm12, 49",
-            "vpxor ymm10, ymm13, ymm14",
-            "vpshufd ymm11, ymm10, 78", "vpxor ymm10, ymm10, ymm11",
-            "vpshufd ymm11, ymm10, 177", "vpxor ymm10, ymm10, ymm11",
-            "vmovd dword ptr [r9], xmm10",
-            "vextracti128 xmm11, ymm10, 1",
-            "vmovd dword ptr [r9+4], xmm11",
-            "add r9, 8", "dec r8d", "jnz @panel"]
+            # all 16 rows, both 128-bit halves, then one dword XORed into out (eax is free:
+            # the step counter reached zero)
+            "vpxor ymm10, ymm10, ymm12",
+            "vextracti128 xmm11, ymm10, 1", "vpxor xmm10, xmm10, xmm11",
+            "vpshufd xmm11, xmm10, 78", "vpxor xmm10, xmm10, xmm11",
+            "vpshufd xmm11, xmm10, 177", "vpxor xmm10, xmm10, xmm11",
+            "vmovd eax, xmm10",
+            "xor dword ptr [r9], eax",
+            "add r9, 4", "dec r8d", "jnz @panel"]
     return out
 
 
@@ -302,12 +301,14 @@ def ssse3_parked_body(_kernel):
         out += [f"movdqu xmmword ptr [rsp+{PARK}+{(half * 8 + i) * 16}], xmm{i}"
                 for i in range(8)]
         out += ["movdqa xmm12, xmm0"] + [f"pxor xmm12, xmm{i}" for i in range(1, 8)]
+        # Each half XORs its dword into out[ms] (eax is free: the step counter reached zero).
         out += ["pshufd xmm13, xmm12, 78", "pxor xmm12, xmm13",
                 "pshufd xmm13, xmm12, 177", "pxor xmm12, xmm13",
-                f"movd dword ptr [r9+{half * 4}], xmm12"]
+                "movd eax, xmm12",
+                "xor dword ptr [r9], eax"]
         if half == 0:
             out.append(f"sub r11, {B_PANEL}")   # rows 8..15 read the same B panel
-    out += ["add rcx, 16", "add r9, 8", "dec r8d", "jnz @panel"]
+    out += ["add rcx, 16", "add r9, 4", "dec r8d", "jnz @panel"]
     return out
 
 

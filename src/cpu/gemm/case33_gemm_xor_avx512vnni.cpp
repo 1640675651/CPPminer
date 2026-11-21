@@ -17,8 +17,8 @@
  *    compiler has ymm16..ymm31 available and the 16 accumulators + A + 8 B broadcasts
  *    never spill (the AVX2 kernel runs out of 16 ymm regs).
  *  - Targets Zen4-class parts that expose AVX512_VNNI but not VEX AVX-VNNI.
- * The hash tile stays 8x16 int32; XOR is lane-order independent so the reduction order
- * does not affect the result. */
+ * The micro tile stays 8x16 int32 (the caller XORs two into a 16x16 hash tile); XOR is
+ * lane-order independent so the reduction order does not affect the result. */
 
 namespace {
 
@@ -219,11 +219,11 @@ void avx512vnni_micro_gemm_xor_fused_k_impl(const int8_t *a_base, const int8_t *
 }
 
 /* ---------------------------------------------------------------------------------------
- * zmm pair variant: two vertically adjacent 8x16 hash tiles (rows r..r+7 and r+8..r+15 of
+ * zmm pair variant: two vertically adjacent 8x16 micro tiles (rows r..r+7 and r+8..r+15 of
  * the same 16 columns) computed together as one 16x16 register block. Each zmm accumulator
  * holds one column: lanes 0-7 = tile 0 rows, lanes 8-15 = tile 1 rows. Both tiles share every
  * B broadcast, so B loads per MAC halve; the A operand is the two tiles' 32-byte k-group rows
- * joined with vinserti64x4. The hash tiles themselves stay 8x16 (low/high zmm halves), and the
+ * joined with vinserti64x4. The micro tiles themselves stay 8x16 (low/high zmm halves), and the
  * milestone XOR runs per KR panel exactly as in the single-tile kernel, so the int32 values
  * and XOR schedule are identical to the reference. Fast u8s8 mode only: AVX-512 has no
  * vpsignb, so the exact s8s8 path uses the ymm kernel twice. */

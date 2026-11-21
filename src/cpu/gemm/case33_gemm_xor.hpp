@@ -36,15 +36,18 @@ enum class Case33SseTile {
     R4C16, /* 4x16: one row-half x all 16 cols (better A reuse) */
 };
 
-// Case 3.3: Case 3.2 8x16 ukernel + milestoned 8x16 tile XOR.
-// tile_xor[milestone * tile_count + spatial_tile_id]
+// Case 3.3: Case 3.2 8x16 ukernel + milestoned tile XOR over 16x16 hash tiles
+// (CP_TILE_LAYOUT_CONTIGUOUS_16x16): two vertically adjacent 8x16 micro tiles, or four
+// 16x4 column quarters with the 16x4 kernels.
+// tile_xor[milestone * tile_count + spatial_tile_id], spatial ids over 16x16 tiles.
 // Pearl jackpot milestones are every R_RANK along K (GEMM KR may be larger).
 struct Case33GemmXor {
     static constexpr int kNumMilestones = K_DIM / R_RANK;
     static constexpr int kMR = Case32Gemm::kMR;
     static constexpr int kNR = Case32Gemm::kNR;
     static constexpr int kKR = Case32Gemm::kKR;
-    static constexpr int kTileRows = kMR;
+    /* Hash tile: rows/cols of C whose cells XOR into one word per milestone. */
+    static constexpr int kTileRows = 2 * kMR;
     static constexpr int kTileCols = kNR;
     static constexpr int kMacroM = Case32Gemm::kMacroM;
     static constexpr int kMacroN = Case32Gemm::kMacroN;
@@ -73,8 +76,8 @@ struct Case33GemmXor {
      * the +128 offset and B carries compensation sums. ARM kernels are s8s8. */
     bool fast_u8s8_active() const { return use_fast_u8s8_(); }
     /* True when a 16x4 assembly kernel (Case 3.5 port) runs: AVX-VNNI u8s8 or AVX-VNNI-INT8.
-     * Packed B is then quarter-major (each 4-column slice contiguous over K), and hash tiles
-     * are still 8x16. */
+     * Packed B is then quarter-major (each 4-column slice contiguous over K), and each kernel
+     * call XORs its 16x4 block straight into its 16x16 hash tile's milestone words. */
     bool tile16x4_active() const;
     Case33SseTile sse_tile() const { return sse_tile_; }
     /* Resolve the requested ISA against compiled and runtime capabilities. */
@@ -94,6 +97,7 @@ struct Case33GemmXor {
     void run();
     void run_gemm_only();
 
+    /* on_tile gets each 16x16 hash tile's milestone words and its first row and column. */
     bool scan_tiles(const std::function<bool(const uint32_t *milestone_xor, int t_rows,
                                              int t_cols)> &on_tile,
                     const std::function<bool()> &should_cancel = {});

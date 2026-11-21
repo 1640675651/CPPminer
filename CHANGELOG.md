@@ -1,14 +1,12 @@
 # Changelog
 
 ## v1.1 (tentative)
-### New features
-- CUDA backend now support RTX 20-50 series (TODO)
-- Multi GPU (TODO)
 
 ### Fix & Enhancements
 - Improved OneDNN and OpenCL efficiency
 - CPU: interleave XOR with dot product instructions
-- CPU: use 16x4 tile to reduce B broadcast overhead and eliminate register spilling
+- CPU: use 16x4 register tile to reduce B broadcast overhead and eliminate register spilling
+- CPU: use 16x16 hash tiles to reduce blake overhead
 
 ### Pearl OneDNN
 - use constant, unsigned matrix, remove 512MiB A buffer and reduce power

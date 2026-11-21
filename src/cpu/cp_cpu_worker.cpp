@@ -399,7 +399,8 @@ extern "C" void cp_cpu_worker_init(void)
     if(affinity_ok)
         cp_cpu_affinity_bind_openmp_pool();
     printf("[cpu] affinity: %s\n", cp_cpu_affinity_summary());
-    printf("[cpu] fused GEMM+XOR worker (contiguous 8x16 tiles, zero-B)\n");
+    printf("[cpu] fused GEMM+XOR worker (contiguous %dx%d hash tiles, zero-B)\n",
+           Case33GemmXor::kTileRows, Case33GemmXor::kTileCols);
     printf("[cpu] SIMD ISA: %s\n", simd_isa_label(g_gemm.isa_used(), g_gemm.sse_tile()));
     printf("[cpu] prepack mode: %s\n", prepack_mode_name(g_prepack_mode));
     fflush(stdout);

@@ -98,34 +98,33 @@ case33_avxvnni_16x4_xor:
     vmovdqu ymm9, ymmword ptr [rdx+0]
     {vex} vpdpbusd ymm0, ymm8, ymm14
     {vex} vpdpbusd ymm4, ymm9, ymm14
-    vpshufd ymm13, ymm12, 78
+    vpshufd xmm13, xmm12, 78
     vpbroadcastd ymm14, dword ptr [r11+16]
     {vex} vpdpbusd ymm1, ymm8, ymm15
     {vex} vpdpbusd ymm5, ymm9, ymm15
-    vpxor ymm12, ymm12, ymm13
+    vpxor xmm12, xmm12, xmm13
     vpbroadcastd ymm15, dword ptr [r11+20]
     {vex} vpdpbusd ymm2, ymm8, ymm10
     {vex} vpdpbusd ymm6, ymm9, ymm10
-    vpshufd ymm13, ymm12, 177
+    vpshufd xmm13, xmm12, 177
     vpbroadcastd ymm10, dword ptr [r11+24]
     {vex} vpdpbusd ymm3, ymm8, ymm11
     {vex} vpdpbusd ymm7, ymm9, ymm11
-    vpxor ymm12, ymm12, ymm13
+    vpxor xmm12, xmm12, xmm13
     vpbroadcastd ymm11, dword ptr [r11+28]
     vmovdqu ymm8, ymmword ptr [r10+32]
     vmovdqu ymm9, ymmword ptr [rdx+32]
     {vex} vpdpbusd ymm0, ymm8, ymm14
     {vex} vpdpbusd ymm4, ymm9, ymm14
-    vmovd dword ptr [r9], xmm12
+    vmovd eax, xmm12
     {vex} vpdpbusd ymm1, ymm8, ymm15
     {vex} vpdpbusd ymm5, ymm9, ymm15
-    vextracti128 xmm13, ymm12, 1
+    xor dword ptr [r9], eax
     {vex} vpdpbusd ymm2, ymm8, ymm10
     {vex} vpdpbusd ymm6, ymm9, ymm10
-    vmovd dword ptr [r9+4], xmm13
     {vex} vpdpbusd ymm3, ymm8, ymm11
     {vex} vpdpbusd ymm7, ymm9, ymm11
-    add r9, 8
+    add r9, 4
     vpbroadcastd ymm12, dword ptr [r11+32]
     vpbroadcastd ymm13, dword ptr [r11+36]
     vpbroadcastd ymm14, dword ptr [r11+40]
@@ -553,21 +552,20 @@ case33_avxvnni_16x4_xor:
     vpxor ymm12, ymm12, ymm3
     {vex} vpdpbusd ymm7, ymm9, ymm11
     vpxor ymm13, ymm13, ymm7
-    vperm2i128 ymm14, ymm12, ymm13, 32
-    vperm2i128 ymm15, ymm12, ymm13, 49
-    vpxor ymm12, ymm14, ymm15
+    vpxor ymm12, ymm12, ymm13
+    vextracti128 xmm13, ymm12, 1
+    vpxor xmm12, xmm12, xmm13
     add r10, 1024
     add rdx, 1024
     add r11, 512
     dec r8d
     jnz .Lcase33_avxvnni_16x4_xor_next
-    vpshufd ymm13, ymm12, 78
-    vpxor ymm12, ymm12, ymm13
-    vpshufd ymm13, ymm12, 177
-    vpxor ymm12, ymm12, ymm13
-    vmovd dword ptr [r9], xmm12
-    vextracti128 xmm13, ymm12, 1
-    vmovd dword ptr [r9+4], xmm13
+    vpshufd xmm13, xmm12, 78
+    vpxor xmm12, xmm12, xmm13
+    vpshufd xmm13, xmm12, 177
+    vpxor xmm12, xmm12, xmm13
+    vmovd eax, xmm12
+    xor dword ptr [r9], eax
     vzeroupper
     ret
     .size case33_avxvnni_16x4_xor, .-case33_avxvnni_16x4_xor
@@ -637,34 +635,33 @@ case33_avxvnni_int8_16x4_xor:
     vmovdqu ymm9, ymmword ptr [rdx+0]
     vpdpbssd ymm0, ymm8, ymm14
     vpdpbssd ymm4, ymm9, ymm14
-    vpshufd ymm13, ymm12, 78
+    vpshufd xmm13, xmm12, 78
     vpbroadcastd ymm14, dword ptr [r11+16]
     vpdpbssd ymm1, ymm8, ymm15
     vpdpbssd ymm5, ymm9, ymm15
-    vpxor ymm12, ymm12, ymm13
+    vpxor xmm12, xmm12, xmm13
     vpbroadcastd ymm15, dword ptr [r11+20]
     vpdpbssd ymm2, ymm8, ymm10
     vpdpbssd ymm6, ymm9, ymm10
-    vpshufd ymm13, ymm12, 177
+    vpshufd xmm13, xmm12, 177
     vpbroadcastd ymm10, dword ptr [r11+24]
     vpdpbssd ymm3, ymm8, ymm11
     vpdpbssd ymm7, ymm9, ymm11
-    vpxor ymm12, ymm12, ymm13
+    vpxor xmm12, xmm12, xmm13
     vpbroadcastd ymm11, dword ptr [r11+28]
     vmovdqu ymm8, ymmword ptr [r10+32]
     vmovdqu ymm9, ymmword ptr [rdx+32]
     vpdpbssd ymm0, ymm8, ymm14
     vpdpbssd ymm4, ymm9, ymm14
-    vmovd dword ptr [r9], xmm12
+    vmovd eax, xmm12
     vpdpbssd ymm1, ymm8, ymm15
     vpdpbssd ymm5, ymm9, ymm15
-    vextracti128 xmm13, ymm12, 1
+    xor dword ptr [r9], eax
     vpdpbssd ymm2, ymm8, ymm10
     vpdpbssd ymm6, ymm9, ymm10
-    vmovd dword ptr [r9+4], xmm13
     vpdpbssd ymm3, ymm8, ymm11
     vpdpbssd ymm7, ymm9, ymm11
-    add r9, 8
+    add r9, 4
     vpbroadcastd ymm12, dword ptr [r11+32]
     vpbroadcastd ymm13, dword ptr [r11+36]
     vpbroadcastd ymm14, dword ptr [r11+40]
@@ -1092,21 +1089,20 @@ case33_avxvnni_int8_16x4_xor:
     vpxor ymm12, ymm12, ymm3
     vpdpbssd ymm7, ymm9, ymm11
     vpxor ymm13, ymm13, ymm7
-    vperm2i128 ymm14, ymm12, ymm13, 32
-    vperm2i128 ymm15, ymm12, ymm13, 49
-    vpxor ymm12, ymm14, ymm15
+    vpxor ymm12, ymm12, ymm13
+    vextracti128 xmm13, ymm12, 1
+    vpxor xmm12, xmm12, xmm13
     add r10, 1024
     add rdx, 1024
     add r11, 512
     dec r8d
     jnz .Lcase33_avxvnni_int8_16x4_xor_next
-    vpshufd ymm13, ymm12, 78
-    vpxor ymm12, ymm12, ymm13
-    vpshufd ymm13, ymm12, 177
-    vpxor ymm12, ymm12, ymm13
-    vmovd dword ptr [r9], xmm12
-    vextracti128 xmm13, ymm12, 1
-    vmovd dword ptr [r9+4], xmm13
+    vpshufd xmm13, xmm12, 78
+    vpxor xmm12, xmm12, xmm13
+    vpshufd xmm13, xmm12, 177
+    vpxor xmm12, xmm12, xmm13
+    vmovd eax, xmm12
+    xor dword ptr [r9], eax
     vzeroupper
     ret
     .size case33_avxvnni_int8_16x4_xor, .-case33_avxvnni_int8_16x4_xor
@@ -1283,17 +1279,16 @@ case33_avx2_16x4_xor:
     vpxor ymm12, ymm4, ymm5
     vpxor ymm13, ymm6, ymm7
     vpxor ymm12, ymm12, ymm13
-    vperm2i128 ymm13, ymm10, ymm12, 32
-    vperm2i128 ymm14, ymm10, ymm12, 49
-    vpxor ymm10, ymm13, ymm14
-    vpshufd ymm11, ymm10, 78
-    vpxor ymm10, ymm10, ymm11
-    vpshufd ymm11, ymm10, 177
-    vpxor ymm10, ymm10, ymm11
-    vmovd dword ptr [r9], xmm10
+    vpxor ymm10, ymm10, ymm12
     vextracti128 xmm11, ymm10, 1
-    vmovd dword ptr [r9+4], xmm11
-    add r9, 8
+    vpxor xmm10, xmm10, xmm11
+    vpshufd xmm11, xmm10, 78
+    vpxor xmm10, xmm10, xmm11
+    vpshufd xmm11, xmm10, 177
+    vpxor xmm10, xmm10, xmm11
+    vmovd eax, xmm10
+    xor dword ptr [r9], eax
+    add r9, 4
     dec r8d
     jnz .Lcase33_avx2_16x4_xor_panel
     vzeroupper
@@ -1542,7 +1537,8 @@ case33_ssse3_16x4_xor:
     pxor xmm12, xmm13
     pshufd xmm13, xmm12, 177
     pxor xmm12, xmm13
-    movd dword ptr [r9+0], xmm12
+    movd eax, xmm12
+    xor dword ptr [r9], eax
     sub r11, 512
     movdqu xmm0, xmmword ptr [rsp+0+128]
     movdqu xmm1, xmmword ptr [rsp+0+144]
@@ -1751,9 +1747,10 @@ case33_ssse3_16x4_xor:
     pxor xmm12, xmm13
     pshufd xmm13, xmm12, 177
     pxor xmm12, xmm13
-    movd dword ptr [r9+4], xmm12
+    movd eax, xmm12
+    xor dword ptr [r9], eax
     add rcx, 16
-    add r9, 8
+    add r9, 4
     dec r8d
     jnz .Lcase33_ssse3_16x4_xor_panel
     add rsp, 256
