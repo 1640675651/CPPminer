@@ -1,6 +1,6 @@
 # CPPminer
 
-Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide range of hardware. Tested with LuckyPool, Herominers, and Kryptex. 
+Cross-Platform Pearl (now multi-algo) miner written in C++ supporting a wide range of hardware. Tested on LuckyPool, Herominers, and Kryptex. 
 
 ## Algorithms and Backends
 Select the algorithm and backend at runtime with `--algo` (default `pearl`) and `--backend` (default `cpu`).
@@ -12,19 +12,19 @@ Select the algorithm and backend at runtime with `--algo` (default `pearl`) and 
 
 | Backend | Directory | Status |
 |---------|-----------|--------|
-| CPU | `src/cpu/` | Pearl: fused GEMM+XOR (contiguous 8×16) |
+| CPU | `src/cpu/` | Pearl: fused GEMM+XOR |
 | CUDA | `src/cuda/` | Pearl: Pascal CUTLASS fused GEMM+XOR+jackpot |
 | OpenCL | `src/opencl/` | Pearl: fused GEMM+XOR+jackpot (AMD / generic OpenCL) |
 | OneDNN | `src/onednn/` | Pearl: Intel GPU gemmstone IGEMM + tile XOR + GPU jackpot |
 | wgpu | `src/pearl/wgpu/` + `rust/cp-pearl-wgpu-ffi` | Pearl: WGSL fused GEMM+XOR+jackpot (Vulkan / DX12 / Metal), optional LDS staging |
-| Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR (contiguous 4×64) + host jackpot ([README](src/pearl/hexagon/README.md)) |
+| Hexagon | `src/pearl/hexagon/` (+ DSP library in `dsp/`) | Pearl: Snapdragon cDSP HVX fused GEMM+XOR+jackpot ([README](src/pearl/hexagon/README.md)) |
 | Intel NPU | `src/pearl/intel_npu/` | Pearl: Core Ultra NPU via OpenVINO + patched NPU compiler, int8 GEMM on the DPU + tile XOR on the SHAVE cores ([README](src/pearl/intel_npu/README.md)) |
 | Quantus CPU | `src/qpow/cpu/` | Poseidon2 midstate search (scalar + AVX2 4-wide) |
 | Quantus CUDA | `src/qpow/cuda/` | Poseidon2 kernel on the nonce line, self-tested per device |
 | Quantus wgpu | `src/qpow/wgpu/` + `rust/cp-quantus-wgpu-ffi` | GpuEngine FFI |
 | Quantus OpenCL | `src/qpow/opencl/` | Poseidon2 kernel on the nonce line (`qpow/nonce_line.hpp`); product/reduction variants probed and self-tested per device ([docs](docs/quantus_opencl.md)) |
 
-## Requirements
+## Build Requirements
 
 - MSVC + **CMake** (Windows) or GCC/Clang + CMake (Linux/macOS)
 - **Rust toolchain** (`cargo` / `rustup`, or `conda install -c conda-forge rust`) for in-process proof build and `--verify`
@@ -331,19 +331,19 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 ### CPU
 
-| Device | Clock Speed | ISA | Hashrate | Note |
-|--------|-------------|-----|----------|------|
-| Celeron G1840 | 2.8GHz | SSSE3 | 35 GH/s | |
-| Core i9 9980HK | 2.4GHz | AVX2 | 440 GH/s | turbo boost disabled |
-| Core i5 12490F | 4.0GHz | AVX-VNNI | 1.1 TH/s | |
-| Core i9 12900K | 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | 2.5 TH/s | |
-| Core Ultra 9 275HX | 8P @ 4.3GHz + 8E @ 3.8GHz | AVX-VNNI-INT8 | 3.4 TH/s | |
-| BCM2837 | 1.2GHz | NEON | 9 GH/s | rpi3b, m=n=32 |
-| Dimensity 6300 | 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | 160 GH/s |
+| Device | Clock Speed | ISA | Hashrate | Power (W) | Note |
+|--------|-------------|-----|----------|-----------|------|
+| Celeron G1840 | 2.8GHz | SSSE3 | 35 GH/s | | |
+| Core i9 9980HK | 2.4GHz | AVX2 | 490 GH/s | 37 | no turbo |
+| Core i5 12490F | 4.0GHz | AVX-VNNI | 1.1 TH/s | | |
+| Core i9 12900K | 8P @ 3.2GHz + 8E @ 2.4GHz | AVX-VNNI | 1.7 TH/s | 82 | no turbo |
+| Core i9 12900K | 8P @ 4.9GHz + 8E @ 3.7GHz | AVX-VNNI | 2.5 TH/s | 250 | |
+| Core Ultra 9 275HX | 8P @ 2.7GHz + 16E @ 2.1GHz | AVX-VNNI-INT8 | 2.3 TH/s | 52 | no turbo |
+| Core Ultra 9 275HX | 8P @ 4.3GHz + 16E @ 3.8GHz | AVX-VNNI-INT8 | 3.5 TH/s | 125 | |
+| BCM2837 | 1.2GHz | NEON | 9 GH/s | | rpi3b, m=n=32 |
+| Dimensity 6300 | 2x A76 @ 2.6GHz + 6x A55 @ 2.0GHz | NEON DotProd | 160 GH/s | |
 
 ## Vendored proof stack (`third_party/`)
-
-`cp-proof-ffi` is self-contained under this repo — no external `pearl/` checkout:
 
 | Crate | Path | Purpose |
 |-------|------|---------|
@@ -353,13 +353,6 @@ Hashrate on matrix size `m=n=131072`, `k=4096`, `r=128`. Rates are MAC/s (`docs/
 
 `build.ps1` / `build.sh` both drive CMake, which runs `cargo build --release` in `rust/cp-proof-ffi/` when `cargo` is available and links the static library into the miner (`cp_proof_ffi.lib` on Windows, `libcp_proof_ffi.a` on Linux/macOS). Proofs are built and verified in-process.
 
-If any are missing, copy from the Pearl repo:
-
-```powershell
-Copy-Item -Recurse pearl\pearl-blake3 third_party\pearl-blake3
-Copy-Item -Recurse pearl\zk-pow       third_party\zk-pow
-Copy-Item -Recurse pearl\plonky2      third_party\plonky2
-```
 
 ## Kryptex gzip stratum (v2)
 
