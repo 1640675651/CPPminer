@@ -1,7 +1,6 @@
 # Changelog
 
-## v1.1 (tentative)
-
+## v1.1
 ### Fix & Enhancements
 - Improved OneDNN and OpenCL efficiency
 - CPU: interleave XOR with dot product instructions
@@ -9,14 +8,14 @@
 - CPU: use 16x16 hash tiles to reduce blake overhead
 
 ### Pearl OneDNN
-- use constant, unsigned matrix, remove 512MiB A buffer and reduce power
-- code refactor, use a fork of onednn instead of keeping patches
-- tiled A packing for higher GEMM throughput
-- lower XOR overhead on Xe2
-- taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
-- 65536^2 GEMM panels with the fused jackpot on all Arc GPUs (Xe2 used 32768^2)
-- keep two GEMM panels in flight with the fused jackpot
-- queue the first panel after the matrix preparation instead of waiting for it
+- Use constant, unsigned matrix, remove 512MiB A buffer and reduce power
+- Cleaner code structure, use a fork of onednn instead of keeping patches
+- Tiled A packing for higher GEMM throughput
+- Lower XOR overhead on Xe2
+- Taller boustrophedon walk slices on Arc GPUs to reduce power (Xe2 switches from the Hilbert walk)
+- Unified 65536^2 GEMM launches on Arc GPUs (Xe2 used 32768^2)
+- Keep two GEMM launches in flight
+- Queue the first panel after the matrix preparation instead of waiting for it
 
 ## v1.0
 ### New features

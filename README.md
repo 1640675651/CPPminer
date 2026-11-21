@@ -188,6 +188,9 @@ CPPminer keeps **1%** of mining for its development. About one matrix scan in ev
 
 Windows: `powershell -ExecutionPolicy Bypass -File build.ps1 -Backend Cpu,OpenCl` (pick your backends). Linux and macOS: `./build.sh --backend cpu,opencl`. Requirements, all backends and build options: [docs/building.md](docs/building.md). How the code is organized: [docs/structure.md](docs/structure.md).
 
+## Limitations
+Close sourced miners already extensively optimized Nvidia RTX20-50 and AMD RDNA3/4 GPUs. Competing with them is not the first priority of CPPminer today. The current CUDA backend is optimized for GTX10 (Pascal) GPUs only, which is unsupported in most miners. Support for those GPUs will be introduced in future versions, likely after the FP8 fork.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Changes per release: [CHANGELOG.md](CHANGELOG.md).

@@ -2,3 +2,5 @@
 # byte-exact, never converted to CRLF (core.autocrlf would break the hunks).
 *.diff -text
 *.patch -text
+# cmd.exe expects CRLF in batch files (labels and goto can misparse with LF).
+*.bat text eol=crlf

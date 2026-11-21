@@ -15,6 +15,9 @@ DLL that gets bundled, so new dependencies are picked up automatically:
   - Windows system DLLs / api-ms-* sets            -> skipped
 Anything else is an error, so a release never ships with a missing dependency.
 
+The main zip also carries the example launch scripts in EXAMPLE_SCRIPTS (scripts/*.bat), next to
+cppminer.exe.
+
 A build with the Intel NPU backend (the exe imports openvino.dll) also gets a second zip,
 <name>_intel_npu_runtime.zip: the OpenVINO NPU plugin, the patched NPU compiler (~85 MB) and the
 NPU kernels, under a top folder named like the zip; its contents (kernels\\intel_npu included) go
@@ -44,6 +47,8 @@ VCRT_PATTERNS = ("msvcp140", "vcruntime140", "vcomp140", "concrt140")
 NPU_RUNTIME_DLLS = ("openvino_intel_npu_plugin.dll", "openvino_intel_npu_compiler_loader.dll",
                     "openvino_intel_npu_compiler.dll")
 NPU_KERNEL_DIR = os.path.join("kernels", "intel_npu")
+# Example launch scripts, shipped next to cppminer.exe in the main zip.
+EXAMPLE_SCRIPTS = ("start_pearl.bat",)
 
 
 def pe_imports(path):
@@ -273,6 +278,8 @@ def main():
     files += [(src, os.path.basename(src)) for src in sorted(bundled.values())]
     for cl in sorted(glob.glob(os.path.join(exe_dir, "kernels", "*.cl"))):
         files.append((cl, os.path.join("kernels", os.path.basename(cl))))
+    for script in EXAMPLE_SCRIPTS:
+        files.append((os.path.join(ROOT, "scripts", script), script))
 
     zips = [package(args.out, name, name, files)]
     if npu_files:
