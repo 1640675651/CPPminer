@@ -29,7 +29,7 @@ Rates are printed as TMAC/s when ≥ 10¹² MAC/s (`cp_pp_fmt_mac_rate`).
 |----------|---------|-----------|----------|
 | `[ocl]` / `[cpu]` / `[gpu] plain_proof progress` | tiles_so_far / scan_elapsed | From scan start of **this** matrix attempt | Scan only |
 | `[…] attempt timing: … X TMAC/s` | tiles_this_attempt / **scan_sec** | Scan start → scan end | Scan only (`prep=` is printed separately and **not** in the rate) |
-| `[pearl] … no share yet` | `tiles_scanned_total` / `(now − first attempt start)` | First attempt of the job → now | Prep, scans, gaps, hit handling since the first attempt — **not** job setup |
+| `[pearl] attempts=… (prep included)` | `tiles_scanned_total` / `(now − first attempt start)` | First attempt of the job → now | Prep, scans, gaps, hit handling since the first attempt — **not** job setup |
 | `[pearl] proof ready … X TMAC/s (hs=…)` | `tiles_since_prev` / `interval_sec` | Previous share → this share (or **job start** → first share) | Prep, misses, scans, and gaps in that interval — **not** proof build |
 | Pool submit `hs` | Same as proof-ready | Same interval | Same as proof-ready |
 
@@ -53,10 +53,10 @@ Logged once per matrix attempt when the scan returns:
 - Early exit shortens both tiles and `scan_sec` together → rate stays close to progress  
 - Prep (~0.3s GPU matrix prep) does **not** dilute this number  
 
-### Job-level `[pearl] … no share yet`
+### Job-level `[pearl] attempts=… (prep included)`
 
 ```text
-[pearl] attempts=… (…/s) 4.16 TMAC/s no share yet
+[pearl] attempts=… (…/s) 4.16 TMAC/s (prep included)
 ```
 
 - Printed after every 5th attempt of a job (unless that attempt found a share)  
@@ -93,7 +93,7 @@ Typical ordering (OpenCL production):
 ```text
 progress / attempt timing   ≈ 4.6–4.8 TMAC/s   (scan-only)
 proof ready / pool hs       ≈ slightly lower   (interval includes prep + prior misses)
-no share yet                ≈ lower still      (whole job wall clock)
+attempts (prep included)    ≈ lower still      (whole job wall clock)
 ```
 
 ### Early exit does not lower attempt TMAC

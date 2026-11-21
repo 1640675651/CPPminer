@@ -297,7 +297,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 char mac_buf[32];
                 cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_scanned_total, sec), mac_buf,
                                    sizeof(mac_buf));
-                printf("[pearl] attempts=%llu (%.2f/s) %s no share yet\n",
+                printf("[pearl] attempts=%llu (%.2f/s) %s (cumulative avg, prep included)\n",
                        (unsigned long long)attempts, (double)attempts / sec, mac_buf);
                 fflush(stdout);
             }
